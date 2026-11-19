@@ -175,6 +175,7 @@ pub(super) fn idle_delivery_poll(exit: u8) -> bool {
 }
 
 thread_local! {
+    static METRIC_REPOSITORY: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     static METRIC_SESSION_ID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
     static WRAPPED_COMMAND_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -188,6 +189,11 @@ pub(super) fn mark_wrapped_command_failure() {
 
 pub(super) fn set_metric_session(id: i64) {
     METRIC_SESSION_ID.with(|slot| slot.set(Some(id)));
+}
+
+/// Preserve the repository context of a command that can remove its own cwd.
+pub(super) fn set_metric_repository(root: &std::path::Path) {
+    METRIC_REPOSITORY.with(|path| *path.borrow_mut() = Some(root.to_path_buf()));
 }
 
 fn metric_session() -> Option<i64> {
@@ -213,7 +219,9 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
     let Some(surface) = safe_command_surface(args) else {
         return;
     };
-    let Ok(cwd) = std::env::current_dir() else {
+    let Ok(cwd) =
+        METRIC_REPOSITORY.with(|path| path.borrow().clone().map_or_else(std::env::current_dir, Ok))
+    else {
         return;
     };
     let Ok(repo) = crate::GitRepo::discover(&cwd) else {
@@ -354,6 +362,7 @@ pub(super) fn record_command_metric(
     spans: &crate::phase_telemetry::Recorder,
 ) {
     let session_id = METRIC_SESSION_ID.with(|slot| slot.take());
+    let repository = METRIC_REPOSITORY.with(|path| path.take());
     let duration_ms = (ended - started).as_millis() as i64;
     let details = take_command_metric_details();
     // Inspection commands are contractually side-effect free: the CLI documents
@@ -372,7 +381,7 @@ pub(super) fn record_command_metric(
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
     let mut details = with_spans(details.unwrap_or_default(), spans);
-    let Ok(cwd) = std::env::current_dir() else {
+    let Ok(cwd) = repository.map_or_else(std::env::current_dir, Ok) else {
         return;
     };
     let Ok(repo) = crate::GitRepo::discover(&cwd) else {

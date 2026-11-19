@@ -3721,6 +3721,18 @@ use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
 This requires the broker's current live duplicate-work evidence and a clean,
 unchanged checkout. Ordinary overlap warnings remain a separate count.
 
+`costs` in each task row and `completed_task_totals` also record
+`gate_cache_hits`, `gate_execution_ms_avoided`, `shared_gate_verdicts` and
+`shared_gate_wait_ms`. The counters use session-attributed `gate.cached`
+events in the reporting window. An event with `shared_wait_ms` records a
+successful reuse after waiting for a producer. Older cache events contribute
+only to total hits and recorded execution avoided. The source run's recorded
+duration measures reused child work. The waiting duration is observed
+separately and cannot be subtracted from the source duration to infer a task
+wall-time saving. The existing `gate_verdict_wait` span contributes to the
+command's queue partition. Finish retains the command's repository identity
+through checkout removal so it can still append the timing and outcome.
+
 ### Session scratch directories
 
 Introduced 2026-11-18. Every spawned session whose checkout sits in a

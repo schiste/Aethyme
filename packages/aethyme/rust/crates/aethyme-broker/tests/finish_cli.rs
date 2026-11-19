@@ -1073,6 +1073,16 @@ fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
     assert_eq!(report["status"], "cleaned");
     assert_eq!(report["cleanup"]["worktree_removed"], true);
     assert!(!worktree.exists());
+
+    let metrics =
+        std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let metric = metrics
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["command"] == "finish" && row["session_id"] == session_id)
+        .expect("finish recorded a timing from its removed checkout");
+    assert_eq!(metric["outcome"], "succeeded");
+    assert!(metric["output_bytes"].as_u64().unwrap() > 0);
 }
 
 #[test]

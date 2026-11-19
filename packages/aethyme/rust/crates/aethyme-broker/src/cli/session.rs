@@ -2242,6 +2242,7 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     // machine, not on this session, and would otherwise spend the budget
     // before the first finish check runs.
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    telemetry::set_metric_repository(broker.main_root());
     let options = crate::FinishOptions {
         keep_worktree: parsed.keep_worktree,
     };

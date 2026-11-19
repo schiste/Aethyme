@@ -909,26 +909,26 @@ pub fn gate_result_payload(
 }
 
 /// `saved_ms` is the cached run's recorded duration — the execution time
-/// this cache hit avoided.
+/// this cache hit avoided. An in-flight join also records the elapsed wait.
 pub fn gate_cached_payload(
-    gate: &str,
-    tree: &str,
-    saved_ms: i64,
-    cached_status: crate::types::GateStatus,
+    hit: &crate::types::GateResult,
     failure_class: Option<crate::types::GateFailureClass>,
-    run_id: i64,
     cache_provenance: &crate::GateCacheProvenance,
+    shared_wait_ms: Option<i64>,
 ) -> String {
-    json!({
-        "gate": gate,
-        "tree": tree,
-        "saved_ms": saved_ms,
-        "cached_status": cached_status.as_str(),
+    let mut payload = json!({
+        "gate": hit.gate_name,
+        "tree": hit.tree_hash,
+        "saved_ms": hit.duration_ms.unwrap_or_default(),
+        "cached_status": hit.status.as_str(),
         "failure_class": failure_class.map(|class| class.as_str()),
-        "run_id": run_id,
+        "run_id": hit.id,
         "cache_provenance": cache_provenance,
-    })
-    .to_string()
+    });
+    if let Some(wait_ms) = shared_wait_ms {
+        payload["shared_wait_ms"] = json!(wait_ms);
+    }
+    payload.to_string()
 }
 
 pub fn gate_cache_bypassed_payload(gate: &str, tree: &str) -> String {

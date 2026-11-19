@@ -76,6 +76,10 @@ struct Costs {
     conflicts_detected: u64,
     conflicts_resolved: u64,
     reported_duplicate_work_avoided: u64,
+    gate_cache_hits: u64,
+    gate_execution_ms_avoided: u64,
+    shared_gate_verdicts: u64,
+    shared_gate_wait_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +117,22 @@ impl Costs {
         }
     }
 
+    fn add_gate_hit(&mut self, event: &crate::types::Event) {
+        self.gate_cache_hits += 1;
+        let Some(payload) = event
+            .payload_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        else {
+            return;
+        };
+        self.gate_execution_ms_avoided += payload["saved_ms"].as_u64().unwrap_or_default();
+        if let Some(wait_ms) = payload["shared_wait_ms"].as_u64() {
+            self.shared_gate_verdicts += 1;
+            self.shared_gate_wait_ms += wait_ms;
+        }
+    }
+
     fn add(&mut self, item: &Self) {
         self.commands += item.commands;
         self.wall_ms += item.wall_ms;
@@ -124,6 +144,10 @@ impl Costs {
         self.conflicts_detected += item.conflicts_detected;
         self.conflicts_resolved += item.conflicts_resolved;
         self.reported_duplicate_work_avoided += item.reported_duplicate_work_avoided;
+        self.gate_cache_hits += item.gate_cache_hits;
+        self.gate_execution_ms_avoided += item.gate_execution_ms_avoided;
+        self.shared_gate_verdicts += item.shared_gate_verdicts;
+        self.shared_gate_wait_ms += item.shared_gate_wait_ms;
         for (outcome, count) in &item.outcomes {
             *self.outcomes.entry(outcome.clone()).or_default() += count;
         }
@@ -179,6 +203,7 @@ pub(super) fn collect(
             "merge.verified" if pending.remove(&key) => {
                 costs.entry(key).or_default().conflicts_resolved += 1;
             }
+            crate::events::GATE_CACHED => costs.entry(key).or_default().add_gate_hit(event),
             crate::events::DUPLICATE_WORK_AVOIDED if duplicates.insert(key) => {
                 costs
                     .entry(key)
@@ -256,7 +281,7 @@ impl TaskCosts {
     pub(super) fn render(&self) -> String {
         let cost = &self.completed_task_totals;
         format!(
-            "Task attribution: {}/{} completed tasks had measured commands; {} commands, {} ms child work, {} ms queue, {} ms broker and unattributed, {} stdout bytes, {} retries. Conflict episodes: {} detected, {} verified after conflict. Reported duplicate work avoided: {}.{}",
+            "Task attribution: {}/{} completed tasks had measured commands; {} commands, {} ms child work, {} ms queue, {} ms broker and unattributed, {} stdout bytes, {} retries. Conflict episodes: {} detected, {} verified after conflict. Reported duplicate work avoided: {}. Gate cache: {} hits, {} ms of recorded execution avoided, {} in-flight verdicts reused ({} ms wait).{}",
             self.completed_tasks_with_metrics,
             self.completed_tasks,
             cost.commands,
@@ -268,6 +293,10 @@ impl TaskCosts {
             cost.conflicts_detected,
             cost.conflicts_resolved,
             cost.reported_duplicate_work_avoided,
+            cost.gate_cache_hits,
+            cost.gate_execution_ms_avoided,
+            cost.shared_gate_verdicts,
+            cost.shared_gate_wait_ms,
             if self.history_limited {
                 " Command history limited to its newest 16 MiB."
             } else {
@@ -337,14 +366,26 @@ mod tests {
             payload_json: None,
         };
         let events = [
-            event(1, 120, "session.closed"),
-            event(2, 130, crate::events::SESSION_REUSED),
+            crate::types::Event {
+                payload_json: Some(r#"{"saved_ms":30,"shared_wait_ms":11}"#.into()),
+                ..event(1, 70, crate::events::GATE_CACHED)
+            },
+            crate::types::Event {
+                payload_json: Some(r#"{"saved_ms":42}"#.into()),
+                ..event(2, 80, crate::events::GATE_CACHED)
+            },
+            event(3, 120, "session.closed"),
+            event(4, 130, crate::events::SESSION_REUSED),
         ];
         let report = collect(root.path(), 50, 5, &input, &events);
         assert_eq!(report.completed_tasks, 3);
         assert_eq!(report.completed_tasks_with_metrics, 1);
         assert_eq!(report.unattributed_command_rows, 1);
         assert_eq!(report.completed_task_totals.wall_ms, 9);
+        assert_eq!(report.completed_task_totals.gate_cache_hits, 2);
+        assert_eq!(report.completed_task_totals.gate_execution_ms_avoided, 72);
+        assert_eq!(report.completed_task_totals.shared_gate_verdicts, 1);
+        assert_eq!(report.completed_task_totals.shared_gate_wait_ms, 11);
         assert_eq!(report.completed_task_totals.output_bytes, 13);
         assert_eq!(report.completed_task_totals.outcomes["outcome_unknown"], 1);
         assert_eq!(report.tasks.len(), 4);
