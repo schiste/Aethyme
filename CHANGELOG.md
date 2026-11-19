@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.138] - 2026-11-19
+
+### Changed
+
+- `submit` hashes its freshly created verification checkout from that checkout's own index instead of from an empty one, so Git re-reads only files whose size, timestamps or identity changed rather than every tracked file. The shortcut is used only for the checkout `submit` has just created, and only when all of these are proven; otherwise the full hash runs as before: no entry is flagged assume-unchanged or skip-worktree; the index is exactly the commit's tree; no tracked path is subject to content conversion (line endings, filters, ident, working-tree encoding) and `core.autocrlf` is off; the index did not change while it was copied; and the copy kept the original's timestamp. Git's strictest stat comparison is forced for these commands. A session's own gate runs, the recheck after waiting for a shared verdict, native gates, semantic-patch preview and graph integrity keep the full hash (#1851).
+
+### Added
+
+- Spans inside every tree hash (`tree_hash_index_build`, `tree_hash_tracked_rehash`, `tree_hash_untracked_walk`, `tree_hash_untracked_add`, `tree_hash_write_tree`, and the `tree_hash_seed*` steps) and one per call site (`gate_inputs_tree_hash`, `gate_shared_wait_tree_hash`, `session_gate_tree_hash`, `native_gate_tree_hash`, `semantic_patch_tree_hash`, `graph_integrity_tree_hash`); attachment `tree_hash_files` with hashes, tracked entries and untracked files; counters `tree_hash_seeded` and `tree_hash_seed_fallback_<reason>` (#1851).
+
+### Upgrade notes
+
+- `AETHYME_TREE_HASH_SEED=off` forces the full hash everywhere.
+- A repository whose Git configuration sets `core.autocrlf`, or whose tracked files carry converting attributes, always takes the full hash; `tree_hash_seed_fallback_content_conversion` counts it.
+
+### Known issues
+
+- The saving is not yet measured; the new spans report it.
+
 ## [0.8.137] - 2026-11-19
 
 ### Fixed
