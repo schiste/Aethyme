@@ -3668,9 +3668,6 @@ pub struct RemoteDefaultBranch {
 pub const BROKER_WORKTREE_LOCK_REASON: &str =
     "aethyme: worktree on a configured, possibly removable root";
 
-/// Completion evidence is separate from the hash result: a failed operation
-/// can still prove that its repository-selected child processes were stopped.
-#[derive(Debug)]
 /// Set `AETHYME_TREE_HASH_SEED=off` to always take the full tree hash.
 const TREE_HASH_SEED_ENV: &str = "AETHYME_TREE_HASH_SEED";
 
@@ -3836,6 +3833,9 @@ fn record_tree_hash_files(tracked: u64, untracked: u64) {
     );
 }
 
+/// Completion evidence is separate from the hash result: a failed operation
+/// can still prove that its repository-selected child processes were stopped.
+#[derive(Debug)]
 pub(crate) struct WorkingTreeHashObservation {
     pub(crate) result: Result<String, GitError>,
     pub(crate) writers_quiescent: bool,
