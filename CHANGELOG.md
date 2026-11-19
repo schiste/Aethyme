@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.135] - 2026-11-19
+
+### Fixed
+
+- The trash catch-up process introduced in 0.8.134 gave up after about one second and deleted nothing. Every check of whether a catch-up was running took the host-wide lane lock for an instant and left a holder line naming no repository; a starting catch-up that met such a line ended as `lane_busy` instead of waiting. Checks now take the lock without writing anything and trust the holder line only while the lock is actually held, so a line left by a killed process or a reboot is ignored. A catch-up waits and retries every 45 s, within its 60-minute bound, for any holder other than its own repository's live catch-up. Exclusion is still the kernel lock (#1841).
+- Stored "which files did this session change" answers are reused again by `agents` and `status`. On macOS all watched worktrees shared one file-event stream; a few worktrees installing dependencies made it report dropped events, and each drop marked every worktree changed, so on the busiest repository only 970 of 10,184 answers were reused in a day. Up to 128 worktrees now get their own stream, so a drop marks only that worktree; the rest share one stream as before. Commands that decide, such as `submit`, still always ask Git (#1839).
+- A worktree that cannot be watched is retried with a backoff from 1 s to 4 minutes instead of every second (#1839).
+
+### Added
+
+- Counters `changed_files_reused` and `changed_files_miss_<reason>`; watcher status fields `own_stream_cap`, `own_streams`, `shared_streams`, `watched_on_shared`, `stream_threads`, `rescans_scoped`, `watch_set_changes`, `watch_failures` (#1839).
+- `checkout_trash_catchup` gains `lane_started_after_worker_ms` (#1841).
+
+### Upgrade notes
+
+- `checkout_trash_catchup` field `lane_held_by_other_repository` is replaced by its inverse, `lane_held_by_own_repository`.
+- The watcher's `rescans` now counts only invalidations of every worktree; per-worktree ones are `rescans_scoped`.
+- The file watcher holds one thread per own stream on macOS, at most 128. The new behaviour starts when the watcher's supervisor restarts.
+
+### Known issues
+
+- If a file-event stream stopped delivering events without reporting an error, a stored answer could be reused for up to 10 minutes by `agents` and `status`. This was already true of the shared stream.
+- Other bulk removals inside the worker still run at the lowest disk priority.
+
 ## [0.8.134] - 2026-11-19
 
 ### Fixed
