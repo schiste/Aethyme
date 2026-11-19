@@ -564,6 +564,8 @@ base, recorded in the same digest and supplied to the gate command. The
 `submission_base_snapshot` span measures this read-only lookup. Submission
 independently pins its verification base. It can reuse a session verdict when
 the candidate tree, definition, execution profile, and base still match.
+Execution-profile provenance uses the `sha256:` algorithm prefix for both
+ordinary and comparison-bound digests.
 
 ## Git wrapper probe verdict cache (2026-11-15)
 
