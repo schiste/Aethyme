@@ -486,6 +486,10 @@ preview store cannot supply cache evidence for a submission. Recipe phases
 are `semantic_patch_prepare`, `semantic_patch_candidate`, and
 `semantic_patch_verify`.
 
+From the session checkout at the reported base, inspect the patch with
+`git apply --check -- <patch_file>`. A user or agent can then apply it and
+review the working diff before committing the migration.
+
 ## Concurrent gate verdict reuse
 
 Cache-eligible local gates with a complete execution profile check the existing
