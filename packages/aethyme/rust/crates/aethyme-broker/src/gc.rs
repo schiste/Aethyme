@@ -5132,6 +5132,31 @@ impl Broker {
 
     /// A deferred request found this repository's worker already alive. The
     /// running worker serves it; count it so the run can report coalescing.
+    /// True when this repository's detached worker holds its singleton lock,
+    /// after counting the request as coalesced into that run (as an open that
+    /// found work due and the worker running always did). The probe takes
+    /// the lock only for the instant of the check and releases it at once:
+    /// an admission that goes on to launch takes it again, as before, so a
+    /// probe never holds the lock across the due checks and never hides a
+    /// pressure request's launch from another process.
+    fn worker_admission_coalesced_into_live_worker(
+        &mut self,
+        root: &Path,
+    ) -> Result<bool, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("worker_admission_live_worker_probe");
+        let alive = try_artifact_sweep_worker_lock(root)?.is_none();
+        if !alive {
+            crate::phase_telemetry::add("worker_admission_due_checks_run", Duration::ZERO);
+            return Ok(false);
+        }
+        crate::phase_telemetry::add("worker_admission_skipped_live_worker", Duration::ZERO);
+        crate::warn_unrecorded(
+            "count coalesced artifact worker request",
+            self.record_coalesced_artifact_worker_request(),
+        );
+        Ok(true)
+    }
+
     fn record_coalesced_artifact_worker_request(&mut self) -> Result<(), BrokerOpError> {
         let count = self
             .artifact_sweep_meta_get(ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY)?
@@ -8956,6 +8981,13 @@ impl Broker {
         {
             let _span = crate::phase_telemetry::span("worker_admission_compact_backfill");
             self.reconcile_compact_checkout_backfill()?;
+        }
+        // A live worker makes the due checks moot: nothing below may start a
+        // second one, and a request that is due stays durable for the open
+        // after the worker exits. Most opens on a busy repository found the
+        // worker running and spent 57 ms (median, 0.8.134) learning so.
+        if self.worker_admission_coalesced_into_live_worker(&root)? {
+            return Ok(());
         }
         let due_checks = crate::phase_telemetry::span("worker_admission_due_checks");
         let artifact_pending = self.artifact_sweep_backlog_pending()?
@@ -15512,6 +15544,38 @@ mod tests {
         assert_eq!(summary.entries_removed, 0);
         // The count was consumed by this run.
         assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_live_worker_skips_the_due_checks_and_counts_the_request_as_coalesced() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, mut broker) = pacing_fixture_broker(root.path());
+        // No worker: the due checks run, nothing is counted, and the probe
+        // left the lock free for the launch that may follow.
+        assert!(
+            !broker
+                .worker_admission_coalesced_into_live_worker(root.path())
+                .unwrap()
+        );
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
+        let launch = try_artifact_sweep_worker_lock(root.path()).unwrap();
+        assert!(launch.is_some(), "the probe kept the worker lock");
+        // A worker holds its singleton: the due checks are skipped and the
+        // request is counted once per open, as a coalesced request.
+        for _ in 0..2 {
+            assert!(
+                broker
+                    .worker_admission_coalesced_into_live_worker(root.path())
+                    .unwrap()
+            );
+        }
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 2);
+        drop(launch);
+        assert!(
+            !broker
+                .worker_admission_coalesced_into_live_worker(root.path())
+                .unwrap()
+        );
     }
 
     #[test]

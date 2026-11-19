@@ -404,6 +404,30 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Worker admission skips its due checks while the worker runs (2026-11-19)
+
+Every broker open admits the detached maintenance worker: it reads eight
+"is work due" sources (about 57 ms median on the busiest repository, 0.8.134)
+and only then tries the worker's singleton lock. On that repository the worker
+was almost always running, so nearly every open read everything only to count
+a coalesced request. The open now probes the singleton lock first. When the
+worker holds it, the open counts the coalesced request (as before) and skips
+the due checks; work that is due stays durable for the first open after the
+worker exits, as it did when the lock was found held after the checks. The
+probe holds the lock only for the instant of the check, so an admission that
+goes on to launch takes it again exactly as before. The main-checkout sync
+timer slot is no longer claimed while the worker runs; it is claimed by the
+first open after the worker exits, which then launches the worker that runs
+the timer lane.
+
+- **Phase counters (introduced).** In the command's `phase_counts`:
+  `worker_admission_skipped_live_worker` (the worker held its lock; the due
+  checks did not run) or `worker_admission_due_checks_run` (they did). The
+  probe's time is the span `worker_admission_live_worker_probe`; the existing
+  `worker_admission_due_checks` span now appears only when the checks run.
+  `gc.artifact_sweep.*.coalesced_requests` now counts every open that found
+  the worker running, not only those that had found work due first.
+
 ## Worktree watch streams and changed-path reuse counts (2026-11-19)
 
 A lease scan asks Git which files each session changed unless the host
