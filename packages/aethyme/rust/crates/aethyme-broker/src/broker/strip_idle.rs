@@ -68,6 +68,15 @@ use std::time::{Duration, Instant};
 /// `last_activity_at` it saw (JSON: session id to that time); a session is
 /// looked at again only once its activity moved.
 pub(crate) const IDLE_STRIP_DONE_KEY: &str = "checkout_strip.idle_done";
+/// Meta key: the coverage rules the memo in [`IDLE_STRIP_DONE_KEY`] was
+/// written under. A memo from older rules is set aside, so every idle
+/// session is examined once more under the current rules (one that a
+/// narrower rule left with directories it may now remove).
+pub(crate) const IDLE_STRIP_RULES_KEY: &str = "checkout_strip.idle_done_rules";
+/// The current coverage rules; bump it whenever what the idle strip may
+/// remove from an open session widens. 2: environment roots whose
+/// interpreter a step declares, and pnpm workspace members with their root.
+pub(crate) const IDLE_STRIP_RULES: u32 = 2;
 /// Remembered sessions at most; the lowest ids go first.
 const IDLE_STRIP_DONE_MAX: usize = 16_384;
 /// Open sessions the idle strip lists per run, at most (each costs a few
@@ -563,7 +572,16 @@ impl Broker {
             }
         };
         idle.sort_by_key(|session| (session.last_activity_at, session.id));
-        let handled: BTreeMap<i64, i64> = self.meta_json(IDLE_STRIP_DONE_KEY);
+        // A memo written under older coverage rules is set aside: every
+        // idle session is examined once more under the current ones.
+        let rules: u32 = self.meta_json(IDLE_STRIP_RULES_KEY);
+        let memo_outdated = rules != IDLE_STRIP_RULES;
+        let handled: BTreeMap<i64, i64> = if memo_outdated {
+            crate::phase_telemetry::add("checkout_idle_strip_memo_outdated", Duration::ZERO);
+            BTreeMap::new()
+        } else {
+            self.meta_json(IDLE_STRIP_DONE_KEY)
+        };
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let idle_hours = idle_after_ms / 3_600_000;
         let mut newly_handled = BTreeMap::new();
@@ -663,12 +681,23 @@ impl Broker {
             crate::warn_unrecorded(
                 "remember idle-stripped sessions",
                 self.update_meta_json(IDLE_STRIP_DONE_KEY, |stored: &mut BTreeMap<i64, i64>| {
+                    if memo_outdated {
+                        stored.clear();
+                    }
                     stored.extend(newly_handled.iter().map(|(id, at)| (*id, *at)));
                     while stored.len() > IDLE_STRIP_DONE_MAX {
                         stored.pop_first();
                     }
                 }),
             );
+            if memo_outdated {
+                crate::warn_unrecorded(
+                    "record the idle strip's coverage rules",
+                    self.update_meta_json(IDLE_STRIP_RULES_KEY, |stored: &mut u32| {
+                        *stored = IDLE_STRIP_RULES;
+                    }),
+                );
+            }
         }
         crate::phase_telemetry::attach(
             "checkout_idle_strip",
@@ -685,6 +714,7 @@ impl Broker {
                 "kept_not_declared_output": report.kept_not_declared,
                 "by_kind": report.by_kind,
                 "measure_ms": report.measure_ms,
+                "memo_outdated": memo_outdated,
                 "refused": report.strip.refused,
                 "more_remaining": report.strip.more_remaining,
                 "phase_ms": {
@@ -804,8 +834,9 @@ impl Broker {
                         .refused
                         .entry("environment_root_creation_unproven".to_string())
                         .or_default() += 1;
+                    // One directory kept, not a refusal of the checkout.
                     crate::phase_telemetry::add(
-                        "checkout_idle_strip_refused_environment_root_creation_unproven",
+                        "checkout_idle_strip_kept_environment_root_creation_unproven",
                         Duration::ZERO,
                     );
                 }

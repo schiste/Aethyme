@@ -6499,6 +6499,26 @@ mod tests {
         assert_eq!(again.skipped_handled, 1, "{again:#?}");
         assert!(worktree.join("node_modules").exists());
 
+        // A memo written under older coverage rules is set aside: the
+        // session is examined once more (and stripped again), then
+        // remembered under the current rules.
+        broker
+            .update_meta_json(
+                super::super::strip_idle::IDLE_STRIP_RULES_KEY,
+                |stored: &mut u32| *stored = super::super::strip_idle::IDLE_STRIP_RULES - 1,
+            )
+            .unwrap();
+        let reexamined = pass(&mut broker);
+        assert_eq!(reexamined.skipped_handled, 0, "{reexamined:#?}");
+        assert_eq!(reexamined.strip.checkouts_stripped, 1, "{reexamined:#?}");
+        assert_eq!(
+            broker.meta_json::<u32>(super::super::strip_idle::IDLE_STRIP_RULES_KEY),
+            super::super::strip_idle::IDLE_STRIP_RULES
+        );
+        populate(&worktree);
+        let remembered = pass(&mut broker);
+        assert_eq!(remembered.skipped_handled, 1, "{remembered:#?}");
+
         // New activity, then idle again: armed again.
         idle_since(&mut broker, 5, 1_000);
         assert_eq!(pass(&mut broker).strip.checkouts_stripped, 1);
