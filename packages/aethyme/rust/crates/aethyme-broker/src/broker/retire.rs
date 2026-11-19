@@ -91,6 +91,31 @@ pub(crate) const CHECKOUT_RETIREMENT_SUPERSEDED_KEY: &str = "checkout_retirement
 const RETIRE_SUPERSEDED_MAX: usize = 16_384;
 /// The longest a retirement run spends expiring retired-commit pins.
 const RETIRE_PIN_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Expiring retired-commit pins runs at most this often (ms).
+const RETIRE_PIN_PRUNE_INTERVAL_MS: i64 = 30 * 60 * 1_000;
+/// When pins were last expired (epoch ms).
+const CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY: &str = "checkout_retirement.pins_pruned_at_ms";
+/// Closed checkouts on disk at or above which the closed lap gets
+/// [`RETIRE_LAP_BACKLOG_MIN_SHARE`] instead of [`RETIRE_LAP_MIN_SHARE`].
+const RETIRE_LAP_BACKLOG_AT: usize = 50;
+const RETIRE_LAP_BACKLOG_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether expiring retired-commit pins is due: never done, or done at least
+/// [`RETIRE_PIN_PRUNE_INTERVAL_MS`] ago (a clock that went back counts as
+/// due).
+fn retire_pin_prune_due(last_ms: Option<i64>, now_ms: i64) -> bool {
+    last_ms.is_none_or(|last| now_ms < last || now_ms - last >= RETIRE_PIN_PRUNE_INTERVAL_MS)
+}
+
+/// The closed lap's floor: larger while many closed checkouts wait (still
+/// bounded by the lane's deadline).
+fn closed_lap_floor(closed_folders: usize) -> std::time::Duration {
+    if closed_folders >= RETIRE_LAP_BACKLOG_AT {
+        RETIRE_LAP_BACKLOG_MIN_SHARE
+    } else {
+        RETIRE_LAP_MIN_SHARE
+    }
+}
 /// The least time a retirement run gives the strip pass, the closed lap
 /// and the cleaned lap, whatever the phases before them used (bounded by
 /// the lane's own deadline).
@@ -684,6 +709,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "trash_refused" => "checkout_retirement_kept_trash_refused",
         "archive_too_large" => "checkout_retirement_kept_archive_too_large",
         "archive_failed" => "checkout_retirement_kept_archive_failed",
+        "archive_environment_denied" => "checkout_retirement_kept_archive_environment_denied",
         "archive_cleanup_failed" => "checkout_retirement_kept_archive_cleanup_failed",
         "deadline" => "checkout_retirement_kept_deadline",
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
@@ -694,6 +720,18 @@ fn kept_counter(code: &'static str) -> &'static str {
         "leftover_superseded" => "checkout_retirement_kept_leftover_superseded",
         _ => "checkout_retirement_kept_other",
     }
+}
+
+/// Whether an archive error is the environment refusing a write (`EPERM`,
+/// `EACCES`), not anything about the checkout: measured on the busiest
+/// repository, all 15 of a day's `archive_failed` keeps were
+/// `Operation not permitted` from two worker runs that had inherited a
+/// sandboxed caller's sandbox (their process listings were denied too).
+fn archive_error_is_environment_denied(detail: &str) -> bool {
+    detail.contains("Operation not permitted")
+        || detail.contains("Permission denied")
+        || detail.contains("(os error 1)")
+        || detail.contains("(os error 13)")
 }
 
 /// Keeps about the checkout's content or ownership, which only a change to
@@ -757,6 +795,10 @@ pub(crate) struct RetireRun {
     /// The last inspection this run could not complete (session and the
     /// failing step), retried next run rather than remembered.
     last_inspection_failure: Option<String>,
+    /// The environment refused an archive write this run (`EPERM` or
+    /// `EACCES`: this worker inherited a sandboxed caller's sandbox, or a
+    /// volume refused writes): no further archive is attempted this run.
+    archive_environment_denied: bool,
 }
 
 impl RetireRun {
@@ -1892,6 +1934,7 @@ impl Broker {
             ),
             keep_detail: None,
             last_inspection_failure: None,
+            archive_environment_denied: false,
         }))
     }
 
@@ -2398,6 +2441,11 @@ impl Broker {
         {
             return Ok(Kept("archive_deferred"));
         }
+        // An archive write the environment refused this run would be refused
+        // again: the checkout waits for the next run, not remembered.
+        if run.archive_environment_denied {
+            return Ok(Kept("archive_environment_denied"));
+        }
         let digest = plan.digest.clone();
         drop(git_deadline);
         let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
@@ -2421,9 +2469,19 @@ impl Broker {
                 }))
             }
             Err(error) => {
-                run.keep_detail = Some(error.to_string());
+                let detail = error.to_string();
+                // A refused write (a sandbox this worker inherited, a volume
+                // that refused it) says nothing about the checkout: it is
+                // retried by the next run, not remembered for an hour.
+                let denied = archive_error_is_environment_denied(&detail);
+                run.keep_detail = Some(detail);
+                if denied {
+                    run.archive_environment_denied = true;
+                }
                 Ok(Kept(if out_of_time {
                     "deadline"
+                } else if denied {
+                    "archive_environment_denied"
                 } else {
                     "archive_failed"
                 }))
@@ -2569,6 +2627,13 @@ impl Broker {
             .behind(crate::clock::epoch_ms());
         let sweep_deadline = retirement_sweep_deadline(started, window, trash_behind);
         let mut report = CheckoutRetirementReport::default();
+        // Closed checkouts still on disk, as the last strip pass counted
+        // them: a large backlog gets the closed lap a larger floor.
+        let closed_backlog = self
+            .checkout_retirement_progress()
+            .strip
+            .backlog
+            .closed_folders;
         let mut last_inspection_failure = None;
         // Resolving the open sessions' paths may use a third of the window,
         // never the phases after it.
@@ -2624,7 +2689,7 @@ impl Broker {
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other.
-            let closed_deadline = share(1, 2, RETIRE_LAP_MIN_SHARE);
+            let closed_deadline = share(1, 2, closed_lap_floor(closed_backlog));
             run.deadline = closed_deadline;
             report.lap_complete =
                 self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
@@ -2689,16 +2754,40 @@ impl Broker {
                 super::retire_operation::sweep_stale_partials(&root);
             }
         }
-        let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
-        let retired_pins =
+        // Expiring pins is not urgent (a pin only keeps a commit longer)
+        // and used its whole budget on every run: it runs at most every
+        // `RETIRE_PIN_PRUNE_INTERVAL_MS`, so the runs in between end sooner
+        // and the next run, with its laps, starts sooner.
+        let retired_pins = if retire_pin_prune_due(
+            self.store_ref()
+                .meta_get(CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse().ok()),
+            crate::clock::epoch_ms(),
+        ) {
+            let _prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
+            crate::warn_unrecorded(
+                "record when retired-commit pins were expired",
+                self.store_ref().meta_set(
+                    CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY,
+                    &crate::clock::epoch_ms().to_string(),
+                ),
+            );
             match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
                 Ok(remaining) => remaining,
                 Err(error) => {
                     crate::warn_unrecorded::<(), _>("expire retired-commit pins", Err(error));
                     self.checkout_retirement_progress().retired_pins
                 }
-            };
-        drop(prune_span);
+            }
+        } else {
+            crate::phase_telemetry::add(
+                "checkout_retirement_prune_pins_not_due",
+                std::time::Duration::ZERO,
+            );
+            self.checkout_retirement_progress().retired_pins
+        };
         let _record_span = crate::phase_telemetry::span("checkout_retirement_record_progress");
         let kept = report.kept.values().sum::<usize>();
         crate::phase_telemetry::attach(
@@ -8180,5 +8269,75 @@ mod tests {
         .unwrap();
         assert_eq!(pass(&mut broker).strip.checkouts_examined, 0);
         assert!(worktree.join("node_modules").exists());
+    }
+
+    /// An archive write the environment refused (the measured case: a
+    /// worker that inherited a sandboxed caller's sandbox got `Operation not
+    /// permitted` creating its staging directory) is a keep retried by the
+    /// next run, never remembered like an archive that failed on the
+    /// checkout's content; a capacity refusal is not a denial.
+    #[test]
+    fn an_archive_refused_by_the_environment_is_retried_not_remembered() {
+        let measured = "the recovery archive for session 6485 failed verification, so its worktree was left in place: cannot exclusively create /pool/.aethyme-recovery-archives/repo/6485.retirement-v6.partial: Operation not permitted (os error 1)";
+        assert!(super::archive_error_is_environment_denied(measured));
+        assert!(super::archive_error_is_environment_denied(
+            "cannot create archive root: Permission denied (os error 13)"
+        ));
+        assert!(!super::archive_error_is_environment_denied(
+            "archive capacity preflight failed: archive destination has 7649083392 free bytes, below the 8623560966 bytes required"
+        ));
+        assert!(!remembered_keep("archive_environment_denied"));
+        assert!(remembered_keep("archive_failed"));
+        assert_eq!(
+            kept_counter("archive_environment_denied"),
+            "checkout_retirement_kept_archive_environment_denied"
+        );
+    }
+
+    /// Expiring retired-commit pins runs at most every half hour (it used
+    /// its whole 20 s budget on every run), and a closed backlog of 50 or
+    /// more checkouts gives the closed lap a 45 s floor instead of 20 s.
+    #[test]
+    fn pin_expiry_is_paced_and_a_closed_backlog_widens_the_lap() {
+        let now = 1_800_000_000_000_i64;
+        assert!(super::retire_pin_prune_due(None, now));
+        assert!(!super::retire_pin_prune_due(Some(now - 60_000), now));
+        assert!(super::retire_pin_prune_due(
+            Some(now - super::RETIRE_PIN_PRUNE_INTERVAL_MS),
+            now
+        ));
+        assert!(
+            super::retire_pin_prune_due(Some(now + 60_000), now),
+            "clock went back"
+        );
+        assert_eq!(super::closed_lap_floor(0), super::RETIRE_LAP_MIN_SHARE);
+        assert_eq!(super::closed_lap_floor(49), super::RETIRE_LAP_MIN_SHARE);
+        assert_eq!(
+            super::closed_lap_floor(313),
+            super::RETIRE_LAP_BACKLOG_MIN_SHARE
+        );
+    }
+
+    /// A second retirement run within the interval does not expire pins
+    /// again.
+    #[test]
+    fn a_second_run_within_the_interval_skips_pin_expiry() {
+        let (_owner, _storage, mut broker) = fixture();
+        let _first = run(&mut broker);
+        let stamped = broker
+            .store_ref()
+            .meta_get(super::CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+            .unwrap()
+            .expect("the first run expired pins and stamped it");
+        let _second = run(&mut broker);
+        assert_eq!(
+            broker
+                .store_ref()
+                .meta_get(super::CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(stamped.as_str()),
+            "not expired again within the interval"
+        );
     }
 }

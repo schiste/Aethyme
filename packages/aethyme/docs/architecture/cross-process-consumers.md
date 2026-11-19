@@ -3437,6 +3437,12 @@ Introduced 2026-11-17. Changes consumers may see:
   - `checkout_trash_catchup` adds `lane_started_after_worker_ms`: when the lane process started, relative to the worker's start (set whenever the worker's start reached the lane). `catchup_start_delay_ms` stays null when no slice ran.
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
 
+- Changed 2026-11-19 (retirement reaches its backlog). Measured on the busiest repository over a day: 174 retirement runs judged 775 closed checkouts (median 3 a run) in a closed lap of about 31 s a run, out of a 205 s run, and retired 140; the pool holds about 308 closed checkouts not retired. Now:
+  - An archive the environment refused (`Operation not permitted`, `Permission denied`: all 15 of the day's `archive_failed` keeps came from two worker runs that had inherited a sandboxed caller's sandbox) is kept as `archive_environment_denied` (counter `checkout_retirement_kept_archive_environment_denied`), not remembered, so the next run tries again instead of waiting 1 h, 6 h then 24 h; no further archive is attempted in that run.
+  - Expiring retired-commit pins runs at most every 30 minutes (meta key `checkout_retirement.pins_pruned_at_ms`; counter `checkout_retirement_prune_pins_not_due` when skipped) instead of using its whole 20 s budget on every run.
+  - While the last strip pass counted 50 or more closed checkouts on disk, the closed lap's floor is 45 s instead of 20 s (still bounded by the lane's deadline).
+Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
