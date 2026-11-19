@@ -26,6 +26,12 @@ fn take_command_metric_details() -> Option<serde_json::Map<String, serde_json::V
 /// session ids, task text) can never leak into the metrics file. Best
 /// effort — any failure is silently ignored.
 pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
+    "hook",
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
     "adopt",
     "commit",
     "start",
@@ -396,6 +402,9 @@ pub(super) fn record_command_metric(
             .flatten()?;
         session_for_metric(args, &store, &repo)
     });
+    if args.first().is_some_and(|command| command == "hook") && session_id.is_none() {
+        return;
+    }
     details.insert("session_id".into(), serde_json::json!(session_id));
     details.insert("attribution".into(), spans.attribution(started, ended));
     details.insert(
@@ -435,6 +444,30 @@ pub(super) fn record_command_metric(
 /// fields. A phase or count the command named itself wins over a span of the
 /// same name; `phase_counts` says how many times each span ran, beside any
 /// counts the command attached.
+/// Record the actual hook transport result without changing its exit or stdout.
+pub(crate) fn record_hook_metric(
+    repo: Option<&str>,
+    event: crate::agent_hook::HookEvent,
+    started: std::time::Instant,
+    output_bytes: u64,
+    delivery: &'static str,
+    spans: &crate::phase_telemetry::Recorder,
+) {
+    let ended = std::time::Instant::now();
+    if let Some(repo) = repo {
+        set_metric_repository(std::path::Path::new(repo));
+    }
+    set_command_metric_details(serde_json::json!({ "hook_delivery": delivery }));
+    record_command_metric(
+        &["hook".into(), event.as_str().into()],
+        0,
+        started,
+        ended,
+        output_bytes,
+        spans,
+    );
+}
+
 fn with_spans(
     mut fields: serde_json::Map<String, serde_json::Value>,
     spans: &crate::phase_telemetry::Recorder,
@@ -487,7 +520,7 @@ fn object_field<'a>(
 /// Off by default so inspection stays side-effect free. `AETHYME_MEASURE_OUTPUT`
 /// is read per invocation rather than cached, so enabling it needs no restart of
 /// anything and a wrapper can scope it to a single command.
-pub(super) fn output_measurement_opted_in() -> bool {
+pub(crate) fn output_measurement_opted_in() -> bool {
     std::env::var_os("AETHYME_MEASURE_OUTPUT")
         .map(|value| {
             let value = value.to_string_lossy().to_ascii_lowercase();

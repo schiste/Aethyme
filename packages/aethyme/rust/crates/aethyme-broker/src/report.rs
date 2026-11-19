@@ -1802,21 +1802,18 @@ mod tests {
             .append_event(
                 crate::events::GATE_CACHED,
                 None,
-                Some(
-                    &serde_json::json!({
-                        "gate": "cargo-test",
-                        "tree": "0123456789abcdef",
-                        "saved_ms": 42,
-                        "cached_status": "pass",
-                        "failure_class": null,
-                        "run_id": 7,
-                        "cache_provenance": {
-                            "execution_profile_digest": "sha256:profile",
-                            "profile_scope": "fixture profile scope"
-                        }
-                    })
-                    .to_string(),
-                ),
+                Some(&crate::events::gate_cached_payload(
+                    "cargo-test",
+                    "0123456789abcdef",
+                    42,
+                    GateStatus::Pass,
+                    None,
+                    7,
+                    &crate::GateCacheProvenance {
+                        execution_profile_digest: Some("sha256:profile".into()),
+                        profile_scope: "fixture profile scope".into(),
+                    },
+                )),
             )
             .unwrap();
 

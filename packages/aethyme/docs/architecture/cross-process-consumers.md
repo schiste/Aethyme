@@ -3733,6 +3733,14 @@ wall-time saving. The existing `gate_verdict_wait` span contributes to the
 command's queue partition. Finish retains the command's repository identity
 through checkout removal so it can still append the timing and outcome.
 
+With `AETHYME_MEASURE_OUTPUT` enabled, recognized agent hooks in a registered
+worktree add `hook.<event>` rows to the same ledger. `hook_dispatch` names
+the broker work. `hook_delivery` is `context`, `denied`, `silent`,
+`unavailable` or `output_error`. `output_bytes` includes the emitted
+envelope's trailing newline and is zero for no successful delivery.
+The hook's wire format and exit contract are unchanged. The row measures
+the native invocation, excluding the host's process launch and shim time.
+
 ### Session scratch directories
 
 Introduced 2026-11-18. Every spawned session whose checkout sits in a

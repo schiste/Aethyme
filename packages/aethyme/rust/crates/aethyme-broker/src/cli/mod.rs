@@ -35,6 +35,10 @@ mod status_revision;
 mod submit;
 mod surface;
 mod telemetry;
+
+pub(crate) use telemetry::{
+    output_measurement_opted_in as hook_metrics_enabled, record_hook_metric,
+};
 #[cfg(test)]
 mod tests;
 mod watch;

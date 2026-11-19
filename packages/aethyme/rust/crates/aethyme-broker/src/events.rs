@@ -908,23 +908,63 @@ pub fn gate_result_payload(
     payload.to_string()
 }
 
-/// `saved_ms` is the cached run's recorded duration — the execution time
-/// this cache hit avoided. An in-flight join also records the elapsed wait.
+/// `saved_ms` is the cached run's recorded duration.
 pub fn gate_cached_payload(
+    gate: &str,
+    tree: &str,
+    saved_ms: i64,
+    cached_status: crate::types::GateStatus,
+    failure_class: Option<crate::types::GateFailureClass>,
+    run_id: i64,
+    cache_provenance: &crate::GateCacheProvenance,
+) -> String {
+    gate_cached_fields(
+        gate,
+        tree,
+        saved_ms,
+        cached_status,
+        failure_class,
+        run_id,
+        cache_provenance,
+    )
+    .to_string()
+}
+
+fn gate_cached_fields(
+    gate: &str,
+    tree: &str,
+    saved_ms: i64,
+    cached_status: crate::types::GateStatus,
+    failure_class: Option<crate::types::GateFailureClass>,
+    run_id: i64,
+    cache_provenance: &crate::GateCacheProvenance,
+) -> serde_json::Value {
+    json!({
+        "gate": gate,
+        "tree": tree,
+        "saved_ms": saved_ms,
+        "cached_status": cached_status.as_str(),
+        "failure_class": failure_class.map(|class| class.as_str()),
+        "run_id": run_id,
+        "cache_provenance": cache_provenance,
+    })
+}
+
+pub(crate) fn gate_cache_hit_payload(
     hit: &crate::types::GateResult,
     failure_class: Option<crate::types::GateFailureClass>,
     cache_provenance: &crate::GateCacheProvenance,
     shared_wait_ms: Option<i64>,
 ) -> String {
-    let mut payload = json!({
-        "gate": hit.gate_name,
-        "tree": hit.tree_hash,
-        "saved_ms": hit.duration_ms.unwrap_or_default(),
-        "cached_status": hit.status.as_str(),
-        "failure_class": failure_class.map(|class| class.as_str()),
-        "run_id": hit.id,
-        "cache_provenance": cache_provenance,
-    });
+    let mut payload = gate_cached_fields(
+        &hit.gate_name,
+        &hit.tree_hash,
+        hit.duration_ms.unwrap_or_default(),
+        hit.status,
+        failure_class,
+        hit.id,
+        cache_provenance,
+    );
     if let Some(wait_ms) = shared_wait_ms {
         payload["shared_wait_ms"] = json!(wait_ms);
     }

@@ -3803,7 +3803,7 @@ where
                     store.append_event(
                         crate::events::GATE_CACHED,
                         session_id,
-                        Some(&crate::events::gate_cached_payload(
+                        Some(&crate::events::gate_cache_hit_payload(
                             &hit,
                             cached_failure_class(hit.status),
                             cache_provenance

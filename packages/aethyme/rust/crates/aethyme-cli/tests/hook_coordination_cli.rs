@@ -465,6 +465,53 @@ fn session_start_shows_relevant_paths_and_defers_diffs_to_the_edit() {
     assert!(edit_context.contains("| +changed 2"), "{edit_context}");
 }
 
+#[test]
+fn hook_output_and_silence_are_attributed_only_when_opted_in() {
+    let fixture = Fixture::new();
+    let (id, tree) = fixture.start("work", "work");
+    let log = fixture.repo.join(".aethyme/logs/command-metrics.jsonl");
+    let invoke = |event, opted_in| {
+        fixture
+            .command(&tree)
+            .args(["hook", event])
+            .env("AETHYME_MEASURE_OUTPUT", if opted_in { "1" } else { "0" })
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let hook_metrics = || {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| {
+                row["command"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("hook."))
+            })
+            .collect::<Vec<_>>()
+    };
+    let silent = invoke("PostToolUse", false);
+    assert!(silent.status.success() && silent.stdout.is_empty());
+    assert!(hook_metrics().is_empty());
+
+    let delivered = invoke("SessionStart", true);
+    assert!(delivered.status.success() && !delivered.stdout.is_empty());
+    let silent = invoke("PostToolUse", true);
+    assert!(silent.status.success() && silent.stdout.is_empty());
+    let observed = hook_metrics();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0]["command"], "hook.SessionStart");
+    assert_eq!(observed[0]["session_id"], id);
+    assert_eq!(observed[0]["hook_delivery"], "context");
+    assert_eq!(observed[0]["output_bytes"], delivered.stdout.len());
+    assert_eq!(observed[0]["phase_counts"]["hook_dispatch"], 1);
+    assert_eq!(observed[1]["command"], "hook.PostToolUse");
+    assert_eq!(observed[1]["session_id"], id);
+    assert_eq!(observed[1]["hook_delivery"], "silent");
+    assert_eq!(observed[1]["output_bytes"], 0);
+}
+
 /// Measured, not asserted against a budget: the hook runs on every edit, so
 /// its cost belongs in the PR, but a wall-clock assertion would be flaky on a
 /// loaded machine.
