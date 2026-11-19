@@ -760,10 +760,17 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
-        self.run_gates_with_policy_and_progress(
-            session_id,
+        let (checkout, gates, changed) = self.gate_inputs(session_id)?;
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_affected_in(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            &changed,
+            Some(session_id),
             cache_policy,
-            &crate::gates::StderrGateProgressSink,
+            storage,
         )
     }
 
@@ -778,7 +785,6 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
-        let base = self.submission_base_snapshot()?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_named_in(
             &mut self.store,
@@ -789,7 +795,6 @@ impl Broker {
             gate_name,
             Some(session_id),
             cache_policy,
-            Some(&base.commit),
             storage,
         )
     }
@@ -817,7 +822,6 @@ impl Broker {
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let _span = crate::phase_telemetry::span("gates_run");
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
-        let base = self.submission_base_snapshot()?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_affected_with_progress_in(
             &mut self.store,
@@ -827,7 +831,7 @@ impl Broker {
             &changed,
             Some(session_id),
             crate::gates::GateExecutionContext {
-                comparison_base: Some(&base.commit),
+                comparison_base: None,
                 cache_policy,
                 progress,
             },
@@ -856,8 +860,9 @@ impl Broker {
     /// Run every configured gate against the checkout containing `dir`,
     /// in cost order with no diff selection (`gates run --all`) — the CI
     /// entrypoint, making gates.toml the single definition of "verified"
-    /// for CI and broker alike. Results are recorded and cacheable across
-    /// standalone runs of the same tree and execution profile.
+    /// for CI and broker alike. No session attribution: results are still
+    /// recorded and tree-hash cached, so a broker run on the same tree
+    /// reuses them (and vice versa).
     pub fn run_all_gates(
         &mut self,
         dir: &Path,
@@ -910,7 +915,6 @@ impl Broker {
             gate_name,
             None,
             cache_policy,
-            None,
             storage,
         )
     }

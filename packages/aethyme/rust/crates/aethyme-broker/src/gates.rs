@@ -905,7 +905,7 @@ pub trait GateProgressSink: Send + Sync {
     fn report(&self, line: &str);
 }
 
-pub(crate) struct StderrGateProgressSink;
+struct StderrGateProgressSink;
 
 impl GateProgressSink for StderrGateProgressSink {
     fn report(&self, line: &str) {
@@ -2091,6 +2091,34 @@ pub fn cancel_obsolete_runs(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let progress = StderrGateProgressSink;
+    run_affected_with_progress_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        GateExecutionContext {
+            cache_policy,
+            comparison_base: None,
+            progress: &progress,
+        },
+        storage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_affected_for_submit_in(
     store: &mut BrokerStore,
     main_root: &Path,
@@ -2309,7 +2337,6 @@ pub(crate) fn run_named(
         name,
         session_id,
         cache_policy,
-        None,
         GateStorageLocations::default(),
     )
 }
@@ -2324,7 +2351,6 @@ pub(crate) fn run_named_in(
     name: &str,
     session_id: Option<i64>,
     cache_policy: CachePolicy,
-    comparison_base: Option<&str>,
     storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let gate = gates.iter().find(|gate| gate.name == name).ok_or_else(|| {
@@ -2353,7 +2379,7 @@ pub(crate) fn run_named_in(
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
-            comparison_base,
+            comparison_base: None,
             storage,
         },
     )
@@ -3586,8 +3612,12 @@ where
             // capture reports that every owned probe group was reaped or did
             // not spawn.
             profile_guard.dispatch_attempted();
-            let profile = capture_profile(checkout.root(), subprocess_path.as_deref())
-                .bind_comparison_base(runtime.comparison_base);
+            // The comparison base is deliberately not part of this identity:
+            // a gate that reads `AETHYME_GATE_BASE_COMMIT` must set
+            // `cache = false`, so a cached verdict depends only on the tree,
+            // gate definition and execution profile, and a session's proof
+            // stays reusable by a submission of the same tree.
+            let profile = capture_profile(checkout.root(), subprocess_path.as_deref());
             if !profile.writers_quiescent() {
                 return Err(crate::BrokerError::Io {
                     path: checkout.root().to_path_buf(),
