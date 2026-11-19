@@ -1,5 +1,31 @@
 use super::*;
 
+/// One live session's own live lease paths (none unless the session is live).
+const SESSION_OWN_LIVE_LEASE_PATHS_SQL: &str = "SELECT DISTINCT mine.path
+     FROM leases mine JOIN sessions own_session ON own_session.id = mine.session_id
+     WHERE mine.session_id = ?1 AND mine.released_at IS NULL
+       AND (mine.expires_at IS NULL OR mine.expires_at > ?2)
+       AND own_session.status IN ('active', 'idle', 'stale')
+     ORDER BY mine.path";
+
+/// Other live sessions' live leases on exactly one path, through the
+/// live-lease path index.
+const PEER_LIVE_LEASES_AT_PATH_SQL: &str = "SELECT peer.session_id, peer.path
+     FROM leases peer JOIN sessions peer_session ON peer_session.id = peer.session_id
+     WHERE peer.released_at IS NULL AND peer.path = ?1
+       AND peer.session_id <> ?2
+       AND (peer.expires_at IS NULL OR peer.expires_at > ?3)
+       AND peer_session.status IN ('active', 'idle', 'stale')";
+
+/// Other live sessions' live leases whose path sorts in `[?1, ?2)`, through
+/// the live-lease path index.
+const PEER_LIVE_LEASES_IN_PATH_RANGE_SQL: &str = "SELECT peer.session_id, peer.path
+     FROM leases peer JOIN sessions peer_session ON peer_session.id = peer.session_id
+     WHERE peer.released_at IS NULL AND peer.path >= ?1 AND peer.path < ?2
+       AND peer.session_id <> ?3
+       AND (peer.expires_at IS NULL OR peer.expires_at > ?4)
+       AND peer_session.status IN ('active', 'idle', 'stale')";
+
 fn replace_implicit_leases_in_tx(
     tx: &Transaction<'_>,
     session_id: i64,
@@ -2294,31 +2320,84 @@ impl BrokerStore {
     }
 
     /// Recorded peer leases overlapping this session's live leases.
+    /// Only while this session is live; otherwise nothing overlaps.
     /// These are advisory observations, not a fresh worktree inspection.
+    ///
+    /// Two leases overlap when their paths are equal, or one is a directory
+    /// lease (ending in `/`) that is a prefix of the other. Rows are distinct
+    /// and ordered by peer session, own path, peer path.
+    ///
+    /// Each own path is looked up through the live-lease path index: its exact
+    /// path, every directory prefix of it ending in `/` (a peer directory
+    /// lease covering it) and, for a directory lease, the half-open range of
+    /// paths it prefixes. Joining every live lease against every own lease
+    /// instead scanned all live leases of the repository on each call, which
+    /// on a repository with thousands of live leases cost most of a session
+    /// status view.
     pub(crate) fn session_peer_lease_overlaps(
         &self,
         session_id: i64,
         now: i64,
     ) -> Result<Vec<(i64, String, String)>, BrokerError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT peer.session_id, mine.path, peer.path
-             FROM leases mine JOIN leases peer ON peer.session_id <> mine.session_id
-             JOIN sessions peer_session ON peer_session.id = peer.session_id
-             JOIN sessions own_session ON own_session.id = mine.session_id
-             WHERE mine.session_id = ?1 AND mine.released_at IS NULL AND peer.released_at IS NULL
-               AND (mine.expires_at IS NULL OR mine.expires_at > ?2)
-               AND (peer.expires_at IS NULL OR peer.expires_at > ?2)
-               AND own_session.status IN ('active', 'idle', 'stale')
-               AND peer_session.status IN ('active', 'idle', 'stale')
-               AND (mine.path = peer.path
-                    OR (substr(mine.path, -1) = '/' AND instr(peer.path, mine.path) = 1)
-                    OR (substr(peer.path, -1) = '/' AND instr(mine.path, peer.path) = 1))
-             ORDER BY peer.session_id, mine.path, peer.path",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![session_id, now], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mine = {
+            let _span = crate::phase_telemetry::span("peer_view_own_leases");
+            let mut stmt = self.conn.prepare(SESSION_OWN_LIVE_LEASE_PATHS_SQL)?;
+            let rows = stmt.query_map(rusqlite::params![session_id, now], |row| row.get(0))?;
+            rows.collect::<Result<Vec<String>, _>>()?
+        };
+        let _span = crate::phase_telemetry::span("peer_view_lease_overlaps");
+        let mut exact = self.conn.prepare(PEER_LIVE_LEASES_AT_PATH_SQL)?;
+        let mut range = self.conn.prepare(PEER_LIVE_LEASES_IN_PATH_RANGE_SQL)?;
+        let mut overlaps = std::collections::BTreeSet::new();
+        fn collect(
+            statement: &mut rusqlite::Statement<'_>,
+            params: impl rusqlite::Params,
+            own: &str,
+            overlaps: &mut std::collections::BTreeSet<(i64, String, String)>,
+        ) -> Result<(), BrokerError> {
+            let rows = statement.query_map(params, |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (peer_id, peer_path) = row?;
+                overlaps.insert((peer_id, own.to_string(), peer_path));
+            }
+            Ok(())
+        }
+        for own in &mine {
+            // The same path.
+            collect(
+                &mut exact,
+                rusqlite::params![own, session_id, now],
+                own,
+                &mut overlaps,
+            )?;
+            // Peer directory leases that prefix this path (the whole path
+            // too, when it is itself a directory lease; the set drops the
+            // repeat).
+            for (index, byte) in own.bytes().enumerate() {
+                if byte == b'/' {
+                    collect(
+                        &mut exact,
+                        rusqlite::params![&own[..=index], session_id, now],
+                        own,
+                        &mut overlaps,
+                    )?;
+                }
+            }
+            // Peer leases this directory lease prefixes: every path starting
+            // with `dir/` sorts in [`dir/`, `dir0`), because `0` follows `/`,
+            // and nothing else does.
+            if let Some(directory) = own.strip_suffix('/') {
+                collect(
+                    &mut range,
+                    rusqlite::params![own, format!("{directory}0"), session_id, now],
+                    own,
+                    &mut overlaps,
+                )?;
+            }
+        }
+        Ok(overlaps.into_iter().collect())
     }
 
     /// Declared peer scopes matching a scope of this session.
@@ -3065,5 +3144,194 @@ mod abandoned_close_cas_tests {
             .unwrap();
         assert_eq!(restored_timeout_ms, BUSY_TIMEOUT_MS as i64);
         assert_unclosed_without_abandoned_event(&store, observed.id);
+    }
+}
+
+#[cfg(test)]
+mod peer_lease_overlap_tests {
+    use super::*;
+
+    /// The join this lookup replaced, kept as the reference it must match.
+    const REFERENCE_SQL: &str = "SELECT DISTINCT peer.session_id, mine.path, peer.path
+         FROM leases mine JOIN leases peer ON peer.session_id <> mine.session_id
+         JOIN sessions peer_session ON peer_session.id = peer.session_id
+         JOIN sessions own_session ON own_session.id = mine.session_id
+         WHERE mine.session_id = ?1 AND mine.released_at IS NULL AND peer.released_at IS NULL
+           AND (mine.expires_at IS NULL OR mine.expires_at > ?2)
+           AND (peer.expires_at IS NULL OR peer.expires_at > ?2)
+           AND own_session.status IN ('active', 'idle', 'stale')
+           AND peer_session.status IN ('active', 'idle', 'stale')
+           AND (mine.path = peer.path
+                OR (substr(mine.path, -1) = '/' AND instr(peer.path, mine.path) = 1)
+                OR (substr(peer.path, -1) = '/' AND instr(mine.path, peer.path) = 1))
+         ORDER BY peer.session_id, mine.path, peer.path";
+
+    fn store() -> (tempfile::TempDir, BrokerStore) {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let store = BrokerStore::open_in_repo(&root).unwrap();
+        (owner, store)
+    }
+
+    fn session(store: &mut BrokerStore, name: &str, status: &str) -> i64 {
+        let session = store
+            .register_session(&NewSession {
+                worktree_path: format!("/nonexistent/{name}"),
+                branch: format!("agent/{name}"),
+                origin: SessionOrigin::Adopted,
+                task: Some(name.into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, session.id],
+            )
+            .unwrap();
+        session.id
+    }
+
+    fn lease(
+        store: &BrokerStore,
+        session_id: i64,
+        path: &str,
+        kind: &str,
+        expires_at: Option<i64>,
+        released_at: Option<i64>,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO leases (session_id, path, kind, created_at, expires_at, released_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                rusqlite::params![session_id, path, kind, expires_at, released_at],
+            )
+            .unwrap();
+    }
+
+    fn reference(store: &BrokerStore, session_id: i64, now: i64) -> Vec<(i64, String, String)> {
+        let mut statement = store.conn.prepare(REFERENCE_SQL).unwrap();
+        statement
+            .query_map(rusqlite::params![session_id, now], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn indexed_lookup_matches_the_full_join_on_every_overlap_shape() {
+        let (_owner, mut store) = store();
+        let now = 1_000;
+        let me = session(&mut store, "me", "active");
+        let idle = session(&mut store, "idle-peer", "idle");
+        let stale = session(&mut store, "stale-peer", "stale");
+        let closed = session(&mut store, "closed-peer", "exited");
+        let closed_me = session(&mut store, "closed-me", "cleaned");
+        for (path, kind) in [
+            ("src/", "explicit"),
+            ("src/lib.rs", "implicit"),
+            ("src/lib.rs", "explicit"),
+            ("docs/guide.md", "implicit"),
+            ("a/b/c/d.rs", "implicit"),
+            ("tools", "explicit"),
+            ("über/ß.rs", "implicit"),
+        ] {
+            lease(&store, me, path, kind, None, None);
+        }
+        lease(&store, me, "gone.rs", "implicit", None, Some(5));
+        lease(&store, me, "expired.rs", "implicit", Some(500), None);
+        for (peer, path, expires, released) in [
+            (idle, "src/lib.rs", None, None),
+            (idle, "src/deep/x.rs", None, None),
+            (idle, "src", None, None),
+            (idle, "src0", None, None),
+            (idle, "srcx/y.rs", None, None),
+            (idle, "a/", None, None),
+            (idle, "a/b/", Some(2_000), None),
+            (idle, "a/b/c", None, None),
+            (idle, "a/b/c/d.rs/", None, None),
+            (stale, "docs/", None, None),
+            (stale, "docs/guide.md", None, None),
+            (stale, "tools/", None, None),
+            (stale, "tools", None, None),
+            (stale, "über/", None, None),
+            (stale, "gone.rs", None, None),
+            (stale, "expired.rs", None, None),
+            (stale, "src/released.rs", None, Some(7)),
+            (stale, "src/expired.rs", Some(999), None),
+            (closed, "src/lib.rs", None, None),
+            (closed_me, "src/", None, None),
+        ] {
+            lease(&store, peer, path, "implicit", expires, released);
+        }
+        lease(&store, closed_me, "src/lib.rs", "explicit", None, None);
+
+        for session_id in [me, idle, stale, closed, closed_me] {
+            let expected = reference(&store, session_id, now);
+            assert_eq!(
+                store.session_peer_lease_overlaps(session_id, now).unwrap(),
+                expected,
+                "session {session_id}"
+            );
+        }
+        assert!(
+            !reference(&store, me, now).is_empty()
+                && !reference(&store, idle, now).is_empty()
+                && reference(&store, closed_me, now).is_empty(),
+            "the fixture exercises both overlaps and a closed session"
+        );
+    }
+
+    /// The join scanned every live lease of the repository on each call;
+    /// each lookup must instead search the live-lease path index.
+    #[test]
+    fn peer_lookups_search_the_path_index_instead_of_scanning_leases() {
+        let (_owner, store) = store();
+        for (sql, params) in [
+            (PEER_LIVE_LEASES_AT_PATH_SQL, 3),
+            (PEER_LIVE_LEASES_IN_PATH_RANGE_SQL, 4),
+        ] {
+            let mut statement = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let values: Vec<rusqlite::types::Value> = (0..params)
+                .map(|index| rusqlite::types::Value::Text(format!("p{index}")))
+                .collect();
+            let plan: Vec<String> = statement
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH peer USING INDEX leases_by_path")),
+                "{sql}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN peer")),
+                "{sql}: {plan:?}"
+            );
+        }
     }
 }

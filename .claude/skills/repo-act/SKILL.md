@@ -68,6 +68,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Verify both binaries match the candidate version and, when release commit
   metadata is required, the exact source commit; do not reuse stale artifacts.
 
+- If the broker cannot allocate a disposable Playground because the temporary
+  volume is below its recovery reserve, put the fixture roots on a volume with
+  sufficient headroom and smoke-test session creation there. Keep all arms on
+  the same volume. On macOS, a short temporary symlink to that directory can
+  keep a compiler cache's Unix socket within the platform path limit.
+  If the shared cache daemon still uses a retired session's temp path,
+  set `RUSTC_WRAPPER=` for the isolated build and leave the daemon running.
+  Pass the resolved directory to Codex sandboxed trials because the workspace
+  sandbox rejects symlinked writable roots.
+
 - For short CLI benchmarks, wait on OS process-exit notifications rather than
   adding a polling sleep to the measured wall time. Retain raw command receipts
   and normalize platform-specific CPU/RSS accounting. On Linux, a Python-launched
@@ -77,7 +87,32 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   readings rather than treating a harness correction as a retroactive fix.
   Before long runs, exercise success, nonzero exit, and timeout controls through
   the exact runner; signal only the owned process group before reaping it.
-  Verify semantic output equality before comparing speed.
+  Verify semantic output equality before comparing speed. For a fast path
+  conditioned on retained state, create that state through the real command
+  and require a telemetry hit in the smoke test. Measure a fresh-state
+  control too.
+
+- For paired gate benchmarks, give every sample a fresh exact tree shared by
+  both arms. Keep PATH and the tool environment stable so unrelated discovery
+  caches behave normally. Count an avoided execution only when a reused verdict
+  points to a fresh producer in that pair with the same execution profile.
+  Record pair wall time and child work separately.
+
+- Before timing broker session startup hooks, put the pinned build first on
+  the fixture's PATH and verify the actual `SessionStart` payload arrives in
+  the worker. Preserve the installed plugin's trust records, including
+  `trusted_content_hash` where present, in an isolated Codex profile. Set
+  `AETHYME_UPDATE_CHECK=off` in both arms.
+
+- For concurrent-agent comparisons, register both worktrees and their task
+  scopes before launching either worker. Use the same ordered integration and
+  repair rules in every arm, then verify both features on the final tree. A
+  scripted peer applied after publication measures conflict repair only.
+  Keep the setup coordinator from becoming the worker's session holder. Smoke
+  test actual staging and publication in the worker sandbox, including the
+  repair path. If the sandbox protects linked Git metadata, keep authoring
+  sandboxed and have the coordinator stage only verified owned paths and
+  publish in both arms. Include that work in the elapsed time.
 
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
@@ -227,6 +262,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
   which Git ignores. Require nonempty start events and a positive control that
   captures the exact Git command shape the regression intends to forbid.
+  Record whether `refs/remotes/origin/HEAD` exists and whether the Git binary
+  validation cache is warm. Coordinated pushes use a private Trace2 sink. On a
+  disposable local remote, add `GIT_TRACE` and confirm it captures the actual
+  `git push` before treating the external trace as a complete call inventory.
+  Before batching Git reads, search existing Trace2 assertions for the old
+  subcommands and their ref or path arguments. Update affected assertions to
+  verify the replacement call and keep the checks for fresh, successful reads.
+- If host pressure delays local benchmark builds, reuse the repository's
+  hosted test archives for both exact revisions. Verify the same platform
+  and build profile, then extract and hash each router and engine pair in
+  separate scratch directories. Run both arms on one host.
 - When combining Git identity queries, preserve checkout-context checks.
   `--git-common-dir` succeeds in bare repositories too; require an explicit
   true `--is-inside-work-tree` result when checkout evidence is needed. Compare

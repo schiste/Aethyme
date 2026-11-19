@@ -92,12 +92,19 @@ def create_worktree(root, repo, env, git, binary, arm):
     return checkout, "agent/worker", None
 
 
-def codex_attempt(args, result_path, root, checkout, env, prompt):
+def codex_attempt(args, result_path, root, checkout, env, prompt, *, config=None):
     argv = [
-        args.codex, "exec", "--ignore-user-config", "--ephemeral", "--json",
+        args.codex, "exec", "--ephemeral", "--json",
         "--sandbox", "workspace-write", "-c", 'model_reasoning_effort="low"',
-        "-C", str(checkout), "--add-dir", str(root), "-m", args.model, prompt,
+        "-C", str(checkout), "--add-dir", str(root), "-m", args.model,
     ]
+    if config is None:
+        argv.append("--ignore-user-config")
+    else:
+        argv.append("--ignore-rules")
+        for key, value in config.items():
+            argv.extend(("-c", f"{key}={json.dumps(value)}"))
+    argv.append(prompt)
     try:
         with result_path.open("w") as stdout, result_path.with_suffix(".stderr").open("w") as stderr:
             process = subprocess.run(argv, env=env, cwd=checkout, stdout=stdout, stderr=stderr,

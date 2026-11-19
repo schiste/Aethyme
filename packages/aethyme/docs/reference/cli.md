@@ -343,9 +343,14 @@ budget only when proven landed in the default branch and past their manifest's
 creation time plus its minimum retention. An unlanded archive is never removed
 here, and no archive is removed by age.
 
-Recovery archives also expire by age, landed or not. An archive's age is
-up at its manifest's `created_at_ms` plus the larger of `unlanded_archive_days`
-(default 30; 0 turns age expiry off) and the manifest's
+Recovery archives also expire by age. An archive holding unlanded commits or
+uncommitted changes is kept at its age and named by advice
+`storage.unlanded-archives-at-age` (session, restore command) until its owner
+runs `aethyme storage keep-archive <id> --dismiss` (writing
+`<archive>.aethyme-dismissed`) or `[budget] expire_unlanded_archives = true`
+(default false) allows it; fully landed archives expire as described here. An
+archive's age is up at its manifest's `created_at_ms` plus the larger of
+`unlanded_archive_days` (default 90; 0 turns age expiry off) and the manifest's
 `minimum_archive_retention_ms`; a missing or implausible creation time (before
 2017 or in the future) means it is never removed by age. Age comes from the
 manifest only. Removal also needs its notice served: the archive must have
@@ -355,7 +360,7 @@ command that keeps one) at least seven days earlier, in at least two worker
 passes a day or more apart. If the clock went back, or no pass ran for over a
 week, a pass removes nothing by age and every pending notice starts again. At
 most 50 archives or 1 GiB expire per pass, oldest first. `aethyme storage
-keep-archive <id> [--unkeep]` creates (never through a link) or removes
+keep-archive <id> [--unkeep | --dismiss]` creates (never through a link) or removes
 `<archive>.aethyme-keep` beside the archive directory, which exempts it from
 age expiry; `aethyme storage archives [--json]` (`aethyme.storage-archives/v1`)
 lists archives with landed or not, created, expires, noticed and kept.
@@ -1281,6 +1286,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker gc forget-abandoned --confirm <archived-plan-digest> [--json]`
 - `aethyme broker gc sweep [--json]`
 - `aethyme broker gc remote-branches plan [--limit <n>] [--json]` — preview, writing nothing, the merged remote session-branch cleanup: which `agent/*` branches would be deleted (PR merged at exactly the remote tip, every session on the branch cleaned, no open PR using it as head, no open session stacked on it; open PRs based on it retargeted first; delete leased on the merged head) and which are kept, by reason. The background worker (`gc sweep`) applies the same rules when `[remote_branches] delete_merged = true` (default off), at most `max_deletions_per_run` (default 25) deletions among `scan_per_run` (default 25) candidates per run, backing off from 15 minutes up to 6 hours after a failure.
+- `aethyme broker gc trash drain [--max-minutes <n>] [--json]` — drain this repository's checkout trash now, in the foreground, with the lane the background worker runs (the single host-wide deleter, paced, re-reading host pressure every 2 s and stopping at once at critical memory pressure, 30-second slices of 3 deleter threads) until no entry is left to delete or `--max-minutes` (default 20, at most 60) pass. Refused while another catch-up lane runs on the host. Prints the entries removed, files per second and what remains.
 - `aethyme broker gc storage [--json]`
 - `aethyme broker gc storage plan [--json]`
 - `aethyme broker gc storage apply --confirm <sha256> [--json]`

@@ -91,9 +91,7 @@ pub(crate) fn judge(facts: BranchFacts) -> Verdict {
 
 /// `[cleanup] delete_merged_session_branches` (default true).
 pub(crate) fn enabled(main_root: &Path) -> bool {
-    let Ok(Some((_, text))) =
-        aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-    else {
+    let Ok(Some((_, text))) = crate::cleanup_config::cleanup_config_toml(main_root) else {
         return true;
     };
     toml::from_str::<toml::Value>(&text)
@@ -182,23 +180,30 @@ impl crate::Broker {
         if session.cleanup_state != crate::SessionCleanupState::Cleaned {
             return Some(true);
         }
-        let root = self.recovery_archive_root().ok()?;
-        let listing = match std::fs::read_dir(&root) {
-            Ok(listing) => listing,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
-            Err(_) => return None,
-        };
+        // Retired through an archive that `start --reuse` restores at the
+        // same path: recorded with the session, and marked by a tombstone.
+        if self.session_restorable_archive(session.id).is_some()
+            || crate::broker::is_checkout_tombstone(std::path::Path::new(&session.worktree_path))
+        {
+            return Some(true);
+        }
+        // Both archive directories: the pool-side one and the host state one.
         let prefix = format!("{}-", session.id);
-        let mut found = false;
-        for entry in listing {
-            let name = entry.ok()?.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && !name.ends_with(".partial") {
-                found = true;
-                break;
+        for root in self.recovery_archive_roots() {
+            let listing = match std::fs::read_dir(&root) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            for entry in listing {
+                let name = entry.ok()?.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && !name.ends_with(".partial") {
+                    return Some(true);
+                }
             }
         }
-        Some(found)
+        Some(false)
     }
 
     /// Why the branch must stay, judged afresh: every session that uses it

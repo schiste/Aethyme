@@ -4,6 +4,303 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.140] - 2026-11-19
+
+### Fixed
+
+- Graph integrity verification no longer regenerates the whole graph for a tree that has none committed. A repository that declares `committed_fragments` but has nothing under `.aethyme/graph/` can only be reported `stale`, because regeneration always writes the manifest and attributes file. Verification rebuilt every fragment to say so: on the busiest repository about 26,500 fragments and 316 to 439 s on every submission, more than half of it. The verdict now comes from one tree lookup, on every lane that runs the check: submission, gate runs, session gate runs, pull-request advice and native gates. Precedence is unchanged: an environment refusal is `error`, a missing pin is `incompatible`, otherwise `stale`. The full verification still runs when anything under `.aethyme/graph/` is in the index or untracked, or when the graph directory is ignored (#1858).
+- The background context warm-up returns quietly for a commit with no committed graph instead of printing a deferred warning on every tick (#1858).
+
+### Added
+
+- Span `graph_integrity_absent_check`; counters `graph_integrity_absent_tree` and `start_context_warmup_no_graph` (#1858).
+
+### Upgrade notes
+
+- For a tree with no committed graph, `changed_paths` is the single entry `.aethyme/graph` instead of every regenerated path, and the reason reads "no committed graph fragments in tree; nothing to verify".
+- A failure that the full regeneration could have hit while indexing such a tree was reported as `error`; it is now `stale`, since those steps no longer run.
+- The advice names the two ways out: run `aethyme graph refresh plan --repo .` and commit `.aethyme/graph/`, or set `[graph] authority = "disabled"`.
+
+## [0.8.139] - 2026-11-19
+
+### Fixed
+
+- Checkout retirement reaches more of its backlog. On the busiest repository it judged 775 closed checkouts in a day and retired 140, with about 31 s per run for the closed lap. Expiring commit pins used its full 20 s on 173 of 174 runs; it now runs at most every 30 minutes. While 50 or more closed checkouts are on disk, the closed lap's minimum time is 45 s instead of 20 s, within the lane's deadline. What may be removed is unchanged (#1853).
+- An archive that fails because the archive destination refuses a directory creation (a worker that inherited a sandbox, a read-only archive root) is kept as `archive_environment_denied` and retried by the next run instead of being remembered for 1, 6 and 24 hours. Repeated denials wait 10 minutes, doubling to a 6-hour cap, and raise the status advice `cleanup.retire-archive-denied` after three in a row. A fault inside the checkout itself, such as an unreadable file, is still `archive_failed` with the existing wait. A checkout whose archive is denied is always kept (#1853).
+- For an enforced graph policy, `submit` no longer hashes the whole verification checkout to choose which commit to verify. It checks that the checkout's commit carries the merge candidate's tree and verifies that commit; on a mismatch the general path runs. The verifier's own temporary copy is hashed from its index, as introduced in 0.8.138. Verdicts are unchanged (#1856).
+
+### Added
+
+- Counters `graph_integrity_full_enforced`, `graph_integrity_full_environment_refused` and `graph_integrity_known_tree_mismatch`; spans `graph_integrity_isolate`, `graph_integrity_source_check`, `graph_integrity_index`, `graph_integrity_link` and `graph_integrity_compare` (#1856).
+- Counters `checkout_retirement_kept_archive_environment_denied`, `checkout_retirement_archive_denied_waiting`, `checkout_retirement_prune_pins_not_due` and `checkout_retirement_closed_lap_backlog_floor`; the `checkout_retirement` attachment gains `closed_backlog` and `closed_lap_floor_ms` (#1853).
+
+### Upgrade notes
+
+- The shortcut for a disabled graph check introduced in 0.8.137 applies only where the policy at the submission's base is disabled. A repository whose base declares committed fragments runs the full verification; `graph_integrity_full_enforced` counts it.
+- Commit pins are expired at most every 30 minutes, so a pin can outlive its expiry by that long.
+
+### Known issues
+
+- Retirement keeps a checkout that any process holds open, including a file browser listing its folders. On the busiest repository that was 315 keeps in a day.
+- An enforced graph check whose committed fragments are stale costs minutes per submission and reports `stale` each time; it is advice and blocks nothing.
+
+## [0.8.138] - 2026-11-19
+
+### Changed
+
+- `submit` hashes its freshly created verification checkout from that checkout's own index instead of from an empty one, so Git re-reads only files whose size, timestamps or identity changed rather than every tracked file. The shortcut is used only for the checkout `submit` has just created, and only when all of these are proven; otherwise the full hash runs as before: no entry is flagged assume-unchanged or skip-worktree; the index is exactly the commit's tree; no tracked path is subject to content conversion (line endings, filters, ident, working-tree encoding) and `core.autocrlf` is off; the index did not change while it was copied; and the copy kept the original's timestamp. Git's strictest stat comparison is forced for these commands. A session's own gate runs, the recheck after waiting for a shared verdict, native gates, semantic-patch preview and graph integrity keep the full hash (#1851).
+
+### Added
+
+- Spans inside every tree hash (`tree_hash_index_build`, `tree_hash_tracked_rehash`, `tree_hash_untracked_walk`, `tree_hash_untracked_add`, `tree_hash_write_tree`, and the `tree_hash_seed*` steps) and one per call site (`gate_inputs_tree_hash`, `gate_shared_wait_tree_hash`, `session_gate_tree_hash`, `native_gate_tree_hash`, `semantic_patch_tree_hash`, `graph_integrity_tree_hash`); attachment `tree_hash_files` with hashes, tracked entries and untracked files; counters `tree_hash_seeded` and `tree_hash_seed_fallback_<reason>` (#1851).
+
+### Upgrade notes
+
+- `AETHYME_TREE_HASH_SEED=off` forces the full hash everywhere.
+- A repository whose Git configuration sets `core.autocrlf`, or whose tracked files carry converting attributes, always takes the full hash; `tree_hash_seed_fallback_content_conversion` counts it.
+
+### Known issues
+
+- The saving is not yet measured; the new spans report it.
+
+## [0.8.137] - 2026-11-19
+
+### Fixed
+
+- `submit` no longer re-hashes every tracked file of the verification checkout to report a graph check that is turned off. When the repository's graph policy does not enforce committed fragments, the check returned `disabled` only after building a temporary index and hashing the whole freshly created checkout; on the busiest repository that was 3 to 8 minutes per submission before any gate started. The disabled outcome now carries the tree the checkout was created from, which `submit` already knows, and reads no files. An enforced policy, or an environment that refuses graph verification, takes the full verification as before. Gate selection is unchanged (#1849).
+
+### Added
+
+- Spans `submit_selection_policy_load`, `submit_graph_integrity` and `submit_gate_definitions_load`; counters `graph_integrity_disabled_known_tree` and `graph_integrity_full_verification` (#1849).
+
+### Upgrade notes
+
+- For a disabled graph check, the reported `tree_hash` is the merge candidate's tree rather than a hash of the checkout's files. They differ only where Git renormalizes content on add (line-ending conversion, a non-idempotent clean filter) or in a sparse checkout. Nothing reads the value for a decision.
+
+### Known issues
+
+- Gate execution still hashes the whole verification checkout once before the gates run.
+
+## [0.8.136] - 2026-11-19
+
+### Fixed
+
+- `status` no longer scans every live lease to list overlapping sessions. The peer view joined the session's leases against all live leases with a test no index could serve; on the busiest repository that was about 17,000 leases and one second per call. It now searches the lease path index per path: the path itself, each directory prefix of it, and for a directory lease the range of paths under it. The rows returned are the same (#1844).
+- While a host resource lease is quarantined, `status` no longer resolves the checkout path of every recorded session; a path that does not exist is skipped (#1844).
+- Opening the broker no longer reads the eight sources of due background work when the background worker is already running. The open checks the worker's lock first and, if it is held, counts the request as coalesced as before. On the busiest repository the worker was already running in 416 of 418 measured opens, at about 57 ms each (#1842).
+
+### Added
+
+- Phase timings: one span per source of `blockers`, the steps of the session coordination and peer views, the steps `finish` runs under the lifecycle claim, and each Git worktree removal (#1844).
+- Counters `worker_admission_skipped_live_worker` and `worker_admission_due_checks_run`; span `worker_admission_live_worker_probe` (#1842).
+
+### Upgrade notes
+
+- `coalesced_requests` now also counts opens that found the worker running before reading what was due.
+- The main-checkout sync timer slot is claimed by the first open after the worker exits rather than while it runs.
+
+### Known issues
+
+- Nothing detects a background worker that hangs while holding its lock; opens count their request as coalesced and background work stops until that process exits.
+- `finish` still removes the checkout while holding the lifecycle claim.
+
+## [0.8.135] - 2026-11-19
+
+### Fixed
+
+- The trash catch-up process introduced in 0.8.134 gave up after about one second and deleted nothing. Every check of whether a catch-up was running took the host-wide lane lock for an instant and left a holder line naming no repository; a starting catch-up that met such a line ended as `lane_busy` instead of waiting. Checks now take the lock without writing anything and trust the holder line only while the lock is actually held, so a line left by a killed process or a reboot is ignored. A catch-up waits and retries every 45 s, within its 60-minute bound, for any holder other than its own repository's live catch-up. Exclusion is still the kernel lock (#1841).
+- Stored "which files did this session change" answers are reused again by `agents` and `status`. On macOS all watched worktrees shared one file-event stream; a few worktrees installing dependencies made it report dropped events, and each drop marked every worktree changed, so on the busiest repository only 970 of 10,184 answers were reused in a day. Up to 128 worktrees now get their own stream, so a drop marks only that worktree; the rest share one stream as before. Commands that decide, such as `submit`, still always ask Git (#1839).
+- A worktree that cannot be watched is retried with a backoff from 1 s to 4 minutes instead of every second (#1839).
+- `submit` reuses a session's own gate results again. A change made earlier the same day added the comparison base to the identity of a cached gate result; `submit` passes a base and a session's own gate run does not, so the identities never matched and every gate the session had already passed ran again. The identity is back to tree, gate definition and execution profile, as documented; gates that read the comparison base must set `cache = false`, as before (#1846).
+
+### Added
+
+- Counters `changed_files_reused` and `changed_files_miss_<reason>`; watcher status fields `own_stream_cap`, `own_streams`, `shared_streams`, `watched_on_shared`, `stream_threads`, `rescans_scoped`, `watch_set_changes`, `watch_failures` (#1839).
+- `checkout_trash_catchup` gains `lane_started_after_worker_ms` (#1841).
+
+### Upgrade notes
+
+- `checkout_trash_catchup` field `lane_held_by_other_repository` is replaced by its inverse, `lane_held_by_own_repository`.
+- The watcher's `rescans` now counts only invalidations of every worktree; per-worktree ones are `rescans_scoped`.
+- The file watcher holds one thread per own stream on macOS, at most 128. The new behaviour starts when the watcher's supervisor restarts.
+
+### Known issues
+
+- If a file-event stream stopped delivering events without reporting an error, a stored answer could be reused for up to 10 minutes by `agents` and `status`. This was already true of the shared stream.
+- Other bulk removals inside the worker still run at the lowest disk priority.
+
+## [0.8.134] - 2026-11-19
+
+### Fixed
+
+- The checkout trash is now actually deleted while other work uses the disk. The background worker runs at the lowest disk priority, and on macOS that priority delays each of its disk operations whenever anything else used the same disk recently. On the busiest repository the deleter managed 25 files per second while a plain removal on the same volume in the same minute ran several hundred times faster, so the trash grew to over a thousand entries. The trash catch-up now runs as its own process, started by the worker as soon as a deletable entry exists, at normal disk priority and reduced CPU priority. It keeps every existing bound: the rate limit (8,000, 4,000 or 200 unlinks per second by host pressure), the configured ceiling, the 250 ms debt cap, the yield at critical memory pressure, and a 20-minute lap, with up to three laps back to back. Below the storage headroom it is held to 8,000 unlinks per second instead of running unpaced. What is deleted is unchanged (#1837).
+- The catch-up no longer waits for the worker's other lanes, which take 10 to 18 minutes on the busiest repository (#1837).
+- One catch-up process per repository; repositories take turns on the host-wide lane, a waiting repository gets it after the holder's current lap, and a retirement run skips its own trash drain only while its own repository's catch-up is live (#1837).
+- `finish` measures the checkout's size before taking the repository-wide lifecycle claim instead of while holding it. On the busiest repository that walk held the claim for about 37 s per finish (#1838).
+- In the trash deleter, ancestor identities are re-checked every 256 unlinks or every 50 ms, whichever comes first, so a directory moved out of the trash mid-removal loses at most the unlink already under way. Catch-up byte figures are measured once per slice (#1833).
+
+### Added
+
+- `aethyme broker gc trash drain [--max-minutes <n>] [--json]` runs the trash catch-up now for the current repository, with the same guards and pacing, and reports entries removed, files per second and what remains. It refuses while another catch-up is live (#1837).
+- Phase timings for `commit`, the checks before and after `exec`, worker admission on broker open, and the session `status` view. `commit` and `prepare` rows now carry the guarded command's `precheck`, `command_and_supervision` and `postcheck` (#1838).
+- Metric rows `gc.__trash-catchup` and `gc.trash`, with `io_policy` (the policy read back from the system), `catchup_start_delay_ms`, laps and end reason; counter `checkout_trash_catchup_priority_not_raised` when the priority raise did not take (#1837).
+
+### Upgrade notes
+
+- The `checkout_trash_catchup` attachment moves from the worker's `gc` row to the catch-up process's own `gc.__trash-catchup` row.
+- A repository that wants a quieter deleter sets `[cleanup] unattended_unlinks_per_second`; it applies in every mode of the catch-up process.
+
+### Known issues
+
+- Other bulk removals inside the worker still run at the lowest disk priority and can be starved the same way: the artifact cache sweep, checkout removal, compact-checkout removal and recovery-archive eviction.
+- The manual `gc trash drain` runs at the caller's priority and is unpaced below the storage headroom.
+- The checks before and after each `exec` are unchanged; the new timings show which step costs most.
+
+## [0.8.133] - 2026-11-19
+
+### Fixed
+
+- The checkout trash deleter is faster and runs most of the time while the trash is behind. On the busiest repository, whose pool is on an external volume, the deleter was allowed 8,000 unlinks per second but reached a few hundred to 2,300: over half its time went to a status call before each unlink, and it ran about a quarter of wall time. The trash deleter now takes each entry's type from the directory listing and unlinks without a prior status call, falling back to one for an unknown type or a refused unlink. While the trash is behind, the worker keeps draining after its other lanes, with the repository's worker lock released: 30 s slices with a 1 s gap, for at most 20 minutes, three deleter threads sharing the one rate ceiling, one such lane per host. It still honours the configured ceiling, re-reads host pressure every 2 s and stops at critical memory pressure. Other removal paths are unchanged (#1831).
+
+### Changed
+
+- In the trash deleter only, ancestor identities are re-checked at every directory open, before every directory removal and every 256 unlinks, in place of before every unlink. All operations remain relative to pinned directory descriptors, links are never followed and mounts are never crossed (#1831).
+- Trash drain byte figures (`bytes`, `stripped_bytes`, `scratch_bytes`, the strip ledger's `bytes_freed`) are now the volume's free-space change across each entry: approximate, and report-only (#1831).
+- Telemetry: attachment `checkout_trash_catchup` (end reason, slices, entries, unlinks, `files_per_second_observed`, `worker_drain_share_pct`); `checkout_trash_drain` gains `threads` and `end_reason` (#1831).
+
+### Known issues
+
+- A directory moved out of the trash by hand while the deleter is inside it can lose up to 255 more of its own files at its new location before removal stops.
+- Catch-up byte figures can be overstated up to three times, because three threads measure the same volume at once.
+- The worker process can live up to 20 minutes longer while it catches up; its later lanes (cache measurement, transcripts, final status record) wait for it.
+
+## [0.8.132] - 2026-11-19
+
+### Fixed
+
+- The checkout trash drain keeps up with what cleanup moves into it. Everything cleanup removes is first moved to the pool's trash and deleted later by the background worker; that deletion ran at 2,000 unlinks per second (200 whenever the one-minute load was above the core count) in whatever time a retirement run had left. On the busiest repository 7 entries were deleted while 64 arrived, and the trash reached 736 entries, the oldest 16 days old, so removed checkouts and dependencies never gave their space back. Now, when the trash is behind (16 or more deletable entries, or one a day old), the deleter runs at up to 8,000 unlinks per second on a quiet host, 4,000 under load, I/O pressure or a memory warning, and 200 under critical memory pressure, re-reading host pressure every 2 s. The drain has its own share of each run (a third, half when behind). The rate is a ceiling over short intervals: after a stall at most 250 ms of work goes through unpaced. What is deleted is unchanged: recorded trash entries only, one deleter per host, no links followed (#1829).
+- An entry that failed to delete is tried after the others; an entry still in use is passed over, retried on later runs, and no longer keeps the trash counted as behind (#1829).
+- The recovery archive size pass runs before the trash drain, so it is no longer left without time on a busy repository (#1829).
+
+### Added
+
+- `[cleanup] unattended_unlinks_per_second`, when a repository sets it explicitly, is a ceiling for the trash deleter's paced modes. Left unset, the rates above apply. Below the storage headroom the deleter stays unpaced, as before (#1829).
+- Advice `cleanup.trash-backlog` when the trash holds an entry a day old or has grown for three runs in a row. Telemetry attachment `checkout_trash_drain` reports backlog, oldest age, pace, observed rate, entries and unlinks removed, and entries passed over by reason (#1829).
+
+### Upgrade notes
+
+- Consumers of the `checkout_trash_drain` attachment read `initial_pace` and `initial_unlinks_per_second` in place of `pace` and `unlinks_per_second`.
+- A repository that wants a quieter deleter sets `[cleanup] unattended_unlinks_per_second`.
+
+### Known issues
+
+- A worker run can last longer than before while the trash is behind: the archive pass and the drain may each extend it by their own bounded budgets.
+- The deleter is single-threaded and re-checks each ancestor directory before each unlink; the catch-up rates may not be reached on a slow volume. `unlinks_per_second_observed` shows the real rate.
+
+## [0.8.131] - 2026-11-19
+
+### Fixed
+
+- The idle strip re-examines sessions it handled under older rules. A handled session was remembered until it became active again, so a session stripped by an earlier version never got the removals a later version added. The memo now records the rules it was written under (`checkout_strip.idle_done_rules`); when they change, each idle session is examined once more (`checkout_idle_strip_memo_outdated`) (#1826).
+- Leaked artifact-use markers no longer keep an idle checkout busy forever. On the busiest repository, markers left weeks earlier by commands whose processes were gone refused the idle strip on almost half of the idle sessions. The idle strip now passes a marker only when its producer is proven exited: running phase, recorded process identity and start token, process absent or its identity reused (observed twice), process group absent. A live or unprovable marker refuses as `checkout_marker_live`; `checkout_busy` now means the checkout lock itself is held. The lock is still taken and held across proof and removal. Markers are not removed (#1827).
+- An idle session whose `git status` cannot finish in time is no longer always kept as `activity_unknown`. A bounded walk of file modification times decides instead (at most 5 s and 200,000 entries, inside the pass deadline): a recent time means active, a finished walk with none means idle, an unfinished walk keeps the session. The walk leaves out only `.git`, the broker's runtime paths, and directories the strip itself accepts as regenerable (#1827).
+
+### Changed
+
+- The counter for an environment kept because preparation is not proven to create it is renamed from `checkout_idle_strip_refused_environment_root_creation_unproven` to `checkout_idle_strip_kept_environment_root_creation_unproven`: it counts kept directories, not refused sessions (#1826).
+
+### Upgrade notes
+
+- Consumers of the renamed counter must read the new name.
+- After upgrading, every idle session is examined once more over the following worker runs.
+
+### Known issues
+
+- An idle session holding an operation left `running` by a process that is gone is still refused as `operation_unresolved`.
+- Leaked artifact-use markers of open sessions are passed over but not removed.
+- A producer on another host or in another process namespace sharing the volume is not visible to the exited-producer proof.
+
+## [0.8.130] - 2026-11-18
+
+### Changed
+
+- The idle strip removes more from idle open sessions. Besides directories a preparation step declares exactly, it now removes: a Python environment whose interpreter a step declares as an output (`<root>/pyvenv.cfg`, `<root>/bin/python*` or `<root>/Scripts/python*`), when it passes the same check the closed-checkout strip uses; and pnpm workspace-member `node_modules` directories proven regenerated by the declared root install, only once the root `node_modules` has moved in the same pass or was already absent. An environment with other declared files but no declared interpreter is kept as `environment_root_creation_unproven`; members whose root stays are kept as `member_root_kept`. `aethyme broker submit prepare --session <id>` runs every step again after a strip and recreates what was removed (#1820).
+- The `checkout_idle_strip` telemetry attachment gains `by_kind`: removed and kept counts and bytes per kind (`node_modules`, `node_modules_member`, `venv`, `pnpm_store`, `cargo_target`), measured only for directories being judged, within 2 s per checkout and 6 s per pass (#1820).
+
+### Upgrade notes
+
+- For an idle session's Python environment to be removed, the preparation step that creates it must list the interpreter among its `outputs`, for example `"<dir>/.venv/bin/python"`. Declaring only tools installed into the environment is not enough.
+
+### Known issues
+
+- A repository whose preparation config does not declare the environment's interpreter keeps that environment on idle sessions.
+
+## [0.8.129] - 2026-11-18
+
+### Fixed
+
+- The recovery archive size bound is enforced even when one archive is slow to verify. Removals get their own time budget (60 s), separate from listing and sizing (20 s). An archive whose verification times out or fails is passed over by later runs and retried on its own after an hour, so it no longer blocks the archives behind it. A removal already proven may run up to 30 s past the budget, so it is never left half done (#1817).
+- The archive pass judges whether each archive's work landed at most once per run, and stops those checks at its deadline (`landing_unjudged`). Before, an over-bound repository repeated them for every measured archive with no deadline (#1817).
+- A failed archive size measurement is no longer remembered as 0 bytes; it is counted `size_failed` and measured again. Size walks stop at the deadline and are retried next run. Archives the broker does not own are measured fresh every run (#1817).
+- An archive listing that reaches its time budget resumes after the last archive it listed, instead of always starting from the first (#1817).
+
+### Known issues
+
+- The removal budget is capped by the retirement run's own deadline: a run that has used its time before the archive pass removes nothing in that run.
+- An archive that can never be verified (altered content, or too large for the budget) is retried once an hour and never removed for size.
+- On the busiest repository most idle sessions keep their dependency directories because those directories are not declared preparation outputs (`not_declared_output`).
+
+## [0.8.128] - 2026-11-18
+
+### Fixed
+
+- The background cleanup worker no longer stalls on recovery archives. In 0.8.127 every retirement run fully walked and hashed every recovery archive, outside the pass's time budget; on the busiest repository one run exceeded 50 minutes and no checkout was stripped, retired or archived meanwhile. The archive size pass now classifies archives from their manifests, keeps measured sizes between runs, stops at its budget, and fully verifies only the one archive it is about to remove. Restore, `gc apply` and `gc plan --full-scan` still verify fully, and an archive holding unlanded work is still never removed for size (#1816).
+- Setting `[cleanup] delete_merged_session_branches` no longer makes the cleanup policy fail to load. Before, a repository that set this documented key lost automatic checkout removal and the ignored-output sweep (#1813).
+- `aethyme certify` no longer warns "unknown key(s)" on `[cleanup]`, `[main_checkout]`, `[coordination]`, `[console]` and `[watch]` (#1813).
+
+### Changed
+
+- The background worker reads `[cleanup]` from the remote default branch as last fetched (`origin/HEAD` only) when the primary checkout is simply behind it and its config has no local edit. A locally edited, diverged, non-regular or unreadable config, a missing `origin/HEAD`, and a default-branch config that does not validate all keep the working copy, as before. A config edit made during a worker run takes effect for the rest of that run. `broker status` shows advice `cleanup.config-source` when the two copies differ, naming which one the worker follows. Foreground commands and previews still read the working copy (#1813).
+
+### Upgrade notes
+
+- A repository whose primary checkout is held behind its default branch now gets `[cleanup]` settings merged on the default branch. If `origin/HEAD` is not set, run `git remote set-head origin --auto`.
+
+### Known issues
+
+- A landed archive whose full verification cannot finish inside the archive pass's budget is not removed, and archives behind it are not tried in that run; it is counted `recovery_archive_bound_evict_failed`. Nothing is lost; the size bound is not enforced for that repository until this is fixed.
+- When a repository is over the archive bound, the landing check runs for every measured archive without the pass deadline.
+- `certify` checks `[cleanup]` key names only; an invalid value still certifies.
+
+## [0.8.127] - 2026-11-18
+
+### Added
+
+- Stacked sessions. `broker start --stack-on <session>` starts a session on top of another session's branch; its pull request is based on the parent's branch and says "Stacked on #N". When the parent's pull request merges, the child is retargeted to the nearest unmerged ancestor, only from the base the broker expected, and a failed lookup aborts the retarget. `broker sync --unstack` detaches a child. Schema 66 adds `session_stacks` (#1796).
+- Merged remote session branches can be deleted: `[remote_branches] delete_merged = true`. Off by default. A branch is deleted only when its pull request is merged, no open pull request is based on it, no session still uses it, and the remote tip is still the merged head; each fact is read again before each delete, which is a `--force-with-lease` push pinned to that head. At most 25 per run. `gc remote-branches plan` lists what a run would delete without deleting (#1796).
+- Idle open sessions lose their regenerable dependency directories after `[cleanup] idle_strip_after_hours` (default 4). Only directories that a declared preparation step output names exactly are removed; anything else is kept and counted `not_declared_output`. The session gets a notice in `.aethyme/broker-action-required.md` (never overwriting another notice, never written to a tracked path), a session-scoped blocker, and advice `idle_strip_prepare`; `aethyme broker submit prepare --session <id>` rebuilds what was removed. A session is not idle while a process uses its checkout (observed again when the observation is older than 5 s), while files Git reports as changed or untracked were modified inside the window, or while its checkout lock is held; when that check cannot complete the session is kept as `activity_unknown` (#1790, #1794).
+- Idle sessions are archived, then removed. A session with no activity for 24 hours (4 hours when its work already landed) has its commits, patches, untracked files and protected ignored files archived with a SHA-256 manifest, and its checkout replaced by a small tombstone directory holding `ARCHIVED-SESSION.txt`. `aethyme broker start --reuse '<path>'` restores it: the checkout is rebuilt at a staging path and moved into place only when complete, a restore onto a branch that moved is reported, and the session gets the same rebuild notice as an idle strip. A closing-soon notice is raised 4 hours before. `--json` refusals of a closed session that left a tombstone carry `error.action` (#1794).
+- Recovery archives live next to the checkout pool, in `<pool>/.aethyme-recovery-archives/<repository key>`; existing archives in host state are still read and never migrated. `[cleanup] recovery_archive_bound_gib` (default 20) removes the oldest archives whose content is fully landed; an archive holding unlanded work, an older-format archive, and one with a keep marker are never removed for size. Unlanded archives are kept past their retention age and named in advice until `storage keep-archive --dismiss` or `[budget] expire_unlanded_archives`. `storage status` gains `recovery_archives_by_location` (#1794).
+- `push` and `sync` print one `Next:` line with the prepare command while a session's dependencies are missing after an idle strip or a restore; `--json` carries `preparation_next_action` (#1794).
+- Blocker scope `session`: other sessions' hooks do not count it (#1790).
+
+### Upgrade notes
+
+- Consumers of `broker blockers --json` that match the scope exhaustively must accept `session`.
+- Remote branch deletion stays off until `[remote_branches] delete_merged = true` is set. Run `gc remote-branches plan` first.
+- An agent returning to a session idle for more than 24 hours finds a tombstone directory in place of its checkout; `aethyme broker start --reuse '<path>'` restores it. Restore does not bring back file modes beyond the executable bit, timestamps, links or extended attributes.
+- A pool root whose repository was moved or renamed is not removed while it holds a recovery archive not proven landed.
+- An agent returning to a session idle for more than 4 hours finds its dependencies gone and a blocker naming the one command that rebuilds them. Set `[cleanup] idle_strip_after_hours` to change the window.
+
+### Known issues
+
+- The remote-branch cleanup lock is taken for 20 minutes and not renewed; a run is a single pass well inside that.
+- `submit`, auto-close and the landed check do not yet treat a stacked child as depending on its parent.
+- Archives holding unlanded work have no total size limit; they are kept and named in advice.
+- Catalogued regenerable directories (Python environments, build output, test caches) are not archived and are not restored; the rebuild command recreates them.
+- A repository that sets `session_abandoned_after_hours` itself keeps its own window.
+- `[cleanup]` settings are read from the primary checkout's working copy. On a repository whose primary checkout is held behind its default branch, a setting merged on the default branch is not in effect.
+
 ## [0.8.126] - 2026-11-18
 
 ### Added

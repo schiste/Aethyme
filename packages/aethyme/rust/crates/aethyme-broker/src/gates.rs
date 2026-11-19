@@ -994,6 +994,7 @@ impl GateProgressSink for SubmitGateProgressSink<'_> {
 
 pub(crate) struct GateExecutionContext<'a> {
     pub cache_policy: CachePolicy,
+    pub comparison_base: Option<&'a str>,
     pub progress: &'a dyn GateProgressSink,
 }
 
@@ -1045,7 +1046,12 @@ struct GateRuntimeContext<'a> {
     progress: &'a dyn GateProgressSink,
     admission_host: &'a dyn crate::gate_admission::AdmissionHost,
     deadline: Option<Instant>,
+    comparison_base: Option<&'a str>,
     storage: GateStorageLocations,
+    /// The checkout is a submit verification slot the broker just
+    /// materialized and nothing has written to yet, so its tree may be hashed
+    /// with [`GitRepo::working_tree_hash_observation_for_fresh_checkout`].
+    fresh_checkout: bool,
 }
 
 pub(crate) fn heartbeat_interval() -> Duration {
@@ -2174,6 +2180,7 @@ pub(crate) fn run_affected_in(
         session_id,
         GateExecutionContext {
             cache_policy,
+            comparison_base: None,
             progress: &progress,
         },
         storage,
@@ -2187,36 +2194,35 @@ pub(crate) fn run_affected_for_submit_in(
     checkout: &GitRepo,
     gates: &[Gate],
     changed: &[String],
+    comparison_base: &str,
     session_id: Option<i64>,
     cache_policy: CachePolicy,
     submit: Option<&crate::submit_progress::SubmitProgress>,
     storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    let Some(submit) = submit else {
-        return run_affected_in(
-            store,
-            main_root,
-            checkout,
-            gates,
-            changed,
-            session_id,
-            cache_policy,
-            storage,
-        );
+    let submit_progress = submit.map(|progress| SubmitGateProgressSink { progress });
+    let progress: &dyn GateProgressSink = match &submit_progress {
+        Some(progress) => progress,
+        None => &StderrGateProgressSink,
     };
-    let progress = SubmitGateProgressSink { progress: submit };
-    run_affected_with_progress_in(
+    // The verification slot was materialized from the merge commit just
+    // before, and only the disabled graph check (which reads nothing) ran
+    // in it since.
+    run_selections(
         store,
         main_root,
         checkout,
-        gates,
-        changed,
+        select_gates(gates, changed),
         session_id,
-        GateExecutionContext {
-            cache_policy,
-            progress: &progress,
+        cache_policy,
+        GateRuntimeContext {
+            progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: None,
+            comparison_base: Some(comparison_base),
+            storage,
+            fresh_checkout: true,
         },
-        storage,
     )
 }
 
@@ -2238,6 +2244,7 @@ pub(crate) fn run_affected_bounded(
         gates,
         changed,
         allowance,
+        None,
         GateStorageLocations::default(),
     )
 }
@@ -2250,6 +2257,7 @@ pub(crate) fn run_affected_bounded_in(
     gates: &[Gate],
     changed: &[String],
     allowance: Duration,
+    comparison_base: Option<&str>,
     storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
@@ -2261,9 +2269,11 @@ pub(crate) fn run_affected_bounded_in(
         None,
         CachePolicy::Bypass,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: Some(Instant::now() + allowance),
+            comparison_base,
             storage,
         },
     )
@@ -2289,9 +2299,11 @@ pub(crate) fn run_affected_with_progress_in(
         session_id,
         context.cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: context.progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: context.comparison_base,
             storage,
         },
     )
@@ -2370,9 +2382,11 @@ pub(crate) fn run_all_with_progress_in(
         session_id,
         cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: None,
             storage,
         },
     )
@@ -2439,9 +2453,11 @@ pub(crate) fn run_named_in(
         session_id,
         cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: None,
             storage,
         },
     )
@@ -3501,6 +3517,48 @@ fn begin_gate_artifact_use(
     })
 }
 
+/// Hash the existing cache identity into a bounded set of persistent locks.
+fn gate_verdict_shard(gate: &Gate, tree: &str, profile: &str) -> u16 {
+    let mut digest = Sha256::new();
+    for key in [&gate.name, tree, &gate.definition_hash, profile] {
+        digest.update(key.len().to_le_bytes());
+        digest.update(key.as_bytes());
+    }
+    let digest = digest.finalize();
+    u16::from_be_bytes([digest[0], digest[1]]) & 0x0fff
+}
+
+fn claim_gate_verdict(
+    main_root: &Path,
+    shard: u16,
+    deadline: Option<Instant>,
+    progress: &dyn GateProgressSink,
+) -> std::io::Result<(Option<crate::file_lock::ExclusiveFileLock>, bool)> {
+    let lock = crate::file_lock::ExclusiveFileLock::try_acquire(
+        crate::file_lock::open_gate_verdict_lock(main_root, shard)?,
+    )?;
+    if lock.is_some() {
+        return Ok((lock, false));
+    }
+
+    let _span = crate::phase_telemetry::span("gate_verdict_wait");
+    let limit = Instant::now() + Duration::from_secs(60);
+    let deadline = deadline.map_or(limit, |deadline| deadline.min(limit));
+    progress.report("Waiting for an in-flight gate verdict");
+    while Instant::now() < deadline {
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+        if let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(
+            crate::file_lock::open_gate_verdict_lock(main_root, shard)?,
+        )? {
+            return Ok((Some(lock), true));
+        }
+    }
+
+    Ok((None, true))
+}
+
 /// Keeps both storage admission probes injectable for ordering regressions.
 #[allow(clippy::too_many_arguments)]
 fn run_selections_with_admission<CachedEventAdmission, GateAdmission>(
@@ -3566,7 +3624,14 @@ where
         .as_mut()
         .expect("invocation marker was just created")
         .dispatch_attempted();
-    let hash = checkout.working_tree_hash_observation();
+    let hash = {
+        let _span = crate::phase_telemetry::span("gate_inputs_tree_hash");
+        if runtime.fresh_checkout {
+            checkout.working_tree_hash_observation_for_fresh_checkout()
+        } else {
+            checkout.working_tree_hash_observation()
+        }
+    };
     if hash.writers_quiescent {
         invocation_artifact_use
             .as_mut()
@@ -3632,6 +3697,11 @@ where
             // capture reports that every owned probe group was reaped or did
             // not spawn.
             profile_guard.dispatch_attempted();
+            // The comparison base is deliberately not part of this identity:
+            // a gate that reads `AETHYME_GATE_BASE_COMMIT` must set
+            // `cache = false`, so a cached verdict depends only on the tree,
+            // gate definition and execution profile, and a session's proof
+            // stays reusable by a submission of the same tree.
             let profile = capture_profile(checkout.root(), subprocess_path.as_deref());
             if !profile.writers_quiescent() {
                 return Err(crate::BrokerError::Io {
@@ -3658,32 +3728,118 @@ where
         // measurable (kill-criterion accounting). Gates that inspect
         // commit metadata must opt out: the tree can stay identical while
         // commit bodies change.
-        let mut cache_miss_reason = None;
-        let cached_result = if cache_policy == CachePolicy::Use && gate.cache {
-            if let Some(profile_digest) = profile.and_then(|profile| profile.digest()) {
-                let found = store.cached_gate_result_for_execution_profile(
-                    &gate.name,
-                    &tree,
-                    &gate.definition_hash,
-                    profile_digest,
-                )?;
-                if found.is_none() {
-                    cache_miss_reason = Some(crate::events::GateCacheMissReason::NoReusableVerdict);
-                }
-                found
-            } else {
-                cache_miss_reason = Some(crate::events::GateCacheMissReason::ProfileIncomplete);
-                progress.report(&format!(
-                    "gate {} cache unavailable: execution profile could not be captured ({})",
-                    gate.name,
-                    profile.map_or_else(String::new, |profile| profile.incomplete())
-                ));
-                None
-            }
-        } else {
-            None
+        let wait_started = Instant::now();
+        let eligible = cache_policy == CachePolicy::Use && gate.cache;
+        let profile_digest = eligible
+            .then(|| profile.and_then(crate::gate_profile::ExecutionProfile::digest))
+            .flatten();
+        let lookup = |store: &BrokerStore, digest| {
+            store.cached_gate_result_for_execution_profile(
+                &gate.name,
+                &tree,
+                &gate.definition_hash,
+                digest,
+            )
         };
+        let mut cached_result = profile_digest
+            .map(|digest| lookup(store, digest))
+            .transpose()?
+            .flatten();
+        let mut shared_wait = false;
+        // Hold the producer claim until the command's result is durable.
+        let mut verdict_claim = None;
+        if cached_result.is_none() {
+            if artifact_use.is_none() {
+                artifact_use = Some(begin_gate_artifact_use(
+                    store,
+                    main_root,
+                    checkout,
+                    session_id,
+                    runtime.deadline,
+                )?);
+            }
+            // A completed cache hit remains available during storage pressure.
+            // A miss must pass admission before creating its rendezvous file.
+            if let Some(diagnostic) = gate_admission(store, main_root, checkout, gate) {
+                artifact_use
+                    .as_mut()
+                    .expect("storage admission has an artifact marker")
+                    .finish_not_started()
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: checkout.root().to_path_buf(),
+                        source,
+                    })?;
+                let database_refusal = database_write_admission(store, main_root);
+                outcomes.push(gate_storage_resource_failure(
+                    store,
+                    gate,
+                    &tree,
+                    session_id,
+                    &diagnostic,
+                    database_refusal.as_deref(),
+                    progress,
+                )?);
+                break;
+            }
+
+            if let Some(digest) = profile_digest {
+                let shard = gate_verdict_shard(gate, &tree, digest);
+                (verdict_claim, shared_wait) =
+                    claim_gate_verdict(main_root, shard, runtime.deadline, progress).map_err(
+                        |source| crate::BrokerError::Io {
+                            path: main_root.join(".aethyme/run"),
+                            source,
+                        },
+                    )?;
+                if shared_wait {
+                    let marker = artifact_use
+                        .as_mut()
+                        .expect("verdict wait has an artifact marker");
+                    marker.dispatch_attempted();
+                    let observation = {
+                        let _span = crate::phase_telemetry::span("gate_shared_wait_tree_hash");
+                        checkout.working_tree_hash_observation()
+                    };
+                    if observation.writers_quiescent {
+                        marker.confirm_no_spawn_or_quiescence();
+                    }
+                    if observation.result? != tree {
+                        return Err(crate::BrokerError::Io {
+                            path: checkout.root().to_path_buf(),
+                            source: std::io::Error::other(
+                                "gate inputs changed while waiting for a shared verdict; retry against the current tree",
+                            ),
+                        }.into());
+                    }
+                }
+                cached_result = lookup(store, digest)?;
+                if cached_result.is_none() && verdict_claim.is_none() {
+                    outcomes.push(gate_storage_resource_failure(
+                        store,
+                        gate,
+                        &tree,
+                        session_id,
+                        "shared gate verdict wait expired; retry after the in-flight run completes",
+                        database_write_admission(store, main_root).as_deref(),
+                        progress,
+                    )?);
+                    break;
+                }
+            }
+        }
+        if eligible && profile_digest.is_none() {
+            progress.report(&format!(
+                "gate {} cache unavailable: execution profile could not be captured ({})",
+                gate.name,
+                profile.map_or_else(String::new, |profile| profile.incomplete())
+            ));
+        }
         if let Some(hit) = cached_result {
+            let shared_wait_ms = shared_wait.then(|| wait_started.elapsed().as_millis() as i64);
+            drop(verdict_claim);
+            if shared_wait {
+                let _span = crate::phase_telemetry::span("gate_verdict_joined");
+            }
             if let Some(mut artifact_use) = artifact_use.take() {
                 artifact_use
                     .finish_not_started()
@@ -3712,16 +3868,13 @@ where
                     store.append_event(
                         crate::events::GATE_CACHED,
                         session_id,
-                        Some(&crate::events::gate_cached_payload(
-                            &gate.name,
-                            &tree,
-                            saved_ms,
-                            hit.status,
+                        Some(&crate::events::gate_cache_hit_payload(
+                            &hit,
                             cached_failure_class(hit.status),
-                            hit.id,
                             cache_provenance
                                 .as_ref()
                                 .expect("profile-backed cache lookup has provenance"),
+                            shared_wait_ms,
                         )),
                     ),
                 );
@@ -3741,7 +3894,7 @@ where
                 cached: true,
                 exit_code: hit.exit_code,
                 duration_ms: hit.duration_ms,
-                wait_duration_ms: Some(0),
+                wait_duration_ms: Some(shared_wait_ms.unwrap_or_default()),
                 first_output_ms: hit.first_output_ms,
                 output_bytes: hit.output_bytes,
                 log_path: hit.log_path,
@@ -3756,42 +3909,7 @@ where
             continue;
         }
 
-        // A cache miss keeps the marker created before the tree/profile probes
-        // (or acquires one here when those probes already completed in an
-        // earlier selection) through storage, load, owner-lock and resource
-        // admission, all before any gate-owned path is created.
-        let mut artifact_use = match artifact_use {
-            Some(artifact_use) => artifact_use,
-            None => {
-                begin_gate_artifact_use(store, main_root, checkout, session_id, runtime.deadline)?
-            }
-        };
-
-        // Check every volume this run will write before making run/log
-        // directories or preparing a managed cache. A cache hit above has no
-        // such writes and remains usable even when a build volume is low.
-        if let Some(diagnostic) = gate_admission(store, main_root, checkout, gate) {
-            artifact_use
-                .finish_not_started()
-                .map_err(|source| crate::BrokerError::Io {
-                    path: checkout.root().to_path_buf(),
-                    source,
-                })?;
-            // Persist at most one bounded diagnostic row, and only when a
-            // separate probe confirms the broker database itself can accept it.
-            // The full preflight may have stopped at an earlier low-volume probe.
-            let database_refusal = database_write_admission(store, main_root);
-            outcomes.push(gate_storage_resource_failure(
-                store,
-                gate,
-                &tree,
-                session_id,
-                &diagnostic,
-                database_refusal.as_deref(),
-                progress,
-            )?);
-            break;
-        }
+        let mut artifact_use = artifact_use.expect("a cache miss has an artifact marker");
 
         // Cache: bypass is an execution choice, so record it only after the
         // storage admission check establishes that the gate can proceed.
@@ -3812,7 +3930,12 @@ where
         // record it waits for storage admission, so a gate refused before it
         // could run (and a refused database write) leaves no record, and a
         // failed write never fails the gate.
-        if let Some(reason) = cache_miss_reason {
+        if eligible {
+            let reason = if profile_digest.is_some() {
+                crate::events::GateCacheMissReason::NoReusableVerdict
+            } else {
+                crate::events::GateCacheMissReason::ProfileIncomplete
+            };
             crate::warn_unrecorded(
                 "record the gate cache miss event",
                 store.append_event(
@@ -3849,7 +3972,6 @@ where
             }
         }
 
-        let wait_started = Instant::now();
         let log_path = log_dir.join(format!(
             "{}-{}-{}.log",
             gate.name,
@@ -4115,6 +4237,7 @@ where
             &gate.command,
             GateCommandContext {
                 cwd: checkout.root(),
+                comparison_base: runtime.comparison_base,
                 available_bytes: available.map(|headroom| headroom.bytes),
                 available_inodes: available.and_then(|headroom| headroom.inodes),
                 environment: &environment,
@@ -4285,6 +4408,7 @@ where
             cache_provenance.as_ref(),
             cache_bypass_reason,
         )?;
+        drop(verdict_claim);
         let failed = gate_status != GateStatus::Pass;
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
@@ -4908,6 +5032,7 @@ fn command_mentions_cargo(command: &str) -> bool {
 /// maintaining the pidfile for cancellation. Returns the exit code.
 struct GateCommandContext<'a> {
     cwd: &'a Path,
+    comparison_base: Option<&'a str>,
     /// Free bytes on `cwd`'s filesystem, measured once by the caller: the
     /// headroom check refuses on it and the gate result records it.
     available_bytes: Option<u64>,
@@ -5425,6 +5550,7 @@ fn run_gate_command_inner(
         .env_remove(crate::session_scratch::SESSION_SCRATCH_ENV)
         .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
         .env(crate::gate_database::SCOPE_ENV, isolated_broker_scope)
+        .env_remove("AETHYME_GATE_BASE_COMMIT")
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
         .env(crate::gate_debris::GATE_RUN_ID_ENV, &context.run_labels.run)
         .env(
@@ -5435,6 +5561,9 @@ fn run_gate_command_inner(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
+    if let Some(base) = context.comparison_base {
+        process.env("AETHYME_GATE_BASE_COMMIT", base);
+    }
     if let Some(resources) = context.resources {
         for (key, value) in resources.grant.environment() {
             process.env(key, value);
@@ -6324,9 +6453,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
@@ -6376,6 +6507,96 @@ mod tests {
         }));
         assert!(!checkout_root.join(".aethyme/logs/gates").exists());
         assert!(!checkout_root.join("should-not-run").exists());
+    }
+
+    #[test]
+    fn overlapping_gate_request_reuses_the_durable_producer_verdict() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("shared", true, "false");
+        let tree = checkout.working_tree_hash().unwrap();
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        let shard = gate_verdict_shard(&gate, &tree, profile.digest().unwrap());
+        let producer_claim = crate::file_lock::ExclusiveFileLock::try_acquire(
+            crate::file_lock::open_gate_verdict_lock(&checkout_root, shard).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        struct OnWait<F>(std::sync::Mutex<Option<F>>);
+        impl<F: FnOnce() + Send> GateProgressSink for OnWait<F> {
+            fn report(&self, line: &str) {
+                if line == "Waiting for an in-flight gate verdict" {
+                    self.0.lock().unwrap().take().unwrap()();
+                }
+            }
+        }
+        let producer_run = std::sync::atomic::AtomicI64::new(0);
+        let run = &producer_run;
+        let provenance = profile.provenance();
+        let result = NewGateResult {
+            gate_name: gate.name.clone(),
+            tree_hash: tree,
+            definition_hash: gate.definition_hash.clone(),
+            status: GateStatus::Pass,
+            failure_class: None,
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            wait_duration_ms: Some(0),
+            first_output_ms: None,
+            output_bytes: Some(0),
+            log_path: None,
+            session_id: None,
+        };
+        let progress = OnWait(std::sync::Mutex::new(Some(move || {
+            let mut writer = BrokerStore::open(&database).unwrap();
+            let id = writer
+                .record_gate_result_with_execution_profile(
+                    &result,
+                    &crate::GateEnvironment::default(),
+                    Some(&provenance),
+                )
+                .unwrap();
+            run.store(id, std::sync::atomic::Ordering::Relaxed);
+            drop(producer_claim);
+        })));
+        let outcomes = run_selections_with_profile_capture(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                fresh_checkout: false,
+                progress: &progress,
+                admission_host: &SequencedAdmissionHost::new(vec![None]),
+                deadline: None,
+                comparison_base: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+            |_, _| profile.clone(),
+        )
+        .unwrap();
+
+        let producer_run = producer_run.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(producer_run > 0);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].cached);
+        assert_eq!(outcomes[0].run_id, Some(producer_run));
+        assert_eq!(outcomes[0].status, GateStatus::Pass);
+        assert!(outcomes[0].wait_duration_ms.unwrap() > 0);
+        assert!(!checkout_root.join(".aethyme/logs/gates").exists());
     }
 
     #[test]
@@ -6437,9 +6658,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
@@ -6502,9 +6725,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6551,9 +6776,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6668,9 +6895,11 @@ mod tests {
             Some(session_id),
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6751,9 +6980,11 @@ mod tests {
                 None,
                 CachePolicy::Bypass,
                 GateRuntimeContext {
+                    fresh_checkout: false,
                     progress: &progress,
                     admission_host: &admission_host,
                     deadline: None,
+                    comparison_base: None,
                     storage: GateStorageLocations::default(),
                 },
                 |_, _| None,
@@ -6928,9 +7159,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -7028,9 +7261,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -7096,9 +7331,11 @@ mod tests {
             Some(session.id),
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -7161,6 +7398,7 @@ mod tests {
         let log = root.path().join("log");
         let context = || GateCommandContext {
             cwd: root.path(),
+            comparison_base: None,
             available_bytes: None,
             available_inodes: None,
             environment: &environment,
@@ -7246,6 +7484,7 @@ mod tests {
         let labels = crate::gate_debris::GateRunLabels::new("renewal-stop", None, "synthetic");
         let context = GateCommandContext {
             cwd: root.path(),
+            comparison_base: None,
             available_bytes: None,
             available_inodes: None,
             environment: &environment,
@@ -7343,9 +7582,11 @@ mod tests {
             None,
             CachePolicy::Bypass,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::Captured {
                     host_resource_db_path: Some(resource_db.clone()),
                     host_cache_dir: Some(owner.path().join("cache")),
@@ -7896,9 +8137,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -7938,9 +8181,11 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &recovered_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -7985,9 +8230,11 @@ mod tests {
             None,
             CachePolicy::Bypass,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -8677,6 +8924,7 @@ mod tests {
     ) -> GateCommandContext<'a> {
         GateCommandContext {
             cwd: root,
+            comparison_base: None,
             available_bytes: Some(u64::MAX),
             available_inodes: Some(u64::MAX),
             environment,

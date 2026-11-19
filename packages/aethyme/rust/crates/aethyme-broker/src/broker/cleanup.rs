@@ -2636,6 +2636,7 @@ impl Broker {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_item(
         &self,
         session: &Session,
@@ -2947,7 +2948,11 @@ impl Broker {
             allow_adopted_path,
         } = inspection;
         let worktree_path = PathBuf::from(&session.worktree_path);
-        let worktree_present = worktree_path.exists();
+        // A retired checkout's tombstone is no checkout: never an orphaned
+        // or unusable worktree to report or remove. The retirement lane owns
+        // it (and expires it); here the path reads as already gone.
+        let worktree_present =
+            worktree_path.exists() && !tombstone_at_checkout_path(&worktree_path);
         let branch_ref = format!("refs/heads/{}", session.branch);
         let branch_tip = match branch_tips {
             Some(tips) => tips.get(&branch_ref).cloned(),
@@ -3598,7 +3603,7 @@ impl Broker {
         if !self.is_broker_owned_worktree(session, path) {
             return None;
         }
-        let present = path.exists();
+        let present = path.exists() && !tombstone_at_checkout_path(path);
         let branch_ref = format!("refs/heads/{}", session.branch);
         let tip = tips.and_then(|tips| tips.get(&branch_ref).cloned());
         if !present && tip.is_none() {
@@ -3815,6 +3820,7 @@ impl Broker {
             let path = Path::new(&session.worktree_path);
             if let Some(closed_at) = session.closed_at
                 && path.exists()
+                && !tombstone_at_checkout_path(path)
                 && self.is_broker_owned_worktree(session, path)
             {
                 oldest_closed_at =
@@ -5359,8 +5365,14 @@ impl Broker {
 
         let mut removed_orphan_branch = None;
         let mut removed_checkout_session_ids = vec![session_id];
-        let retained_checkout_present =
-            worktree_path_is_real_directory(&worktree_path, session_id)?;
+        let retained_path_present = worktree_path_is_real_directory(&worktree_path, session_id)?;
+        // A retired checkout's tombstone is no checkout to remove: Git has
+        // no registration for it and its saved work lives elsewhere. The
+        // path reads as gone and the tombstone stays for the retirement
+        // lane to expire.
+        let retained_tombstone =
+            retained_path_present && tombstone_at_checkout_path(&worktree_path);
+        let retained_checkout_present = retained_path_present && !retained_tombstone;
         if archive_guard.is_some() && !retained_checkout_present {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
@@ -5543,7 +5555,9 @@ impl Broker {
                 }
             }
         }
-        require_worktree_path_absent(&worktree_path, session_id)?;
+        if !(retained_tombstone && tombstone_at_checkout_path(&worktree_path)) {
+            require_worktree_path_absent(&worktree_path, session_id)?;
+        }
         if let Some((branch_ref, branch_tip)) = removed_orphan_branch.as_ref() {
             self.refuse_live_checkout(session_id, &worktree_path)?;
             self.ensure_orphan_branch_not_checked_out(session_id, branch_ref, branch_tip, None)?;
@@ -5775,6 +5789,20 @@ fn overlapping_live_checkout(
         }
     }
     Ok(None)
+}
+
+/// Whether a session's checkout path holds a retired checkout's tombstone
+/// (see `super::tombstone`), counted so a lap shows how often the cleanup
+/// and orphan lanes met one.
+fn tombstone_at_checkout_path(path: &Path) -> bool {
+    let tombstone = super::tombstone::is_checkout_tombstone(path);
+    if tombstone {
+        crate::phase_telemetry::add(
+            "checkout_cleanup_tombstone_skipped",
+            std::time::Duration::ZERO,
+        );
+    }
+    tombstone
 }
 
 fn worktree_path_is_real_directory(path: &Path, session_id: i64) -> Result<bool, BrokerOpError> {
@@ -6958,6 +6986,53 @@ mod registered_removal_failure_tests {
                 "a proofless orphan must retain its branch"
             );
         }
+    }
+
+    #[test]
+    fn a_retired_checkout_tombstone_is_never_reported_as_an_orphaned_checkout() {
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let repository = initialized_repository(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("retired checkout leaves a tombstone", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        broker.close(session.id).unwrap();
+        // What retirement leaves: Git's registration gone, and a directory
+        // holding only the tombstone note at the checkout path.
+        remove_worktree_admin_directory(&worktree);
+        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let note = worktree.join("ARCHIVED-SESSION.txt");
+        std::fs::write(&note, "aethyme: retired session checkout\narchive: none\n").unwrap();
+        assert!(crate::broker::is_checkout_tombstone(&worktree));
+
+        let plan = broker.cleanup_plan().unwrap();
+
+        if let Some(item) = plan
+            .worktrees
+            .iter()
+            .find(|item| item.session_id == session.id)
+        {
+            assert!(
+                !item.worktree_present,
+                "a tombstone is not a retained checkout: {item:?}"
+            );
+            assert_eq!(item.estimated_bytes, Some(0));
+            assert!(
+                !item.reason.contains("not a usable worktree")
+                    && !item.reason.contains("orphaned checkout"),
+                "a tombstone must not be reported as an orphan: {}",
+                item.reason
+            );
+        }
+        assert_eq!(plan.retained_worktree_count, 0);
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "aethyme: retired session checkout\narchive: none\n",
+            "planning must leave the tombstone untouched"
+        );
     }
 
     #[test]

@@ -8,14 +8,23 @@
 //! subsystem, and only one of the two lanes enforced it.
 
 use std::path::Path;
+use std::time::Duration;
 
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 #[cfg(test)]
 use aethyme_graph_storage::GraphAuthority;
 use aethyme_graph_storage::{
-    GraphIntegrityPolicy, bootstrap_repo, committed_source_tree_digest, read_coverage,
-    read_engine_version, write_graph_authority_manifest,
+    GRAPH_MANIFEST_RELPATH, GraphIntegrityPolicy, bootstrap_repo, committed_source_tree_digest,
+    read_coverage, read_engine_version, write_graph_authority_manifest,
 };
+
+/// The directory committed graph fragments live in.
+const GRAPH_DIRECTORY: &str = ".aethyme/graph";
+/// The engine pin, read from the verified state.
+const ENGINE_VERSION_PATH: &str = ".aethyme/engine-version";
+/// The reason of a `stale` outcome for a tree with no committed graph at all.
+pub(crate) const ABSENT_GRAPH_REASON: &str =
+    "no committed graph fragments in tree; nothing to verify";
 
 pub(crate) fn load_graph_policy_at_commit(
     repository: &crate::GitRepo,
@@ -123,6 +132,13 @@ impl GraphIntegrityOutcome {
     pub fn advice(&self) -> Option<String> {
         match self.verdict() {
             GraphIntegrityVerdict::Disabled | GraphIntegrityVerdict::Fresh => None,
+            GraphIntegrityVerdict::Stale if self.reason == ABSENT_GRAPH_REASON => Some(format!(
+                "this repository declares committed graph fragments authoritative, but tree {} \
+                 has none committed; this is advice and blocks nothing. Generate them with \
+                 `aethyme graph refresh plan --repo .` and commit `.aethyme/graph/`, or set \
+                 `[graph] authority = \"disabled\"` in `.aethyme/config.toml`",
+                short_tree(&self.tree_hash)
+            )),
             GraphIntegrityVerdict::Stale => Some(format!(
                 "committed graph fragments are stale for tree {}; this is advice and blocks \
                  nothing. Refresh them with `aethyme graph refresh plan --repo .` and commit \
@@ -190,10 +206,15 @@ pub(crate) fn verify_disposable_checkout(
     if !policy.enforces_committed_fragments() {
         return verify_generation_checkout(checkout, policy);
     }
-    let tree = match checkout.working_tree_hash() {
+    let tree = match checkout.working_tree_hash_at("graph_integrity_tree_hash") {
         Ok(tree) => tree,
         Err(error) => return graph_error(String::new(), policy.digest(), None, error.to_string()),
     };
+    if let Some(outcome) =
+        absent_graph_outcome(checkout, policy, "HEAD", &tree, GraphSubject::WorkingState)
+    {
+        return outcome;
+    }
     let isolated = (|| -> Result<_, crate::BrokerOpError> {
         let head = checkout.head_commit()?;
         let commit = if checkout.commit_tree_id(&head)? == tree {
@@ -229,7 +250,7 @@ pub(crate) fn verify_disposable_checkout(
         })?;
         let generated =
             checkout.isolated_checkout_at(&temporary.path().join("repository"), &commit)?;
-        if generated.working_tree_hash()? != tree {
+        if generated.working_tree_hash_at("graph_integrity_tree_hash")? != tree {
             return Err(crate::BrokerError::Io {
                 path: generated.root().to_path_buf(),
                 source: std::io::Error::new(
@@ -252,12 +273,164 @@ pub(crate) fn verify_disposable_checkout(
     }
 }
 
+/// [`verify_disposable_checkout`] for a checkout the caller just
+/// materialized from a commit whose tree is `tree`, and has not changed since.
+///
+/// With graph fragments not authoritative the verdict is `Disabled` whatever
+/// the checkout holds; the only thing the full path computed for it was the
+/// tree hash, by re-hashing every file of the checkout through a fresh index.
+/// On the busiest repository that was the whole of submit's 3 to 8 minute
+/// `graph_and_gate_selection` phase. The tree the checkout was made from is
+/// that hash. An enforced policy, or an environment that refuses graph
+/// verification, takes the full path unchanged.
+pub(crate) fn verify_disposable_checkout_of_tree(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    tree: &str,
+) -> GraphIntegrityOutcome {
+    if crate::git::graph_verification_environment_refusal().is_some() {
+        // Refused before any work: the outcome is an immediate error.
+        crate::phase_telemetry::add("graph_integrity_full_verification", Duration::ZERO);
+        crate::phase_telemetry::add("graph_integrity_full_environment_refused", Duration::ZERO);
+        return verify_disposable_checkout(checkout, policy);
+    }
+    if policy.enforces_committed_fragments() {
+        crate::phase_telemetry::add("graph_integrity_full_verification", Duration::ZERO);
+        crate::phase_telemetry::add("graph_integrity_full_enforced", Duration::ZERO);
+        return verify_materialized_commit(checkout, policy, tree);
+    }
+    crate::phase_telemetry::add("graph_integrity_disabled_known_tree", Duration::ZERO);
+    GraphIntegrityOutcome {
+        status: GraphIntegrityStatus::Disabled,
+        enforced: false,
+        tree_hash: tree.to_string(),
+        policy_digest: policy.digest(),
+        engine_version: None,
+        changed_paths: Vec::new(),
+        reason: "repository does not declare committed graph fragments authoritative".into(),
+    }
+}
+
+/// How a graph verification hashes the checkout it regenerates in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeHashing {
+    /// The full hash: every tracked file re-read.
+    Full,
+    /// The stat-seeded hash, for a checkout the broker created itself and
+    /// that nothing but this verification writes to: it equals the full hash
+    /// (see `GitRepo::working_tree_hash_observation_for_fresh_checkout`) and
+    /// takes the full hash itself whenever it cannot prove that.
+    Seeded,
+}
+
+fn hash_tree(checkout: &crate::GitRepo, hashing: TreeHashing) -> Result<String, crate::GitError> {
+    match hashing {
+        TreeHashing::Full => checkout.working_tree_hash_at("graph_integrity_tree_hash"),
+        TreeHashing::Seeded => {
+            let _span = crate::phase_telemetry::span("graph_integrity_tree_hash");
+            checkout
+                .working_tree_hash_observation_for_fresh_checkout()
+                .result
+        }
+    }
+}
+
+/// The enforced verification of a checkout the caller just materialized
+/// from its HEAD commit, whose tree is `tree`, and has not written to since.
+///
+/// The general path hashes the checkout to learn which commit to verify
+/// (HEAD when the hash equals HEAD's tree, otherwise a synthetic commit of
+/// the dirty state). Here HEAD's tree is checked against `tree` instead, a
+/// single object lookup, so the checkout's files are never re-read; on any
+/// mismatch the general path runs. The isolated copy the fragments are
+/// regenerated in is created by this function and written only by it, so it
+/// is hashed with the stat-seeded hash.
+fn verify_materialized_commit(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    tree: &str,
+) -> GraphIntegrityOutcome {
+    let git_environment = crate::git::graph_verification_git_guard();
+    let head = match checkout
+        .head_commit()
+        .and_then(|head| Ok((checkout.commit_tree_id(&head)?, head)))
+    {
+        Ok((head_tree, head)) if head_tree == tree => head,
+        _ => {
+            crate::phase_telemetry::add("graph_integrity_known_tree_mismatch", Duration::ZERO);
+            drop(git_environment);
+            return verify_disposable_checkout(checkout, policy);
+        }
+    };
+    if let Some(outcome) = absent_graph_outcome(checkout, policy, &head, tree, GraphSubject::Commit)
+    {
+        return outcome;
+    }
+    let isolated = (|| -> Result<_, crate::BrokerOpError> {
+        let _span = crate::phase_telemetry::span("graph_integrity_isolate");
+        let temporary = tempfile::Builder::new()
+            .prefix("aethyme-graph-verification-")
+            .tempdir()
+            .map_err(|source| crate::BrokerError::Io {
+                path: std::env::temp_dir(),
+                source,
+            })?;
+        let (projected_bytes, projected_inodes) = checkout.graph_snapshot_inventory(&head)?;
+        crate::verification::ensure_graph_snapshot_storage_available(
+            checkout.root(),
+            temporary.path(),
+            projected_bytes,
+            projected_inodes,
+        )
+        .map_err(|source| crate::BrokerError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+        let generated =
+            checkout.isolated_checkout_at(&temporary.path().join("repository"), &head)?;
+        let generated_tree = {
+            let _span = crate::phase_telemetry::span("graph_integrity_source_check");
+            hash_tree(&generated, TreeHashing::Seeded)?
+        };
+        if generated_tree != tree {
+            return Err(crate::BrokerError::Io {
+                path: generated.root().to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "isolated graph source does not match the exact verification tree",
+                ),
+            }
+            .into());
+        }
+        Ok((temporary, generated))
+    })();
+    match isolated {
+        Ok((_temporary, generated)) => {
+            verify_generation_checkout_with(&generated, policy, TreeHashing::Seeded)
+        }
+        Err(error) => graph_error(
+            tree.to_string(),
+            policy.digest(),
+            None,
+            format!("cannot isolate exact graph verification source: {error}"),
+        ),
+    }
+}
+
 fn verify_generation_checkout(
     checkout: &crate::GitRepo,
     policy: &GraphIntegrityPolicy,
 ) -> GraphIntegrityOutcome {
+    verify_generation_checkout_with(checkout, policy, TreeHashing::Full)
+}
+
+fn verify_generation_checkout_with(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    hashing: TreeHashing,
+) -> GraphIntegrityOutcome {
     let policy_digest = policy.digest();
-    let tree_hash = match checkout.working_tree_hash() {
+    let tree_hash = match hash_tree(checkout, hashing) {
         Ok(tree) => tree,
         Err(error) => {
             return GraphIntegrityOutcome {
@@ -379,7 +552,10 @@ fn verify_generation_checkout(
                 );
             }
         };
-    if let Err(error) = index_repo_to_disk(&context, &WalkOptions::default()) {
+    let index_span = crate::phase_telemetry::span("graph_integrity_index");
+    let indexed = index_repo_to_disk(&context, &WalkOptions::default());
+    drop(index_span);
+    if let Err(error) = indexed {
         return graph_error(
             tree_hash,
             policy_digest,
@@ -387,7 +563,10 @@ fn verify_generation_checkout(
             format!("cannot regenerate graph fragments: {error}"),
         );
     }
-    if let Err(error) = link_repo(&context) {
+    let link_span = crate::phase_telemetry::span("graph_integrity_link");
+    let linked = link_repo(&context);
+    drop(link_span);
+    if let Err(error) = linked {
         return graph_error(
             tree_hash,
             policy_digest,
@@ -406,7 +585,8 @@ fn verify_generation_checkout(
         );
     }
 
-    let regenerated_tree = match checkout.working_tree_hash() {
+    let compare_span = crate::phase_telemetry::span("graph_integrity_compare");
+    let regenerated_tree = match hash_tree(checkout, hashing) {
         Ok(tree) => tree,
         Err(error) => {
             return graph_error(
@@ -424,6 +604,7 @@ fn verify_generation_checkout(
         .filter(|path| path == ".aethyme/engine-version" || path.starts_with(".aethyme/graph/"))
         .collect::<Vec<_>>();
     changed_paths.sort();
+    drop(compare_span);
     if regenerated_tree == tree_hash {
         GraphIntegrityOutcome {
             status: GraphIntegrityStatus::Passed,
@@ -482,6 +663,108 @@ fn preflight_graph_snapshot_slot(
         source,
     })?;
     Ok(placement)
+}
+
+/// What an absent-graph check looks at besides the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphSubject {
+    /// Only the commit: the checkout was just materialized from it, so its
+    /// files are the commit's.
+    Commit,
+    /// The checkout's working state (HEAD, index and untracked files), which
+    /// the general path verifies through a synthetic commit.
+    WorkingState,
+}
+
+/// The outcome for a verified state with no committed graph at all, or
+/// `None` when the state has one or this cannot be shown, and the full
+/// verification must run. Call under the graph-verification Git guard.
+///
+/// Regeneration always writes `.aethyme/graph/.gitattributes` (bootstrap) and
+/// `.aethyme/graph/manifest.json`. When the verified state has nothing under
+/// `.aethyme/graph` and the manifest path is not ignored, the regenerated
+/// tree therefore always holds paths the source tree lacks, so `stale` is the
+/// only verdict the full path can reach after its pin check. The checks keep
+/// that check's precedence: a missing or empty pin is `incompatible`, as the
+/// full path reports it. Ignore rules are read from the checkout with every
+/// source Git consults, a superset of what the isolated copy sees, so a path
+/// found not ignored here is not ignored there either.
+fn absent_graph_outcome(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    treeish: &str,
+    tree_hash: &str,
+    subject: GraphSubject,
+) -> Option<GraphIntegrityOutcome> {
+    let _span = crate::phase_telemetry::span("graph_integrity_absent_check");
+    if !matches!(checkout.tree_has_path(treeish, GRAPH_DIRECTORY), Ok(false)) {
+        return None;
+    }
+    if subject == GraphSubject::WorkingState {
+        if !matches!(
+            checkout.index_or_untracked_under(GRAPH_DIRECTORY),
+            Ok(false)
+        ) {
+            return None;
+        }
+        // The pin is read from disk below; in a working state the synthetic
+        // commit carries it only when Git would hash it.
+        if checkout.root().join(ENGINE_VERSION_PATH).exists()
+            && !matches!(
+                checkout.path_is_ignored_checked(ENGINE_VERSION_PATH),
+                Ok(false)
+            )
+        {
+            return None;
+        }
+    }
+    if !matches!(
+        checkout.path_is_ignored_checked(GRAPH_MANIFEST_RELPATH),
+        Ok(false)
+    ) {
+        return None;
+    }
+    crate::phase_telemetry::add("graph_integrity_absent_tree", Duration::ZERO);
+    let policy_digest = policy.digest();
+    Some(match read_engine_version(checkout.root()) {
+        Err(error) => GraphIntegrityOutcome {
+            status: GraphIntegrityStatus::Incompatible,
+            enforced: true,
+            tree_hash: tree_hash.to_string(),
+            policy_digest,
+            engine_version: None,
+            changed_paths: Vec::new(),
+            reason: format!(
+                "cannot read .aethyme/engine-version: {error}; run `aethyme graph refresh plan --repo .`"
+            ),
+        },
+        Ok(pinned_version) => GraphIntegrityOutcome {
+            status: GraphIntegrityStatus::Stale,
+            enforced: true,
+            tree_hash: tree_hash.to_string(),
+            policy_digest,
+            engine_version: Some(pinned_version),
+            changed_paths: vec![GRAPH_DIRECTORY.to_string()],
+            reason: ABSENT_GRAPH_REASON.into(),
+        },
+    })
+}
+
+/// Whether `commit` has committed graph fragments, under the graph
+/// verification Git guard. An environment that refuses graph verification
+/// is an error, as for every other graph read.
+pub(crate) fn commit_has_committed_graph(
+    repository: &crate::GitRepo,
+    commit: &str,
+) -> Result<bool, String> {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return Err(reason.into());
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
+    let _span = crate::phase_telemetry::span("graph_integrity_absent_check");
+    repository
+        .tree_has_path(commit, GRAPH_DIRECTORY)
+        .map_err(|error| error.to_string())
 }
 
 fn graph_error(
@@ -545,7 +828,12 @@ pub(crate) fn verify_checkout_without_mutation_with_worktree_root_plan(
     if !policy.enforces_committed_fragments() {
         return Ok(verify_disposable_checkout(checkout, policy));
     }
-    let tree = checkout.working_tree_hash()?;
+    let tree = checkout.working_tree_hash_at("graph_integrity_tree_hash")?;
+    if let Some(outcome) =
+        absent_graph_outcome(checkout, policy, "HEAD", &tree, GraphSubject::WorkingState)
+    {
+        return Ok(outcome);
+    }
     let head = checkout.head_commit()?;
     let commit = checkout.commit_tree(
         &tree,
@@ -998,6 +1286,254 @@ mod tests {
         );
         let error = GraphIntegrityPolicy::load(repo.path()).unwrap_err();
         assert!(error.to_string().contains("contain no ':'"));
+    }
+
+    #[test]
+    fn a_disabled_policy_reports_the_known_tree_without_hashing_the_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let checkout = graph_less_checkout(repo.path());
+        let policy = GraphIntegrityPolicy::default();
+        assert!(!policy.enforces_committed_fragments());
+        let full = verify_disposable_checkout(&checkout, &policy);
+        let head_tree = checkout
+            .commit_tree_id(&checkout.head_commit().unwrap())
+            .unwrap();
+        assert_eq!(full.tree_hash, head_tree);
+        // The checkout is not hashed: the tree it was made from is reported.
+        // A different value proves nothing re-derived it from the files.
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let known = verify_disposable_checkout_of_tree(&checkout, &policy, marker);
+        assert_eq!(known.tree_hash, marker);
+        let with_head_tree = verify_disposable_checkout_of_tree(&checkout, &policy, &head_tree);
+        assert_eq!(with_head_tree, full, "same outcome as the full path");
+    }
+
+    #[test]
+    fn an_enforced_policy_still_verifies_the_checkout_in_full() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        // A tree HEAD does not carry: the general path, which hashes the
+        // checkout itself, decides.
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let outcome = verify_disposable_checkout_of_tree(&checkout, &policy, marker);
+        assert_eq!(outcome, verify_disposable_checkout(&checkout, &policy));
+        assert_eq!(outcome.status, GraphIntegrityStatus::Passed);
+        assert_ne!(outcome.tree_hash, marker);
+    }
+
+    fn head_tree(checkout: &crate::GitRepo) -> String {
+        checkout
+            .commit_tree_id(&checkout.head_commit().unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn an_enforced_policy_with_the_known_tree_matches_the_full_verification() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let known = verify_disposable_checkout_of_tree(&checkout, &policy, &head_tree(&checkout));
+        assert_eq!(known.status, GraphIntegrityStatus::Passed, "{known:?}");
+        assert_eq!(known, verify_disposable_checkout(&checkout, &policy));
+    }
+
+    #[test]
+    fn a_stale_graph_with_the_known_tree_matches_the_full_verification() {
+        let repo = graph_repo();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 43 }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "src/lib.rs"]);
+        git(repo.path(), &["commit", "-m", "change source only"]);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let known = verify_disposable_checkout_of_tree(&checkout, &policy, &head_tree(&checkout));
+        assert_eq!(known.status, GraphIntegrityStatus::Stale, "{known:?}");
+        assert!(
+            known
+                .changed_paths
+                .iter()
+                .any(|path| path == ".aethyme/graph/src/lib.rs.bin")
+        );
+        assert_eq!(known, verify_disposable_checkout(&checkout, &policy));
+    }
+
+    /// A repository that declares committed fragments but has none
+    /// committed, with or without the engine pin.
+    fn enforced_repo_without_graph(pin: bool) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.name", "Graph Test"]);
+        git(repo.path(), &["config", "user.email", "graph@example.test"]);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        write_config(
+            repo.path(),
+            "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+        );
+        if pin {
+            bootstrap_repo(repo.path(), env!("CARGO_PKG_VERSION")).unwrap();
+            std::fs::remove_dir_all(repo.path().join(GRAPH_DIRECTORY)).unwrap();
+        }
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "enrolled, never refreshed"]);
+        repo
+    }
+
+    /// The full path's outcome for HEAD, bypassing every shortcut: the
+    /// fragments regenerated in an isolated copy and compared.
+    fn full_regeneration_outcome(
+        checkout: &crate::GitRepo,
+        policy: &GraphIntegrityPolicy,
+    ) -> GraphIntegrityOutcome {
+        let _guard = crate::git::graph_verification_git_guard();
+        let temporary = tempfile::tempdir().unwrap();
+        let head = checkout.head_commit().unwrap();
+        let generated = checkout
+            .isolated_checkout_at(&temporary.path().join("repository"), &head)
+            .unwrap();
+        verify_generation_checkout(&generated, policy)
+    }
+
+    fn recorded<T>(run: impl FnOnce() -> T) -> (T, std::collections::BTreeMap<String, u64>) {
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let value = run();
+        drop(installed);
+        (value, recorder.totals().1)
+    }
+
+    #[test]
+    fn a_declared_graph_with_none_committed_is_stale_without_regenerating() {
+        let repo = enforced_repo_without_graph(true);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let tree = head_tree(&checkout);
+        let (outcome, counts) =
+            recorded(|| verify_disposable_checkout_of_tree(&checkout, &policy, &tree));
+        assert_eq!(outcome.status, GraphIntegrityStatus::Stale, "{outcome:?}");
+        assert!(outcome.enforced);
+        assert_eq!(outcome.reason, ABSENT_GRAPH_REASON);
+        assert_eq!(outcome.changed_paths, [GRAPH_DIRECTORY]);
+        assert_eq!(outcome.tree_hash, tree);
+        assert_eq!(
+            outcome.engine_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(outcome.advice().unwrap().contains("has none committed"));
+        assert!(
+            counts.contains_key("graph_integrity_absent_tree"),
+            "{counts:?}"
+        );
+        for span in [
+            "graph_integrity_isolate",
+            "graph_integrity_index",
+            "graph_integrity_link",
+            "graph_integrity_tree_hash",
+        ] {
+            assert!(!counts.contains_key(span), "{span} ran: {counts:?}");
+        }
+
+        // The full regeneration reaches the same verdict, pin and tree.
+        let full = full_regeneration_outcome(&checkout, &policy);
+        assert_eq!(full.status, outcome.status, "{full:?}");
+        assert_eq!(full.tree_hash, outcome.tree_hash);
+        assert_eq!(full.engine_version, outcome.engine_version);
+        assert!(
+            full.changed_paths
+                .iter()
+                .any(|path| path == aethyme_graph_storage::GRAPH_MANIFEST_RELPATH),
+            "{:?}",
+            full.changed_paths
+        );
+
+        // The general (working-state) path takes the same shortcut.
+        let (general, counts) = recorded(|| verify_disposable_checkout(&checkout, &policy));
+        assert_eq!(general, outcome);
+        assert!(!counts.contains_key("graph_integrity_index"), "{counts:?}");
+    }
+
+    #[test]
+    fn a_declared_graph_without_a_pin_is_incompatible_as_the_full_path_says() {
+        let repo = enforced_repo_without_graph(false);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let tree = head_tree(&checkout);
+        let (outcome, counts) =
+            recorded(|| verify_disposable_checkout_of_tree(&checkout, &policy, &tree));
+        assert_eq!(
+            outcome.status,
+            GraphIntegrityStatus::Incompatible,
+            "{outcome:?}"
+        );
+        assert!(
+            counts.contains_key("graph_integrity_absent_tree"),
+            "{counts:?}"
+        );
+        assert_eq!(outcome, full_regeneration_outcome(&checkout, &policy));
+    }
+
+    #[test]
+    fn a_working_state_with_graph_files_takes_the_full_path() {
+        let repo = enforced_repo_without_graph(true);
+        std::fs::create_dir_all(repo.path().join(GRAPH_DIRECTORY)).unwrap();
+        std::fs::write(repo.path().join(".aethyme/graph/new.bin"), b"fragment").unwrap();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let (_, counts) = recorded(|| verify_disposable_checkout(&checkout, &policy));
+        assert!(
+            !counts.contains_key("graph_integrity_absent_tree"),
+            "{counts:?}"
+        );
+        assert!(counts.contains_key("graph_integrity_index"), "{counts:?}");
+    }
+
+    #[test]
+    fn an_ignored_graph_directory_takes_the_full_path() {
+        // Regenerated fragments Git ignores are invisible to the tree hash,
+        // so `stale` is not certain there.
+        let repo = enforced_repo_without_graph(true);
+        std::fs::write(repo.path().join(".gitignore"), ".aethyme/graph/\n").unwrap();
+        git(repo.path(), &["add", ".gitignore"]);
+        git(repo.path(), &["commit", "-m", "ignore the graph"]);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let tree = head_tree(&checkout);
+        let (_, counts) =
+            recorded(|| verify_disposable_checkout_of_tree(&checkout, &policy, &tree));
+        assert!(
+            !counts.contains_key("graph_integrity_absent_tree"),
+            "{counts:?}"
+        );
+        assert!(counts.contains_key("graph_integrity_index"), "{counts:?}");
+    }
+
+    /// A committed checkout with no graph policy.
+    fn graph_less_checkout(root: &Path) -> crate::GitRepo {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        crate::GitRepo::discover(root).unwrap()
     }
 
     #[test]

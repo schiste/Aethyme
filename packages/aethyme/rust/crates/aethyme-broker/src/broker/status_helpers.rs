@@ -1693,6 +1693,27 @@ pub(crate) fn checked_worktree_activity_ms(
         let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
         newest = Some(newest.map_or(millis, |known| known.max(millis)));
     }
+    // Deep edits touch neither the index nor any directory above them: the
+    // changed files' own modification times (and their parents') count too.
+    // A status call that times out or reaches its cap without evidence
+    // leaves the index and HEAD evidence alone (counted).
+    if newest.is_some() {
+        let status = crate::worktree_status_activity::status_activity(
+            worktree,
+            crate::worktree_status_activity::STATUS_ACTIVITY_BUDGET,
+            crate::worktree_status_activity::STATUS_ACTIVITY_PATH_CAP,
+        );
+        match status.newest_ms {
+            Some(changed) => {
+                newest = newest.map(|known| known.max(changed));
+            }
+            None if !status.complete => crate::phase_telemetry::add(
+                "worktree_activity_status_fallback",
+                std::time::Duration::ZERO,
+            ),
+            None => {}
+        }
+    }
     newest.map(Some).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,

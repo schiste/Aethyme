@@ -68,6 +68,8 @@ impl BlockerKind {
 pub enum BlockerScope {
     Repo,
     Host,
+    /// Only the session it names can act on it; other agents are not told.
+    Session,
 }
 
 /// One current blocker, in one id namespace across every store.
@@ -264,28 +266,35 @@ impl Broker {
         let _span = crate::phase_telemetry::span("blockers");
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();
+        let operations = crate::phase_telemetry::span("blockers_operations");
         match self.operation_blockers(&mut linked_host_operations) {
             Ok(found) => report.blockers.extend(found),
             Err(error) => report
                 .unavailable
                 .push(source_error("broker.db operations", error)),
         }
+        drop(operations);
+        let host_operations = crate::phase_telemetry::span("blockers_host_operations");
         match self.host_operation_blockers(&linked_host_operations) {
             Ok(found) => report.blockers.extend(found),
             Err(error) => report
                 .unavailable
                 .push(source_error("host-operations.db", error)),
         }
+        drop(host_operations);
+        let resource_leases = crate::phase_telemetry::span("blockers_resource_leases");
         match self.resource_lease_blockers() {
             Ok(found) => report.blockers.extend(found),
             Err(error) => report
                 .unavailable
                 .push(source_error("host-resources.db", error)),
         }
+        drop(resource_leases);
         // Path leases never refuse a claim, so none is a repository-wide
         // blocker; the full lease and liveness views expose them for
         // information.
         if inspect_recovery {
+            let _span = crate::phase_telemetry::span("blockers_gate_cache");
             match self.gate_cache_blockers() {
                 Ok(found) => report.blockers.extend(found),
                 Err(error) => report
@@ -293,8 +302,12 @@ impl Broker {
                     .push(source_error("broker.db gate_results", error)),
             }
         }
-        report.blockers.extend(self.pidfile_blockers());
+        {
+            let _span = crate::phase_telemetry::span("blockers_pidfiles");
+            report.blockers.extend(self.pidfile_blockers());
+        }
         if inspect_recovery {
+            let _span = crate::phase_telemetry::span("blockers_action_required");
             match self.action_required_blockers() {
                 Ok(found) => report.blockers.extend(found),
                 Err(error) => report
@@ -514,7 +527,10 @@ impl Broker {
         }
 
         let repository = self.origin_fingerprint();
-        let sessions = self.sessions_by_worktree_fingerprint()?;
+        let sessions = {
+            let _span = crate::phase_telemetry::span("blockers_resource_lease_owners");
+            self.sessions_by_worktree_fingerprint()?
+        };
         let mut found = Vec::new();
         for lease in leases {
             if lease.repository != repository
@@ -753,9 +769,7 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<Option<Blocker>, BrokerOpError> {
-        Ok(Self::action_required_blocker(
-            &self.store_ref().session(session_id)?,
-        ))
+        Ok(self.action_required_blocker(&self.store_ref().session(session_id)?))
     }
 
     fn action_required_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
@@ -763,16 +777,41 @@ impl Broker {
             .store_ref()
             .live_sessions()?
             .iter()
-            .filter_map(Self::action_required_blocker)
+            .filter_map(|session| self.action_required_blocker(session))
             .collect())
     }
 
-    fn action_required_blocker(session: &crate::Session) -> Option<Blocker> {
-        let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
-        if session.status.is_closed() || !notice.is_file() {
+    fn action_required_blocker(&self, session: &crate::Session) -> Option<Blocker> {
+        if session.status.is_closed() {
             return None;
         }
-        Some(Blocker {
+        let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
+        let notice_present = notice.is_file();
+        let idle_notice = notice_present && crate::preparation::is_idle_strip_notice(&notice);
+        if notice_present && !idle_notice {
+            return Some(Self::conflict_notice_blocker(session, &notice));
+        }
+        // The idle strip removed dependencies: the work is untouched and one
+        // command rebuilds them. This holds whether or not the notice could
+        // be written in the checkout (another notice, a tracked or unignored
+        // path), and clears itself once the session is prepared again.
+        if crate::preparation::stripped_since_prepared(self.main_root(), session.id) {
+            return Some(idle_strip_blocker(
+                session.id,
+                idle_notice.then_some(notice.as_path()),
+            ));
+        }
+        if idle_notice {
+            crate::warn_unrecorded(
+                "clear a satisfied idle strip notice",
+                std::fs::remove_file(&notice),
+            );
+        }
+        None
+    }
+
+    fn conflict_notice_blocker(session: &crate::Session, notice: &Path) -> Blocker {
+        Blocker {
             id: format!("action:{}", session.id),
             kind: BlockerKind::ActionRequired,
             scope: BlockerScope::Repo,
@@ -786,7 +825,7 @@ impl Broker {
             clear: format!("aethyme broker submit --session {}", session.id),
             safe_to_clear_automatically: false,
             inspect: None,
-        })
+        }
     }
 
     // ── clearing ────────────────────────────────────────────────────
@@ -1268,6 +1307,17 @@ impl Broker {
         let mut mapped = Vec::new();
         for session in sessions {
             mapped.push((sha256_text(&session.worktree_path), session.clone()));
+            // Most recorded checkouts are long gone. One `stat` says so for
+            // a fraction of what resolving every component of a missing
+            // path costs, and a path that does not resolve has no canonical
+            // form either way.
+            if !Path::new(&session.worktree_path).exists() {
+                continue;
+            }
+            crate::phase_telemetry::add(
+                "blockers_resource_lease_owner_canonicalized",
+                std::time::Duration::ZERO,
+            );
             if let Ok(canonical) = std::fs::canonicalize(&session.worktree_path) {
                 mapped.push((sha256_text(&canonical.to_string_lossy()), session));
             }
@@ -1281,6 +1331,25 @@ impl Broker {
 /// the code's verdict until someone shows the host caused them, and advice
 /// that points at invalidating them would teach agents to retry red tests.
 /// Conflict notices already have their own submit advice.
+/// The session-scoped blocker of a session whose regenerable directories
+/// the idle strip removed, naming the notice when one was written.
+pub(crate) fn idle_strip_blocker(session_id: i64, notice: Option<&Path>) -> Blocker {
+    Blocker {
+        id: format!("action:{session_id}"),
+        kind: BlockerKind::ActionRequired,
+        scope: BlockerScope::Session,
+        cause: format!(
+            "session {session_id}'s regenerable dependency directories were stripped while it \
+             was idle; its work is untouched; prepare it again before building or testing{}",
+            notice.map_or_else(String::new, |notice| format!(" ({})", notice.display()))
+        ),
+        session_id: Some(session_id),
+        clear: crate::preparation::prepare_command(session_id),
+        safe_to_clear_automatically: false,
+        inspect: None,
+    }
+}
+
 pub(crate) fn status_advice(blockers: &[Blocker]) -> Option<crate::StatusAdvice> {
     let actionable: Vec<&Blocker> = blockers
         .iter()
@@ -1656,6 +1725,84 @@ fn gate_pidfiles(main_root: &Path) -> Vec<GatePidfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolving every component of a long-gone checkout path cost a share
+    /// of every routine status while any host resource lease was
+    /// quarantined; only a checkout that exists is resolved now, and the
+    /// mapping is the same.
+    #[test]
+    fn resource_lease_owners_resolve_only_checkouts_that_exist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["commit", "-q", "--allow-empty", "-m", "fixture"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let present = broker.start_worktree("present checkout", None).unwrap();
+        let missing_path = temporary.path().join("gone/checkout");
+        let missing = broker
+            .store()
+            .register_session(&crate::types::NewSession {
+                worktree_path: missing_path.to_string_lossy().into_owned(),
+                branch: "agent/gone".into(),
+                origin: crate::SessionOrigin::Adopted,
+                task: Some("gone checkout".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let mapped = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.sessions_by_worktree_fingerprint().unwrap()
+        };
+        let canonical = std::fs::canonicalize(&present.worktree_path).unwrap();
+        let fingerprints = |id: i64| {
+            mapped
+                .iter()
+                .filter(|(_, session)| session.id == id)
+                .map(|(fingerprint, _)| fingerprint.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fingerprints(present.id),
+            vec![
+                sha256_text(&present.worktree_path),
+                sha256_text(&canonical.to_string_lossy()),
+            ]
+        );
+        assert_eq!(
+            fingerprints(missing.id),
+            vec![sha256_text(&missing.worktree_path)]
+        );
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("blockers_resource_lease_owner_canonicalized"),
+            Some(&1),
+            "{counts:?}"
+        );
+    }
 
     #[test]
     fn every_blocker_id_round_trips_through_one_namespace() {

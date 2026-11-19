@@ -3002,7 +3002,9 @@ fn push_checkout_retirement_advice(
     in_progress: &std::collections::BTreeSet<i64>,
 ) {
     let backlog = &progress.strip.backlog;
-    if backlog.closed_folders >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT {
+    if backlog.closed_folders >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT
+        || progress.strip.idle_backlog >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT
+    {
         let mut evidence = vec![
             format!(
                 "{} checkout folder(s) on disk, {} of them for closed or cleaned sessions; {} of those still hold a top-level regenerable directory",
@@ -3023,6 +3025,12 @@ fn push_checkout_retirement_advice(
                 today.checkouts_retired,
                 today.cleaned_leftovers_retired,
                 today.checkouts_stripped
+            ));
+        }
+        if progress.strip.idle_backlog > 0 || progress.strip.last_idle_checkouts_stripped > 0 {
+            evidence.push(format!(
+                "{} open session(s) idle past [cleanup] idle_strip_after_hours still hold regenerable directories; the last run stripped {}",
+                progress.strip.idle_backlog, progress.strip.last_idle_checkouts_stripped
             ));
         }
         if let Some(failure) = &progress.last_inspection_failure {
@@ -3147,10 +3155,17 @@ fn push_checkout_retirement_advice(
             ),
             session_id: Some(first),
             queue_entry_id: None,
-            evidence: unprovable_advice_evidence(too_large),
-            commands: vec![format!(
-                "aethyme broker finish cleanup resolve {first} --archive"
-            )],
+            evidence: {
+                let mut evidence = unprovable_advice_evidence(too_large);
+                evidence.push(
+                    "each one's largest paths (names and sizes only) are listed in `aethyme broker gc plan --json` under checkout_retirement_keeps[].detail".into(),
+                );
+                evidence
+            },
+            commands: vec![
+                format!("aethyme broker finish cleanup resolve {first} --archive"),
+                "aethyme broker gc plan --json".into(),
+            ],
         });
     }
     if progress.stalled_runs >= retire::RETIRE_STALLED_RUNS
@@ -3198,6 +3213,81 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    if progress.archive_denials_consecutive >= retire::ARCHIVE_DENIAL_ADVICE_AT {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-archive-denied",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "creating a recovery archive was refused by its destination (a permission error creating the archive directory: a worker that inherited a sandbox, or a read-only archive volume); closed checkouts that need an archive wait, and archives are retried with a growing back-off",
+            summary: format!(
+                "{} archive attempt(s) in a row refused by the archive destination",
+                progress.archive_denials_consecutive
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: Vec::new(),
+        });
+    }
+    push_trash_backlog_advice(view, progress, crate::clock::epoch_ms());
+}
+
+/// A trash whose deletion does not keep up: entries over a day old, or more
+/// entries after each of several runs in a row. Space moved into the trash
+/// is not free until the deleter removes it.
+fn push_trash_backlog_advice(
+    view: &mut StatusView,
+    progress: &retire::CheckoutRetirementProgress,
+    now_ms: i64,
+) {
+    if progress.trash_pending == 0 {
+        return;
+    }
+    let oldest_age_ms = progress
+        .trash_oldest_entry_ms
+        .map(|created| now_ms.saturating_sub(created).max(0));
+    let old = oldest_age_ms.is_some_and(|age| age >= crate::checkout_trash::TRASH_BACKLOG_AGE_MS);
+    let growing = progress.trash_growing_runs >= retire::TRASH_GROWING_RUNS_ADVICE_AT;
+    if !old && !growing {
+        return;
+    }
+    let mut evidence = vec![format!(
+        "{} entr(y/ies) recorded in the checkout trash",
+        progress.trash_pending
+    )];
+    if let Some(age) = oldest_age_ms {
+        evidence.push(format!(
+            "the oldest was moved in {} hour(s) ago",
+            age / 3_600_000
+        ));
+    }
+    if growing {
+        evidence.push(format!(
+            "the trash grew after each of the last {} retirement runs",
+            progress.trash_growing_runs
+        ));
+    }
+    if progress.trash_entries_in_use > 0 {
+        evidence.push(format!(
+            "{} trash entr(y/ies) left alone because a process still uses them",
+            progress.trash_entries_in_use
+        ));
+    }
+    evidence.push(
+        "the deleter raises its rate while the trash is behind; the metric line's checkout_trash_drain field shows the pace it used and why".into(),
+    );
+    view.advice.push(StatusAdvice {
+        id: "cleanup.trash-backlog",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "stripped directories and retired checkouts are moved into the pool's checkout trash and only free their space once the background deleter removes them; it is not keeping up",
+        summary: format!(
+            "{} checkout trash entr(y/ies) waiting for deletion",
+            progress.trash_pending
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: Vec::new(),
+    });
 }
 
 /// The `status` row naming sessions whose landed proof timed out even with
@@ -3723,6 +3813,7 @@ pub struct Broker {
     pub(crate) worktree_lifecycle_test_observer: Option<WorktreeLifecycleTestObserver>,
 }
 
+mod archive_bound;
 mod cleanup;
 mod finish;
 mod gates;
@@ -3734,6 +3825,8 @@ mod retire;
 mod retire_operation;
 mod scratch;
 mod strip;
+mod strip_idle;
+mod tombstone;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,
@@ -3743,16 +3836,25 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
+#[cfg(test)]
+pub(crate) use retire::TRASH_CATCHUP_LOCK_FILE;
+pub(crate) use retire::{
+    TRASH_CATCHUP_MAX_LAPS, TrashCatchupBounds, TrashCatchupEnd, restore_incomplete_reason,
+    take_last_checkout_restore,
+};
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]
 pub(crate) use scratch::scratch_instruction;
+pub(crate) use tombstone::{is_checkout_tombstone, restore_command};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;
 mod status_helpers;
 
-pub use scope_capture::ScopeCaptureReport;
-use scope_capture::derive_scopes_from_task;
+use scope_capture::derive_task_context;
+mod context_warmup;
+pub(crate) mod semantic_patch;
+pub use scope_capture::{ScopeCaptureReport, TaskContext};
 pub(super) use status_helpers::*;
 
 #[cfg(test)]

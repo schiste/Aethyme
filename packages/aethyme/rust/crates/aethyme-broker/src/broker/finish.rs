@@ -262,11 +262,39 @@ impl Broker {
         Ok(())
     }
 
+    /// Measure a session's checkout without holding the lifecycle claim, as
+    /// a size record keyed by its recorded path. A missing checkout or a walk
+    /// that fails records nothing, which the plan reads exactly as it read a
+    /// failed walk: size unknown (and zero for a checkout that is gone).
+    fn measure_checkout_before_lifecycle_claim(
+        &self,
+        session: &Session,
+    ) -> crate::measurement::SizeRecords {
+        let _span = crate::phase_telemetry::span("finish_size_walk_unlocked");
+        let mut records = crate::measurement::SizeRecords::default();
+        let path = Path::new(&session.worktree_path);
+        if path.exists()
+            && let Ok(usage) = crate::disk_headroom::directory_usage_without_following_links(path)
+        {
+            records.record_usage(
+                &session.worktree_path,
+                usage.bytes,
+                Some(usage.inodes),
+                now_ms(),
+            );
+        }
+        records
+    }
+
     pub(super) fn run_finish_cleanup(
         &mut self,
         report: &mut FinishReport,
         session: &Session,
     ) -> Result<(), BrokerOpError> {
+        // Walk the checkout before taking the lifecycle claim: on a large tree
+        // on a slow volume the walk takes tens of seconds, and every other
+        // session's start, finish and cleanup waits on this claim meanwhile.
+        let mut checkout_size = self.measure_checkout_before_lifecycle_claim(session);
         // Acquire before persisting finish's cleanup intent and keep the claim
         // through physical removal. Cleanup calls the already-claimed helper
         // below so this path never tries to acquire its own lock recursively.
@@ -280,7 +308,13 @@ impl Broker {
         )?;
         let session = &current_session;
         let worktree_path = PathBuf::from(&session.worktree_path);
-        let item = self.cleanup_item(session)?;
+        // The plan reads the walk above as a recorded size. The size only
+        // feeds the reported `reclaimed_bytes`; eligibility never reads it,
+        // and the path cannot have changed: the session check above refuses.
+        let item = {
+            let _span = crate::phase_telemetry::span("finish_claim_cleanup_plan");
+            self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut checkout_size)?
+        };
         report.cleanup_safe = item.as_ref().is_none_or(|item| item.eligible());
         let recovery_retry =
             !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
@@ -330,6 +364,7 @@ impl Broker {
         // even when the removal that follows is clean and needs none.
         let mut finish_reproof: Option<&'static str> = None;
         if !recovery_retry {
+            let _span = crate::phase_telemetry::span("finish_claim_recovery_proof");
             let spawned_witness = if session.origin == SessionOrigin::Spawned {
                 self.store()
                     .spawned_worktree_instance_witness(session.id)
@@ -416,9 +451,12 @@ impl Broker {
         // Once closed, reclaiming the worktree runs to completion: killing a
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
-        match crate::git::without_git_deadline(|| {
+        let removal = crate::phase_telemetry::span("finish_claim_removal");
+        let removed = crate::git::without_git_deadline(|| {
             self.cleanup_without_archive_under_lifecycle_claim(&cleanup_session, false)
-        }) {
+        });
+        drop(removal);
+        match removed {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;
@@ -742,8 +780,14 @@ impl Broker {
             if options.keep_worktree || session.origin != SessionOrigin::Spawned {
                 report.cleanup.kept = options.keep_worktree;
                 report.summary = format!("session {session_id} is already closed");
+                // Only eligibility is read here, and it never depends on the
+                // size, so this does not walk the checkout.
                 report.cleanup_safe = self
-                    .cleanup_item(&session)?
+                    .cleanup_item_scanned(
+                        &session,
+                        crate::SizeScan::Recorded,
+                        &mut crate::measurement::SizeRecords::default(),
+                    )?
                     .is_some_and(|item| item.eligible());
                 if report.cleanup_safe {
                     report

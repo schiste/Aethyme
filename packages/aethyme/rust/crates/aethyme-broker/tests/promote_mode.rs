@@ -550,9 +550,10 @@ fn configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref() {
     let default_ref_reads = starts
         .iter()
         .filter(|event| {
-            event["argv"][1] == "symbolic-ref"
-                && event["argv"][2] == "--quiet"
-                && event["argv"][3] == "refs/remotes/origin/HEAD"
+            event["argv"][1] == "for-each-ref"
+                && event["argv"][3]
+                    == "--format=%(refname)%00%(symref)%00%(objecttype)%00%(objectname)"
+                && event["argv"][4] == "refs/remotes/origin/HEAD"
         })
         .count();
     assert_eq!(

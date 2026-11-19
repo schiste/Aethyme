@@ -14,9 +14,11 @@ aethyme storage — what Aethyme stores on this host, and its budgets
                             a directory other than the host state and cache
   storage archives [--json] recovery archives: landed or not, created,
                             expires, kept
-  storage keep-archive <id> [--unkeep]
+  storage keep-archive <id> [--unkeep | --dismiss]
                             exempt an archive from expiry by age (a marker
-                            beside it), or lift that
+                            beside it), or lift that; --dismiss lets an
+                            archive holding unlanded work expire at its age
+                            (by default such an archive is kept and named)
 
 Budgets: defaults, overridden by <host state>/storage.toml [budget].
 --- stderr

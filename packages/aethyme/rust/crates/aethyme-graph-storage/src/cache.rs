@@ -82,6 +82,22 @@ impl GraphStoreArtifactCache {
     }
 
     pub fn acquire(&self, key: GraphStoreCacheKey) -> Result<GraphStoreCacheEntry, String> {
+        self.acquire_with(key, false)?
+            .ok_or_else(|| "graph cache entry is busy".to_string())
+    }
+
+    pub fn try_acquire(
+        &self,
+        key: GraphStoreCacheKey,
+    ) -> Result<Option<GraphStoreCacheEntry>, String> {
+        self.acquire_with(key, true)
+    }
+
+    fn acquire_with(
+        &self,
+        key: GraphStoreCacheKey,
+        nonblocking: bool,
+    ) -> Result<Option<GraphStoreCacheEntry>, String> {
         let key_sha256 = key.digest()?;
         let directory = self.root.join(&key_sha256);
         std::fs::create_dir_all(&directory)
@@ -99,29 +115,33 @@ impl GraphStoreArtifactCache {
         protect(&lock_path, false)?;
         #[cfg(unix)]
         {
+            let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
             // SAFETY: `lock` is a live `File` opened just above and still owned
             // here, so `as_raw_fd` yields a valid descriptor for the duration of
-            // the call. `flock` takes the descriptor by value and only sets the
-            // advisory lock on it; it dereferences nothing, cannot invalidate
-            // the borrow, and touches no memory this crate owns.
-            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+            // the call. `flock` takes the descriptor and an integer operation by
+            // value and only sets the advisory lock on it (with `LOCK_NB` it
+            // returns `EWOULDBLOCK` instead of waiting); it dereferences
+            // nothing, cannot invalidate the borrow, and touches no memory this
+            // crate owns.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), mode) };
             if result != 0 {
-                return Err(format!(
-                    "lock graph cache entry: {}",
-                    std::io::Error::last_os_error()
-                ));
+                let error = std::io::Error::last_os_error();
+                if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(format!("lock graph cache entry: {error}"));
             }
         }
         #[cfg(not(unix))]
         {
             return Err("graph store host caching requires Unix file locking".into());
         }
-        Ok(GraphStoreCacheEntry {
+        Ok(Some(GraphStoreCacheEntry {
             _lock: lock,
             directory,
             key,
             key_sha256,
-        })
+        }))
     }
 }
 

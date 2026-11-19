@@ -260,7 +260,20 @@ fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
         "[promote]\nmode = \"verify-only\"\n",
     )
     .unwrap();
-    sh(tmp.path(), &["add", ".aethyme/config.toml"]);
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        r#"[[gate]]
+name = "comparison-base"
+command = 'test "$AETHYME_GATE_BASE_COMMIT" = "$(git rev-parse HEAD^)" && test "$(git diff --name-only "$AETHYME_GATE_BASE_COMMIT")" = src/notes.md'
+triggers = ["src/**"]
+cache = false
+"#,
+    )
+    .unwrap();
+    sh(
+        tmp.path(),
+        &["add", ".aethyme/config.toml", ".aethyme/gates.toml"],
+    );
     sh(tmp.path(), &["commit", "-qm", "configure verify-only mode"]);
     let stale_integration = resolve(tmp.path(), "HEAD");
     sh(
@@ -326,6 +339,11 @@ fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
         outcome.submission_plan.integration_head,
         plan.integration_head
     );
+    assert_eq!(
+        outcome.gate_verification.status,
+        SubmissionGateVerificationStatus::Passed
+    );
+    assert_eq!(outcome.gate_outcomes.len(), 1);
     assert!(!outcome.promoted);
 }
 

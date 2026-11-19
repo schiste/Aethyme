@@ -442,6 +442,9 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 now,
                 limit,
             )?;
+            if let Err(error) = broker.warm_default_task_context() {
+                eprintln!("Warning: default-branch navigation warmup deferred ({error:?})");
+            }
             let next_tick_at = broker
                 .repository_watches(false)?
                 .into_iter()

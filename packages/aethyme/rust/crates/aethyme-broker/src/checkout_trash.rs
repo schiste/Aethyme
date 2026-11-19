@@ -7,8 +7,9 @@
 //! caller does two O(1) steps instead: `renameat(2)` the checkout into the
 //! pool's trash (same parent directory, so the same volume) and drop its Git
 //! registration. The branch ref is never touched. The deleter later unlinks
-//! the tree at a fixed rate that slows under load but never below a floor,
-//! never waits for memory pressure, and runs unpaced below the disk headroom.
+//! the tree at a steady rate that slows under load but never below a floor,
+//! rises to a bounded catch-up rate while the trash is behind
+//! ([`TrashBacklog::behind`]), and runs unpaced below the disk headroom.
 //!
 //! Scope is narrow on purpose:
 //!
@@ -53,6 +54,22 @@ pub(crate) const TRASH_FAILURE_REPORT_AFTER: u32 = 3;
 pub(crate) const DELETER_STEADY_UNLINKS_PER_SECOND: u32 = 2_000;
 /// The rate the deleter never goes below, however loaded the host.
 pub(crate) const DELETER_FLOOR_UNLINKS_PER_SECOND: u32 = 200;
+/// The catch-up rate while the trash is behind on a host with no pressure:
+/// the deleter's bounded maximum outside disk pressure. A dependency tree of
+/// about 100,000 entries goes in about 12 s.
+pub(crate) const DELETER_CATCHUP_UNLINKS_PER_SECOND: u32 = 8_000;
+/// The catch-up rate while the trash is behind on a loaded host (load above
+/// the core count, Linux I/O pressure) or at the memory warning level.
+pub(crate) const DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND: u32 = 4_000;
+/// Recorded entries at or above which the trash is behind.
+pub(crate) const TRASH_BACKLOG_ENTRIES: usize = 16;
+/// Age of the oldest recorded entry at or above which the trash is behind.
+pub(crate) const TRASH_BACKLOG_AGE_MS: i64 = 24 * 3_600_000;
+/// The longest one continuing catch-up lane (the detached worker's, after
+/// its other lanes) drains the trash.
+pub(crate) const TRASH_CATCHUP_MAX: Duration = Duration::from_secs(20 * 60);
+/// How often a catching-up drain reads the host's pressure again.
+const DELETER_PACE_RESAMPLE_EVERY: Duration = Duration::from_secs(2);
 /// Unlinks between checks that an entry being deleted is still in the trash.
 const TRASH_LOCATION_CHECK_EVERY: u32 = 256;
 /// File name of the host-wide single-flight lock.
@@ -792,14 +809,65 @@ pub(crate) enum DeleterPace {
     Steady,
     /// The host is loaded: the floor rate.
     Floor,
+    /// The trash is behind and the host is loaded (or at the memory warning
+    /// level): the loaded catch-up rate.
+    CatchupLoaded,
+    /// The trash is behind and the host shows no pressure: the catch-up
+    /// rate, the bounded maximum outside disk pressure.
+    Catchup,
     /// The volume is below its headroom: as fast as the disk allows.
     Unpaced,
 }
 
+/// Why the deleter needs the pace it runs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainNeed {
+    /// The volume is below its headroom.
+    DiskPressure,
+    /// The trash is behind ([`TrashBacklog::behind`]).
+    Backlog,
+    /// Neither: the gentle steady pace.
+    Gentle,
+}
+
+impl DrainNeed {
+    pub(crate) const fn of(below_headroom: bool, behind: bool) -> Self {
+        if below_headroom {
+            Self::DiskPressure
+        } else if behind {
+            Self::Backlog
+        } else {
+            Self::Gentle
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiskPressure => "disk_pressure",
+            Self::Backlog => "backlog",
+            Self::Gentle => "gentle",
+        }
+    }
+}
+
+/// The host's pressure as the deleter reads it, from the signals the
+/// unattended pacer already samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HostPressure {
+    /// One-minute load above the core count, or a pacer load or Linux I/O
+    /// pressure signal.
+    pub(crate) loaded: bool,
+    /// Memory at the warning level (or a level that could not be read).
+    pub(crate) memory_warning: bool,
+    /// Memory at the critical level.
+    pub(crate) memory_critical: bool,
+}
+
 impl DeleterPace {
     /// The pace for a volume that is (or is not) below its headroom on a
-    /// host that is (or is not) loaded. Memory pressure is deliberately not
-    /// an input: unlinking frees page cache rather than using memory.
+    /// host that is (or is not) loaded, with the trash not behind. Memory
+    /// pressure is deliberately not an input: unlinking frees page cache
+    /// rather than using memory.
     pub(crate) const fn for_host(below_headroom: bool, loaded: bool) -> Self {
         if below_headroom {
             Self::Unpaced
@@ -810,12 +878,103 @@ impl DeleterPace {
         }
     }
 
+    /// The pace for `need` on a host under `host` pressure. Below the
+    /// headroom it is unpaced and with no backlog it is the gentle pace of
+    /// [`Self::for_host`]. Behind, it rises to the catch-up rate, held to the
+    /// loaded catch-up rate under load or at the memory warning level, and
+    /// to the floor at critical memory pressure.
+    pub(crate) const fn for_need(need: DrainNeed, host: HostPressure) -> Self {
+        match need {
+            DrainNeed::DiskPressure => Self::Unpaced,
+            DrainNeed::Gentle => Self::for_host(false, host.loaded),
+            DrainNeed::Backlog => {
+                if host.memory_critical {
+                    Self::Floor
+                } else if host.loaded || host.memory_warning {
+                    Self::CatchupLoaded
+                } else {
+                    Self::Catchup
+                }
+            }
+        }
+    }
+
     pub(crate) const fn unlinks_per_second(self) -> Option<u32> {
         match self {
             Self::Steady => Some(DELETER_STEADY_UNLINKS_PER_SECOND),
             Self::Floor => Some(DELETER_FLOOR_UNLINKS_PER_SECOND),
+            Self::CatchupLoaded => Some(DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND),
+            Self::Catchup => Some(DELETER_CATCHUP_UNLINKS_PER_SECOND),
             Self::Unpaced => None,
         }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steady => "steady",
+            Self::Floor => "floor",
+            Self::CatchupLoaded => "catchup_loaded",
+            Self::Catchup => "catchup",
+            Self::Unpaced => "unpaced",
+        }
+    }
+}
+
+/// The recorded entries the deleter still has to delete: how many, and when
+/// the oldest was moved in (from its name). Unconfirmed rows and entries
+/// already reported as failing do not count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TrashBacklog {
+    pub(crate) entries: usize,
+    pub(crate) oldest_created_ms: Option<i64>,
+}
+
+impl TrashBacklog {
+    pub(crate) fn of(rows: &TrashRows) -> Self {
+        Self::deletable(rows, &std::collections::BTreeSet::new())
+    }
+
+    /// The backlog the deleter can work on: as [`Self::of`], also leaving
+    /// out the entries the last run passed over because a process still used
+    /// them (`in_use`, entry names). An entry held open for days must not
+    /// keep the trash behind with nothing deletable.
+    pub(crate) fn deletable(rows: &TrashRows, in_use: &std::collections::BTreeSet<String>) -> Self {
+        let mut backlog = Self::default();
+        for (name, _) in rows
+            .values()
+            .flat_map(BTreeMap::iter)
+            .filter(|(name, row)| {
+                !row.pending
+                    && row.failures < TRASH_FAILURE_REPORT_AFTER
+                    && is_broker_entry_name(name)
+                    && !in_use.contains(*name)
+            })
+        {
+            backlog.entries += 1;
+            if let Some(created) = entry_created_ms(name) {
+                backlog.oldest_created_ms = Some(
+                    backlog
+                        .oldest_created_ms
+                        .map_or(created, |oldest| oldest.min(created)),
+                );
+            }
+        }
+        backlog
+    }
+
+    pub(crate) fn oldest_age_ms(&self, now_ms: i64) -> Option<i64> {
+        self.oldest_created_ms
+            .map(|created| now_ms.saturating_sub(created).max(0))
+    }
+
+    /// The trash is behind: at least [`TRASH_BACKLOG_ENTRIES`] entries, or
+    /// an entry at least [`TRASH_BACKLOG_AGE_MS`] old.
+    pub(crate) fn behind(&self, now_ms: i64) -> bool {
+        self.entries >= TRASH_BACKLOG_ENTRIES
+            || (self.entries > 0
+                && self
+                    .oldest_age_ms(now_ms)
+                    .is_some_and(|age| age >= TRASH_BACKLOG_AGE_MS))
     }
 }
 
@@ -828,36 +987,231 @@ pub(crate) fn host_loaded() -> bool {
     samples >= 1 && load[0] > parallelism
 }
 
-/// Holds unlinks to a rate by sleeping only when ahead of it.
-struct UnlinkLimiter {
+/// One reading of the host's pressure: this deleter's load test plus the
+/// unattended pacer's memory, load and Linux I/O signals.
+pub(crate) fn sample_host_pressure() -> HostPressure {
+    use crate::gc::unattended_pacing::PressureSignal;
+    let sample = crate::gc::unattended_pacing::SystemPressure::new().sample();
+    HostPressure {
+        loaded: host_loaded() || sample.load_elevated == Some(true),
+        memory_warning: sample.memory_warning == Some(true),
+        memory_critical: sample.memory_elevated == Some(true),
+    }
+}
+
+/// The pace of one drain: fixed, or following the host's pressure for a
+/// need, read again every [`DELETER_PACE_RESAMPLE_EVERY`] while paced.
+pub(crate) struct DrainPacer {
+    need: Option<DrainNeed>,
+    sample: fn() -> HostPressure,
+    pace: DeleterPace,
+    /// `[cleanup] unattended_unlinks_per_second` when the repository sets
+    /// it explicitly: the ceiling of every paced mode (never of unpaced).
+    ceiling: Option<u32>,
+    /// Deleter threads sharing the rate: each paces itself at its share.
+    share: u32,
+    /// The rate the unpaced mode (below the headroom) is held to: set in a
+    /// process that raised its own disk I/O priority, where the OS throttle
+    /// no longer bounds it.
+    unpaced_cap: Option<u32>,
+    /// Stop the drain, resumably, as soon as a reading shows critical
+    /// memory pressure (the continuing catch-up lane), instead of going on
+    /// at the floor.
+    yield_on_memory_critical: bool,
+    /// The last reading showed critical memory pressure.
+    memory_critical: bool,
+}
+
+impl DrainPacer {
+    /// Always `pace`.
+    #[cfg(test)]
+    pub(crate) fn fixed(pace: DeleterPace) -> Self {
+        Self {
+            need: None,
+            sample: HostPressure::default,
+            pace,
+            ceiling: None,
+            share: 1,
+            unpaced_cap: None,
+            yield_on_memory_critical: false,
+            memory_critical: false,
+        }
+    }
+
+    /// The pace for `need`, from `sample` now and again during the drain.
+    pub(crate) fn for_need(need: DrainNeed, sample: fn() -> HostPressure) -> Self {
+        let host = sample();
+        Self {
+            need: Some(need),
+            sample,
+            pace: DeleterPace::for_need(need, host),
+            ceiling: None,
+            share: 1,
+            unpaced_cap: PRIORITY_RAISED
+                .load(Ordering::Relaxed)
+                .then_some(DELETER_CATCHUP_UNLINKS_PER_SECOND),
+            yield_on_memory_critical: false,
+            memory_critical: host.memory_critical,
+        }
+    }
+
+    /// Hold the unpaced mode to `cap` unlinks a second (and the configured
+    /// ceiling); `None` leaves it unpaced.
+    #[cfg(test)]
+    pub(crate) fn with_unpaced_cap(mut self, cap: Option<u32>) -> Self {
+        self.unpaced_cap = cap;
+        self
+    }
+
+    /// Pace one of `threads` deleter threads: its share of the rate, so the
+    /// threads together stay within it.
+    pub(crate) fn with_share(mut self, threads: u32) -> Self {
+        self.share = threads.max(1);
+        self
+    }
+
+    /// Stop at the first reading of critical memory pressure instead of
+    /// slowing to the floor.
+    pub(crate) fn yielding_on_memory_critical(mut self) -> Self {
+        self.yield_on_memory_critical = true;
+        self
+    }
+
+    /// Whether the drain must stop now for memory pressure.
+    fn must_yield(&self) -> bool {
+        self.yield_on_memory_critical && self.memory_critical
+    }
+
+    /// Hold every paced mode at or below `ceiling` unlinks a second (a
+    /// configured rate; `None` leaves the paces as they are).
+    pub(crate) fn with_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.ceiling = ceiling.filter(|rate| *rate > 0);
+        self
+    }
+
+    pub(crate) fn pace(&self) -> DeleterPace {
+        self.pace
+    }
+
+    pub(crate) fn need(&self) -> Option<DrainNeed> {
+        self.need
+    }
+
+    pub(crate) fn ceiling(&self) -> Option<u32> {
+        self.ceiling
+    }
+
+    /// The rate the current pace allows, held to the configured ceiling;
+    /// `None` when unpaced.
+    pub(crate) fn unlinks_per_second(&self) -> Option<u32> {
+        self.pace
+            .unlinks_per_second()
+            .or(self.unpaced_cap)
+            .map(|rate| self.ceiling.map_or(rate, |ceiling| rate.min(ceiling)))
+            .map(|rate| (rate / self.share.max(1)).max(1))
+    }
+
+    fn resample(&mut self) -> DeleterPace {
+        if let Some(need) = self.need {
+            let host = (self.sample)();
+            self.memory_critical = host.memory_critical;
+            self.pace = DeleterPace::for_need(need, host);
+        }
+        self.pace
+    }
+}
+
+/// The most a limiter may fall behind its rate (a stall of the volume, a
+/// slow directory) and catch up without sleeping: the rate is a ceiling
+/// over any interval longer than this, never an average that a stall
+/// banks for a later burst.
+const DELETER_MAX_RATE_DEBT: Duration = Duration::from_millis(250);
+/// The least a limiter sleeps once ahead, so pacing costs no syscall per
+/// unlink.
+const DELETER_MIN_SLEEP: Duration = Duration::from_millis(5);
+
+/// The rate window of one limiter, on an explicit clock.
+#[derive(Debug, Clone, Copy)]
+struct RateWindow {
     per_second: Option<u32>,
     started: Instant,
     unlinks: u64,
 }
 
-impl UnlinkLimiter {
-    fn new(pace: DeleterPace) -> Self {
+impl RateWindow {
+    fn new(per_second: Option<u32>, now: Instant) -> Self {
         Self {
-            per_second: pace.unlinks_per_second(),
-            started: Instant::now(),
+            per_second,
+            started: now,
             unlinks: 0,
         }
     }
 
-    fn before_unlink(&mut self) {
+    /// Count one unlink at `now` and return how long to sleep before it.
+    /// A window more than [`DELETER_MAX_RATE_DEBT`] behind its rate moves
+    /// its start forward, so what a stall left undone is never issued in
+    /// one burst.
+    fn admit(&mut self, now: Instant) -> Option<Duration> {
         self.unlinks = self.unlinks.saturating_add(1);
-        let Some(per_second) = self.per_second.filter(|rate| *rate > 0) else {
-            return;
-        };
+        let per_second = self.per_second.filter(|rate| *rate > 0)?;
         let due = Duration::from_secs_f64(self.unlinks as f64 / f64::from(per_second));
-        let elapsed = self.started.elapsed();
-        // Sleep in batches of at least 5 ms so pacing costs no syscall per
-        // unlink.
-        if let Some(ahead) = due.checked_sub(elapsed)
-            && ahead >= Duration::from_millis(5)
-        {
+        let elapsed = now.saturating_duration_since(self.started);
+        if let Some(ahead) = due.checked_sub(elapsed) {
+            return (ahead >= DELETER_MIN_SLEEP).then_some(ahead);
+        }
+        let behind = elapsed - due;
+        if let Some(forgiven) = behind.checked_sub(DELETER_MAX_RATE_DEBT) {
+            self.started += forgiven;
+        }
+        None
+    }
+}
+
+/// Holds unlinks to a rate by sleeping only when ahead of it, re-reading
+/// the drain's pace every [`DELETER_PACE_RESAMPLE_EVERY`].
+struct UnlinkLimiter<'a> {
+    pacer: &'a mut DrainPacer,
+    window: RateWindow,
+    sampled: Instant,
+    pace_changes: u64,
+}
+
+impl<'a> UnlinkLimiter<'a> {
+    fn new(pacer: &'a mut DrainPacer) -> Self {
+        let now = Instant::now();
+        Self {
+            window: RateWindow::new(pacer.unlinks_per_second(), now),
+            pacer,
+            sampled: now,
+            pace_changes: 0,
+        }
+    }
+
+    /// Start the rate window again (a new entry): time spent between
+    /// entries never buys a burst.
+    fn restart(&mut self) {
+        self.window = RateWindow::new(self.window.per_second, Instant::now());
+    }
+
+    /// Pace one unlink; `false` when the drain must stop now for memory
+    /// pressure (only a yielding pacer asks that).
+    fn before_unlink(&mut self) -> bool {
+        if self.sampled.elapsed() >= DELETER_PACE_RESAMPLE_EVERY {
+            self.sampled = Instant::now();
+            self.pacer.resample();
+            let per_second = self.pacer.unlinks_per_second();
+            if per_second != self.window.per_second {
+                self.window = RateWindow::new(per_second, Instant::now());
+                self.pace_changes = self.pace_changes.saturating_add(1);
+            }
+        }
+        if self.pacer.must_yield() {
+            return false;
+        }
+        if let Some(ahead) = self.window.admit(Instant::now()) {
             std::thread::sleep(ahead);
         }
+        true
     }
 }
 
@@ -891,6 +1245,120 @@ pub(crate) fn try_deleter_lock(path: &Path) -> std::io::Result<Option<DeleterLoc
         )),
     );
     Ok(Some(DeleterLock { _lock: lock }))
+}
+
+/// A catch-up lane lock (the host lane, or a repository's lane-process
+/// lock). Its holder line names the process and repository while it is
+/// held, and is emptied, still under the lock, when it is dropped: a line
+/// that names a live process therefore means the lock is held, and other
+/// processes read it without ever taking the lock.
+pub(crate) struct CatchupLaneLock {
+    lock: crate::file_lock::ExclusiveFileLock,
+}
+
+impl Drop for CatchupLaneLock {
+    fn drop(&mut self) {
+        crate::warn_unrecorded("clear the catch-up lane holder", self.lock.clear_holder());
+    }
+}
+
+/// Take the catch-up lane lock at `path` if nobody holds it, naming this
+/// process and `repository` in its holder line ([`catchup_lane_holder`]).
+pub(crate) fn try_catchup_lane_lock(
+    path: &Path,
+    repository: &Path,
+) -> std::io::Result<Option<CatchupLaneLock>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? else {
+        return Ok(None);
+    };
+    crate::warn_unrecorded(
+        "name the checkout trash catch-up lane",
+        lock.record_holder(&format!(
+            "pid {} since {}\n{CATCHUP_LANE_REPOSITORY_PREFIX}{}\n",
+            std::process::id(),
+            crate::clock::epoch_ms(),
+            repository.display()
+        )),
+    );
+    Ok(Some(CatchupLaneLock { lock }))
+}
+
+/// Holder-line prefix naming the repository whose catch-up lane holds the
+/// lane lock.
+const CATCHUP_LANE_REPOSITORY_PREFIX: &str = "repository ";
+
+/// Who a catch-up lane lock's holder line names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatchupLaneHolder {
+    pub(crate) pid: i64,
+    /// `None` for a line written by something other than a lane (an older
+    /// release's probe wrote `pid <n> since <ms>` alone).
+    pub(crate) repository: Option<PathBuf>,
+}
+
+impl CatchupLaneHolder {
+    /// The named process still exists.
+    pub(crate) fn alive(&self) -> bool {
+        crate::blockers::process_alive(self.pid)
+    }
+}
+
+/// What a probe of a catch-up lane lock found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatchupLaneProbe {
+    /// Nobody holds the lock: no lane, whatever its holder line says (a
+    /// lane killed without running its drop leaves its line behind).
+    Free,
+    /// Someone holds the lock; its holder line, if it has one.
+    Held(Option<CatchupLaneHolder>),
+}
+
+/// Probe the lane lock at `path`: a non-blocking take that writes nothing
+/// and is released at once, then, only when the lock is held, its holder
+/// line. A missing directory reads as free; any other failure to open or
+/// lock reads as held by an unknown holder, so a probe never mistakes
+/// trouble for a free lane.
+pub(crate) fn probe_catchup_lane_lock(path: &Path) -> CatchupLaneProbe {
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path);
+    match opened.map(crate::file_lock::ExclusiveFileLock::try_acquire) {
+        Ok(Ok(Some(_free))) => CatchupLaneProbe::Free,
+        // No directory for it: nobody can hold it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CatchupLaneProbe::Free,
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => CatchupLaneProbe::Held(catchup_lane_holder(path)),
+    }
+}
+
+/// The holder line of the lane lock at `path`, read without taking the
+/// lock; `None` when it is empty, missing or unreadable. Meaningful only
+/// while the lock is held ([`probe_catchup_lane_lock`]).
+pub(crate) fn catchup_lane_holder(path: &Path) -> Option<CatchupLaneHolder> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid = text.lines().find_map(|line| {
+        line.strip_prefix("pid ")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })?;
+    let repository = text.lines().find_map(|line| {
+        line.strip_prefix(CATCHUP_LANE_REPOSITORY_PREFIX)
+            .map(PathBuf::from)
+    });
+    Some(CatchupLaneHolder { pid, repository })
 }
 
 /// Clear the user-immutable and append-only flags that make an unlink fail
@@ -969,25 +1437,217 @@ pub(crate) struct TrashDrainReport {
     /// The run's open-file observation could not be taken completely, so it
     /// deleted nothing.
     pub(crate) process_use_unknown: bool,
+    /// The run's deadline stopped it with entries left (before an entry or
+    /// part-way through one).
+    pub(crate) budget_stopped: bool,
+    /// Why the run needed its pace (`None` for a fixed pace).
+    pub(crate) need: Option<DrainNeed>,
+    /// The pace the run ended at (it follows host pressure while paced).
+    pub(crate) final_pace: Option<DeleterPace>,
+    /// Times the pace changed during the run.
+    pub(crate) pace_changes: u64,
+    /// When the oldest entry still recorded after the run was moved in.
+    pub(crate) oldest_pending_created_ms: Option<i64>,
+    /// The rate the run started at, after the configured ceiling (`None`
+    /// when unpaced).
+    pub(crate) initial_unlinks_per_second: Option<u32>,
+    /// The configured ceiling the paced modes were held to, if any.
+    pub(crate) configured_ceiling: Option<u32>,
+    /// Names of the entries passed over because a process used them (at
+    /// most [`TRASH_IN_USE_NAMES_MAX`]).
+    pub(crate) in_use_names: Vec<String>,
+    /// The run stopped, resumably, at a reading of critical memory pressure
+    /// (only a yielding pacer stops for it).
+    pub(crate) yielded_to_pressure: bool,
+    /// The host-wide deleter lock was held elsewhere: the run deleted
+    /// nothing.
+    pub(crate) deleter_busy: bool,
+    /// Deleter threads the run used (0 or 1: one).
+    pub(crate) threads: u32,
+    /// A retirement run skipped its drain because a catch-up lane was live
+    /// on this host (it drains this trash anyway).
+    pub(crate) skipped_for_catchup_lane: bool,
 }
+
+impl TrashDrainReport {
+    /// Why the run ended: `deleter_busy`, `process_use_unknown`,
+    /// `pressure`, `deadline`, or `finished` (every deletable entry was
+    /// attempted).
+    pub(crate) fn end_reason(&self) -> &'static str {
+        if self.skipped_for_catchup_lane {
+            "skipped_for_catchup_lane"
+        } else if self.deleter_busy {
+            "deleter_busy"
+        } else if self.process_use_unknown {
+            "process_use_unknown"
+        } else if self.yielded_to_pressure {
+            "pressure"
+        } else if self.budget_stopped {
+            "deadline"
+        } else {
+            "finished"
+        }
+    }
+}
+
+/// This process raised its own disk I/O priority (the worker's trash
+/// catch-up lane process): its below-headroom drains are held to the
+/// catch-up rate instead of running unpaced.
+static PRIORITY_RAISED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process raised its disk I/O priority out of the
+/// worker's throttle.
+pub(crate) fn mark_priority_raised() {
+    PRIORITY_RAISED.store(true, Ordering::Relaxed);
+}
+
+/// Wall time this process has spent in [`drain_trash_paced`], for the
+/// drain's share of a worker run.
+static DRAIN_NANOS_THIS_PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall time this process has spent draining the trash.
+pub(crate) fn drain_time_this_process() -> Duration {
+    Duration::from_nanos(DRAIN_NANOS_THIS_PROCESS.load(Ordering::Relaxed))
+}
+
+/// Bytes available to this user on the volume holding `fd`, or `None`
+/// when they cannot be read. The deleter measures what an entry freed as
+/// the change across its removal: with no per-file `stat` it cannot sum
+/// file lengths, and the volume's own figure is what matters. Other writers
+/// on the volume make it approximate; it never goes below zero.
+fn volume_available_bytes(fd: RawFd) -> Option<u64> {
+    // SAFETY: `statvfs` is a plain C struct whose zeroed representation is
+    // valid; `fstatvfs` fills it before any field is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live descriptor and `stat` is writable for the call.
+    if unsafe { libc::fstatvfs(fd, &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    let (available, fragment) = (u64::from(stat.f_bavail), stat.f_frsize as u64);
+    Some(available.saturating_mul(fragment))
+}
+
+/// In-use entry names one run reports and the next run leaves out of the
+/// backlog decision, at most.
+pub(crate) const TRASH_IN_USE_NAMES_MAX: usize = 256;
 
 /// The longest one deleter run's open-file observation may take.
 const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 
+/// Apply what one drain did to the stored rows `current`: the drain read
+/// `before` and left `after`. An entry it removed or forgot is dropped; for
+/// an entry it kept, only the fields it changed (failures, pending) are
+/// written, so a confirmation or a new row another process stored during
+/// the drain survives.
+pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, after: &TrashRows) {
+    for (dir, entries) in before {
+        for (name, was) in entries {
+            match after.get(dir).and_then(|after| after.get(name)) {
+                Some(now) => {
+                    if let Some(stored) =
+                        current.get_mut(dir).and_then(|stored| stored.get_mut(name))
+                    {
+                        if now.failures != was.failures {
+                            stored.failures = now.failures;
+                        }
+                        if now.pending != was.pending {
+                            stored.pending = now.pending;
+                        }
+                    }
+                }
+                None => {
+                    if let Some(stored) = current.get_mut(dir) {
+                        stored.remove(name);
+                    }
+                }
+            }
+        }
+    }
+    current.retain(|_, entries| !entries.is_empty());
+}
+
+/// The order one trash directory's confirmed, broker-named entries are
+/// deleted in: fewest failures first (capped at
+/// [`TRASH_FAILURE_REPORT_AFTER`]), then oldest first by name. An entry
+/// that failed is retried after the others, so it never holds them up.
+fn drain_order(entries: &BTreeMap<String, TrashRow>) -> Vec<String> {
+    let mut order = entries
+        .iter()
+        .filter(|(name, row)| is_broker_entry_name(name) && !row.pending)
+        .map(|(name, row)| (row.failures.min(TRASH_FAILURE_REPORT_AFTER), name.clone()))
+        .collect::<Vec<_>>();
+    order.sort();
+    order.into_iter().map(|(_, name)| name).collect()
+}
+
 /// Delete recorded entries of the trash directories in `rows` oldest first
-/// until `deadline`, at `pace`; `rows` is updated (removed entries dropped,
-/// failures counted, entries gone missing forgotten). The caller holds the
-/// deleter lock and persists `rows`. Each trash directory is re-verified,
-/// each entry must have the broker's name format and its recorded device and
-/// inode, re-checked on the pinned directory immediately before deletion.
+/// until `deadline`, at `pace` ([`drain_trash_paced`] with a fixed pace).
+#[cfg(test)]
 pub(crate) fn drain_trash(
     rows: &mut TrashRows,
     deadline: Instant,
     pace: DeleterPace,
 ) -> TrashDrainReport {
+    drain_trash_paced(rows, deadline, &mut DrainPacer::fixed(pace))
+}
+
+/// Delete recorded entries of the trash directories in `rows` oldest first
+/// (an entry that failed before goes after every entry that has failed
+/// fewer times) until `deadline`, at the pace `pacer` sets; `rows` is
+/// updated (removed entries dropped, failures counted, entries gone missing
+/// forgotten). An entry in use or failing is passed over, never blocking
+/// the entries behind it. The caller holds the deleter lock and persists
+/// `rows`. Each trash directory is re-verified, each entry must have the
+/// broker's name format and its recorded device and inode, re-checked on
+/// the pinned directory immediately before deletion.
+pub(crate) fn drain_trash_paced(
+    rows: &mut TrashRows,
+    deadline: Instant,
+    pacer: &mut DrainPacer,
+) -> TrashDrainReport {
+    drain_trash_in(rows, deadline, pacer, DrainContext::default())
+}
+
+/// How one drain over (part of) the trash runs.
+#[derive(Clone, Copy)]
+struct DrainContext<'a> {
+    /// Every recorded row, when `rows` holds only this thread's part: names
+    /// another part owns are not unrecognized.
+    known: Option<&'a TrashRows>,
+    /// Count names nobody recorded (only one of several threads does).
+    count_unrecognized: bool,
+    /// An open-file observation taken once for all threads.
+    process_use: Option<&'a crate::reclaim::OpenFileSnapshot>,
+    /// A worker thread of a parallel drain: the caller accounts its wall
+    /// time once.
+    worker_thread: bool,
+}
+
+impl Default for DrainContext<'_> {
+    fn default() -> Self {
+        Self {
+            known: None,
+            count_unrecognized: true,
+            process_use: None,
+            worker_thread: false,
+        }
+    }
+}
+
+fn drain_trash_in(
+    rows: &mut TrashRows,
+    deadline: Instant,
+    pacer: &mut DrainPacer,
+    context: DrainContext<'_>,
+) -> TrashDrainReport {
     let _span = crate::phase_telemetry::span("checkout_trash_drain");
+    let pace = pacer.pace();
     let mut report = TrashDrainReport {
         pace: Some(pace),
+        need: pacer.need(),
+        initial_unlinks_per_second: pacer.unlinks_per_second(),
+        configured_ceiling: pacer.ceiling(),
         ..TrashDrainReport::default()
     };
     match pace {
@@ -997,8 +1657,15 @@ pub(crate) fn drain_trash(
         DeleterPace::Floor => {
             crate::phase_telemetry::add("checkout_trash_floor_runs", Duration::ZERO);
         }
+        DeleterPace::CatchupLoaded => {
+            crate::phase_telemetry::add("checkout_trash_catchup_loaded_runs", Duration::ZERO);
+        }
+        DeleterPace::Catchup => {
+            crate::phase_telemetry::add("checkout_trash_catchup_runs", Duration::ZERO);
+        }
         DeleterPace::Steady => {}
     }
+    let mut limiter = UnlinkLimiter::new(pacer);
     let started = Instant::now();
     // One process table, only when some row is still unconfirmed: it is
     // what proves a pending row's creator gone.
@@ -1012,7 +1679,7 @@ pub(crate) fn drain_trash(
     // an entry a live process still has as its working directory, or holds
     // a file open in, is never deleted. An incomplete observation deletes
     // nothing this run.
-    let mut process_use: Option<crate::reclaim::OpenFileSnapshot> = None;
+    let mut process_use: Option<crate::reclaim::OpenFileSnapshot> = context.process_use.cloned();
     // The worker's unattended pacer would stop this deleter on memory
     // pressure; it paces itself instead.
     crate::gc::unattended_pacing::without_pacer(|| {
@@ -1041,8 +1708,13 @@ pub(crate) fn drain_trash(
                 .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
                 .filter(|name| name != TRASH_MARKER)
                 .collect::<Vec<_>>();
-            for name in &listed {
-                if !is_broker_entry_name(name) || !entries.contains_key(name) {
+            let known_here = context.known.and_then(|known| known.get(trash_path));
+            for name in listed.iter().filter(|_| context.count_unrecognized) {
+                let recorded = known_here.map_or_else(
+                    || entries.contains_key(name),
+                    |known| known.contains_key(name),
+                );
+                if !is_broker_entry_name(name) || !recorded {
                     report.unrecognized += 1;
                     if report.unrecognized_names.len() < 20 {
                         report.unrecognized_names.push(name.clone());
@@ -1087,14 +1759,9 @@ pub(crate) fn drain_trash(
             for name in dropped {
                 entries.remove(&name);
             }
-            let mut order = entries
-                .iter()
-                .filter(|(name, row)| is_broker_entry_name(name) && !row.pending)
-                .map(|(name, row)| (row.failures >= TRASH_FAILURE_REPORT_AFTER, name.clone()))
-                .collect::<Vec<_>>();
-            order.sort();
-            for (_, name) in order {
+            for name in drain_order(entries) {
                 if Instant::now() >= deadline {
+                    report.budget_stopped = true;
                     break 'dirs;
                 }
                 let Some(row) = entries.get(&name).copied() else {
@@ -1158,16 +1825,21 @@ pub(crate) fn drain_trash(
                     .is_some()
                 {
                     report.entries_in_use += 1;
+                    if report.in_use_names.len() < TRASH_IN_USE_NAMES_MAX {
+                        report.in_use_names.push(name.clone());
+                    }
                     crate::phase_telemetry::add("checkout_trash_entry_in_use", Duration::ZERO);
                     continue;
                 }
                 let left_trash = std::cell::Cell::new(false);
-                let mut limiter = UnlinkLimiter::new(pace);
+                let yielded = std::cell::Cell::new(false);
+                limiter.restart();
                 let mut since_check = 0_u32;
-                match pinned.remove_with_progress_and_observed_file_bytes_and_guard(
-                    None,
-                    Some(deadline),
-                    || {
+                let available_before = volume_available_bytes(trash_fd);
+                // Listing types, no per-file `stat`: the trash is private
+                // to the broker and nothing else writes into an entry.
+                let removed =
+                    pinned.remove_trusting_listing_types_with_guard(Some(deadline), || {
                         since_check += 1;
                         if since_check >= TRASH_LOCATION_CHECK_EVERY {
                             since_check = 0;
@@ -1176,10 +1848,16 @@ pub(crate) fn drain_trash(
                                 return Err(std::io::Error::other("the entry left the trash"));
                             }
                         }
-                        limiter.before_unlink();
+                        if !limiter.before_unlink() {
+                            yielded.set(true);
+                            return Err(std::io::Error::other("critical memory pressure"));
+                        }
                         Ok(())
-                    },
-                ) {
+                    });
+                let bytes = available_before
+                    .zip(volume_available_bytes(trash_fd))
+                    .map_or(0, |(before, after)| after.saturating_sub(before));
+                match removed.map(|(outcome, unlinks)| (outcome, unlinks, bytes)) {
                     Ok((crate::gc::TreeRemoval::Complete, unlinks, bytes)) => {
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
@@ -1210,6 +1888,21 @@ pub(crate) fn drain_trash(
                         } else if row.stripped {
                             report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
                         }
+                        report.budget_stopped = true;
+                        crate::phase_telemetry::add(
+                            "checkout_trash_entry_interrupted",
+                            Duration::ZERO,
+                        );
+                        break 'dirs;
+                    }
+                    Err(error) if yielded.get() => {
+                        report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
+                        report.bytes = report.bytes.saturating_add(bytes);
+                        report.yielded_to_pressure = true;
+                        crate::phase_telemetry::add(
+                            "checkout_trash_yielded_to_pressure",
+                            Duration::ZERO,
+                        );
                         break 'dirs;
                     }
                     Err(error) if left_trash.get() => {
@@ -1241,8 +1934,203 @@ pub(crate) fn drain_trash(
         }
     });
     crate::phase_telemetry::add("checkout_trash_drain_time", started.elapsed());
+    if !context.worker_thread {
+        DRAIN_NANOS_THIS_PROCESS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+    if report.budget_stopped {
+        crate::phase_telemetry::add("checkout_trash_budget_stops", Duration::ZERO);
+    }
+    report.pace_changes = limiter.pace_changes;
+    report.final_pace = Some(limiter.pacer.pace());
     rows.retain(|_, entries| !entries.is_empty());
     report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    report
+}
+
+/// Deleter threads a catching-up drain uses, each over its own entries.
+/// The volume, not the CPU, bounds unlinks (the worker sat blocked in the
+/// kernel on an external USB volume); several outstanding unlinks on
+/// different directories let the device queue them.
+pub(crate) const TRASH_CATCHUP_THREADS: u32 = 3;
+
+/// Split `rows` into `parts` row sets: each directory's confirmed entries
+/// dealt round-robin in drain order (so every part starts with the oldest
+/// it can), and every other row (pending, foreign names) in the first part,
+/// which alone confirms pending rows.
+fn partition_rows(rows: &TrashRows, parts: usize) -> Vec<TrashRows> {
+    let parts = parts.max(1);
+    let mut split = vec![TrashRows::new(); parts];
+    for (dir, entries) in rows {
+        let order = drain_order(entries);
+        for (index, name) in order.iter().enumerate() {
+            if let Some(row) = entries.get(name) {
+                split[index % parts]
+                    .entry(dir.clone())
+                    .or_default()
+                    .insert(name.clone(), *row);
+            }
+        }
+        for (name, row) in entries {
+            if !order.contains(name) {
+                split[0]
+                    .entry(dir.clone())
+                    .or_default()
+                    .insert(name.clone(), *row);
+            }
+        }
+    }
+    split
+}
+
+/// One report for a parallel drain's parts.
+fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrainReport {
+    let mut merged = TrashDrainReport::default();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index == 0 {
+            merged.pace = part.pace;
+            merged.need = part.need;
+            merged.final_pace = part.final_pace;
+            merged.configured_ceiling = part.configured_ceiling;
+            merged.initial_unlinks_per_second = part
+                .initial_unlinks_per_second
+                .map(|rate| rate.saturating_mul(threads));
+        }
+        merged.entries_removed += part.entries_removed;
+        merged.entries_interrupted += part.entries_interrupted;
+        merged.unlinks = merged.unlinks.saturating_add(part.unlinks);
+        // Each thread's per-entry bytes are the volume's change while the
+        // other threads delete too: summing them counts the same space up
+        // to `threads` times. The caller measures the slice once instead,
+        // and stripped and scratch bytes stay out of the ledger.
+        merged.stripped_entries_removed += part.stripped_entries_removed;
+        merged.scratch_entries_removed += part.scratch_entries_removed;
+        merged.failed.extend(part.failed);
+        merged.reported.extend(part.reported);
+        merged.unrecognized += part.unrecognized;
+        merged.unrecognized_names.extend(part.unrecognized_names);
+        merged.stale_pending.extend(part.stale_pending);
+        merged.invalid_trash_dirs = merged.invalid_trash_dirs.max(part.invalid_trash_dirs);
+        merged.entries_in_use += part.entries_in_use;
+        merged.in_use_names.extend(part.in_use_names);
+        merged.process_use_unknown |= part.process_use_unknown;
+        merged.budget_stopped |= part.budget_stopped;
+        merged.yielded_to_pressure |= part.yielded_to_pressure;
+        merged.pace_changes = merged.pace_changes.saturating_add(part.pace_changes);
+    }
+    merged.unrecognized_names.truncate(20);
+    merged.in_use_names.truncate(TRASH_IN_USE_NAMES_MAX);
+    merged.threads = threads;
+    merged
+}
+
+/// Bytes available to this user, summed over the distinct volumes holding
+/// the trash directories `dirs`; `None` when any cannot be read.
+pub(crate) fn trash_volumes_available(dirs: &[PathBuf]) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0_u64;
+    for dir in dirs {
+        let metadata = std::fs::metadata(dir).ok()?;
+        if !seen.insert(metadata.dev()) {
+            continue;
+        }
+        let trash = open_dir_nofollow(dir).ok()?;
+        total = total.saturating_add(volume_available_bytes(trash.as_raw_fd())?);
+    }
+    Some(total)
+}
+
+/// Drain `rows` with `threads` deleter threads, each over its own part
+/// ([`partition_rows`]) with a pacer from `pacer` (give each its share of
+/// the rate, [`DrainPacer::with_share`]). One open-file observation is
+/// taken for all of them (`process_use`, or a fresh one); each thread
+/// records into this thread's telemetry. A thread that panics leaves its
+/// part's rows as they were. `rows` is updated as [`drain_trash_paced`]
+/// updates it. `bytes` is the change in `available` (bytes free on the
+/// trash volumes) from before the threads start to after they join,
+/// measured once for the slice; `stripped_bytes` and `scratch_bytes` stay
+/// zero.
+pub(crate) fn drain_trash_parallel(
+    rows: &mut TrashRows,
+    deadline: Instant,
+    pacer: impl Fn() -> DrainPacer,
+    threads: u32,
+    process_use: Option<crate::reclaim::OpenFileSnapshot>,
+    available: impl Fn() -> Option<u64>,
+) -> TrashDrainReport {
+    let started = Instant::now();
+    let available_before = available();
+    let process_use = process_use.unwrap_or_else(|| {
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(DELETER_PROCESS_USE_BUDGET);
+        let observed = crate::session_holder::trash_deleter_process_use_snapshot(budget);
+        crate::phase_telemetry::add("checkout_trash_process_snapshot", started.elapsed());
+        observed
+    });
+    let known = rows.clone();
+    let parts = partition_rows(rows, threads as usize);
+    let recorder = crate::phase_telemetry::active();
+    let results = std::thread::scope(|scope| {
+        let handles = parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut part)| {
+                let original = part.clone();
+                let mut pacer = pacer();
+                let known = &known;
+                let process_use = &process_use;
+                let recorder = recorder.clone();
+                let handle = scope.spawn(move || {
+                    let _telemetry = recorder.map(crate::phase_telemetry::install);
+                    let report = drain_trash_in(
+                        &mut part,
+                        deadline,
+                        &mut pacer,
+                        DrainContext {
+                            known: Some(known),
+                            count_unrecognized: index == 0,
+                            process_use: Some(process_use),
+                            worker_thread: true,
+                        },
+                    );
+                    (part, report)
+                });
+                (original, handle)
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(original, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    crate::phase_telemetry::add("checkout_trash_thread_panicked", Duration::ZERO);
+                    (original, TrashDrainReport::default())
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut merged_rows = TrashRows::new();
+    let mut reports = Vec::with_capacity(results.len());
+    for (part, report) in results {
+        for (dir, entries) in part {
+            merged_rows.entry(dir).or_default().extend(entries);
+        }
+        reports.push(report);
+    }
+    merged_rows.retain(|_, entries| !entries.is_empty());
+    *rows = merged_rows;
+    let mut report = merge_drain_reports(reports, threads);
+    report.bytes = available_before
+        .zip(available())
+        .map_or(0, |(before, after)| after.saturating_sub(before));
+    report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    DRAIN_NANOS_THIS_PROCESS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     report
 }
 
@@ -1556,6 +2444,7 @@ mod tests {
         assert_eq!(stopped.entries_removed, 0);
         assert!(trashed.path().exists());
         assert_eq!(stopped.entries_pending, 1);
+        assert!(stopped.budget_stopped, "the budget stop is reported");
 
         let resumed = drain_trash(
             &mut rows,
@@ -1565,6 +2454,515 @@ mod tests {
         assert_eq!(resumed.entries_removed, 1, "{resumed:?}");
         assert!(!trashed.path().exists());
         assert_eq!(resumed.entries_pending, 0);
+        assert!(!resumed.budget_stopped, "{resumed:?}");
+    }
+
+    thread_local! {
+        static SCRIPTED_PRESSURE: std::cell::Cell<HostPressure> =
+            const { std::cell::Cell::new(HostPressure { loaded: false, memory_warning: false, memory_critical: false }) };
+    }
+
+    fn scripted_pressure() -> HostPressure {
+        SCRIPTED_PRESSURE.with(std::cell::Cell::get)
+    }
+
+    fn set_scripted_pressure(pressure: HostPressure) {
+        SCRIPTED_PRESSURE.with(|cell| cell.set(pressure));
+    }
+
+    fn row_for_backlog(failures: u32, pending: bool) -> TrashRow {
+        TrashRow {
+            device: 1,
+            inode: 1,
+            session_id: 1,
+            failures,
+            pending,
+            creator_pid: 0,
+            creator_started_ms: 0,
+            stripped: true,
+            scratch: false,
+        }
+    }
+
+    /// A drain writes back only what it changed: a confirmation stored by
+    /// another process during the drain is not overwritten with the
+    /// drain's stale `pending`, a new row survives, a failure the drain
+    /// counted and a confirmation it made are applied, and an entry it
+    /// removed is dropped.
+    #[test]
+    fn a_drain_writes_back_only_the_fields_it_changed() {
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let name = |nonce: u32| format!("1790000000000-1-1-{nonce}");
+        let mut before = TrashRows::new();
+        for (nonce, pending) in [(1, true), (2, false), (3, true), (4, false)] {
+            before
+                .entry(dir.clone())
+                .or_default()
+                .insert(name(nonce), row_for_backlog(0, pending));
+        }
+        // The drain: 1 still pending (its creator lives), 2 failed once,
+        // 3 confirmed, 4 removed.
+        let mut after = before.clone();
+        let entries = after.get_mut(&dir).unwrap();
+        entries.get_mut(&name(2)).unwrap().failures = 1;
+        entries.get_mut(&name(3)).unwrap().pending = false;
+        entries.remove(&name(4));
+        // Meanwhile another process confirmed 1 and recorded 5.
+        let mut current = before.clone();
+        let stored = current.get_mut(&dir).unwrap();
+        stored.get_mut(&name(1)).unwrap().pending = false;
+        stored.insert(name(5), row_for_backlog(0, true));
+
+        apply_drain_rows(&mut current, &before, &after);
+
+        let stored = &current[&dir];
+        assert!(
+            !stored[&name(1)].pending,
+            "the confirmation made meanwhile survives"
+        );
+        assert_eq!(stored[&name(2)].failures, 1);
+        assert!(!stored[&name(3)].pending);
+        assert!(!stored.contains_key(&name(4)));
+        assert!(
+            stored[&name(5)].pending,
+            "a row recorded meanwhile survives"
+        );
+    }
+
+    /// The trash is behind once it holds [`TRASH_BACKLOG_ENTRIES`] entries
+    /// or one a day old; unconfirmed rows and entries already reported as
+    /// failing do not count.
+    #[test]
+    fn a_growing_or_old_backlog_puts_the_trash_behind() {
+        let now = 1_800_000_000_000_i64;
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let name = |created: i64, nonce: usize| format!("{created:013}-1-1-{nonce}");
+        let mut rows = TrashRows::new();
+        for nonce in 0..TRASH_BACKLOG_ENTRIES - 1 {
+            rows.entry(dir.clone())
+                .or_default()
+                .insert(name(now - 60_000, nonce), row_for_backlog(0, false));
+        }
+        rows.entry(dir.clone())
+            .or_default()
+            .insert(name(now - 120_000, 900), row_for_backlog(0, true));
+        rows.entry(dir.clone()).or_default().insert(
+            name(now - 120_000, 901),
+            row_for_backlog(TRASH_FAILURE_REPORT_AFTER, false),
+        );
+        let small = TrashBacklog::of(&rows);
+        assert_eq!(small.entries, TRASH_BACKLOG_ENTRIES - 1, "{small:?}");
+        assert_eq!(small.oldest_age_ms(now), Some(60_000));
+        assert!(!small.behind(now), "a small, recent backlog stays gentle");
+
+        rows.entry(dir.clone())
+            .or_default()
+            .insert(name(now - 30_000, 999), row_for_backlog(0, false));
+        let grown = TrashBacklog::of(&rows);
+        assert_eq!(grown.entries, TRASH_BACKLOG_ENTRIES);
+        assert!(grown.behind(now), "growth past the threshold is behind");
+
+        let mut old = TrashRows::new();
+        old.entry(dir).or_default().insert(
+            name(now - TRASH_BACKLOG_AGE_MS, 0),
+            row_for_backlog(0, false),
+        );
+        let old = TrashBacklog::of(&old);
+        assert_eq!(old.oldest_age_ms(now), Some(TRASH_BACKLOG_AGE_MS));
+        assert!(old.behind(now), "one entry a day old is behind");
+        assert!(!TrashBacklog::default().behind(now));
+    }
+
+    /// Behind, the pace rises above the steady rate, held lower under load
+    /// or memory warning and to the floor at critical memory pressure, and
+    /// never above the catch-up maximum outside disk pressure; with no
+    /// backlog it stays the gentle pace.
+    #[test]
+    fn a_backlog_raises_the_pace_within_its_maximum() {
+        let clear = HostPressure::default();
+        let loaded = HostPressure {
+            loaded: true,
+            ..HostPressure::default()
+        };
+        let warning = HostPressure {
+            memory_warning: true,
+            ..HostPressure::default()
+        };
+        let critical = HostPressure {
+            memory_critical: true,
+            loaded: true,
+            ..HostPressure::default()
+        };
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Gentle, clear),
+            DeleterPace::Steady
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Gentle, loaded),
+            DeleterPace::Floor
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Gentle, warning),
+            DeleterPace::Steady,
+            "the gentle pace ignores memory, as before"
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Backlog, clear),
+            DeleterPace::Catchup
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Backlog, loaded),
+            DeleterPace::CatchupLoaded
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Backlog, warning),
+            DeleterPace::CatchupLoaded
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::Backlog, critical),
+            DeleterPace::Floor
+        );
+        assert_eq!(
+            DeleterPace::for_need(DrainNeed::DiskPressure, critical),
+            DeleterPace::Unpaced
+        );
+        for pace in [
+            DeleterPace::Steady,
+            DeleterPace::Floor,
+            DeleterPace::CatchupLoaded,
+            DeleterPace::Catchup,
+        ] {
+            let rate = pace.unlinks_per_second().unwrap();
+            assert!(rate <= DELETER_CATCHUP_UNLINKS_PER_SECOND, "{pace:?}");
+            assert!(rate >= DELETER_FLOOR_UNLINKS_PER_SECOND, "{pace:?}");
+        }
+        const {
+            assert!(DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND > DELETER_STEADY_UNLINKS_PER_SECOND);
+            assert!(DELETER_CATCHUP_UNLINKS_PER_SECOND > DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND);
+        };
+        assert_eq!(DrainNeed::of(true, true), DrainNeed::DiskPressure);
+        assert_eq!(DrainNeed::of(false, true), DrainNeed::Backlog);
+        assert_eq!(DrainNeed::of(false, false), DrainNeed::Gentle);
+    }
+
+    /// A catching-up drain reads the host's pressure again and follows it;
+    /// a fixed pace never changes.
+    #[test]
+    fn a_catching_up_pacer_follows_host_pressure() {
+        set_scripted_pressure(HostPressure::default());
+        let mut pacer = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure);
+        assert_eq!(pacer.pace(), DeleterPace::Catchup);
+        set_scripted_pressure(HostPressure {
+            loaded: true,
+            ..HostPressure::default()
+        });
+        assert_eq!(pacer.resample(), DeleterPace::CatchupLoaded);
+        set_scripted_pressure(HostPressure {
+            memory_critical: true,
+            ..HostPressure::default()
+        });
+        assert_eq!(pacer.resample(), DeleterPace::Floor);
+        set_scripted_pressure(HostPressure::default());
+        assert_eq!(pacer.resample(), DeleterPace::Catchup);
+        let mut fixed = DrainPacer::fixed(DeleterPace::Steady);
+        assert_eq!(fixed.resample(), DeleterPace::Steady);
+        assert_eq!(fixed.need(), None);
+    }
+
+    /// A stall inside one entry (the volume blocking unlinks for 10 s) is
+    /// not banked: once it ends the limiter lets through at most the bounded
+    /// debt before sleeping again, and about the rate over the next second,
+    /// instead of the ~80,000 unlinks the stall left undone in one burst.
+    #[test]
+    fn a_stall_never_buys_an_unpaced_burst() {
+        let rate = DELETER_CATCHUP_UNLINKS_PER_SECOND;
+        let per_interval =
+            |interval: Duration| (f64::from(rate) * interval.as_secs_f64()).ceil() as u64;
+        let start = Instant::now();
+        let mut now = start;
+        let mut window = RateWindow::new(Some(rate), now);
+        // A second at the rate (unlinks themselves take no time here).
+        while now < start + Duration::from_secs(1) {
+            if let Some(sleep) = window.admit(now) {
+                now += sleep;
+            }
+        }
+        // The volume stalls for 10 s.
+        now += Duration::from_secs(10);
+        let stall_end = now;
+        let mut burst = 0_u64;
+        loop {
+            match window.admit(now) {
+                None => burst += 1,
+                Some(sleep) => {
+                    now += sleep;
+                    break;
+                }
+            }
+            assert!(burst < 1_000_000, "the limiter never slept again");
+        }
+        assert!(
+            burst <= per_interval(DELETER_MAX_RATE_DEBT) + per_interval(DELETER_MIN_SLEEP) + 8,
+            "{burst} unlinks issued without a sleep after the stall"
+        );
+        let mut next_second = burst + 1;
+        while now < stall_end + Duration::from_secs(1) {
+            if let Some(sleep) = window.admit(now) {
+                now += sleep;
+            }
+            next_second += 1;
+        }
+        assert!(
+            next_second
+                <= per_interval(Duration::from_secs(1))
+                    + per_interval(DELETER_MAX_RATE_DEBT)
+                    + per_interval(DELETER_MIN_SLEEP)
+                    + 8,
+            "{next_second} unlinks in the second after the stall"
+        );
+        // Unpaced never sleeps.
+        let mut unpaced = RateWindow::new(None, start);
+        assert_eq!(unpaced.admit(start), None);
+    }
+
+    /// In a process that raised its disk I/O priority, the below-headroom
+    /// mode is held to the catch-up rate (and the configured ceiling)
+    /// instead of running unpaced; elsewhere it stays unpaced.
+    #[test]
+    fn a_raised_process_caps_the_unpaced_mode() {
+        set_scripted_pressure(HostPressure::default());
+        let raised = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND));
+        assert_eq!(raised.pace(), DeleterPace::Unpaced);
+        assert_eq!(
+            raised.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+        let ceiling = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND))
+            .with_ceiling(Some(500));
+        assert_eq!(ceiling.unlinks_per_second(), Some(500));
+        let worker =
+            DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure).with_unpaced_cap(None);
+        assert_eq!(worker.unlinks_per_second(), None);
+        let paced = DrainPacer::for_need(DrainNeed::Gentle, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND));
+        assert_eq!(
+            paced.unlinks_per_second(),
+            Some(DELETER_STEADY_UNLINKS_PER_SECOND)
+        );
+    }
+
+    /// An explicitly configured rate holds every paced mode at or below it;
+    /// a higher one changes nothing, and below the headroom it stays
+    /// unpaced.
+    #[test]
+    fn a_configured_ceiling_holds_every_paced_mode() {
+        set_scripted_pressure(HostPressure::default());
+        let capped =
+            DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure).with_ceiling(Some(500));
+        assert_eq!(capped.pace(), DeleterPace::Catchup);
+        assert_eq!(capped.unlinks_per_second(), Some(500));
+        assert_eq!(capped.ceiling(), Some(500));
+        let gentle =
+            DrainPacer::for_need(DrainNeed::Gentle, scripted_pressure).with_ceiling(Some(500));
+        assert_eq!(gentle.unlinks_per_second(), Some(500));
+        let higher = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure)
+            .with_ceiling(Some(1_000_000));
+        assert_eq!(
+            higher.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+        let unpaced = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_ceiling(Some(500));
+        assert_eq!(unpaced.unlinks_per_second(), None);
+        let none = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure).with_ceiling(None);
+        assert_eq!(
+            none.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+    }
+
+    /// An entry the last run passed over as in use, however old, does not
+    /// keep the trash behind; the rest of the backlog still counts.
+    #[test]
+    fn an_entry_in_use_does_not_keep_the_trash_behind() {
+        let now = 1_800_000_000_000_i64;
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let held = format!("{:013}-1-1-0", now - 2 * TRASH_BACKLOG_AGE_MS);
+        let fresh = format!("{:013}-1-1-1", now - 60_000);
+        let mut rows = TrashRows::new();
+        for name in [&held, &fresh] {
+            rows.entry(dir.clone())
+                .or_default()
+                .insert(name.clone(), row_for_backlog(0, false));
+        }
+        assert!(TrashBacklog::of(&rows).behind(now), "counted, it is behind");
+        let in_use = std::collections::BTreeSet::from([held.clone()]);
+        let deletable = TrashBacklog::deletable(&rows, &in_use);
+        assert_eq!(deletable.entries, 1, "{deletable:?}");
+        assert_eq!(deletable.oldest_age_ms(now), Some(60_000));
+        assert!(!deletable.behind(now));
+    }
+
+    /// Several deleter threads each take their own entries: every recorded
+    /// entry goes, the one a process uses stays (and is retried), an
+    /// unrecorded name is counted once and left alone, no symlink is
+    /// followed, and each thread paces itself at its share of the rate.
+    #[test]
+    fn a_parallel_drain_splits_the_entries_and_keeps_every_guard() {
+        let fixture = Fixture::new();
+        let outside = fixture._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), "precious\n").unwrap();
+        let mut rows = TrashRows::new();
+        let mut trashed = Vec::new();
+        for index in 0..5 {
+            let checkout = fixture.checkout(&format!("parallel-{index}"));
+            std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+            std::fs::create_dir_all(checkout.join("node_modules/dep")).unwrap();
+            std::fs::write(checkout.join("node_modules/dep/index.js"), "x").unwrap();
+            let moved = fixture.trash(&checkout, index + 1).unwrap();
+            rows.entry(moved.trash_dir.clone())
+                .or_default()
+                .insert(moved.entry.clone(), moved.row);
+            trashed.push(moved);
+        }
+        let stranger = trashed[0].trash_dir.join("0000000000001-9-9-9");
+        std::fs::create_dir(&stranger).unwrap();
+        let held = std::fs::canonicalize(trashed[2].path()).unwrap();
+        let in_use =
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "shell".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: held.clone(),
+            }]);
+        let parts = partition_rows(&rows, 3);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.values().map(BTreeMap::len).sum::<usize>())
+                .sum::<usize>(),
+            5,
+            "every row in exactly one part"
+        );
+        assert_eq!(
+            DrainPacer::fixed(DeleterPace::Catchup)
+                .with_share(3)
+                .unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND / 3)
+        );
+
+        // The slice's free-space change is measured once, before the
+        // threads start and after they join: here a scripted 1,000 then
+        // 5,000 bytes, whatever each thread's per-entry deltas were.
+        let readings = std::cell::Cell::new(0_u64);
+        let report = drain_trash_parallel(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            || DrainPacer::fixed(DeleterPace::Unpaced),
+            3,
+            Some(in_use),
+            || {
+                readings.set(readings.get() + 1);
+                Some(if readings.get() == 1 { 1_000 } else { 5_000 })
+            },
+        );
+
+        assert_eq!(readings.get(), 2, "measured once before and once after");
+        assert_eq!(report.bytes, 4_000, "{report:?}");
+        assert_eq!(report.stripped_bytes, 0, "{report:?}");
+        assert_eq!(report.scratch_bytes, 0, "{report:?}");
+        assert_eq!(report.threads, 3);
+        assert_eq!(report.entries_removed, 4, "{report:?}");
+        assert_eq!(report.entries_in_use, 1, "{report:?}");
+        assert_eq!(report.unrecognized, 1, "{report:?}");
+        assert_eq!(report.entries_pending, 1, "{report:?}");
+        assert!(held.exists());
+        assert!(stranger.exists());
+        for (index, moved) in trashed.iter().enumerate() {
+            assert_eq!(moved.path().exists(), index == 2, "{index}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+            "precious\n"
+        );
+        let left = rows
+            .values()
+            .flat_map(|entries| entries.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec![trashed[2].entry.clone()]);
+    }
+
+    /// A drain catching up still deletes only recorded entries and never
+    /// follows a symlink out of the trash.
+    #[test]
+    fn a_catching_up_drain_stays_inside_the_trash() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        let outside = fixture._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), "precious\n").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+        std::fs::create_dir_all(checkout.join("node_modules/dep")).unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                checkout.join(format!("node_modules/dep/file-{index}.js")),
+                "x",
+            )
+            .unwrap();
+        }
+        let trashed = fixture.trash(&checkout, 1).unwrap();
+        let stranger = trashed.trash_dir.join("0000000000001-9-9-9");
+        std::fs::create_dir(&stranger).unwrap();
+        std::fs::write(stranger.join("keep.txt"), "not ours\n").unwrap();
+        let mut rows = rows_of(&trashed);
+        set_scripted_pressure(HostPressure::default());
+        let mut pacer = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure);
+
+        let report = drain_trash_paced(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            &mut pacer,
+        );
+
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+        assert_eq!(report.pace, Some(DeleterPace::Catchup));
+        assert_eq!(report.need, Some(DrainNeed::Backlog));
+        assert!(!trashed.path().exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+            "precious\n"
+        );
+        assert!(stranger.join("keep.txt").exists(), "{report:?}");
+        assert_eq!(report.unrecognized, 1, "{report:?}");
+    }
+
+    /// An entry that failed before goes after the entries that failed
+    /// fewer times, whatever its age, so it never holds them up.
+    #[test]
+    fn a_failing_entry_goes_after_the_others() {
+        let mut entries = BTreeMap::new();
+        entries.insert("1790000000001-1-1-1".to_string(), row_for_backlog(1, false));
+        entries.insert("1790000000002-1-1-2".to_string(), row_for_backlog(0, false));
+        entries.insert("1790000000003-1-1-3".to_string(), row_for_backlog(5, false));
+        entries.insert("1790000000004-1-1-4".to_string(), row_for_backlog(0, false));
+        entries.insert("1790000000000-1-1-0".to_string(), row_for_backlog(0, true));
+        entries.insert("not-ours".to_string(), row_for_backlog(0, false));
+        assert_eq!(
+            drain_order(&entries),
+            vec![
+                "1790000000002-1-1-2".to_string(),
+                "1790000000004-1-1-4".to_string(),
+                "1790000000001-1-1-1".to_string(),
+                "1790000000003-1-1-3".to_string(),
+            ],
+            "oldest first among equals; failed entries later; pending and foreign names never"
+        );
     }
 
     /// A move whose environments cannot be destroyed changes nothing: no

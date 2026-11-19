@@ -134,6 +134,12 @@ const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
 /// then moves on whatever the answer, so one session never holds every later
 /// session back for more than one pass.
 const SESSION_RETIREMENT_BUDGET_HOLD_KEY: &str = "auto_cleanup.session_retirement_budget_hold";
+/// Meta key: sessions whose landed proof ran out of budget (JSON: session id
+/// to consecutive exhaustions and the time until which it is not asked).
+const LANDED_BUDGET_BACKOFF_KEY: &str = "auto_cleanup.landed_budget_backoff";
+const LANDED_BUDGET_BACKOFF_BASE_MS: i64 = 3_600_000;
+const LANDED_BUDGET_BACKOFF_MAX_MS: i64 = 24 * 3_600_000;
+const LANDED_BUDGET_BACKOFF_MAX_ENTRIES: usize = 4_096;
 /// Meta key of [`NotDueMemo`]: when each session the abandonment window kept
 /// for recent activity can first be due.
 const SESSION_RETIREMENT_NOT_DUE_KEY: &str = "auto_cleanup.session_retirement_not_due";
@@ -596,9 +602,8 @@ pub(crate) fn parse_abandoned_operation_after_hours(
 /// cleanup policy loader reports it).
 pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     let hours = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_abandoned_operation_after_hours(None);
         };
@@ -610,6 +615,93 @@ pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
         )
     })()
     .unwrap_or(DEFAULT_ABANDONED_OPERATION_AFTER_HOURS);
+    hours.saturating_mul(3_600_000)
+}
+
+/// `[cleanup] recovery_archive_bound_gib`: the most this repository's
+/// recovery archives (both archive directories) may hold together, in GiB;
+/// `0` turns the bound off. Over it, the oldest archives whose content has
+/// fully landed are removed first; an archive holding work that exists
+/// nowhere else is never removed for size (advice instead).
+pub(crate) const RECOVERY_ARCHIVE_BOUND_CONFIG_KEY: &str = "recovery_archive_bound_gib";
+/// The default of [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`].
+pub(crate) const DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB: i64 = 20;
+const MAX_RECOVERY_ARCHIVE_BOUND_GIB: i64 = 1 << 20;
+
+/// Parse [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`]; absent is the default.
+pub(crate) fn parse_recovery_archive_bound_gib(value: Option<&toml::Value>) -> Result<i64, String> {
+    match value {
+        None => Ok(DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB),
+        Some(toml::Value::Integer(gib)) if (0..=MAX_RECOVERY_ARCHIVE_BOUND_GIB).contains(gib) => {
+            Ok(*gib)
+        }
+        Some(_) => Err(format!(
+            "[cleanup] {RECOVERY_ARCHIVE_BOUND_CONFIG_KEY} must be a whole number of GiB between 0 and {MAX_RECOVERY_ARCHIVE_BOUND_GIB}"
+        )),
+    }
+}
+
+/// [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`] of the primary checkout's config,
+/// in bytes (`0`: off). An unreadable or invalid value keeps the default
+/// (the cleanup policy loader reports it).
+pub(crate) fn recovery_archive_bound_bytes(main_root: &Path) -> u64 {
+    let gib = (|| -> Result<i64, String> {
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
+        else {
+            return parse_recovery_archive_bound_gib(None);
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_recovery_archive_bound_gib(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(RECOVERY_ARCHIVE_BOUND_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or(DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB);
+    u64::try_from(gib).unwrap_or(0).saturating_mul(1 << 30)
+}
+
+/// `[cleanup]` key: hours of inactivity after which an open session's
+/// catalogued regenerable directories are stripped (`0` turns it off).
+pub(crate) const IDLE_STRIP_CONFIG_KEY: &str = "idle_strip_after_hours";
+/// The default of [`IDLE_STRIP_CONFIG_KEY`].
+pub(crate) const DEFAULT_IDLE_STRIP_AFTER_HOURS: i64 = 4;
+
+/// Parse [`IDLE_STRIP_CONFIG_KEY`]; absent is the default.
+pub(crate) fn parse_idle_strip_after_hours(value: Option<&toml::Value>) -> Result<i64, String> {
+    match value {
+        None => Ok(DEFAULT_IDLE_STRIP_AFTER_HOURS),
+        Some(toml::Value::Integer(hours))
+            if (0..=MAX_ABANDONED_OPERATION_AFTER_HOURS).contains(hours) =>
+        {
+            Ok(*hours)
+        }
+        Some(_) => Err(format!(
+            "[cleanup] {IDLE_STRIP_CONFIG_KEY} must be a whole number of hours between 0 (off) and {MAX_ABANDONED_OPERATION_AFTER_HOURS}"
+        )),
+    }
+}
+
+/// [`IDLE_STRIP_CONFIG_KEY`] of the primary checkout's config, in
+/// milliseconds; `0` is off. An unreadable or invalid value turns it off
+/// (the cleanup policy loader reports it): an unattended strip only runs
+/// when the setting is known.
+pub(crate) fn idle_strip_after_ms(main_root: &Path) -> i64 {
+    let hours = (|| -> Result<i64, String> {
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
+        else {
+            return parse_idle_strip_after_hours(None);
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_idle_strip_after_hours(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(IDLE_STRIP_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or(0);
     hours.saturating_mul(3_600_000)
 }
 
@@ -673,9 +765,8 @@ pub(crate) fn parse_venv_markers(value: Option<&toml::Value>) -> Result<Vec<Stri
 /// reports it), so the strip keeps such environments.
 pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     (|| -> Result<Vec<String>, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Vec::new());
         };
@@ -688,6 +779,28 @@ pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     })()
     .unwrap_or_default()
 }
+
+/// Every key `[cleanup]` may hold, whichever reader consumes it: the one
+/// list both [`AutoCleanupPolicy`]'s parser (which refuses any other key)
+/// and `certify`'s known-key table use.
+pub(crate) const CLEANUP_CONFIG_KEYS: &[&str] = &[
+    "auto_remove",
+    "strict",
+    "ignored_directory_sweep",
+    "regenerable",
+    "keep",
+    crate::gc::unattended_pacing::UNLINK_RATE_CONFIG_KEY,
+    ABANDONED_OPERATION_CONFIG_KEY,
+    RECOVERY_ARCHIVE_BOUND_CONFIG_KEY,
+    VENV_MARKERS_CONFIG_KEY,
+    IDLE_STRIP_CONFIG_KEY,
+    "delete_merged_session_branches",
+    crate::stale_session_policy::LANDED_KEY,
+    crate::stale_session_policy::PUSHED_KEY,
+    crate::stale_session_policy::UNPUSHED_KEY,
+    crate::stale_session_policy::NOTICE_KEY,
+    crate::stale_session_policy::AUTO_CLOSE_KEY,
+];
 
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,15 +839,24 @@ impl AutoCleanupPolicy {
     /// Read `[cleanup]`. A missing file or table is the default policy; an
     /// unreadable one is an error, which the sweep turns into "removal off"
     /// rather than guessing what the operator meant.
+    ///
+    /// The detached worker reads it from the default branch when its run
+    /// resolved so (the `cleanup_config` module); everything else reads the
+    /// primary checkout's working copy.
     pub fn load(main_root: &Path) -> Result<Self, String> {
         // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Self::default());
         };
-        let root: toml::Value = toml::from_str(&text)
+        Self::from_config_toml(&path, &text)
+    }
+
+    /// `[cleanup]` of one config text (TOML), validated as [`Self::load`]
+    /// does; `path` names where the text came from in messages.
+    pub(crate) fn from_config_toml(path: &Path, text: &str) -> Result<Self, String> {
+        let root: toml::Value = toml::from_str(text)
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
         let Some(table) = root.get("cleanup") else {
             return Ok(Self::default());
@@ -744,6 +866,11 @@ impl AutoCleanupPolicy {
             .ok_or_else(|| "[cleanup] must be a table".to_string())?;
         let mut policy = Self::default();
         for (key, value) in table {
+            // One list of keys, shared with `certify`: a key missing from it
+            // is refused here before any arm can accept it.
+            if !CLEANUP_CONFIG_KEYS.contains(&key.as_str()) {
+                return Err(format!("[cleanup] has no key {key:?}"));
+            }
             match key.as_str() {
                 "auto_remove" => {
                     policy.auto_remove = value
@@ -786,13 +913,27 @@ impl AutoCleanupPolicy {
                     }
                 }
                 "unattended_unlinks_per_second" => {} // Parsed by gc::unattended_pacing.
+                "delete_merged_session_branches" => {
+                    // Read by the merged-branch lane; validated here.
+                    value.as_bool().ok_or_else(|| {
+                        "[cleanup] delete_merged_session_branches must be true or false".to_string()
+                    })?;
+                }
                 ABANDONED_OPERATION_CONFIG_KEY => {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
                 }
+                RECOVERY_ARCHIVE_BOUND_CONFIG_KEY => {
+                    // Read by the checkout retirement lane; validated here.
+                    parse_recovery_archive_bound_gib(Some(value))?;
+                }
                 VENV_MARKERS_CONFIG_KEY => {
                     // Read by the strip pass; validated here.
                     parse_venv_markers(Some(value))?;
+                }
+                IDLE_STRIP_CONFIG_KEY => {
+                    // Read by the idle strip pass; validated here.
+                    parse_idle_strip_after_hours(Some(value))?;
                 }
                 // Read by the abandonment window's per-class gate; validated here.
                 key if crate::stale_session_policy::is_policy_key(key) => {
@@ -7546,6 +7687,47 @@ impl Broker {
 
     /// The session a previous pass left the retirement cursor on because its
     /// landed proof ran out of budget, if any.
+    /// Sessions whose landed proof ran out of budget, with how many times
+    /// in a row and until when their landed proof is not asked again.
+    fn landed_budget_backoff(&self) -> std::collections::BTreeMap<i64, (u32, i64)> {
+        self.store_ref()
+            .meta_get(LANDED_BUDGET_BACKOFF_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record a landed proof's outcome for `session_id`: running out of
+    /// budget backs its landed proof off (1 h, doubling, at most 24 h), so a
+    /// proof that cannot finish in any pass's budget stops holding the
+    /// cursor; any other outcome clears it.
+    fn record_landed_budget_outcome(&self, session_id: i64, exhausted: bool, now_ms: i64) {
+        let mut backoff = self.landed_budget_backoff();
+        if exhausted {
+            let failures = backoff
+                .get(&session_id)
+                .map_or(0, |(failures, _)| *failures)
+                + 1;
+            let delay = LANDED_BUDGET_BACKOFF_BASE_MS
+                .saturating_mul(1_i64 << failures.saturating_sub(1).min(20))
+                .min(LANDED_BUDGET_BACKOFF_MAX_MS);
+            backoff.insert(session_id, (failures, now_ms.saturating_add(delay)));
+            crate::phase_telemetry::add("landed_proof_budget_backoff_set", Duration::ZERO);
+        } else if backoff.remove(&session_id).is_none() {
+            return;
+        }
+        while backoff.len() > LANDED_BUDGET_BACKOFF_MAX_ENTRIES {
+            backoff.pop_first();
+        }
+        if let Ok(raw) = serde_json::to_string(&backoff) {
+            crate::warn_unrecorded(
+                "remember a landed proof's budget backoff",
+                self.store_ref().meta_set(LANDED_BUDGET_BACKOFF_KEY, &raw),
+            );
+        }
+    }
+
     fn retirement_budget_hold(&self) -> Option<i64> {
         self.store_ref()
             .meta_get(SESSION_RETIREMENT_BUDGET_HOLD_KEY)
@@ -7738,6 +7920,7 @@ impl Broker {
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
         let mut budget_hold = self.retirement_budget_hold();
+        let landed_backoff = self.landed_budget_backoff();
         // Set once a landed proof spent the pass's landed budget: no more
         // landed proofs this pass, the cursor stays put, and the cheap
         // abandonment judgements go on.
@@ -7773,8 +7956,15 @@ impl Broker {
                 window_ms,
             )
             .is_abandoned();
+            let landed_backed_off = landed_backoff
+                .get(&session.id)
+                .is_some_and(|(_, until)| *until > now);
+            if landed_backed_off {
+                crate::phase_telemetry::add("landed_proof_budget_backed_off", Duration::ZERO);
+            }
             let idle_enough_for_landed = landed_window_ms > 0
                 && !cursor_pinned
+                && !landed_backed_off
                 && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
                     &crate::SessionActivity {
@@ -7917,6 +8107,11 @@ impl Broker {
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                 }
                 decline_memo.record(self, session.id, memo_key.as_deref(), landed_decline);
+                self.record_landed_budget_outcome(
+                    session.id,
+                    landed_decline == Some(crate::broker::LandedSessionDecline::BudgetExhausted),
+                    now,
+                );
                 // Leave the cursor on this session so the next pass, usually
                 // the background worker with its larger budget, resumes here;
                 // unless this one session alone used a long pass, which must
@@ -12310,6 +12505,54 @@ mod tests {
         assert!(marker_path.exists());
     }
 
+    /// `finish` walks the checkout for the size it reports before it takes
+    /// the repository-wide lifecycle claim, so no other session's start,
+    /// finish or cleanup waits on the walk, and still reports that size.
+    #[cfg(unix)]
+    #[test]
+    fn finish_sizes_the_checkout_before_taking_the_lifecycle_claim() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        let walks_at_claim = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&walks_at_claim);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |_| {
+            let counts = crate::phase_telemetry::active()
+                .map(|recorder| recorder.totals().1)
+                .unwrap_or_default();
+            observed.lock().unwrap().push(
+                counts
+                    .get("finish_size_walk_unlocked")
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.finish(session.id).unwrap()
+        };
+        assert!(
+            report.cleanup.completed && report.cleanup.worktree_removed,
+            "{report:#?}"
+        );
+        assert!(
+            report.cleanup.reclaimed_bytes > 0,
+            "the walked size is still the reported one: {report:#?}"
+        );
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("finish_size_walk_unlocked"),
+            Some(&1),
+            "{counts:?}"
+        );
+        let walks_at_claim = walks_at_claim.lock().unwrap();
+        // The removal's claim is the last one finish takes.
+        assert_eq!(
+            walks_at_claim.last(),
+            Some(&1),
+            "the walk finished before the removal's lifecycle claim: {walks_at_claim:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn removed_spawn_history_does_not_block_a_fresh_instance_at_the_same_path() {
@@ -14699,6 +14942,7 @@ mod tests {
                     .set_modified(old_time)
                     .unwrap();
             }
+            crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
             broker.store().connection().execute("UPDATE sessions SET created_at = ?1, updated_at = ?1, last_activity_at = ?1 WHERE id = ?2", rusqlite::params![old_ms, session.id]).unwrap();
             let summary = broker.retire_abandoned_sessions(None).unwrap();
             assert_eq!(summary.retired, usize::from(!dirty && !disabled));
@@ -14812,6 +15056,7 @@ mod tests {
                 .set_modified(old_time)
                 .unwrap();
         }
+        crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
         broker
             .store()
             .connection()
@@ -18950,6 +19195,73 @@ mod tests {
         write("[cleanup]\nauto_remove = \"yes\"\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
+        assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+
+    /// Every listed key is accepted by the parser with a valid value, and
+    /// the parser refuses anything else: the list and the parser agree.
+    #[test]
+    fn every_listed_cleanup_key_is_accepted_and_no_other() {
+        let sample = r#"[cleanup]
+auto_remove = true
+strict = false
+ignored_directory_sweep = false
+regenerable = []
+keep = []
+unattended_unlinks_per_second = 1000
+abandoned_operation_after_hours = 24
+recovery_archive_bound_gib = 20
+venv_markers = []
+idle_strip_after_hours = 4
+delete_merged_session_branches = true
+stale_landed_close_after_hours = 4
+stale_pushed_close_after_hours = 24
+stale_unpushed_close_after_hours = 24
+stale_closing_notice_hours = 4
+stale_session_auto_close = true
+"#;
+        let parsed: toml::Value = toml::from_str(sample).unwrap();
+        let mut keys = parsed["cleanup"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut listed = crate::auto_cleanup::CLEANUP_CONFIG_KEYS.to_vec();
+        keys.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(keys, listed, "the sample must name every listed key");
+        AutoCleanupPolicy::from_config_toml(Path::new("sample"), sample).unwrap();
+        assert!(
+            AutoCleanupPolicy::from_config_toml(
+                Path::new("sample"),
+                "[cleanup]\nautoremove = true\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// The documented opt-out of the merged-branch lane is a `[cleanup]`
+    /// key like any other: setting it must not turn automatic removal off.
+    #[test]
+    fn the_merged_branch_opt_out_keeps_automatic_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        let config = dir.path().join(".aethyme/config.toml");
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = false\n",
+        )
+        .unwrap();
+        let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
+        assert!(policy.auto_remove);
+        assert!(!crate::merged_branches::enabled(dir.path()));
+
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = \"no\"\n",
+        )
+        .unwrap();
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
     }
 

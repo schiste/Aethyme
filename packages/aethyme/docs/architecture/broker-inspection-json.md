@@ -15,7 +15,15 @@ In a registered worktree, routine status identifies the current session. Use
 carries the next safe action, preparation and publication state, and
 session-owned recovery observations and live waits. When a wait needs no new
 command, the next action carries an instruction and a null command. `peer_state` includes recorded overlaps on
-the session's leased paths and declared scopes. Lease release request details
+the session's leased paths and declared scopes. Its `pre_edit` recommendation
+is also delivered in the agent's startup brief and on relevant peer changes.
+`continue` follows the session's next action. `wait` leaves disjoint work
+available while the agent coordinates an overlap with the earlier session.
+`yield` asks the later session to confirm matching assignments and offers the
+guarded duplicate close for an unchanged checkout. The compact view names the
+relevant peer and shows a bounded assignment preview. These recommendations use
+recorded evidence. Operation admission still checks live ownership and policy.
+Lease release request details
 are limited to requests involving the session. Repository information reports
 counts by warning kind, stale sessions as recorded, and unavailable sources.
 Other sessions' recovery commands and evidence appear in explicit drilldowns.

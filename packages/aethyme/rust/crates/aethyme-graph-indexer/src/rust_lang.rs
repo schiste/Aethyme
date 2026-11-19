@@ -51,6 +51,54 @@ use crate::filesystem::IndexedFile;
 use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
 use crate::rust_calls;
 
+/// Replace direct, crate-qualified Rust call expressions on a parsed source
+/// file. Comments, strings, macro token trees, and indirect calls are untouched.
+pub fn replace_rust_calls(source: &str, from: &str, to: &str) -> Result<(String, usize), String> {
+    fn crate_path(path: &str) -> bool {
+        let Some(path) = path.strip_prefix("crate::") else {
+            return false;
+        };
+        path.split("::").all(|segment| {
+            let mut bytes = segment.bytes();
+            bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    }
+    if from == to || !crate_path(from) || !crate_path(to) {
+        return Err("Rust call replacements require distinct crate-qualified paths".into());
+    }
+    let parse = SourceFile::parse(source, Edition::CURRENT);
+    if !parse.errors().is_empty() {
+        return Err("Rust call replacement requires parseable source".into());
+    }
+    let ranges: Vec<_> = parse
+        .tree()
+        .syntax()
+        .descendants()
+        .filter_map(ast::CallExpr::cast)
+        .filter_map(|call| match call.expr()? {
+            ast::Expr::PathExpr(expr) => expr.path(),
+            _ => None,
+        })
+        .filter(|path| path.syntax().text() == from)
+        .map(|path| path.syntax().text_range())
+        .collect();
+    let mut result = source.to_owned();
+    for range in ranges.iter().rev() {
+        result.replace_range(usize::from(range.start())..usize::from(range.end()), to);
+    }
+    if !ranges.is_empty()
+        && !SourceFile::parse(&result, Edition::CURRENT)
+            .errors()
+            .is_empty()
+    {
+        return Err("replacement produced invalid Rust syntax".into());
+    }
+    Ok((result, ranges.len()))
+}
+
 /// Indexer for `.rs` files via ra_ap_syntax.
 pub struct RustIndexer;
 

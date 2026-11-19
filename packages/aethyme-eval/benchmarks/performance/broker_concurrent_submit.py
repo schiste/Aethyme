@@ -224,11 +224,14 @@ def terminate_owned_group(process, term_grace=0.2):
 
     if term_grace > 0:
         grace_deadline = time.monotonic() + term_grace
-        while time.monotonic() < grace_deadline:
+        while True:
             # Observe without reaping, but let the whole group use the bounded
             # grace even if its direct leader exits before its descendants.
             leader_exited_without_reaping(process)
-            time.sleep(min(0.01, grace_deadline - time.monotonic()))
+            remaining = grace_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.01, remaining))
 
     # Keep the direct child unreaped even if it exited during TERM grace. It
     # pins the original process-group identity while SIGKILL stops descendants.

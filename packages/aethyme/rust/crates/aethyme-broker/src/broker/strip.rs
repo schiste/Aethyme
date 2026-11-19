@@ -232,6 +232,15 @@ pub(crate) struct CheckoutStripDay {
     pub cleaned_leftovers_retired: usize,
     pub checkouts_stripped: usize,
     pub directories_stripped: usize,
+    /// Of the retired checkouts, those that went through a recovery archive
+    /// that day, and the archives' bytes.
+    #[serde(default)]
+    pub checkouts_archived: usize,
+    #[serde(default)]
+    pub archive_bytes: u64,
+    /// Idle open sessions stripped that day.
+    #[serde(default)]
+    pub idle_checkouts_stripped: usize,
     /// Bytes of stripped directories the deleter removed that day.
     pub bytes_freed: u64,
 }
@@ -259,6 +268,13 @@ pub(crate) struct CheckoutStripProgress {
     /// repository has since declared under `[cleanup] venv_markers` drops.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub venv_unexpected: BTreeMap<String, i64>,
+    /// Open sessions idle past `[cleanup] idle_strip_after_hours` whose
+    /// current stretch of inactivity the idle strip has not handled yet.
+    #[serde(default)]
+    pub idle_backlog: usize,
+    /// Open sessions the last run's idle strip stripped.
+    #[serde(default)]
+    pub last_idle_checkouts_stripped: usize,
 }
 
 /// A catalogued directory found in a checkout, not yet proved.
@@ -579,6 +595,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Makes moving the candidate at this relative path fail.
+    pub(crate) static FAIL_MOVE_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 pub(crate) fn set_probes_fail_for_tests(fail: bool) {
     PROBES_FAIL.with(|cell| cell.set(fail));
 }
@@ -895,6 +918,7 @@ fn refused_counter(code: &str) -> &'static str {
         "not_closed" => "checkout_strip_refused_not_closed",
         "adopted" => "checkout_strip_refused_adopted",
         "checkout_missing" => "checkout_strip_refused_checkout_missing",
+        "tombstone" => "checkout_strip_refused_tombstone",
         "checkout_unreadable" => "checkout_strip_refused_checkout_unreadable",
         "not_owned" => "checkout_strip_refused_not_owned",
         "open_session" => "checkout_strip_refused_open_session",
@@ -933,7 +957,7 @@ fn refused_counter(code: &str) -> &'static str {
 }
 
 /// Directory refusals that say nothing lasting about the directory.
-fn transient_refusals(report: &CheckoutStripReport) -> usize {
+pub(super) fn transient_refusals(report: &CheckoutStripReport) -> usize {
     ["probe_failed", "deadline", "move_failed"]
         .iter()
         .filter_map(|code| report.refused.get(*code))
@@ -945,7 +969,7 @@ fn note_refusal(report: &mut CheckoutStripReport, code: &'static str) {
     crate::phase_telemetry::add(refused_counter(code), Duration::ZERO);
 }
 
-fn elapsed_ms(started: Instant) -> u64 {
+pub(super) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -1038,6 +1062,15 @@ fn judges_before(row: &Session, current: &Session) -> bool {
     rank(row) > rank(current)
 }
 
+/// The checkout a strip moves directories out of, and the pool whose trash
+/// receives them.
+#[derive(Clone, Copy)]
+pub(super) struct StripTarget<'a> {
+    pub session_id: i64,
+    pub worktree: &'a Path,
+    pub pool: &'a Path,
+}
+
 /// What one checkout's strip is judged with besides the run's evidence.
 #[derive(Clone, Copy)]
 struct StripContext<'a> {
@@ -1100,6 +1133,15 @@ impl PoolListing {
             .as_ref()
             .map(|names| names.contains(name))
     }
+}
+
+/// Whether a checkout folder the backlog found is a retired checkout's
+/// tombstone: one `lstat` of the tombstone note, and the full check only for
+/// a folder that holds one.
+fn is_backlog_tombstone(folder: &Path) -> bool {
+    std::fs::symlink_metadata(folder.join(super::tombstone::TOMBSTONE_FILE))
+        .is_ok_and(|metadata| metadata.is_file())
+        && super::tombstone::is_checkout_tombstone(folder)
 }
 
 /// The names of the real directories (not symlinks) in `directory`, from
@@ -1459,8 +1501,12 @@ impl Broker {
                 }
                 CheckoutStrip::Refused(code) => {
                     note_refusal(&mut report, code);
+                    // A retired checkout's tombstone is no checkout folder.
+                    if code == "tombstone" {
+                        report.folders_found = report.folders_found.saturating_sub(1);
+                    }
                     // Ownership never changes for a session: not asked again.
-                    if code == "adopted" || code == "not_owned" {
+                    if code == "adopted" || code == "not_owned" || code == "tombstone" {
                         newly_done.insert(session.id, closed_at);
                     }
                     // A folder proven absent (ENOENT) while its pool
@@ -1732,6 +1778,10 @@ impl Broker {
             return Refused("adopted");
         }
         let worktree = PathBuf::from(&session.worktree_path);
+        // A retired checkout's tombstone holds nothing to strip.
+        if super::tombstone::is_checkout_tombstone(&worktree) {
+            return Refused("tombstone");
+        }
         // Absent only when the filesystem says so; a call that fails any
         // other way is not proof the folder is gone.
         match std::fs::symlink_metadata(&worktree) {
@@ -1844,10 +1894,73 @@ impl Broker {
         {
             return Refused(code);
         }
+        let stripped = self.prove_and_move(
+            StripTarget {
+                session_id: session.id,
+                worktree: &worktree,
+                pool: &pool,
+            },
+            &candidates,
+            deadline,
+            venv_markers,
+            report,
+        );
+        CheckoutStrip::Done(stripped.len())
+    }
+
+    /// Prove `candidates` of `worktree` (all at once, see
+    /// [`prove_strippable_all`]) and rename each proved one into `pool`'s
+    /// trash for `session_id`, until `deadline`, counting every refusal in
+    /// `report`. The caller holds the lifecycle claim and has checked the
+    /// checkout-level preconditions. Returns the relative paths moved.
+    pub(super) fn prove_and_move(
+        &self,
+        target: StripTarget<'_>,
+        candidates: &[StripCandidate],
+        deadline: Instant,
+        venv_markers: &[String],
+        report: &mut CheckoutStripReport,
+    ) -> Vec<String> {
+        let StripTarget {
+            session_id,
+            worktree,
+            pool,
+        } = target;
         let prove_started = Instant::now();
-        let verdicts = prove_strippable_all(&worktree, &candidates, deadline, venv_markers);
+        let verdicts = prove_strippable_all(worktree, candidates, deadline, venv_markers);
         report.prove_ms = report.prove_ms.saturating_add(elapsed_ms(prove_started));
-        let mut stripped = 0_usize;
+        self.move_proven(
+            StripTarget {
+                session_id,
+                worktree,
+                pool,
+            },
+            candidates,
+            verdicts,
+            deadline,
+            venv_markers,
+            report,
+        )
+    }
+
+    /// The moving half of [`Self::prove_and_move`]: note each refused
+    /// verdict and move each proved candidate into the trash, in order.
+    /// Returns the relative paths moved.
+    pub(super) fn move_proven(
+        &self,
+        target: StripTarget<'_>,
+        candidates: &[StripCandidate],
+        verdicts: Vec<Result<(), &'static str>>,
+        deadline: Instant,
+        venv_markers: &[String],
+        report: &mut CheckoutStripReport,
+    ) -> Vec<String> {
+        let StripTarget {
+            session_id,
+            worktree,
+            pool,
+        } = target;
+        let mut stripped = Vec::new();
         for (candidate, verdict) in candidates.iter().zip(verdicts) {
             if let Err(code) = verdict {
                 note_refusal(report, code);
@@ -1874,13 +1987,26 @@ impl Broker {
             }
             let _move_span = crate::phase_telemetry::span("checkout_strip_move");
             let move_started = Instant::now();
-            let moved = crate::checkout_trash::move_directory_to_trash(
-                &pool,
-                &worktree,
-                &candidate.relative,
-                session.id,
-                &mut |trash_dir, entry, row| self.record_checkout_trash_row(trash_dir, entry, row),
-            );
+            #[cfg(test)]
+            let injected = FAIL_MOVE_FOR_TEST
+                .with(|cell| cell.borrow().as_deref() == Some(candidate.relative.as_str()));
+            #[cfg(not(test))]
+            let injected = false;
+            let moved = if injected {
+                Err(crate::checkout_trash::StripMoveRefusal::Failed(
+                    "failure injected by the test".into(),
+                ))
+            } else {
+                crate::checkout_trash::move_directory_to_trash(
+                    pool,
+                    worktree,
+                    &candidate.relative,
+                    session_id,
+                    &mut |trash_dir, entry, row| {
+                        self.record_checkout_trash_row(trash_dir, entry, row)
+                    },
+                )
+            };
             report.move_ms = report.move_ms.saturating_add(elapsed_ms(move_started));
             match moved {
                 Ok(moved) => {
@@ -1888,7 +2014,7 @@ impl Broker {
                         "confirm a stripped directory's trash entry",
                         self.record_checkout_trash_row(&moved.trash_dir, &moved.entry, moved.row),
                     );
-                    stripped += 1;
+                    stripped.push(candidate.relative.clone());
                     crate::phase_telemetry::add(
                         "checkout_strip_stripped_directory",
                         Duration::ZERO,
@@ -1906,7 +2032,7 @@ impl Broker {
                 }
             }
         }
-        CheckoutStrip::Done(stripped)
+        stripped
     }
 
     /// Count checkout folders from the broker's records and the pool
@@ -1936,11 +2062,25 @@ impl Broker {
             ..CheckoutBacklog::default()
         };
         let mut folders = BTreeSet::new();
+        let mut tombstones = BTreeSet::new();
         for session in live.iter().chain(closed.iter()) {
-            if folders.contains(session.worktree_path.as_str()) {
+            if folders.contains(session.worktree_path.as_str())
+                || tombstones.contains(session.worktree_path.as_str())
+            {
                 continue;
             }
             match listing.exists(&session.worktree_path, deadline) {
+                // A retired checkout's tombstone is no checkout folder (nor
+                // a closed one). Only a path no open session records can
+                // hold one, and one `lstat` of its note rules most folders
+                // out before the full check.
+                Some(true)
+                    if !open_paths.contains(session.worktree_path.as_str())
+                        && is_backlog_tombstone(Path::new(&session.worktree_path)) =>
+                {
+                    tombstones.insert(session.worktree_path.as_str());
+                    crate::phase_telemetry::add("checkout_strip_backlog_tombstone", Duration::ZERO);
+                }
                 Some(true) => {
                     folders.insert(session.worktree_path.as_str());
                 }
@@ -2010,9 +2150,17 @@ impl Broker {
         day.checkouts_stripped = day
             .checkouts_stripped
             .saturating_add(strip.checkouts_stripped);
+        day.checkouts_archived = day
+            .checkouts_archived
+            .saturating_add(report.retired_archived + report.retired_operation_archived);
+        day.archive_bytes = day.archive_bytes.saturating_add(report.archive_bytes);
         day.directories_stripped = day
             .directories_stripped
-            .saturating_add(strip.directories_stripped);
+            .saturating_add(strip.directories_stripped)
+            .saturating_add(report.idle_strip.strip.directories_stripped);
+        day.idle_checkouts_stripped = day
+            .idle_checkouts_stripped
+            .saturating_add(report.idle_strip.strip.checkouts_stripped);
         day.bytes_freed = day.bytes_freed.saturating_add(report.trash.stripped_bytes);
         while days.len() > STRIP_DAYS_KEPT {
             days.pop_first();
@@ -2057,6 +2205,8 @@ impl Broker {
                 .saturating_add(report.trash.stripped_bytes),
             days,
             venv_unexpected,
+            idle_backlog: report.idle_strip.idle_backlog,
+            last_idle_checkouts_stripped: report.idle_strip.strip.checkouts_stripped,
         }
     }
 
@@ -2362,6 +2512,85 @@ mod tests {
             .reduce(|best, row| if judges_before(row, best) { row } else { best })
             .unwrap();
         assert_eq!(best.id, 3);
+    }
+
+    /// A retired checkout's tombstone is no checkout folder: the backlog
+    /// (the storage ledger's checkout counts) counts neither it as a folder
+    /// nor as a closed one.
+    #[test]
+    fn the_backlog_does_not_count_a_tombstone_as_a_checkout_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repository = base.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&repository).unwrap();
+        let pool = base.join("pool");
+        let live_checkout = pool.join("closed-checkout");
+        std::fs::create_dir_all(live_checkout.join("node_modules")).unwrap();
+        let tombstone = pool.join("retired-checkout");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join(super::super::tombstone::TOMBSTONE_FILE),
+            format!("{}\n", super::super::tombstone::TOMBSTONE_HEADER),
+        )
+        .unwrap();
+        assert!(is_backlog_tombstone(&tombstone));
+        assert!(!is_backlog_tombstone(&live_checkout));
+        let row = |id: i64, path: &Path| Session {
+            id,
+            worktree_path: path.to_string_lossy().into_owned(),
+            branch: format!("agent/closed-{id}"),
+            origin: crate::SessionOrigin::Spawned,
+            status: crate::SessionStatus::Cleaned,
+            cleanup_state: crate::SessionCleanupState::Closed,
+            closed_at: Some(id * 1_000),
+            cleanup_completed_at: None,
+            task: None,
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            accepted_session_head: None,
+            accepted_integration_commit: None,
+            accepted_integration_tree: None,
+            accepted_queue_entry_id: None,
+            accepted_at: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            exit_code: None,
+            agent_identity: None,
+            repository_name: None,
+            tab_name: None,
+            ai_provider: None,
+            short_name: None,
+            created_at: id * 1_000 - 500,
+            updated_at: id * 1_000,
+            last_activity_at: id * 1_000,
+        };
+        let closed = [row(1, &live_checkout), row(2, &tombstone)];
+        let mut listing = PoolListing::default();
+
+        let backlog = broker.observe_checkout_backlog(
+            &mut listing,
+            &[],
+            &closed,
+            &BTreeSet::new(),
+            far(),
+            true,
+        );
+
+        assert_eq!(backlog.folders, 1, "{backlog:?}");
+        assert_eq!(backlog.closed_folders, 1, "{backlog:?}");
+        assert_eq!(backlog.closed_with_regenerable, 1, "{backlog:?}");
+        assert!(
+            tombstone
+                .join(super::super::tombstone::TOMBSTONE_FILE)
+                .is_file()
+        );
     }
 
     #[test]

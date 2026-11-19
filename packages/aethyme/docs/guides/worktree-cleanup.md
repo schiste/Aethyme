@@ -20,9 +20,9 @@ its branch. The broker makes the same close itself, with no `finish`, for an
 open session that has been inactive long enough: a spawned session whose every
 pull request merged and whose landed, clean checkout nothing uses
 (`session_merged_after_hours`, default 2 hours), any other landed clean session
-(`session_landed_after_hours`, 24 hours), a session that never committed and
+(`session_landed_after_hours`, 4 hours), a session that never committed and
 whose agent is gone (`session_no_work_abandoned_after_hours`, 4 hours), and any
-session without a live agent (`session_abandoned_after_hours`, 72 hours). See
+session without a live agent (`session_abandoned_after_hours`, 24 hours). See
 [automatic checkout maintenance](automatic-checkout-maintenance.md). `finish`
 closes and then, for a broker-spawned worktree whose cleanup
 is already proven safe, removes the checkout and its local session branch in the
@@ -476,6 +476,7 @@ keep = ["*-investigation"]     # worktrees never removed automatically
 unattended_unlinks_per_second = 1000 # background worker pace, also under load; 0 or "unlimited" = full speed
 abandoned_operation_after_hours = 24 # the default; a closed checkout's merge/rebase left in progress longer is archived, then retired
 venv_markers = [".env-check.json"] # exact file names your tooling writes at a .venv top (at most 16; never .env)
+idle_strip_after_hours = 4      # the default; an open session idle this long, with no process in its checkout, has its regenerable directories stripped (0 = off)
 ```
 
 The strip pass removes a closed checkout's `.venv` only when its top holds
@@ -487,6 +488,29 @@ write (`CACHEDIR.TAG`, `.gitignore`, `.lock`) and the names declared in
 tooling writes. Names must be exact file names: no path separator, no glob
 character, and never a credentials file (`.env`, `.env.*`, `.envrc`, `.netrc`,
 `.npmrc`, `.pypirc`).
+
+For an open session idle past `idle_strip_after_hours`, only what the
+session's own `.aethyme/prepare.toml` recreates is stripped, so
+`aethyme broker submit prepare --session <id>` rebuilds it:
+
+- a directory a step declares as an output, exactly (`node_modules/`);
+- a Python environment (`.venv` with `pyvenv.cfg`, proved as above) whose
+  interpreter a step declares as an output, which shows the step creates it:
+  `tools/.venv/bin/python` (or `tools/.venv/pyvenv.cfg`) in that step's
+  `outputs`. A step that only declares other files inside the environment
+  (`tools/.venv/bin/tool`) may just install into an environment made
+  elsewhere, so the environment stays (`environment_root_creation_unproven`);
+- a workspace member's `node_modules` that the strip proves is a pnpm member
+  (links into the top-level store, pnpm's shims), when the top-level
+  `node_modules/` is declared and actually moved in the same pass (or is
+  already gone),
+  so the declared install recreates root and members together. Otherwise the
+  members stay (`member_root_kept`).
+
+Everything else stays, counted as `not_declared_output`, and anything the
+proofs refuse stays with the same reason (`witness_missing`,
+`unexpected_content`, ...). Each run reports removed and kept directories
+and bytes per kind in its `checkout_idle_strip` attachment (`by_kind`).
 
 A `finish cleanup resolve` plan refuses a checkout holding an ignored
 directory nothing catalogues as regenerable. Pass
@@ -773,6 +797,47 @@ delete_merged_session_branches = false
 A retired checkout whose session branch was deleted can no longer be
 recreated with `start --reuse` at its old path; its work is already on the
 default branch, so start a new session instead.
+
+## Which copy of `[cleanup]` the background worker reads
+
+The detached background worker resolves once per run where every
+`[cleanup]` key comes from. It reads the `[cleanup]` table from the default
+branch that `refs/remotes/origin/HEAD` names, as last fetched (nothing is
+fetched), only when all of these hold:
+
+- the primary checkout's `.aethyme/config.toml` (and any `.yaml`/`.yml`
+  twin) equals the file at its own `HEAD` once Git's filters for that path
+  are applied (so line-ending conversion is not an edit): no local edit, no
+  untracked twin;
+- the default branch holds a different config file;
+- the primary checkout's `HEAD` is an ancestor of the default branch: it is
+  behind, not diverged;
+- the default-branch file parses and its `[cleanup]` table is valid.
+
+Without `origin/HEAD` it never falls back to the checked-out branch's
+upstream, which could be an unmerged branch, another remote or a local
+branch; run `git remote set-head origin --auto` to set it. In every other
+case it reads the primary checkout's working copy, as foreground commands
+always do. So a `[cleanup]` setting merged on the default branch takes
+effect in background cleanup even while the primary checkout's sync is held
+back by a live session or local changes. If the working copy's config
+changes during the run (size and modification time, then content), the rest
+of that run reads the working copy. The lookup is bounded to a few
+read-only Git calls and 5 seconds, and never fails cleanup.
+
+Each worker run counts its choice in its phase metrics
+(`cleanup_config_source_default_branch`, or
+`cleanup_config_source_working_copy_<reason>` with the reason `same`,
+`no_default_branch`, `default_branch_unreadable`, `head_unreadable`,
+`git_timeout`, `working_copy_not_regular_file`, `working_copy_unverifiable`,
+`local_edit`, `diverged` or `default_branch_unparsable`; and
+`cleanup_config_source_working_copy_changed_during_run` when the working
+copy changed mid-run) and times it (`cleanup_config_resolve`). Whenever the
+two copies differ, `broker status` shows advice `cleanup.config-source`:
+either the reason the working copy was kept, or that background cleanup
+follows the default branch while foreground commands and previews (cleanup
+plans, `finish`, `status`) still show the primary checkout's older settings
+until it is brought up to date.
 
 ## Maintenance during broker open
 

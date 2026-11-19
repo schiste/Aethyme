@@ -55,6 +55,14 @@ exit: 0
       cleaned, no open PR uses it as head and none is stacked on it; open
       PRs based on it are retargeted first, and the delete is leased on the
       merged head. --limit bounds the candidates read (default 25, max 200).
+  aethyme broker gc trash drain [--max-minutes <n>] [--json]
+      Drain this repository's checkout trash now, in the foreground, with
+      the lane the background worker runs: the single host-wide deleter,
+      paced, re-reading host pressure every 2 s and stopping at once at
+      critical memory pressure, in 30-second slices of 3 deleter threads,
+      until no entry is left to delete or --max-minutes (default 20, at
+      most 60) pass. Refused while another catch-up lane runs on this host.
+      Prints the entries removed, files per second and what remains.
   aethyme broker gc service plan [--json]
       Read-only macOS per-repository service plan for fixed `gc sweep --json`
       ticks every 900 seconds. Binds the immutable managed router/engine pair.

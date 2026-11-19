@@ -38,6 +38,7 @@ mod chau7_tabs;
 mod checkout_trash;
 mod cleanup_audit;
 mod cleanup_batch;
+mod cleanup_config;
 mod cleanup_resolve;
 mod clock;
 mod phase_telemetry;
@@ -290,6 +291,7 @@ mod verify_loop;
 mod version;
 mod worktree_freshness;
 mod worktree_reconcile;
+mod worktree_status_activity;
 
 pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,

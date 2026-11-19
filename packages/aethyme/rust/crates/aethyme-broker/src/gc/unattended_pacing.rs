@@ -177,9 +177,8 @@ pub(crate) fn parse_unlink_rate(value: Option<&toml::Value>) -> Result<UnlinkRat
 /// limit, and the error is reported in the run summary.
 pub(crate) fn load_unlink_rate(main_root: &Path) -> (UnlinkRate, Option<String>) {
     let loaded = (|| -> Result<UnlinkRate, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_unlink_rate(None);
         };
@@ -197,6 +196,23 @@ pub(crate) fn load_unlink_rate(main_root: &Path) -> (UnlinkRate, Option<String>)
             Some(error.chars().take(160).collect()),
         ),
     }
+}
+
+/// `[cleanup] unattended_unlinks_per_second` only when the repository's
+/// configuration sets it to a limit. Absent (the shipped default),
+/// unlimited, invalid or unreadable all give `None`: the checkout trash
+/// deleter uses an explicit setting as the ceiling of its paced modes and
+/// never mistakes the default for one.
+pub(crate) fn explicit_unlink_limit(main_root: &Path) -> Option<u32> {
+    let (_, text) = crate::cleanup_config::cleanup_config_toml(main_root).ok()??;
+    let root: toml::Value = toml::from_str(&text).ok()?;
+    explicit_unlink_limit_in(&root)
+}
+
+/// [`explicit_unlink_limit`] on a parsed configuration.
+pub(crate) fn explicit_unlink_limit_in(root: &toml::Value) -> Option<u32> {
+    let value = root.get("cleanup")?.get(UNLINK_RATE_CONFIG_KEY)?;
+    parse_unlink_rate(Some(value)).ok()?.limit()
 }
 
 /// Time source for the limiter; tests inject a fake one.
@@ -2156,6 +2172,35 @@ mod tests {
         ] {
             assert!(parse_unlink_rate(Some(&invalid)).is_err(), "{invalid:?}");
         }
+    }
+
+    /// Only an explicit limit is a ceiling for the trash deleter: the
+    /// default, unlimited and invalid values are not.
+    #[test]
+    fn only_an_explicit_rate_is_a_trash_deleter_ceiling() {
+        let parse = |text: &str| explicit_unlink_limit_in(&toml::from_str(text).unwrap());
+        assert_eq!(
+            parse("[cleanup]\nunattended_unlinks_per_second = 500\n"),
+            Some(500)
+        );
+        assert_eq!(
+            parse("[cleanup]\nother = 1\n"),
+            None,
+            "absent is not a ceiling"
+        );
+        assert_eq!(parse(""), None);
+        assert_eq!(
+            parse("[cleanup]\nunattended_unlinks_per_second = 0\n"),
+            None
+        );
+        assert_eq!(
+            parse("[cleanup]\nunattended_unlinks_per_second = \"unlimited\"\n"),
+            None
+        );
+        assert_eq!(
+            parse("[cleanup]\nunattended_unlinks_per_second = \"fast\"\n"),
+            None
+        );
     }
 
     #[test]

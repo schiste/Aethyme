@@ -529,6 +529,8 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         first["data_freshness"]["global_warnings"],
         "recorded_partial"
     );
+    assert_eq!(first["peer_state"]["pre_edit"]["action"], "continue");
+    assert!(first["peer_state"]["pre_edit"]["peer"].is_null());
     let revision = first["revision"].as_str().unwrap();
     let other = add_worktree(fixture.path(), &fixture.worktree_root(), "view-other");
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
@@ -577,6 +579,17 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         peer_change["changed_sections"]["peer_state"]["lease_count"],
         1
     );
+    let decision = &peer_change["changed_sections"]["peer_state"]["pre_edit"];
+    assert_eq!(decision["action"], "continue");
+    assert_eq!(decision["peer"]["session_id"], peer.id);
+    assert_eq!(decision["peer"]["task"], "unrelated");
+
+    let waiting = json_status(&other, &["status", "--json"]);
+    let decision = &waiting["peer_state"]["pre_edit"];
+    assert_eq!(decision["action"], "wait");
+    assert_eq!(decision["peer"]["session_id"], session.id);
+    assert!(decision["command"].is_null());
+
     std::fs::write(worktree.join("new-view.txt"), "changed").unwrap();
     git(&worktree, &["add", "new-view.txt"]);
     git(&worktree, &["commit", "-qm", "change session"]);

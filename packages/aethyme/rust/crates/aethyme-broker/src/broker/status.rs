@@ -164,6 +164,25 @@ impl Broker {
         {
             advice.push(row);
         }
+        if crate::preparation::stripped_since_prepared(&self.main_root, session_id) {
+            crate::phase_telemetry::add(
+                "status_idle_strip_prepare_advice",
+                std::time::Duration::ZERO,
+            );
+            advice.push(StatusAdvice {
+                id: "idle_strip_prepare",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "dependencies_stripped_while_idle",
+                summary: format!(
+                    "session {session_id}'s regenerable dependency directories were removed while \
+                     it was idle; its work is untouched; prepare it again before building or testing"
+                ),
+                session_id: Some(session_id),
+                queue_entry_id: None,
+                evidence: Vec::new(),
+                commands: vec![crate::preparation::prepare_command(session_id)],
+            });
+        }
         advice.extend(stalled_submit_advice(
             &crate::submit_progress::in_flight_for_sessions(
                 &self.main_root,
@@ -345,6 +364,7 @@ impl Broker {
             now_ms,
         ));
         advice.extend(crate::merged_branches::status_advice(&self.store));
+        advice.extend(crate::cleanup_config::status_advice(&self.store));
         phase_timings_ms.insert(
             "main_checkout".into(),
             phase_started.elapsed().as_millis() as u64,
@@ -1237,6 +1257,7 @@ impl Broker {
             now_ms,
         ));
         advice.extend(crate::merged_branches::status_advice(&self.store));
+        advice.extend(crate::cleanup_config::status_advice(&self.store));
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;

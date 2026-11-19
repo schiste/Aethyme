@@ -51,5 +51,5 @@ pub use pipeline::{
     build_index_records, default_registry, index_repo_to_disk, index_repo_to_disk_with,
 };
 pub use python::PythonIndexer;
-pub use rust_lang::RustIndexer;
+pub use rust_lang::{RustIndexer, replace_rust_calls};
 pub use typescript::TypeScriptIndexer;
