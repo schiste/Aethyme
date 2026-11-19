@@ -411,9 +411,16 @@ worktree watcher shows the worktree unchanged since a stored answer
 (`worktree_watch.rs`). With one file-system stream for every worktree, a
 flagged event loss or a watch-set change outdated every stored answer; on the
 busiest repository `agents` reused 970 of 10,184 answers in a day. On macOS the
-watcher now gives each worktree its own stream, so a loss, an error or a
-watch-set change outdates only the worktree it concerns. Other platforms keep
-one shared stream, because there a stream costs a per-user inotify instance.
+watcher now gives up to 128 worktrees their own stream, the most recently asked
+about first, so a loss, an error or a watch-set change outdates only the
+worktree it concerns. Worktrees past the cap, or whose own stream does not
+start, share one stream; its losses and watch-set changes outdate only the
+worktrees on it. A placement is kept until the worktree is forgotten. Other
+platforms put every worktree on the shared stream, because there a stream costs
+a per-user inotify instance. A worktree whose watch starts nowhere is retried
+after 1 s, doubling to 240 s, instead of every second. Expected idle cost of an
+own stream on macOS: one thread (2 MiB of stack reserved, a few pages touched),
+one run loop and an fseventsd client over Mach ports; no file descriptor.
 What counts as a change, the claim protocol, the answer's key (counter,
 baseline commit, index identity, maximum age) and the commands allowed to
 reuse (`agents`, `status`) are unchanged; `submit` and every other deciding
@@ -433,12 +440,17 @@ command still always ask Git.
   in the existing `changed_files_asked_git` span. Hit rate:
   `changed_files_reused / (changed_files_reused + changed_files_asked_git)`.
 - **Watcher status fields (introduced).** `status.json` in the
-  `worktree-watch-v2` host-state directory gains `stream_per_worktree`
-  (boolean), `rescans_scoped` (errors and flagged losses confined to one
+  `worktree-watch-v2` host-state directory gains the gauges `own_stream_cap`,
+  `own_streams`, `shared_streams` (0 or 1), `watched_on_shared` and
+  `stream_threads` (own plus shared streams, one event-loop thread each), and
+  the counters `rescans_scoped` (errors and flagged losses confined to one
   worktree's own stream), `watch_set_changes` (reviews that started or stopped
-  watching a worktree) and `watch_failures` (watches that could not start;
-  that worktree is asked of Git). `rescans` now counts only invalidations of
-  every watched worktree: shared-stream losses, errors and watch-set changes.
+  watching a worktree), `watch_failures` (watches that could not start
+  anywhere; that worktree is asked of Git), `watch_fell_back_to_shared`
+  (worktrees put on the shared stream although own streams were allowed) and
+  `watch_retries_deferred` (reviews that skipped a worktree waiting for its
+  retry). `rescans` now counts invalidations of the worktrees on the shared
+  stream: its losses, errors and watch-set changes.
   The directory's on-disk protocol is unchanged, so its version suffix is too.
   Readers must tolerate missing fields from older watchers.
 
