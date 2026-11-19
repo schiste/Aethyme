@@ -1314,7 +1314,20 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     // runs startup maintenance, which a refused command must not trigger.
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
-    refuse_new_session_on_main_checkout(&mut broker, &path, parsed.allow_main_checkout)?;
+    // A retired checkout is not a Git repository until it is restored. Its
+    // recorded path must not be the main checkout, even for reuse.
+    let restoring = mode == crate::AdoptMode::Reuse
+        && (!path.exists() || crate::broker::is_checkout_tombstone(&path));
+    if restoring && !parsed.allow_main_checkout {
+        let main = broker.main_root_path();
+        let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        if same_file(&path, &main) || absolute == main {
+            return Err(crate::BrokerOpError::AdoptMainCheckoutRefused {
+                path: main.to_string_lossy().into_owned(),
+            }
+            .into());
+        }
+    }
     // A checkout the broker retired after its session closed is recreated
     // from the session branch, or refused with the archive holding its
     // leftovers; reuse never fails on a missing path.
@@ -1333,6 +1346,8 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             checkout_restored = crate::broker::take_last_checkout_restore();
         }
     }
+    // Check the actual restored repository as well as ordinary adoption.
+    refuse_new_session_on_main_checkout(&mut broker, &path, parsed.allow_main_checkout)?;
     let previous_session = if mode == crate::AdoptMode::Reuse {
         let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         broker
