@@ -43,10 +43,15 @@ pub(crate) const NOTICE_KEY: &str = "stale_closing_notice_hours";
 /// windows would close.
 pub(crate) const AUTO_CLOSE_KEY: &str = "stale_session_auto_close";
 
-pub(crate) const DEFAULT_LANDED_HOURS: i64 = 24;
-pub(crate) const DEFAULT_PUSHED_HOURS: i64 = 72;
-pub(crate) const DEFAULT_UNPUSHED_HOURS: i64 = 168;
-pub(crate) const DEFAULT_NOTICE_HOURS: i64 = 24;
+// Safety comes from saving the work, not from waiting: landed, merged and
+// no-commit sessions close after 4 h idle, pushed-unmerged after a day
+// (branch and pull request untouched), unpushed or uncommitted after a day
+// through the verified recovery archive. The closing-soon notice is counted
+// inside these windows, not added on top. (Before: 24 h, 72 h, 168 h, 24 h.)
+pub(crate) const DEFAULT_LANDED_HOURS: i64 = 4;
+pub(crate) const DEFAULT_PUSHED_HOURS: i64 = 24;
+pub(crate) const DEFAULT_UNPUSHED_HOURS: i64 = 24;
+pub(crate) const DEFAULT_NOTICE_HOURS: i64 = 4;
 
 /// Longest window a key accepts: one year.
 const MAX_HOURS: i64 = 8_760;
@@ -219,9 +224,8 @@ impl StaleSessionPolicy {
     /// missing file, table or key is the default; an invalid value is an
     /// error, which keeps the session open.
     pub(crate) fn load(main_root: &Path) -> Result<Self, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Self::default());
         };
@@ -784,20 +788,59 @@ mod tests {
     }
 
     #[test]
-    fn the_default_windows_are_one_three_and_seven_days() {
+    fn the_default_windows_are_four_hours_then_a_day() {
         let policy = StaleSessionPolicy::default();
-        assert_eq!(policy.window_ms(StaleWorkClass::Landed), 24 * HOUR_MS);
+        assert_eq!(policy.window_ms(StaleWorkClass::Landed), 4 * HOUR_MS);
         assert_eq!(
             policy.window_ms(StaleWorkClass::PushedUnmerged),
-            72 * HOUR_MS
+            24 * HOUR_MS
         );
-        assert_eq!(policy.window_ms(StaleWorkClass::Unpushed), 168 * HOUR_MS);
-        assert_eq!(policy.notice_ms, 24 * HOUR_MS);
+        assert_eq!(policy.window_ms(StaleWorkClass::Unpushed), 24 * HOUR_MS);
+        assert_eq!(policy.notice_ms, 4 * HOUR_MS);
+        // The notice is counted inside the window: unpushed work is noted
+        // at 20 h and closes at 24 h.
+        let activity = 1_000 * HOUR_MS;
+        assert_eq!(
+            policy.judge(
+                StaleWorkClass::Unpushed,
+                activity,
+                activity + 19 * HOUR_MS,
+                None
+            ),
+            StaleClassVerdict::NotDue {
+                due_at_ms: activity + 24 * HOUR_MS,
+                revisit_at_ms: activity + 20 * HOUR_MS,
+            }
+        );
+        assert_eq!(
+            policy.judge(
+                StaleWorkClass::Unpushed,
+                activity,
+                activity + 24 * HOUR_MS,
+                Some(activity + 20 * HOUR_MS)
+            ),
+            StaleClassVerdict::Due {
+                due_at_ms: activity + 24 * HOUR_MS
+            }
+        );
+    }
+
+    /// The windows these judgement tests were written against (the
+    /// defaults before 4 h / 24 h): the judgement itself does not depend on
+    /// which numbers are shipped.
+    fn week_long_windows() -> StaleSessionPolicy {
+        StaleSessionPolicy {
+            landed_ms: 24 * HOUR_MS,
+            pushed_ms: 72 * HOUR_MS,
+            unpushed_ms: 168 * HOUR_MS,
+            notice_ms: 24 * HOUR_MS,
+            auto_close: true,
+        }
     }
 
     #[test]
     fn a_class_closes_only_past_its_window() {
-        let policy = StaleSessionPolicy::default();
+        let policy = week_long_windows();
         let activity = 1_000 * HOUR_MS;
         // Landed work needs no notice.
         assert_eq!(
@@ -841,7 +884,7 @@ mod tests {
 
     #[test]
     fn work_closes_only_after_a_note_has_stood_for_the_notice_period() {
-        let policy = StaleSessionPolicy::default();
+        let policy = week_long_windows();
         let activity = 1_000 * HOUR_MS;
         let due = activity + 72 * HOUR_MS;
         let class = StaleWorkClass::PushedUnmerged;

@@ -1048,6 +1048,18 @@ pub fn scan_root_within(
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
+        // A retired checkout's tombstone is no worktree: it holds no build
+        // output, and the note in it points at saved work.
+        .filter(|path| {
+            let tombstone = crate::broker::is_checkout_tombstone(path);
+            if tombstone {
+                crate::phase_telemetry::add(
+                    "reclaim_discovery_tombstone_skipped",
+                    std::time::Duration::ZERO,
+                );
+            }
+            !tombstone
+        })
         .collect();
     worktrees.sort();
     for worktree in &worktrees {
@@ -3334,6 +3346,32 @@ mod budget_tests {
         assert!(complete.complete);
         assert_eq!(complete.worktrees_not_scanned, 0);
         assert!(all.iter().all(|candidate| candidate.bytes.is_none()));
+    }
+
+    #[test]
+    fn discovery_does_not_treat_a_retired_checkout_tombstone_as_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("a/target/x"), 4);
+        let tombstone = tmp.path().join("retired");
+        std::fs::create_dir(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join("ARCHIVED-SESSION.txt"),
+            "aethyme: retired session checkout\narchive: none\n",
+        )
+        .unwrap();
+
+        let (found, discovery) =
+            scan_root_within(tmp.path(), &[], &[], Sizing::Skip, &mut || false);
+
+        assert!(discovery.complete);
+        assert_eq!(discovery.worktrees_scanned, 1, "{discovery:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(&tombstone))
+        );
+        assert!(tombstone.join("ARCHIVED-SESSION.txt").is_file());
     }
 
     #[test]

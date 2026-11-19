@@ -5089,11 +5089,21 @@ impl Broker {
     ) -> Result<Self, BrokerOpError> {
         let mut storage_context = BrokerStorageContext::capture(options);
         storage_context.ensure_valid()?;
-        let here = GitRepo::discover(path_inside_repo)?;
-        let main_root = here.main_root()?;
-        let repo = GitRepo::discover(&main_root)?;
-        storage_context.bind_repository(&repo)?;
-        let store = BrokerStore::open_in_repo(&main_root)?;
+        let (repo, main_root) = {
+            let _span = crate::phase_telemetry::span("broker_open_repository_discovery");
+            let here = GitRepo::discover(path_inside_repo)?;
+            let main_root = here.main_root()?;
+            let repo = GitRepo::discover(&main_root)?;
+            (repo, main_root)
+        };
+        {
+            let _span = crate::phase_telemetry::span("broker_open_storage_binding");
+            storage_context.bind_repository(&repo)?;
+        }
+        let store = {
+            let _span = crate::phase_telemetry::span("broker_open_database");
+            BrokerStore::open_in_repo(&main_root)?
+        };
         let mut broker = Self {
             repo,
             store,
@@ -5114,6 +5124,7 @@ impl Broker {
             #[cfg(test)]
             worktree_lifecycle_test_observer: None,
         };
+        let setup = crate::phase_telemetry::span("broker_open_policy_and_preparation");
         // Fresh staged stores already have a repository-scoped bootstrap
         // identity, so a separate pinned cache root can be initialized without
         // selecting or creating a worktree root. Legacy-unbound stores defer
@@ -5143,35 +5154,53 @@ impl Broker {
         // requires collaboration capture. Best effort: the open never fails
         // because of it.
         broker.collaboration_fence_state(FenceTrigger::Open);
-        broker.backfill_live_repository_contracts()?;
+        drop(setup);
+        let _recovery = crate::phase_telemetry::span("broker_open_recovery");
+        {
+            let _span = crate::phase_telemetry::span("open_contract_backfill");
+            broker.backfill_live_repository_contracts()?;
+        }
         // Record outcomes a busy database could not take when their child
-        // exited, before anything reads rows that may still say `running`.
-        // Best effort: a journal left behind is retried by the next opener
-        // and by every coordinated write before its write-block check.
-        crate::warn_unrecorded(
-            "replay pending coordinated operation outcomes",
-            broker.replay_operation_outcome_journals("broker_open"),
-        );
-        broker.reap_abandoned_prepared_operations()?;
-        // Best effort: an unresolved repeatable fetch keeps blocking only
-        // until the next write reaches its lock, which retries the same step.
-        crate::warn_unrecorded(
-            "auto-resolve interrupted repeatable fetches",
-            broker.auto_resolve_abandoned_repeatable_fetches(),
-        );
-        broker.recover_prepared_reconciliation()?;
+        // exited, before anything reads rows that may still say running.
+        {
+            let _span = crate::phase_telemetry::span("open_operation_outcome_replay");
+            crate::warn_unrecorded(
+                "replay pending coordinated operation outcomes",
+                broker.replay_operation_outcome_journals("broker_open"),
+            );
+        }
+        {
+            let _span = crate::phase_telemetry::span("open_prepared_operation_reap");
+            broker.reap_abandoned_prepared_operations()?;
+        }
+        // A repeatable fetch whose outcome is still unresolved can be retried
+        // at the next write-lock boundary.
+        {
+            let _span = crate::phase_telemetry::span("open_repeatable_fetch_recovery");
+            crate::warn_unrecorded(
+                "auto-resolve interrupted repeatable fetches",
+                broker.auto_resolve_abandoned_repeatable_fetches(),
+            );
+        }
+        {
+            let _span = crate::phase_telemetry::span("open_integration_reconciliation");
+            broker.recover_prepared_reconciliation()?;
+        }
         // Best effort: only an already-confirmed journal may be resumed here.
         // If current eligibility or an older journal's missing fingerprint
         // prevents continuation, leave the journal for explicit review and
         // report the refusal instead of hiding it.
-        match startup_gc_maintenance {
-            StartupGcMaintenance::Full => {
-                crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+        {
+            let _span = crate::phase_telemetry::span("open_gc_maintenance");
+            match startup_gc_maintenance {
+                StartupGcMaintenance::Full => {
+                    crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+                }
+                StartupGcMaintenance::ConfirmedJournalOnly => crate::warn_unrecorded(
+                    "resume confirmed GC journal",
+                    broker.resume_confirmed_gc_journal_only(),
+                ),
             }
-            StartupGcMaintenance::ConfirmedJournalOnly => crate::warn_unrecorded(
-                "resume confirmed GC journal",
-                broker.resume_confirmed_gc_journal_only(),
-            ),
         }
         Ok(broker)
     }
@@ -8000,9 +8029,9 @@ impl Broker {
         &self,
         base: &str,
         planned_paths: &[String],
+        config: Result<Option<crate::worktree_location::WorktreeLocationConfig>, String>,
     ) -> (Vec<String>, Option<String>) {
-        let settings = match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
-        {
+        let settings = match config {
             Ok(Some(settings)) => settings,
             Ok(None) => return (Vec::new(), None),
             Err(error) => {
@@ -8069,15 +8098,33 @@ impl Broker {
         // verify-only mode selection below already uses the fetched default.
         // Reconciling here reads historical promotions and can wait on an
         // unrelated writer; submit and sync refresh integration themselves.
-        let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
+        // Base selection and sparse planning use the same configuration read
+        // after the fetch. Checkout admission below makes its own observations
+        // under the lifecycle claim.
+        let default = self.repo.upstream_default_checked();
+        let config = crate::merge::repository_config_from_default_observation(&self.repo, &default);
+        let text = config
+            .as_ref()
+            .ok()
+            .and_then(|source| source.as_ref())
+            .map(|(text, _)| text.as_str());
+        let (selected_promote, _) = crate::merge::PromoteConfig::from_text(text);
         let mut start_base = timed_start_phase(&mut phase_timings_ms, "base_selection", || {
-            self.select_session_start_base_with_promote(explicit_base, &selected_promote)
+            let upstream = default.unwrap_or_else(|_| self.repo.upstream_default());
+            self.select_session_start_base_from_upstream(explicit_base, &selected_promote, upstream)
         })?;
         refresh.record(&mut start_base);
-        // The sparse plan reads only configuration and the selected base
-        // commit's tree, never the checkout pool, so it needs no claim.
+        let worktrees = match config {
+            Ok(Some((text, _))) => {
+                crate::worktree_location::WorktreeLocationConfig::from_config_text(&text)
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        };
+        // The sparse plan reads only the selected base commit's tree, never
+        // the checkout pool, so it needs no claim.
         let (sparse_paths, sparse_plan_fallback) =
-            self.sparse_paths_for_new_session(&start_base.commit, planned_paths);
+            self.sparse_paths_for_new_session(&start_base.commit, planned_paths, worktrees);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation
         // writes the marker and build defaults, so it belongs under the same
@@ -10722,16 +10769,17 @@ impl Broker {
     }
 
     /// Compare a chosen start base against the fetched default branch.
-    pub(super) fn start_base_drift(
+    fn start_base_drift(
         &self,
         commit: &str,
+        upstream: Option<&(String, String)>,
     ) -> (Option<u64>, Option<u64>, Option<String>) {
-        let Some((upstream_ref, upstream_head)) = self.repo.upstream_default() else {
+        let Some((upstream_ref, upstream_head)) = upstream else {
             return (None, None, None);
         };
-        let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
-        let ahead = self.repo.commit_count_between(&upstream_head, commit).ok();
-        (behind, ahead, Some(upstream_ref))
+        let behind = self.repo.commit_count_between(commit, upstream_head).ok();
+        let ahead = self.repo.commit_count_between(upstream_head, commit).ok();
+        (behind, ahead, Some(upstream_ref.clone()))
     }
 
     /// Choose the commit a new session's branch is cut from.
@@ -10752,6 +10800,19 @@ impl Broker {
         explicit: Option<&str>,
         promote: &crate::merge::PromoteConfig,
     ) -> Result<SessionStartBase, BrokerOpError> {
+        self.select_session_start_base_from_upstream(
+            explicit,
+            promote,
+            self.repo.upstream_default(),
+        )
+    }
+
+    fn select_session_start_base_from_upstream(
+        &self,
+        explicit: Option<&str>,
+        promote: &crate::merge::PromoteConfig,
+        upstream: Option<(String, String)>,
+    ) -> Result<SessionStartBase, BrokerOpError> {
         if let Some(reference) = explicit {
             let Some(commit) = self.repo.resolve_ref(reference) else {
                 return Err(BrokerOpError::StartBaseUnavailable {
@@ -10761,7 +10822,7 @@ impl Broker {
                 });
             };
             let (behind_default_commits, ahead_default_commits, default_ref) =
-                self.start_base_drift(&commit);
+                self.start_base_drift(&commit, upstream.as_ref());
             return Ok(SessionStartBase {
                 ref_name: reference.to_string(),
                 commit,
@@ -10777,12 +10838,10 @@ impl Broker {
         }
         let integration_ref = format!("refs/heads/{}", promote.branch);
         let integration = self.repo.resolve_ref(&integration_ref);
-        let upstream = self.repo.upstream_default();
-
-        if let Some((upstream_ref, upstream_commit)) = upstream {
+        if let Some((upstream_ref, upstream_commit)) = upstream.as_ref() {
             let bypassed_integration = integration.map(|commit| {
                 let (behind_default_commits, ahead_default_commits, _) =
-                    self.start_base_drift(&commit);
+                    self.start_base_drift(&commit, upstream.as_ref());
                 BypassedIntegration {
                     ref_name: integration_ref,
                     commit,
@@ -10794,11 +10853,11 @@ impl Broker {
             });
             return Ok(SessionStartBase {
                 ref_name: format!("refs/remotes/{upstream_ref}"),
-                commit: upstream_commit,
+                commit: upstream_commit.clone(),
                 evidence: SessionStartBaseEvidence::FetchedDefaultBranch,
                 behind_default_commits: Some(0),
                 ahead_default_commits: Some(0),
-                default_ref: Some(upstream_ref),
+                default_ref: Some(upstream_ref.clone()),
                 bypassed_integration,
                 fetched: None,
                 fetch_error: None,

@@ -73,6 +73,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   sufficient headroom and smoke-test session creation there. Keep all arms on
   the same volume. On macOS, a short temporary symlink to that directory can
   keep a compiler cache's Unix socket within the platform path limit.
+  If the shared cache daemon still uses a retired session's temp path,
+  set `RUSTC_WRAPPER=` for the isolated build and leave the daemon running.
   Pass the resolved directory to Codex sandboxed trials because the workspace
   sandbox rejects symlinked writable roots.
 
@@ -85,7 +87,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   readings rather than treating a harness correction as a retroactive fix.
   Before long runs, exercise success, nonzero exit, and timeout controls through
   the exact runner; signal only the owned process group before reaping it.
-  Verify semantic output equality before comparing speed.
+  Verify semantic output equality before comparing speed. For a fast path
+  conditioned on retained state, create that state through the real command
+  and require a telemetry hit in the smoke test. Measure a fresh-state
+  control too.
 
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and inspect the actual `SessionStart` payload. For
@@ -93,6 +98,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   keep release checks out of the measurement. For linked worktrees, verify
   the agent can stage in its own fixture Git index in both the initial and
   conflict-repair turns.
+
+- For concurrent-agent comparisons, register both worktrees and their task
+  scopes before launching either worker. Use the same ordered integration and
+  repair rules in every arm, then verify both features on the final tree. A
+  scripted peer applied after publication measures conflict repair only.
+  Keep the setup coordinator from becoming the worker's session holder, and
+  verify each real worker can publish from its own sandbox before timing.
 
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
@@ -242,6 +254,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
   which Git ignores. Require nonempty start events and a positive control that
   captures the exact Git command shape the regression intends to forbid.
+  Record whether `refs/remotes/origin/HEAD` exists and whether the Git binary
+  validation cache is warm. Coordinated pushes use a private Trace2 sink. On a
+  disposable local remote, add `GIT_TRACE` and confirm it captures the actual
+  `git push` before treating the external trace as a complete call inventory.
+  Before batching Git reads, search existing Trace2 assertions for the old
+  subcommands and their ref or path arguments. Update affected assertions to
+  verify the replacement call and keep the checks for fresh, successful reads.
+- If host pressure delays local benchmark builds, reuse the repository's
+  hosted test archives for both exact revisions. Verify the same platform
+  and build profile, then extract and hash each router and engine pair in
+  separate scratch directories. Run both arms on one host.
 - When combining Git identity queries, preserve checkout-context checks.
   `--git-common-dir` succeeds in bare repositories too; require an explicit
   true `--is-inside-work-tree` result when checkout evidence is needed. Compare

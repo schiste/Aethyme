@@ -214,6 +214,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | DIRTY_DIRECTORY
                 | CHECKOUTS_DIRECTORY
                 | SESSION_SCRATCH_DIRECTORY
+                | RECOVERY_ARCHIVE_USAGE_DIRECTORY
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE => Class::Coordination,
@@ -311,6 +312,12 @@ pub struct Budgets {
     /// manifest's creation (never sooner than their own minimum retention,
     /// nor than a week after the ledger first saw them); 0 turns it off.
     pub unlanded_archive_days: u64,
+    /// Whether an archive holding unlanded commits or uncommitted changes
+    /// may expire by age at all. Off by default: at its age such an archive
+    /// is kept and named in advice (with its session and restore command)
+    /// until its owner dismisses it (`storage keep-archive <id> --dismiss`)
+    /// or this is turned on. Fully landed archives expire either way.
+    pub expire_unlanded_archives: bool,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -332,7 +339,10 @@ impl Default for Budgets {
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
             hard_minimum_bytes: 2 * GIB,
-            unlanded_archive_days: 30,
+            // Archive-then-delete keeps idle work only in its archive, so
+            // archives are kept a quarter (was 30 days).
+            unlanded_archive_days: 90,
+            expire_unlanded_archives: false,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
@@ -556,6 +566,10 @@ pub struct PassReport {
     pub skipped: Vec<String>,
     /// Recovery archives kept over budget because their work is not landed.
     pub unlanded_archives: Vec<String>,
+    /// Of those, archives kept at their retention age because they hold
+    /// unlanded work (never expired by age alone).
+    #[serde(default)]
+    pub unlanded_archives_at_age: Vec<String>,
     /// Why age expiry was paused this pass (`clock_went_back` or
     /// `gap_over_7_days`), and how many notices it restarted.
     #[serde(default)]
@@ -847,6 +861,156 @@ pub fn record_session_scratch_usage(
     write_atomically(&directory.join(name), &bytes)
 }
 
+/// Per-repository recovery archive usage the retirement lane writes after
+/// each run (`<host state>/storage-ledger-recovery-archives/<sha256 of the
+/// repository root>.json`): bytes and counts by location (the pool's volume,
+/// where new archives go, and host state, where older ones stay), the
+/// repository's bound and what the bound removed. Shown as
+/// `recovery_archives_by_location` by `aethyme storage status`.
+pub const RECOVERY_ARCHIVE_USAGE_DIRECTORY: &str = "storage-ledger-recovery-archives";
+
+/// Archives in one location.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveLocationUsage {
+    pub archives: usize,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
+/// One repository's recovery archives against its bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryArchiveUsage {
+    /// Archives on the pool's volume (where new ones are written).
+    pub pool: ArchiveLocationUsage,
+    /// Archives in host state (written before the move; still restorable).
+    pub host_state: ArchiveLocationUsage,
+    /// `[cleanup] recovery_archive_bound_gib` in bytes (`0`: off).
+    pub bound_bytes: u64,
+    pub over_bound: bool,
+    /// Archives holding work that exists nowhere else, kept although the
+    /// total is over the bound.
+    pub unique_kept_over_bound: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_kept_sessions: Vec<i64>,
+    /// Removed for size by the last pass.
+    pub evicted: usize,
+    pub evicted_bytes: u64,
+    /// Removed for size, all passes.
+    #[serde(default)]
+    pub evicted_total: usize,
+    #[serde(default)]
+    pub evicted_bytes_total: u64,
+    /// The measurement stopped at its deadline (a lower bound).
+    pub partial: bool,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct RecoveryArchiveUsageRecord {
+    repository: String,
+    usage: RecoveryArchiveUsage,
+}
+
+/// The recovery archive usage of every repository that recorded it.
+pub fn recovery_archive_usage(host_state: &Path) -> BTreeMap<String, RecoveryArchiveUsage> {
+    let Ok(listing) = fs::read_dir(host_state.join(RECOVERY_ARCHIVE_USAGE_DIRECTORY)) else {
+        return BTreeMap::new();
+    };
+    listing
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<RecoveryArchiveUsageRecord>(&bytes).ok())
+        .map(|record| (record.repository, record.usage))
+        .collect()
+}
+
+/// Record `repository`'s recovery archive usage in its own file, written
+/// atomically: only this repository's worker writes it.
+pub fn record_recovery_archive_usage(
+    host_state: &Path,
+    repository: &str,
+    usage: RecoveryArchiveUsage,
+) -> io::Result<()> {
+    use sha2::Digest as _;
+    let directory = host_state.join(RECOVERY_ARCHIVE_USAGE_DIRECTORY);
+    fs::create_dir_all(&directory)?;
+    let name = format!("{:x}.json", sha2::Sha256::digest(repository.as_bytes()));
+    let bytes = serde_json::to_vec(&RecoveryArchiveUsageRecord {
+        repository: repository.to_string(),
+        usage,
+    })
+    .map_err(io::Error::other)?;
+    write_atomically(&directory.join(name), &bytes)
+}
+
+/// One measured archive in [`ArchiveBoundState`]: a complete archive
+/// never changes, so its size, measured once, stays valid while the same
+/// archive (same path, same creation time) is there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredArchiveSize {
+    pub created_at_ms: i64,
+    pub bytes: u64,
+}
+
+fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
+    use sha2::Digest as _;
+    // Beside the usage record, with an extension the usage reader skips.
+    host_state
+        .join(RECOVERY_ARCHIVE_USAGE_DIRECTORY)
+        .join(format!(
+            "{:x}.archive-sizes",
+            sha2::Sha256::digest(repository.as_bytes())
+        ))
+}
+
+/// What `repository`'s archive bound pass carries from one run to the
+/// next, so a large backlog is worked through over several runs instead of
+/// redone (or stalled on) every run. Paths are archive directories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveBoundState {
+    /// Sizes measured before. Only completed walks of archives the broker
+    /// owns are kept; a failed walk is never recorded.
+    #[serde(default)]
+    pub sizes: BTreeMap<String, MeasuredArchiveSize>,
+    /// Archives whose size walk ran out of budget, with when: measured
+    /// after the others next run, with what budget is left.
+    #[serde(default)]
+    pub size_deferred_at_ms: BTreeMap<String, i64>,
+    /// Archives whose removal proof ran out of budget or failed, with
+    /// when: later runs rotate past them and retry each, first and with a
+    /// fresh budget, once its retry delay has passed.
+    #[serde(default)]
+    pub proof_deferred_at_ms: BTreeMap<String, i64>,
+    /// The last archive an interrupted listing reached; the next listing
+    /// resumes after it. `None` once a listing reaches every archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_cursor: Option<String>,
+}
+
+/// `repository`'s [`ArchiveBoundState`] (empty when none was recorded or
+/// it cannot be read: the pass then measures from scratch).
+pub fn archive_bound_state(host_state: &Path, repository: &str) -> ArchiveBoundState {
+    fs::read(recovery_archive_sizes_path(host_state, repository))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Record `repository`'s [`ArchiveBoundState`], written atomically.
+pub fn record_archive_bound_state(
+    host_state: &Path,
+    repository: &str,
+    state: &ArchiveBoundState,
+) -> io::Result<()> {
+    let path = recovery_archive_sizes_path(host_state, repository);
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    write_atomically(&path, &serde_json::to_vec(state).map_err(io::Error::other)?)
+}
+
 thread_local! {
     /// Entries visited by walks on this thread, so tests can prove a path
     /// never walks.
@@ -975,7 +1139,9 @@ fn child_names(class: Class, path: &Path) -> Vec<String> {
                     read_names(&group_path)
                         .into_iter()
                         // Keep markers sit beside archives; they are not one.
-                        .filter(|name| !name.ends_with(KEEP_SUFFIX))
+                        .filter(|name| {
+                            !name.ends_with(KEEP_SUFFIX) && !name.ends_with(DISMISS_SUFFIX)
+                        })
                         .map(|name| format!("{group}/{name}")),
                 );
             }
@@ -1027,6 +1193,20 @@ pub fn is_partial_archive_name(name: &str) -> bool {
 /// Suffix of the keep marker written beside an archive directory (outside
 /// it, so the archive's own verified file set never changes).
 pub const KEEP_SUFFIX: &str = ".aethyme-keep";
+
+/// Suffix of the marker an owner writes beside an archive holding unlanded
+/// work to let it expire by age (`storage keep-archive <id> --dismiss`).
+pub const DISMISS_SUFFIX: &str = ".aethyme-dismissed";
+
+/// The dismissal marker of the archive at `path`, beside it.
+pub fn dismiss_marker(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    name.push(DISMISS_SUFFIX);
+    path.with_file_name(name)
+}
 
 /// The keep marker of the archive at `path`: `<archive>.aethyme-keep` beside it.
 pub fn keep_marker(path: &Path) -> PathBuf {

@@ -2065,6 +2065,46 @@ fn identity_recovery_usage_names_the_dispatched_command() {
     assert!(message.contains("--confirm <old-sha256:new-sha256:owner-marker-sha256>"));
 }
 
+/// A refusal that carries a structured action (a closed session whose
+/// checkout must be restored) puts it under `error.action` in `--json`.
+#[test]
+fn a_json_refusal_carries_its_structured_restore_action() {
+    use super::{ErrorRendering, error_output_for_command};
+
+    let args = ["status", "--session", "7", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    crate::session_auto_close::set_refusal_action_for_test(
+        crate::session_auto_close::RestoreRequired {
+            session_id: 7,
+            path: "/pool/checkout".into(),
+            command: "aethyme broker start --reuse '/pool/checkout'".into(),
+        }
+        .json(),
+    );
+    let (_, rendering) =
+        error_output_for_command(&args, crate::exit_status::REFUSED, "closed", false);
+    let ErrorRendering::Json(rendered) = rendering else {
+        panic!("JSON mode renders a JSON error envelope");
+    };
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["error"]["action"]["code"], "restore_required");
+    assert_eq!(
+        value["error"]["action"]["command"],
+        "aethyme broker start --reuse '/pool/checkout'"
+    );
+    assert_eq!(value["error"]["action"]["session_id"], 7);
+    // Taken once: a later error does not repeat it.
+    let (_, rendering) =
+        error_output_for_command(&args, crate::exit_status::REFUSED, "other", false);
+    let ErrorRendering::Json(rendered) = rendering else {
+        panic!("JSON mode renders a JSON error envelope");
+    };
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert!(value["error"].get("action").is_none(), "{value}");
+}
+
 #[test]
 fn json_errors_use_one_versioned_envelope_and_respect_child_argument_boundary() {
     use super::{ErrorRendering, error_output_for_command, json_requested};

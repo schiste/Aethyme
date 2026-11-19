@@ -213,8 +213,8 @@ impl Default for RetentionPolicy {
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
-            session_abandoned_after_hours: 72,
-            session_landed_after_hours: 24,
+            session_abandoned_after_hours: 24,
+            session_landed_after_hours: 4,
             session_merged_after_hours: 2,
             session_no_work_abandoned_after_hours: 4,
             expire_abandoned_task_leases: false,
@@ -226,7 +226,7 @@ impl Default for RetentionPolicy {
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
-            recovery_archive_days: 30,
+            recovery_archive_days: 90,
             // Half the free space a gate demands before it starts. One warm
             // cargo target for this workspace is 2-8 GiB, so the budget keeps
             // a typical cache warm while an overgrown one -- the 7.7 GiB entry

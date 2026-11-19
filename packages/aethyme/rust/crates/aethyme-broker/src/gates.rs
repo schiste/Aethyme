@@ -929,6 +929,7 @@ impl GateProgressSink for SubmitGateProgressSink<'_> {
 
 pub(crate) struct GateExecutionContext<'a> {
     pub cache_policy: CachePolicy,
+    pub comparison_base: Option<&'a str>,
     pub progress: &'a dyn GateProgressSink,
 }
 
@@ -980,6 +981,7 @@ struct GateRuntimeContext<'a> {
     progress: &'a dyn GateProgressSink,
     admission_host: &'a dyn crate::gate_admission::AdmissionHost,
     deadline: Option<Instant>,
+    comparison_base: Option<&'a str>,
     storage: GateStorageLocations,
 }
 
@@ -2109,6 +2111,7 @@ pub(crate) fn run_affected_in(
         session_id,
         GateExecutionContext {
             cache_policy,
+            comparison_base: None,
             progress: &progress,
         },
         storage,
@@ -2122,24 +2125,17 @@ pub(crate) fn run_affected_for_submit_in(
     checkout: &GitRepo,
     gates: &[Gate],
     changed: &[String],
+    comparison_base: &str,
     session_id: Option<i64>,
     cache_policy: CachePolicy,
     submit: Option<&crate::submit_progress::SubmitProgress>,
     storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    let Some(submit) = submit else {
-        return run_affected_in(
-            store,
-            main_root,
-            checkout,
-            gates,
-            changed,
-            session_id,
-            cache_policy,
-            storage,
-        );
+    let submit_progress = submit.map(|progress| SubmitGateProgressSink { progress });
+    let progress: &dyn GateProgressSink = match &submit_progress {
+        Some(progress) => progress,
+        None => &StderrGateProgressSink,
     };
-    let progress = SubmitGateProgressSink { progress: submit };
     run_affected_with_progress_in(
         store,
         main_root,
@@ -2149,7 +2145,8 @@ pub(crate) fn run_affected_for_submit_in(
         session_id,
         GateExecutionContext {
             cache_policy,
-            progress: &progress,
+            comparison_base: Some(comparison_base),
+            progress,
         },
         storage,
     )
@@ -2199,6 +2196,7 @@ pub(crate) fn run_affected_bounded_in(
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: Some(Instant::now() + allowance),
+            comparison_base: None,
             storage,
         },
     )
@@ -2227,6 +2225,7 @@ pub(crate) fn run_affected_with_progress_in(
             progress: context.progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: context.comparison_base,
             storage,
         },
     )
@@ -2308,6 +2307,7 @@ pub(crate) fn run_all_with_progress_in(
             progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: None,
             storage,
         },
     )
@@ -2377,6 +2377,7 @@ pub(crate) fn run_named_in(
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            comparison_base: None,
             storage,
         },
     )
@@ -4050,6 +4051,7 @@ where
             &gate.command,
             GateCommandContext {
                 cwd: checkout.root(),
+                comparison_base: runtime.comparison_base,
                 available_bytes: available.map(|headroom| headroom.bytes),
                 available_inodes: available.and_then(|headroom| headroom.inodes),
                 environment: &environment,
@@ -4842,6 +4844,7 @@ fn command_mentions_cargo(command: &str) -> bool {
 /// maintaining the pidfile for cancellation. Returns the exit code.
 struct GateCommandContext<'a> {
     cwd: &'a Path,
+    comparison_base: Option<&'a str>,
     /// Free bytes on `cwd`'s filesystem, measured once by the caller: the
     /// headroom check refuses on it and the gate result records it.
     available_bytes: Option<u64>,
@@ -5357,6 +5360,7 @@ fn run_gate_command_inner(
         .env_remove(crate::session_scratch::SESSION_SCRATCH_ENV)
         .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
         .env(crate::gate_database::SCOPE_ENV, isolated_broker_scope)
+        .env_remove("AETHYME_GATE_BASE_COMMIT")
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
         .env(crate::gate_debris::GATE_RUN_ID_ENV, &context.run_labels.run)
         .env(
@@ -5367,6 +5371,9 @@ fn run_gate_command_inner(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
+    if let Some(base) = context.comparison_base {
+        process.env("AETHYME_GATE_BASE_COMMIT", base);
+    }
     if let Some(resources) = context.resources {
         for (key, value) in resources.grant.environment() {
             process.env(key, value);
@@ -6205,6 +6212,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
@@ -6318,6 +6326,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
@@ -6383,6 +6392,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6432,6 +6442,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6549,6 +6560,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6631,6 +6643,7 @@ mod tests {
                     progress: &progress,
                     admission_host: &admission_host,
                     deadline: None,
+                    comparison_base: None,
                     storage: GateStorageLocations::default(),
                 },
                 |_, _| None,
@@ -6808,6 +6821,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6908,6 +6922,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -6976,6 +6991,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
             |_, _| None,
@@ -7038,6 +7054,7 @@ mod tests {
         let log = root.path().join("log");
         let context = || GateCommandContext {
             cwd: root.path(),
+            comparison_base: None,
             available_bytes: None,
             available_inodes: None,
             environment: &environment,
@@ -7122,6 +7139,7 @@ mod tests {
         let labels = crate::gate_debris::GateRunLabels::new("renewal-stop", None, "synthetic");
         let context = GateCommandContext {
             cwd: root.path(),
+            comparison_base: None,
             available_bytes: None,
             available_inodes: None,
             environment: &environment,
@@ -7221,6 +7239,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::Captured {
                     host_resource_db_path: Some(resource_db.clone()),
                     host_cache_dir: Some(owner.path().join("cache")),
@@ -7774,6 +7793,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -7816,6 +7836,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &recovered_host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -7863,6 +7884,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                comparison_base: None,
                 storage: GateStorageLocations::default(),
             },
         )
@@ -8552,6 +8574,7 @@ mod tests {
     ) -> GateCommandContext<'a> {
         GateCommandContext {
             cwd: root,
+            comparison_base: None,
             available_bytes: Some(u64::MAX),
             available_inodes: Some(u64::MAX),
             environment,

@@ -445,10 +445,15 @@ fn session_start_shows_relevant_paths_and_defers_diffs_to_the_edit() {
         brief.contains(&format!("session {other} also leases \"shared.txt\".")),
         "{brief}"
     );
+    assert!(brief.contains(&format!("Aethyme session {me}")), "{brief}");
+    assert!(brief.contains("Before editing: wait"), "{brief}");
     assert!(
-        brief.contains(&format!("aethyme broker status --session {me} --json")),
+        brief.contains(&format!(
+            "Peer session {other} assignment: \"Parser rework\""
+        )),
         "{brief}"
     );
+    assert!(!brief.contains("aethyme broker status"), "{brief}");
     assert!(!brief.contains("| +changed 2"), "{brief}");
 
     let edit_context =

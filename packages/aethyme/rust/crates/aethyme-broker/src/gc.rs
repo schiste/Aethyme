@@ -2573,6 +2573,67 @@ mod recovery_archive_minimum_age_tests {
 
 /// Whether `archive` is a removal candidate now, and why: `(landed, reason)`.
 /// Shared by planning and apply so the rule is re-proved, not remembered.
+/// Why an orphaned worktree root must be kept because of the recovery
+/// archives in its broker-owned archive directory
+/// (`<root>/.aethyme-recovery-archives/<key>/<archive>`): how many are not
+/// proven landed, of how many, and where. `None` when there are none, or
+/// every one is proven landed (no unique work in them). Anything that
+/// cannot be read counts as not proven.
+pub(crate) fn orphan_root_archive_refusal(root: &Path) -> Option<String> {
+    let directory = root.join(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY);
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return None;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Some(format!(
+            "{} is not a real directory; the root is kept",
+            directory.display()
+        ));
+    }
+    let mut archives = 0_usize;
+    let mut unproven = 0_usize;
+    let Ok(keys) = std::fs::read_dir(&directory) else {
+        return Some(format!(
+            "{} cannot be read; the root is kept",
+            directory.display()
+        ));
+    };
+    for key in keys {
+        let Ok(key) = key else {
+            unproven += 1;
+            continue;
+        };
+        if !key.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(key.path()) else {
+            unproven += 1;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                unproven += 1;
+                continue;
+            };
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            archives += 1;
+            if crate::storage_ledger::evict::archive_landed(&path).is_err() {
+                unproven += 1;
+            }
+        }
+    }
+    (unproven > 0).then(|| {
+        format!(
+            "orphaned root {} holds {unproven} of {archives} recovery archive(s) not proven landed in {}; it is kept until they are restored or removed by hand",
+            root.display(),
+            directory.display()
+        )
+    })
+}
+
 fn recovery_archive_disposition(
     broker: &Broker,
     archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
@@ -5499,39 +5560,33 @@ impl Broker {
             return Ok((Vec::new(), None, false));
         }
         let archive_scan = if let Some(deadline) = deadline {
-            let root = self.recovery_archive_root()?;
-            if std::time::Instant::now() >= deadline {
-                return Ok((Vec::new(), None, false));
-            }
-            match std::fs::symlink_metadata(&root) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok((Vec::new(), None, true));
+            // Both archive directories (the pool-side one and the host state
+            // one): any entry defers the whole archive set to `--full-scan`.
+            let mut roots = vec![self.recovery_archive_root()?];
+            roots.extend(self.pool_recovery_archive_root(false));
+            for root in roots {
+                if std::time::Instant::now() >= deadline {
+                    return Ok((Vec::new(), None, false));
                 }
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                _ => return Ok((Vec::new(), None, false)),
-            }
-            if std::time::Instant::now() >= deadline {
-                return Ok((Vec::new(), None, false));
-            }
-            match std::fs::read_dir(&root) {
-                Ok(mut entries) => match entries.next() {
-                    None => {
-                        return Ok((Vec::new(), None, true));
-                    }
-                    Some(Ok(_)) => {
-                        // Verifying a recovery archive can hash a bundle up to
-                        // 1 GiB. Keep the default plan bounded by deferring the
-                        // entire archive set; `--full-scan` performs the
+                match std::fs::symlink_metadata(&root) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                    _ => return Ok((Vec::new(), None, false)),
+                }
+                match std::fs::read_dir(&root) {
+                    Ok(mut entries) => match entries.next() {
+                        None => continue,
+                        // Verifying a recovery archive can hash a bundle up
+                        // to 1 GiB. Keep the default plan bounded by deferring
+                        // the entire archive set; `--full-scan` performs the
                         // exhaustive ownership and integrity checks.
-                        return Ok((Vec::new(), None, false));
-                    }
-                    Some(Err(_)) => return Ok((Vec::new(), None, false)),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok((Vec::new(), None, true));
+                        Some(_) => return Ok((Vec::new(), None, false)),
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Ok((Vec::new(), None, false)),
                 }
-                Err(_) => return Ok((Vec::new(), None, false)),
             }
+            return Ok((Vec::new(), None, true));
         } else {
             self.recovery_archives()?
         };
@@ -5539,6 +5594,7 @@ impl Broker {
             root,
             owned,
             unowned,
+            ..
         } = archive_scan;
         if owned.is_empty() && unowned.is_empty() {
             return Ok((Vec::new(), None, true));
@@ -5772,6 +5828,21 @@ impl Broker {
                         root.display(),
                         policy.orphan_worktree_roots_days
                     ),
+                });
+                continue;
+            }
+            // Recovery archives now live on the pool's volume: a root that
+            // holds one not proven landed (its repository being gone, none
+            // can be proven) is kept, and the plan says why.
+            if let Some(reason) = orphan_root_archive_refusal(&root) {
+                crate::phase_telemetry::add(
+                    "gc_orphan_root_kept_recovery_archives",
+                    std::time::Duration::ZERO,
+                );
+                blockers.push(GcBlocker {
+                    kind: "orphan_root_holds_recovery_archives".into(),
+                    id: None,
+                    reason,
                 });
                 continue;
             }
@@ -7196,25 +7267,18 @@ impl Broker {
         // until another preparation writer runs. This bounded, read-only
         // probe uses the Broker-captured cache root and only requests the
         // existing cache-only continuation; it is never deletion authority.
-        crate::warn_unrecorded(
-            "record preparation-cache rotation recovery request",
-            self.request_recovery_for_rotation_debt(),
-        );
-        let policy = load_retention_policy(self.main_root())?;
-        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
-        let resumed = match load_journal(&journal_path)? {
-            Some(journal) => {
-                let budget_ms = policy.startup_budget_ms;
-                self.apply_confirmed_gc_journal(journal, budget_ms)?
-            }
-            None => {
-                crate::warn_unrecorded(
-                    "clear the remembered GC journal resume failure",
-                    self.forget_gc_resume_failure(),
-                );
-                None
-            }
+        {
+            let _span = crate::phase_telemetry::span("open_gc_rotation_debt");
+            crate::warn_unrecorded(
+                "record preparation-cache rotation recovery request",
+                self.request_recovery_for_rotation_debt(),
+            );
+        }
+        let policy = {
+            let _span = crate::phase_telemetry::span("open_gc_retention_policy");
+            load_retention_policy(self.main_root())?
         };
+        let resumed = self.resume_startup_gc_journal(Some(policy.startup_budget_ms))?;
         // A pending journal that backoff skipped leaves its remaining
         // candidates on disk while the sweep below runs. That is the state a
         // budget-limited resume already leaves: the sweep takes the GC lock
@@ -7223,17 +7287,23 @@ impl Broker {
         // already gone as done.
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
-        crate::warn_unrecorded(
-            "run bounded inline artifact sweep",
-            self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
-        );
+        {
+            let _span = crate::phase_telemetry::span("open_gc_inline_sweep");
+            crate::warn_unrecorded(
+                "run bounded inline artifact sweep",
+                self.sweep_artifacts_on_open(&policy),
+            );
+        }
         // Inline admission stays capped at 250 ms. The detached worker
         // continues cache recovery from its own request and whole-checkout
         // cleanup only from its separate deferral request.
-        crate::warn_unrecorded(
-            "start artifact sweep continuation worker",
-            self.maybe_start_artifact_sweep_worker(false),
-        );
+        {
+            let _span = crate::phase_telemetry::span("open_gc_worker_admission");
+            crate::warn_unrecorded(
+                "start artifact sweep continuation worker",
+                self.maybe_start_artifact_sweep_worker(false),
+            );
+        }
         Ok(resumed)
     }
 
@@ -7249,6 +7319,14 @@ impl Broker {
             // must not resume operator-authorized whole-repository journals.
             return Ok(None);
         }
+        self.resume_startup_gc_journal(None)
+    }
+
+    fn resume_startup_gc_journal(
+        &mut self,
+        startup_budget_ms: Option<u64>,
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("open_gc_confirmed_journal");
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let Some(journal) = load_journal(&journal_path)? else {
             crate::warn_unrecorded(
@@ -7257,8 +7335,14 @@ impl Broker {
             );
             return Ok(None);
         };
-        let policy = load_retention_policy(self.main_root())?;
-        self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
+        let budget_ms = match startup_budget_ms {
+            Some(budget_ms) => budget_ms,
+            None => {
+                let _span = crate::phase_telemetry::span("open_gc_retention_policy");
+                load_retention_policy(self.main_root())?.startup_budget_ms
+            }
+        };
+        self.apply_confirmed_gc_journal(journal, budget_ms)
     }
 
     /// Clear a remembered resume failure once it can no longer apply: the
@@ -9033,14 +9117,69 @@ impl Broker {
         &mut self,
         release_worker_lock: impl FnOnce(),
     ) -> Result<(), BrokerOpError> {
+        // For `broker status`: which `[cleanup]` source this run resolved.
+        crate::cleanup_config::record_active(self.store_ref(), self.main_root());
+        let worker_started = Instant::now();
         let result = self.run_artifact_sweep_recovery_worker_lanes();
         release_worker_lock();
+        // Deletes only through the host-wide deleter lock and holds no
+        // repository lock, so it runs after the worker lock is released:
+        // the next worker run starts while it drains.
+        self.run_checkout_trash_catchup_worker_lane(worker_started);
         self.run_preparation_cache_measurement_worker_lane();
         // Recorded on every exit, including a busy host deleter, so status
         // shows why a run removed nothing; after the measurement, so its
         // pacer pauses are in the summary and the run's metric row.
         self.persist_unattended_pacing_summary();
         result
+    }
+
+    /// The detached worker's continuing trash catch-up lane
+    /// ([`Self::run_checkout_trash_catchup`]), while the trash is behind.
+    /// Records `checkout_trash_catchup`, including the share of this worker
+    /// run's wall time spent draining.
+    fn run_checkout_trash_catchup_worker_lane(&mut self, worker_started: Instant) {
+        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
+            || crate::host_state::path_is_ephemeral(self.main_root())
+            || artifact_worker_post_boot_hold_now().is_some()
+            || self.checkout_trash_rows().is_empty()
+        {
+            return;
+        }
+        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+        let report = self.run_checkout_trash_catchup(
+            host_dir.as_deref(),
+            crate::checkout_trash::TRASH_CATCHUP_MAX,
+            crate::checkout_trash::sample_host_pressure,
+        );
+        let drain_secs = report.drain_time.as_secs_f64();
+        let files_per_second = if drain_secs > 0.0 {
+            (report.unlinks as f64 / drain_secs).round() as u64
+        } else {
+            0
+        };
+        let worker_wall = worker_started.elapsed().as_secs_f64();
+        let drain_share_pct = if worker_wall > 0.0 {
+            (crate::checkout_trash::drain_time_this_process().as_secs_f64() * 100.0 / worker_wall)
+                .round() as u64
+        } else {
+            0
+        };
+        crate::phase_telemetry::attach(
+            "checkout_trash_catchup",
+            serde_json::json!({
+                "end_reason": report.end.as_str(),
+                "slices": report.slices,
+                "entries_removed": report.entries_removed,
+                "unlinks": report.unlinks,
+                "bytes": report.bytes,
+                "drain_ms": u64::try_from(report.drain_time.as_millis()).unwrap_or(u64::MAX),
+                "elapsed_ms": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+                "files_per_second_observed": files_per_second,
+                "busy_retries": report.busy_retries,
+                "worker_drain_share_pct": drain_share_pct,
+            }),
+        );
     }
 
     /// The detached worker's measurement lane, under the host-wide
@@ -11490,6 +11629,39 @@ impl Broker {
             .is_some_and(|last| last > 0 && now.saturating_sub(last) < window_ms))
     }
 
+    fn inline_artifact_sweep_is_spaced(
+        &mut self,
+        policy: &RetentionPolicy,
+        now: i64,
+        urgency: crate::disk_headroom::SweepUrgency,
+    ) -> Result<bool, BrokerOpError> {
+        let divisor = urgency.interval_divisor().max(1);
+        let interval_ms = i64::from(policy.artifact_sweep_interval_hours) * 3_600_000 / divisor;
+        let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / divisor;
+        Ok(
+            self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
+                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?,
+        )
+    }
+
+    fn sweep_artifacts_on_open(&mut self, policy: &RetentionPolicy) -> Result<(), BrokerOpError> {
+        // Pressure uses the shortest cadence. A stamp still within that
+        // window spaces out the foreground pass at any current headroom.
+        // Recovery and worker admission run independently of this check.
+        if policy.artifact_sweep_budget_ms != 0
+            && self.inline_artifact_sweep_is_spaced(
+                policy,
+                now_ms(),
+                crate::disk_headroom::SweepUrgency::Pressured,
+            )?
+        {
+            crate::phase_telemetry::add("open_gc_inline_cadence_skip", Duration::ZERO);
+            return Ok(());
+        }
+        self.sweep_artifacts_autonomously(policy, ArtifactSweepScope::Inline)?;
+        Ok(())
+    }
+
     fn artifact_sweep_budget(
         &mut self,
         policy: &RetentionPolicy,
@@ -12117,16 +12289,10 @@ impl Broker {
         // a bounded tail for whole-checkout cleanup so cache discovery cannot
         // consume the entire foreground budget first.
         let budget_started_at = Instant::now();
-        let inline_pass_spaced = if scope == ArtifactSweepScope::Inline {
-            let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
-                / urgency.interval_divisor().max(1);
-            let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / urgency.interval_divisor().max(1);
-            self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
-                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
-        } else {
-            false
-        };
-        if inline_pass_spaced && policy.artifact_sweep_budget_ms != 0 {
+        if scope == ArtifactSweepScope::Inline
+            && self.inline_artifact_sweep_is_spaced(policy, now, urgency)?
+            && policy.artifact_sweep_budget_ms != 0
+        {
             return Ok((ArtifactSweepOutcome::no_work(true, None), 0));
         }
         if policy.artifact_sweep_budget_ms == 0 {
@@ -14046,6 +14212,16 @@ impl Broker {
             }
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
+            // Re-checked at removal: an archive may have appeared since review.
+            if let Some(reason) = orphan_root_archive_refusal(&root) {
+                failures.push(format!(
+                    "{}: {reason}; no deletion performed",
+                    candidate.worktree_root
+                ));
+                journal.remaining_orphans.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
             let Some(fingerprint) = candidate.ownership_fingerprint.as_deref() else {
                 failures.push(format!("{}: legacy orphan authorization revoked; no deletion performed; review a fresh GC plan", candidate.worktree_root));
                 journal.remaining_orphans.remove(0);
@@ -21399,6 +21575,58 @@ mod tests {
     }
 
     #[test]
+    fn writable_open_inline_spacing_uses_the_shortest_cadence() {
+        use crate::disk_headroom::SweepUrgency::{Pressured, Routine};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["commit", "--allow-empty", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let now = now_ms();
+        for (key, window) in [
+            (
+                ARTIFACT_SWEEP_STAMP_KEY,
+                i64::from(policy.artifact_sweep_interval_hours) * 3_600_000,
+            ),
+            (ARTIFACT_SWEEP_PROGRESS_KEY, INLINE_PARTIAL_PASS_SPACING_MS),
+        ] {
+            let threshold = now - window / Pressured.interval_divisor();
+            broker
+                .artifact_sweep_meta_set(key, &(threshold + 1).to_string())
+                .unwrap();
+            assert!(
+                broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                    .unwrap()
+            );
+
+            broker
+                .artifact_sweep_meta_set(key, &threshold.to_string())
+                .unwrap();
+            assert!(
+                !broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                    .unwrap()
+            );
+            assert!(
+                broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Routine)
+                    .unwrap()
+            );
+
+            broker.artifact_sweep_meta_set(key, "0").unwrap();
+        }
+        assert!(
+            !broker
+                .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn inline_partial_cache_removal_respects_spacing_and_resumes_afterward() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -23035,6 +23263,108 @@ mod tests {
         )
         .unwrap();
         (fixture, broker, root.canonicalize().unwrap(), digest)
+    }
+
+    /// The orphan-roots lane judges whole roots by their marker and origin;
+    /// it never classifies the entries inside one. A root holding only
+    /// retired checkouts' tombstones is therefore one whole-root candidate
+    /// while its origin is gone (no tombstone is listed as a checkout or as
+    /// a candidate of its own), and no candidate at all while its origin
+    /// exists.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn an_orphan_root_holding_only_tombstones_is_judged_as_one_whole_root() {
+        let (fixture, mut broker, root, _) = registered_orphan_fixture();
+        std::fs::remove_file(broker.main_root().join(".aethyme/gc-journal.json")).unwrap();
+        std::fs::remove_file(root.join("retained.txt")).unwrap();
+        let tombstone = root.join("retired-checkout");
+        std::fs::create_dir(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join("ARCHIVED-SESSION.txt"),
+            "aethyme: retired session checkout\narchive: none\n",
+        )
+        .unwrap();
+        assert!(crate::broker::is_checkout_tombstone(&tombstone));
+
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(plan.orphans.len(), 1, "{:?}", plan.blockers);
+        assert_eq!(plan.orphans[0].worktree_root, root.to_string_lossy());
+        assert!(
+            plan.orphans
+                .iter()
+                .all(|orphan| !orphan.worktree_root.ends_with("retired-checkout")),
+            "a tombstone is never a candidate of its own"
+        );
+        assert!(tombstone.join("ARCHIVED-SESSION.txt").is_file());
+
+        // An existing origin keeps the root, tombstones and all.
+        std::fs::create_dir(fixture.path().join("disappearing-origin")).unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        assert!(tombstone.join("ARCHIVED-SESSION.txt").is_file());
+    }
+
+    /// An orphaned root holding a recovery archive not proven landed (its
+    /// repository is gone, so none can be) is kept, and the plan names how
+    /// many and where; an archive appearing after review stops the apply.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn an_orphan_root_holding_unproven_recovery_archives_is_kept() {
+        // The fixture reviewed the root as an orphan and journaled the plan.
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+
+        let archive = root
+            .join(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY)
+            .join("example-key")
+            .join("7-0123456789ab-1");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(
+            archive.join("manifest.json"),
+            serde_json::json!({
+                "session_id": 7,
+                "staged_patch": {"bytes": 3},
+                "unstaged_patch": {"bytes": 0},
+                "untracked_files": [],
+                "ignored_files": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Applying the plan reviewed before the archive appeared deletes
+        // nothing.
+        let report = broker.gc_apply(&digest).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|line| line.contains("not proven landed")),
+            "{:?}",
+            report.failures
+        );
+        assert!(archive.join("manifest.json").is_file());
+        assert!(root.join("retained.txt").is_file());
+
+        let journal = broker.main_root().join(".aethyme/gc-journal.json");
+        if journal.exists() {
+            std::fs::remove_file(&journal).unwrap();
+        }
+        let plan = broker.gc_plan().unwrap();
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|blocker| blocker.kind == "orphan_root_holds_recovery_archives")
+            .expect("the plan says why the root is kept");
+        assert!(blocker.reason.contains("1 of 1"), "{}", blocker.reason);
+        assert!(
+            blocker
+                .reason
+                .contains(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY),
+            "{}",
+            blocker.reason
+        );
+        assert!(archive.join("manifest.json").is_file());
     }
 
     #[test]

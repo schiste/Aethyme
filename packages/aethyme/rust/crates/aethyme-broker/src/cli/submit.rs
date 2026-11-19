@@ -757,6 +757,30 @@ fn render_submit_text(
 /// `broker repair`.
 /// `broker push`: publish the session's own branch, optionally with a draft PR.
 /// `broker sync`.
+/// The one command to run next when the session's preparation is stale
+/// because the idle strip or a restore removed its dependencies.
+fn stripped_next_action(broker: &crate::Broker, session: i64) -> Option<String> {
+    crate::preparation::stripped_since_prepared(broker.main_root(), session).then(|| {
+        crate::phase_telemetry::add("prepare_next_action_shown", std::time::Duration::ZERO);
+        crate::preparation::prepare_command(session)
+    })
+}
+
+/// The one-line next action `push` and `sync` print.
+fn prepare_next_line(command: &str) -> String {
+    format!(
+        "Next: dependencies were removed (idle strip or restore); prepare before building or testing: {command}"
+    )
+}
+
+/// `report` with `preparation_next_action` when there is one.
+fn with_prepare_next(mut report: serde_json::Value, next: Option<&str>) -> serde_json::Value {
+    if let (Some(next), Some(object)) = (next, report.as_object_mut()) {
+        object.insert("preparation_next_action".into(), next.into());
+    }
+    report
+}
+
 pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
@@ -764,8 +788,15 @@ pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let report = broker.sync_session_with(session, parsed.unstack)?;
     let conflict = report.outcome == crate::SyncOutcome::Conflict;
+    let prepare_next = stripped_next_action(&broker, session);
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&with_prepare_next(
+                serde_json::to_value(&report)?,
+                prepare_next.as_deref()
+            ))?
+        );
     } else {
         if let Some(note) = &report.stack_note {
             out!("Stack: {note}");
@@ -823,6 +854,9 @@ pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
         }
         if let Some(note) = &report.fetch_note {
             out!("  note: {note}");
+        }
+        if let Some(next) = &prepare_next {
+            out!("{}", prepare_next_line(next));
         }
     }
     if conflict {
@@ -927,9 +961,19 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     phases.insert("push_session".into(), push_ms);
     phases.insert("review_on_push".into(), review_ms);
     telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
+    let prepare_next = stripped_next_action(&broker, session);
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&with_prepare_next(
+                serde_json::to_value(&report)?,
+                prepare_next.as_deref()
+            ))?
+        );
         return Ok(());
+    }
+    if let Some(next) = &prepare_next {
+        out!("{}", prepare_next_line(next));
     }
     let previous = report
         .previous_remote_oid
@@ -1689,5 +1733,25 @@ mod review_on_push_tests {
             run["error"].as_str().unwrap().contains("run_on_pus"),
             "{run:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod prepare_next_tests {
+    use super::*;
+
+    /// `push` and `sync` add the prepare command to their JSON and print it
+    /// as one line when the session's dependencies were removed.
+    #[test]
+    fn the_prepare_next_action_is_added_once_and_named_in_one_line() {
+        let command = crate::preparation::prepare_command(7);
+        let value = with_prepare_next(serde_json::json!({"session_id": 7}), Some(&command));
+        assert_eq!(value["preparation_next_action"], command.as_str());
+        let untouched = with_prepare_next(serde_json::json!({"session_id": 7}), None);
+        assert!(untouched.get("preparation_next_action").is_none());
+        let line = prepare_next_line(&command);
+        assert!(line.starts_with("Next: "), "{line}");
+        assert!(line.contains(&command), "{line}");
+        assert_eq!(line.lines().count(), 1);
     }
 }

@@ -31,11 +31,27 @@
 //! is taken exclusively, and the open-file observation is taken again when
 //! the run's is older than [`PROCESS_USE_FRESH_FOR`].
 //!
-//! Only directories a step of the session's own preparation declares as an
-//! output (or that lie inside one) are stripped from an open session:
-//! `submit prepare` rebuilds exactly those, so the one-command promise
-//! holds. Every other catalogued directory is kept and counted as
-//! `not_declared_output`. (The closed-checkout strip is unchanged.)
+//! Only what the session's own preparation recreates is stripped from an
+//! open session, in three cases (see [`idle_coverage`]): a directory a step
+//! declares as an output exactly; a Python environment root (the
+//! closed-checkout strip's `.venv` witness: `pyvenv.cfg` and nothing outside
+//! the environment layout) whose interpreter a step declares as an output
+//! (`<root>/pyvenv.cfg`, or `<root>/bin/python*`, `<root>/Scripts/python*`),
+//! which proves that step creates it (a root holding other declared files
+//! but no declared interpreter is kept as
+//! `environment_root_creation_unproven`: its step may only install into an
+//! environment made elsewhere); and a workspace member's
+//! `node_modules` the closed-checkout strip proves is a pnpm member (its
+//! links into the top-level store), when the top-level `node_modules` is a
+//! declared output and actually moved in the same pass or is already absent, so
+//! the declared install recreates root and members together. Every candidate
+//! still goes through the closed-checkout strip's proofs; what they refuse
+//! (`witness_missing`, `unexpected_content`, ...) is kept with the same
+//! reason. Members whose top-level `node_modules` stays are kept as
+//! `member_root_kept`. `submit prepare` recreates all of those, so the
+//! one-command promise holds. Every other catalogued directory is kept and
+//! counted as `not_declared_output`. (The closed-checkout strip is
+//! unchanged.)
 //!
 //! After a strip the session's preparation reads stale (see
 //! `preparation::mark_stripped`) with its usual `next_action`, and the
@@ -52,6 +68,15 @@ use std::time::{Duration, Instant};
 /// `last_activity_at` it saw (JSON: session id to that time); a session is
 /// looked at again only once its activity moved.
 pub(crate) const IDLE_STRIP_DONE_KEY: &str = "checkout_strip.idle_done";
+/// Meta key: the coverage rules the memo in [`IDLE_STRIP_DONE_KEY`] was
+/// written under. A memo from older rules is set aside, so every idle
+/// session is examined once more under the current rules (one that a
+/// narrower rule left with directories it may now remove).
+pub(crate) const IDLE_STRIP_RULES_KEY: &str = "checkout_strip.idle_done_rules";
+/// The current coverage rules; bump it whenever what the idle strip may
+/// remove from an open session widens. 2: environment roots whose
+/// interpreter a step declares, and pnpm workspace members with their root.
+pub(crate) const IDLE_STRIP_RULES: u32 = 2;
 /// Remembered sessions at most; the lowest ids go first.
 const IDLE_STRIP_DONE_MAX: usize = 16_384;
 /// Open sessions the idle strip lists per run, at most (each costs a few
@@ -62,6 +87,9 @@ const IDLE_STRIP_CHECKOUT_BUDGET: Duration = Duration::from_secs(15);
 /// The run's open-file observation is used as is while younger than this;
 /// otherwise a fresh one is taken under the claim right before the moves.
 pub(crate) const PROCESS_USE_FRESH_FOR: Duration = Duration::from_secs(5);
+/// [`recent_file_activity`]'s answer when the changed-file probe could not
+/// complete (timeout, failure, or its cap reached without evidence).
+pub(crate) const ACTIVITY_UNKNOWN: &str = "activity_unknown";
 /// Tracked top-level directories whose modification time is read, at most.
 const ACTIVITY_TOP_LEVEL_DIRECTORIES: usize = 32;
 /// The fingerprint of the note left after an idle strip.
@@ -85,6 +113,135 @@ pub(crate) struct IdleStripReport {
     /// Catalogued directories kept because no preparation step declares
     /// them as an output.
     pub kept_not_declared: usize,
+    /// Milliseconds spent measuring bytes this pass (bounded by
+    /// [`IDLE_STRIP_MEASURE_PASS_BUDGET`]).
+    pub measure_ms: u64,
+    /// Per kind (`node_modules`, `node_modules_member`, `venv`,
+    /// `pnpm_store`, `cargo_target`): directories removed and kept, and
+    /// their bytes as far as the bounded measurement got.
+    pub by_kind: BTreeMap<&'static str, KindTally>,
+}
+
+/// Removed and kept directories of one kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct KindTally {
+    pub removed: usize,
+    pub removed_bytes: u64,
+    pub kept: usize,
+    pub kept_bytes: u64,
+    /// Directories whose bytes were not measured (budget spent).
+    pub unmeasured: usize,
+}
+
+/// The longest one checkout's byte measurement may take.
+const IDLE_STRIP_MEASURE_BUDGET: Duration = Duration::from_secs(2);
+/// The longest all byte measurements of one pass may take together.
+const IDLE_STRIP_MEASURE_PASS_BUDGET: Duration = Duration::from_secs(6);
+
+/// How a catalogued directory is covered by the session's preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    /// A step output names it exactly.
+    Exact,
+    /// A Python environment root whose interpreter a step declares as an
+    /// output (`<root>/pyvenv.cfg` or `<root>/bin/python*`, or
+    /// `<root>/Scripts/python*`): that step creates the environment.
+    EnvironmentRoot,
+    /// A Python environment root containing a declared output path, but no
+    /// step declares its interpreter: a step may only install into an
+    /// environment made elsewhere, so it is kept
+    /// (`environment_root_creation_unproven`).
+    EnvironmentRootUnproven,
+    /// A workspace member's `node_modules` while the top-level
+    /// `node_modules` is a declared output.
+    WorkspaceMember,
+}
+
+fn normalised_outputs(outputs: &[String]) -> Vec<String> {
+    outputs
+        .iter()
+        .map(|output| {
+            output
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|output| !output.is_empty())
+        .collect()
+}
+
+/// Whether, and how, the declared step `outputs` cover `candidate` for an
+/// open session (see the module documentation). `None`: not covered, kept
+/// as `not_declared_output`.
+pub(crate) fn idle_coverage(
+    outputs: &[String],
+    candidate: &super::strip::StripCandidate,
+) -> Option<Coverage> {
+    use super::strip::StripKind;
+    let relative = candidate.relative.as_str();
+    if declared_output_covers(outputs, relative) {
+        return Some(Coverage::Exact);
+    }
+    let outputs = normalised_outputs(outputs);
+    if candidate.kind == StripKind::Venv {
+        let inside: Vec<&str> = outputs
+            .iter()
+            .filter_map(|output| output.strip_prefix(relative))
+            .filter_map(|rest| rest.strip_prefix('/'))
+            .collect();
+        if inside.iter().any(|rest| {
+            *rest == "pyvenv.cfg"
+                || rest
+                    .strip_prefix("bin/")
+                    .or_else(|| rest.strip_prefix("Scripts/"))
+                    .is_some_and(|name| name.starts_with("python"))
+        }) {
+            return Some(Coverage::EnvironmentRoot);
+        }
+        if !inside.is_empty() {
+            return Some(Coverage::EnvironmentRootUnproven);
+        }
+    }
+    if candidate.kind == StripKind::NodeModules
+        && relative.contains('/')
+        && outputs.iter().any(|output| output == "node_modules")
+    {
+        return Some(Coverage::WorkspaceMember);
+    }
+    None
+}
+
+/// The telemetry kind of a candidate.
+fn kind_label(candidate: &super::strip::StripCandidate) -> &'static str {
+    use super::strip::StripKind;
+    match candidate.kind {
+        StripKind::NodeModules if candidate.relative.contains('/') => "node_modules_member",
+        StripKind::NodeModules => "node_modules",
+        StripKind::PnpmStore => "pnpm_store",
+        StripKind::Venv => "venv",
+        StripKind::CargoTarget => "cargo_target",
+    }
+}
+
+fn removed_counter(label: &str) -> &'static str {
+    match label {
+        "node_modules_member" => "checkout_idle_strip_removed_node_modules_member",
+        "node_modules" => "checkout_idle_strip_removed_node_modules",
+        "pnpm_store" => "checkout_idle_strip_removed_pnpm_store",
+        "venv" => "checkout_idle_strip_removed_venv",
+        _ => "checkout_idle_strip_removed_cargo_target",
+    }
+}
+
+fn kept_counter(label: &str) -> &'static str {
+    match label {
+        "node_modules_member" => "checkout_idle_strip_kept_node_modules_member",
+        "node_modules" => "checkout_idle_strip_kept_node_modules",
+        "pnpm_store" => "checkout_idle_strip_kept_pnpm_store",
+        "venv" => "checkout_idle_strip_kept_venv",
+        _ => "checkout_idle_strip_kept_cargo_target",
+    }
 }
 
 /// The phase counter of one checkout-level idle strip refusal.
@@ -99,7 +256,9 @@ fn idle_refused_counter(code: &str) -> &'static str {
         "gates_unknown" => "checkout_idle_strip_refused_gates_unknown",
         "start_reserved" => "checkout_idle_strip_refused_start_reserved",
         "recent_file_activity" => "checkout_idle_strip_refused_recent_file_activity",
+        "activity_unknown" => "checkout_idle_strip_refused_activity_unknown",
         "checkout_busy" => "checkout_idle_strip_refused_checkout_busy",
+        "checkout_marker_live" => "checkout_idle_strip_refused_checkout_marker_live",
         "checkout_lock_unknown" => "checkout_idle_strip_refused_checkout_lock_unknown",
         "discovery_failed" => "checkout_idle_strip_refused_discovery_failed",
         "process_using_checkout" => "checkout_idle_strip_refused_process_using_checkout",
@@ -188,6 +347,43 @@ pub(crate) fn write_idle_strip_notice(
     stripped: &[String],
     idle_hours: i64,
 ) -> NoticeOutcome {
+    write_prepare_notice(
+        worktree,
+        session_id,
+        &format!(
+            "Session {session_id} had no activity for {idle_hours} hour(s) and no process in this \
+             checkout, so its regenerable dependency directories were moved out for deletion:"
+        ),
+        stripped,
+    )
+}
+
+/// The same notice after a restore from a recovery archive: regenerable
+/// directories are never archived, so the restored checkout lacks them.
+pub(crate) fn write_restore_notice(
+    worktree: &Path,
+    session_id: i64,
+    missing: &[String],
+) -> NoticeOutcome {
+    write_prepare_notice(
+        worktree,
+        session_id,
+        &format!(
+            "Session {session_id}'s checkout was restored from its recovery archive. Regenerable \
+             dependency directories are never archived, so they are missing:"
+        ),
+        missing,
+    )
+}
+
+/// Write the notice that dependencies are missing and one command rebuilds
+/// them (see [`write_idle_strip_notice`] for where and when it is written).
+fn write_prepare_notice(
+    worktree: &Path,
+    session_id: i64,
+    explanation: &str,
+    removed: &[String],
+) -> NoticeOutcome {
     let relative = crate::merge::ACTION_REQUIRED_RELPATH;
     let path = worktree.join(relative);
     if path.exists() {
@@ -209,15 +405,13 @@ pub(crate) fn write_idle_strip_notice(
         return NoticeOutcome::NotIgnored;
     }
     let body = format!(
-        "{}\n# Dependencies were removed from this checkout\n\n\
-         Session {session_id} had no activity for {idle_hours} hour(s) and no process in this \
-         checkout, so its regenerable dependency directories were moved out for deletion:\n\n{}\n\n\
+        "{}\n# Dependencies were removed from this checkout\n\n{explanation}\n\n{}\n\n\
          Your work is untouched: commits, staged and unstaged changes and every other file are \
          where you left them.\n\n\
          Rebuild the dependencies with one command before building or testing:\n\n    {}\n\n\
          This notice disappears once the session is prepared again.\n",
         crate::preparation::IDLE_STRIP_NOTICE_HEADER,
-        stripped
+        removed
             .iter()
             .map(|relative| format!("- `{relative}`"))
             .collect::<Vec<_>>()
@@ -252,16 +446,14 @@ pub(crate) fn write_idle_strip_notice(
 }
 
 /// Whether a step output covers `relative` (slash-separated, relative to
-/// the checkout): it names that directory or one of its ancestors.
+/// the checkout): it names exactly that directory, so `submit prepare`
+/// rebuilds exactly what the strip removed. A directory merely inside a
+/// declared output is kept: the step may rebuild only part of its output.
 pub(crate) fn declared_output_covers(outputs: &[String], relative: &str) -> bool {
     outputs.iter().any(|output| {
         let output = output.replace('\\', "/");
         let output = output.trim_start_matches("./").trim_end_matches('/');
-        !output.is_empty()
-            && (relative == output
-                || relative
-                    .strip_prefix(output)
-                    .is_some_and(|rest| rest.starts_with('/')))
+        !output.is_empty() && relative == output
     })
 }
 
@@ -310,6 +502,7 @@ fn tracked_top_level_directories(worktree: &Path) -> Vec<String> {
 pub(crate) fn recent_file_activity(
     worktree: &Path,
     since: std::time::SystemTime,
+    deadline: Instant,
 ) -> Option<&'static str> {
     let newer = |path: &Path| {
         std::fs::metadata(path)
@@ -327,10 +520,40 @@ pub(crate) fn recent_file_activity(
     if newer(worktree) {
         return Some("checkout_directory");
     }
-    tracked_top_level_directories(worktree)
+    if tracked_top_level_directories(worktree)
         .iter()
         .any(|name| newer(&worktree.join(name)))
-        .then_some("tracked_directory")
+    {
+        return Some("tracked_directory");
+    }
+    // A deep edit touches none of the above: the changed files' own times
+    // (and their parents'). A probe that cannot tell (timeout, or its cap
+    // reached without evidence) leaves the answer to the checks above.
+    // A probe that could not complete keeps the session: nothing is
+    // stripped on evidence that was not read.
+    match crate::worktree_status_activity::recent_status_activity(worktree, since) {
+        Some(true) => Some("changed_file"),
+        Some(false) => None,
+        // `git status` could not finish (a large checkout on a slow
+        // volume): a bounded walk of the checkout's modification times
+        // decides instead; one that cannot finish keeps the session.
+        // Only what the strip catalogue itself accepts as regenerable (its
+        // witness) is left out of the walk; within the checkout's deadline.
+        None => match crate::worktree_status_activity::recent_mtime_walk(
+            worktree,
+            since,
+            deadline.min(Instant::now() + crate::worktree_status_activity::MTIME_WALK_BUDGET),
+            crate::worktree_status_activity::MTIME_WALK_ENTRIES,
+            &|path: &Path, name: &str| {
+                super::strip::StripKind::for_name(name)
+                    .is_some_and(|kind| kind.witness(path, &[]).is_ok())
+            },
+        ) {
+            Some(true) => Some("changed_file_walk"),
+            Some(false) => None,
+            None => Some(ACTIVITY_UNKNOWN),
+        },
+    }
 }
 
 impl Broker {
@@ -369,7 +592,16 @@ impl Broker {
             }
         };
         idle.sort_by_key(|session| (session.last_activity_at, session.id));
-        let handled: BTreeMap<i64, i64> = self.meta_json(IDLE_STRIP_DONE_KEY);
+        // A memo written under older coverage rules is set aside: every
+        // idle session is examined once more under the current ones.
+        let rules: u32 = self.meta_json(IDLE_STRIP_RULES_KEY);
+        let memo_outdated = rules != IDLE_STRIP_RULES;
+        let handled: BTreeMap<i64, i64> = if memo_outdated {
+            crate::phase_telemetry::add("checkout_idle_strip_memo_outdated", Duration::ZERO);
+            BTreeMap::new()
+        } else {
+            self.meta_json(IDLE_STRIP_DONE_KEY)
+        };
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let idle_hours = idle_after_ms / 3_600_000;
         let mut newly_handled = BTreeMap::new();
@@ -469,12 +701,23 @@ impl Broker {
             crate::warn_unrecorded(
                 "remember idle-stripped sessions",
                 self.update_meta_json(IDLE_STRIP_DONE_KEY, |stored: &mut BTreeMap<i64, i64>| {
+                    if memo_outdated {
+                        stored.clear();
+                    }
                     stored.extend(newly_handled.iter().map(|(id, at)| (*id, *at)));
                     while stored.len() > IDLE_STRIP_DONE_MAX {
                         stored.pop_first();
                     }
                 }),
             );
+            if memo_outdated {
+                crate::warn_unrecorded(
+                    "record the idle strip's coverage rules",
+                    self.update_meta_json(IDLE_STRIP_RULES_KEY, |stored: &mut u32| {
+                        *stored = IDLE_STRIP_RULES;
+                    }),
+                );
+            }
         }
         crate::phase_telemetry::attach(
             "checkout_idle_strip",
@@ -489,6 +732,9 @@ impl Broker {
                 "noted": report.noted,
                 "kept_recent_files": report.kept_recent_files,
                 "kept_not_declared_output": report.kept_not_declared,
+                "by_kind": report.by_kind,
+                "measure_ms": report.measure_ms,
+                "memo_outdated": memo_outdated,
                 "refused": report.strip.refused,
                 "more_remaining": report.strip.more_remaining,
                 "phase_ms": {
@@ -559,7 +805,11 @@ impl Broker {
         let since = std::time::SystemTime::now()
             .checked_sub(idle_after)
             .unwrap_or(std::time::UNIX_EPOCH);
-        if let Some(evidence) = recent_file_activity(&worktree, since) {
+        let evidence = recent_file_activity(&worktree, since, deadline);
+        if evidence == Some(ACTIVITY_UNKNOWN) {
+            return Refused("activity_unknown");
+        }
+        if let Some(evidence) = evidence {
             report.kept_recent_files += 1;
             crate::phase_telemetry::add("checkout_idle_strip_kept_recent_files", Duration::ZERO);
             crate::phase_telemetry::attach(
@@ -580,10 +830,40 @@ impl Broker {
             return Refused("discovery_failed");
         };
         report.strip.candidates_found += candidates.len();
-        // Only what the session's own preparation rebuilds.
-        let (candidates, not_declared): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(|candidate| declared_output_covers(&declared_outputs, &candidate.relative));
+        let all_candidates = candidates.clone();
+        // Only what the session's own preparation recreates: exact outputs
+        // and environment roots first; workspace members only together with
+        // (or after) their top-level `node_modules`.
+        let mut primary = Vec::new();
+        let mut members = Vec::new();
+        let mut not_declared = Vec::new();
+        for candidate in candidates {
+            match idle_coverage(&declared_outputs, &candidate) {
+                Some(Coverage::Exact) => primary.push(candidate),
+                Some(Coverage::EnvironmentRoot) => {
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_covered_environment_root",
+                        Duration::ZERO,
+                    );
+                    primary.push(candidate);
+                }
+                Some(Coverage::WorkspaceMember) => members.push(candidate),
+                Some(Coverage::EnvironmentRootUnproven) => {
+                    *report
+                        .strip
+                        .refused
+                        .entry("environment_root_creation_unproven".to_string())
+                        .or_default() += 1;
+                    // One directory kept, not a refusal of the checkout.
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_kept_environment_root_creation_unproven",
+                        Duration::ZERO,
+                    );
+                }
+                None => not_declared.push(candidate),
+            }
+        }
+        let candidates = primary;
         if !not_declared.is_empty() {
             report.kept_not_declared += not_declared.len();
             *report
@@ -598,7 +878,8 @@ impl Broker {
                 );
             }
         }
-        if candidates.is_empty() {
+        if candidates.is_empty() && members.is_empty() {
+            tally_kinds(report, &all_candidates, &[], &BTreeMap::new());
             return IdleStrip::Done(Vec::new());
         }
         // A complete open-file observation (shared by the run): any process
@@ -627,17 +908,37 @@ impl Broker {
             return Refused("start_reserved");
         }
         // `submit prepare` holds this lock shared while it writes the
-        // directories; busy means a preparation is running.
-        let _checkout_lock = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-            self.main_root(),
-            &worktree,
-        ) {
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock)) => lock,
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(_)) => {
-                return Refused("checkout_busy");
-            }
-            Err(_) => return Refused("checkout_lock_unknown"),
-        };
+        // directories; busy means a preparation is running. A durable marker
+        // left by a producer proved gone (PID/start token and process group
+        // absent) does not keep the checkout: such markers leak when a
+        // guarded command is killed.
+        let _checkout_lock =
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer_past_exited_producers(
+                self.main_root(),
+                &worktree,
+            ) {
+                Ok((
+                    crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock),
+                    passed,
+                )) => {
+                    for _ in 0..passed {
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_exited_producer_marker_passed",
+                            Duration::ZERO,
+                        );
+                    }
+                    lock
+                }
+                Ok((crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block), _)) => {
+                    return Refused(match block {
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            ..
+                        } => "checkout_marker_live",
+                        _ => "checkout_busy",
+                    });
+                }
+                Err(_) => return Refused("checkout_lock_unknown"),
+            };
         // The run's observation may be minutes old: look again right before
         // the moves unless it is fresh.
         if run
@@ -662,17 +963,131 @@ impl Broker {
                 }
             }
         }
-        IdleStrip::Done(self.prove_and_move(
+        // Bytes of what is being removed or kept by the proofs (covered
+        // candidates only), within this checkout's share of the pass budget.
+        let mut covered = candidates.clone();
+        covered.extend(members.iter().cloned());
+        let sizes = self.measure_covered(report, &worktree, &covered, deadline);
+        // Every covered candidate is proved before anything moves (the
+        // pnpm-member proof reads the top-level `node_modules/.bin`).
+        let prove_started = Instant::now();
+        let mut verdicts =
+            super::strip::prove_strippable_all(&worktree, &covered, deadline, venv_markers);
+        report.strip.prove_ms = report
+            .strip
+            .prove_ms
+            .saturating_add(super::strip::elapsed_ms(prove_started));
+        let member_verdicts = verdicts.split_off(candidates.len());
+        let root_present = std::fs::symlink_metadata(worktree.join("node_modules")).is_ok();
+        let mut stripped = self.move_proven(
             StripTarget {
                 session_id: session.id,
                 worktree: &worktree,
                 pool: &pool,
             },
             &candidates,
+            verdicts,
             deadline,
             venv_markers,
             &mut report.strip,
-        ))
+        );
+        // Workspace members move only once the top-level `node_modules`
+        // actually moved (or was already absent), so the declared root
+        // install recreates root and members together; otherwise they stay
+        // as `member_root_kept`.
+        if !members.is_empty() {
+            let root_gone =
+                !root_present || stripped.iter().any(|relative| relative == "node_modules");
+            if root_gone {
+                stripped.extend(self.move_proven(
+                    StripTarget {
+                        session_id: session.id,
+                        worktree: &worktree,
+                        pool: &pool,
+                    },
+                    &members,
+                    member_verdicts,
+                    deadline,
+                    venv_markers,
+                    &mut report.strip,
+                ));
+            } else {
+                *report
+                    .strip
+                    .refused
+                    .entry("member_root_kept".to_string())
+                    .or_default() += members.len();
+                for _ in &members {
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_refused_member_root_kept",
+                        Duration::ZERO,
+                    );
+                }
+            }
+        }
+        tally_kinds(report, &all_candidates, &stripped, &sizes);
+        IdleStrip::Done(stripped)
+    }
+}
+
+impl Broker {
+    /// Bytes of `covered` candidates, within this checkout's budget and what
+    /// is left of the pass budget; unmeasured ones are left out.
+    fn measure_covered(
+        &self,
+        report: &mut IdleStripReport,
+        worktree: &Path,
+        covered: &[super::strip::StripCandidate],
+        deadline: Instant,
+    ) -> BTreeMap<String, u64> {
+        let _span = crate::phase_telemetry::span("checkout_idle_strip_measure");
+        let started = Instant::now();
+        let pass_left =
+            IDLE_STRIP_MEASURE_PASS_BUDGET.saturating_sub(Duration::from_millis(report.measure_ms));
+        let measure_deadline = deadline.min(started + IDLE_STRIP_MEASURE_BUDGET.min(pass_left));
+        let sizes = covered
+            .iter()
+            .filter_map(|candidate| {
+                if Instant::now() >= measure_deadline {
+                    return None;
+                }
+                crate::disk_headroom::directory_usage_bounded(
+                    &worktree.join(&candidate.relative),
+                    measure_deadline,
+                )
+                .map(|usage| (candidate.relative.clone(), usage.bytes))
+            })
+            .collect();
+        report.measure_ms = report
+            .measure_ms
+            .saturating_add(super::strip::elapsed_ms(started));
+        sizes
+    }
+}
+
+/// Add one checkout's removed and kept directories, by kind, to `report`.
+fn tally_kinds(
+    report: &mut IdleStripReport,
+    candidates: &[super::strip::StripCandidate],
+    stripped: &[String],
+    sizes: &BTreeMap<String, u64>,
+) {
+    for candidate in candidates {
+        let label = kind_label(candidate);
+        let tally = report.by_kind.entry(label).or_default();
+        let bytes = sizes.get(&candidate.relative).copied();
+        if bytes.is_none() {
+            tally.unmeasured += 1;
+        }
+        if stripped.contains(&candidate.relative) {
+            tally.removed += 1;
+            tally.removed_bytes = tally.removed_bytes.saturating_add(bytes.unwrap_or(0));
+            crate::phase_telemetry::add(removed_counter(label), Duration::ZERO);
+        } else {
+            tally.kept += 1;
+            tally.kept_bytes = tally.kept_bytes.saturating_add(bytes.unwrap_or(0));
+            crate::phase_telemetry::add(kept_counter(label), Duration::ZERO);
+        }
     }
 }
 
@@ -692,7 +1107,9 @@ mod tests {
             "gates_unknown",
             "start_reserved",
             "recent_file_activity",
+            "activity_unknown",
             "checkout_busy",
+            "checkout_marker_live",
             "checkout_lock_unknown",
             "fresh_process_use_unknown",
             "discovery_failed",
@@ -712,13 +1129,89 @@ mod tests {
         assert!(note.contains("aethyme broker submit prepare --session 7"));
     }
 
-    /// Only directories a declared step output names, or lies above, are
-    /// stripped from an open session.
+    /// Coverage for an open session: exact outputs; a Python environment
+    /// root containing a declared output; workspace members while the
+    /// top-level `node_modules` is declared. Nothing else.
     #[test]
-    fn a_declared_output_covers_itself_and_what_lies_inside() {
-        let outputs = vec!["node_modules/".to_string(), "./web/build".to_string()];
+    fn idle_coverage_takes_exact_outputs_environment_roots_and_members() {
+        use super::super::strip::{StripCandidate, StripKind};
+        let candidate = |relative: &str, kind| StripCandidate {
+            relative: relative.into(),
+            kind,
+        };
+        let outputs = vec![
+            "node_modules/".to_string(),
+            "tools/.venv/bin/tool".to_string(),
+            "tools/.venv/bin/python3".to_string(),
+            "cfg/.venv/pyvenv.cfg".to_string(),
+            "pip/.venv/bin/ruff".to_string(),
+        ];
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("node_modules", StripKind::NodeModules)),
+            Some(Coverage::Exact)
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("tools/.venv", StripKind::Venv)),
+            Some(Coverage::EnvironmentRoot)
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("cfg/.venv", StripKind::Venv)),
+            Some(Coverage::EnvironmentRoot)
+        );
+        // A step that only installs into an environment it did not create
+        // (no interpreter declared) does not prove the environment.
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("pip/.venv", StripKind::Venv)),
+            Some(Coverage::EnvironmentRootUnproven)
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("other/.venv", StripKind::Venv)),
+            None
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("tools/.venvx", StripKind::Venv)),
+            None
+        );
+        assert_eq!(
+            idle_coverage(
+                &outputs,
+                &candidate("apps/a/node_modules", StripKind::NodeModules)
+            ),
+            Some(Coverage::WorkspaceMember)
+        );
+        // Only a Python environment root is taken for an output inside it.
+        assert_eq!(
+            idle_coverage(
+                &["web/node_modules/.bin/x".to_string()],
+                &candidate("web/node_modules", StripKind::NodeModules)
+            ),
+            None
+        );
+        // Members need the top-level `node_modules` declared.
+        assert_eq!(
+            idle_coverage(
+                &["tools/.venv/bin/python".to_string()],
+                &candidate("apps/a/node_modules", StripKind::NodeModules)
+            ),
+            None
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("target", StripKind::CargoTarget)),
+            None
+        );
+    }
+
+    /// A declared output covers exactly the directory it names.
+    #[test]
+    fn a_declared_output_covers_exactly_the_directory_it_names() {
+        let outputs = vec![
+            "node_modules/".to_string(),
+            "./web/build".to_string(),
+            "web\\node_modules".to_string(),
+        ];
         assert!(declared_output_covers(&outputs, "node_modules"));
-        assert!(declared_output_covers(&outputs, "web/build/node_modules"));
+        assert!(declared_output_covers(&outputs, "web/node_modules"));
+        assert!(!declared_output_covers(&outputs, "web/build/node_modules"));
         assert!(!declared_output_covers(&outputs, ".venv"));
         assert!(!declared_output_covers(&outputs, "target"));
         assert!(!declared_output_covers(&outputs, "node_modules_old"));
@@ -739,6 +1232,7 @@ mod tests {
     fn recent_modification_times_count_as_activity() {
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path();
+        let far = || Instant::now() + Duration::from_secs(60);
         let git = |args: &[&str]| {
             assert!(
                 crate::git::git_command()
@@ -775,21 +1269,48 @@ mod tests {
             }
         };
         age_all();
-        assert_eq!(recent_file_activity(worktree, since), None);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
         set_mtime(&worktree.join(".git/index"), std::time::SystemTime::now());
-        assert_eq!(recent_file_activity(worktree, since), Some("git_index"));
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("git_index")
+        );
         age_all();
         set_mtime(&worktree.join("src"), std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("tracked_directory")
         );
         age_all();
         set_mtime(worktree, std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("checkout_directory")
         );
+        // A deep edit: only the file itself is new.
+        std::fs::write(worktree.join("src/lib.rs"), "y\n").unwrap();
+        age_all();
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file")
+        );
+        set_mtime(&worktree.join("src/lib.rs"), old);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        // `git status` does not finish: the walk decides, proving idle,
+        // then seeing a fresh file; out of time it keeps the session.
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(true));
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        std::fs::write(worktree.join("src/lib.rs"), "z\n").unwrap();
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file_walk")
+        );
+        set_mtime(&worktree.join("src/lib.rs"), old);
+        assert_eq!(
+            recent_file_activity(worktree, since, Instant::now()),
+            Some(ACTIVITY_UNKNOWN)
+        );
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(false));
     }
 
     /// The notice is created only when absent: a conflict notice is never

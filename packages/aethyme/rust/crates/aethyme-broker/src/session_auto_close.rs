@@ -310,13 +310,91 @@ pub(crate) fn explain_automatic_close(
 
 /// The refusal a session command prints for a closed session.
 pub(crate) fn closed_session_refusal(store: &crate::BrokerStore, session_id: i64) -> String {
-    match explain_automatic_close(store, session_id) {
+    let refusal = match explain_automatic_close(store, session_id) {
         Some(explanation) => format!(
             "session {session_id} is already closed; it cannot start new session work: \
              {explanation}"
         ),
         None => format!("session {session_id} is already closed; it cannot start new session work"),
+    };
+    match restore_required(store, session_id) {
+        Some(action) => {
+            // `--json` refusals carry the action as data too.
+            REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action.json()));
+            crate::phase_telemetry::add(
+                "closed_session_refusal_restore_required",
+                std::time::Duration::ZERO,
+            );
+            format!("{refusal}; {}", action.text())
+        }
+        None => refusal,
     }
+}
+
+/// The `restore_required` action of a session whose checkout was retired
+/// and left a tombstone: where, and the one command that restores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreRequired {
+    pub session_id: i64,
+    pub path: std::path::PathBuf,
+    pub command: String,
+}
+
+impl RestoreRequired {
+    pub(crate) fn text(&self) -> String {
+        format!(
+            "restore_required: its checkout was retired with all its work saved; restore it at the same path with `{}`",
+            self.command
+        )
+    }
+
+    /// The structured form `--json` errors carry under `error.action`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": "restore_required",
+            "session_id": self.session_id,
+            "path": self.path,
+            "command": self.command,
+        })
+    }
+}
+
+thread_local! {
+    /// The structured action of the last refusal built on this thread, for
+    /// the `--json` error envelope.
+    static REFUSAL_ACTION: std::cell::RefCell<Option<serde_json::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Leave `action` as this thread's structured refusal action.
+#[cfg(test)]
+pub(crate) fn set_refusal_action_for_test(action: serde_json::Value) {
+    REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action));
+}
+
+/// Forget any structured refusal action left on this thread.
+pub(crate) fn clear_refusal_action() {
+    REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Take the structured action of the last refusal built on this thread.
+pub(crate) fn take_refusal_action() -> Option<serde_json::Value> {
+    REFUSAL_ACTION.with(|cell| cell.borrow_mut().take())
+}
+
+/// For a session whose checkout was retired and left a tombstone: the
+/// `restore_required` action and its one command.
+pub(crate) fn restore_required(
+    store: &crate::BrokerStore,
+    session_id: i64,
+) -> Option<RestoreRequired> {
+    let session = store.session(session_id).ok()?;
+    let path = std::path::Path::new(&session.worktree_path);
+    crate::broker::is_checkout_tombstone(path).then(|| RestoreRequired {
+        session_id,
+        path: path.to_path_buf(),
+        command: crate::broker::restore_command(path),
+    })
 }
 
 /// For a command run from a checkout without `--session`: when the latest
@@ -600,6 +678,7 @@ mod lane_tests {
                 .set_modified(old_time)
                 .unwrap();
         }
+        crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
         broker
             .store()
             .connection()
@@ -3233,6 +3312,40 @@ mod lane_tests {
         assert!(is_open(&broker, stale.id));
     }
 
+    /// Re-judging a noted session in later passes neither sends another
+    /// closing-soon note nor moves the one that stands: its time, and so the
+    /// close it announces, stay as first written.
+    #[test]
+    fn a_closing_soon_note_is_neither_resent_nor_reset_by_later_passes() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let (noted, _) = session(&mut broker, "unpushed, in its notice period", false);
+        quiet(&mut broker, &noted, 150);
+        let note_times = |broker: &crate::Broker| {
+            broker
+                .store_ref()
+                .automation_notes(noted.id)
+                .unwrap()
+                .into_iter()
+                .filter(|note| {
+                    note.fingerprint.as_deref()
+                        == Some(crate::stale_session_policy::CLOSING_SOON_NOTE_FINGERPRINT)
+                })
+                .map(|note| (note.id, note.created_at))
+                .collect::<Vec<_>>()
+        };
+
+        broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+        let first = note_times(&broker);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+        let second = note_times(&broker);
+
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(second, first, "the note is not re-sent or rewritten");
+        assert!(is_open(&broker, noted.id));
+    }
+
     fn close_session_row(broker: &mut crate::Broker, session: &crate::Session) {
         broker
             .store()
@@ -3339,8 +3452,16 @@ mod lane_tests {
     }
 
     /// The shipped per-class windows instead of the fixture's.
+    /// The class windows these lane tests were written against (24 h /
+    /// 72 h / 168 h, a 24 h notice), set explicitly: what the lanes do with
+    /// a window does not depend on which numbers are shipped.
     fn shipped_class_windows(broker: &crate::Broker) {
-        std::fs::remove_file(broker.main_root().join(".aethyme/config.toml")).unwrap();
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nstale_landed_close_after_hours = 24\nstale_pushed_close_after_hours = 72\n\
+             stale_unpushed_close_after_hours = 168\nstale_closing_notice_hours = 24\n",
+        )
+        .unwrap();
     }
 
     /// Push the session branch so its remote-tracking ref holds HEAD.
@@ -3565,6 +3686,12 @@ mod lane_tests {
             "untracked work\n",
         )
         .unwrap();
+        // Written long ago (a fresh file would itself be recent activity):
+        // this test is about the remembered class, not file times.
+        crate::worktree_status_activity::age_tree_for_test(
+            &PathBuf::from(&nothing.worktree_path),
+            std::time::SystemTime::now() - Duration::from_secs(80 * 60 * 60),
+        );
         // Remembered, the class still reads clean (nothing it is keyed by
         // changed); the close decision asks afresh.
         assert_eq!(

@@ -22,9 +22,11 @@ const USAGE: &str = "aethyme storage — what Aethyme stores on this host, and i
                             a directory other than the host state and cache
   storage archives [--json] recovery archives: landed or not, created,
                             expires, kept
-  storage keep-archive <id> [--unkeep]
+  storage keep-archive <id> [--unkeep | --dismiss]
                             exempt an archive from expiry by age (a marker
-                            beside it), or lift that
+                            beside it), or lift that; --dismiss lets an
+                            archive holding unlanded work expire at its age
+                            (by default such an archive is kept and named)
 
 Budgets: defaults, overridden by <host state>/storage.toml [budget].
 ";
@@ -82,6 +84,18 @@ pub fn run(args: &[String]) -> u8 {
                 eprintln!("Error: the host state directory cannot be resolved");
                 return crate::exit_status::ENVIRONMENT;
             };
+            if args.iter().any(|arg| arg == "--dismiss") {
+                return match dismiss_archive(&host_state, id) {
+                    Ok(path) => {
+                        println!("dismissed (expires at its age): {}", path.display());
+                        crate::exit_status::SUCCESS
+                    }
+                    Err(message) => {
+                        eprintln!("Error: {message}");
+                        crate::exit_status::REFUSED
+                    }
+                };
+            }
             let unkeep = args.iter().any(|arg| arg == "--unkeep");
             match keep_archive(&host_state, id, !unkeep) {
                 Ok(path) => {
@@ -210,7 +224,34 @@ pub fn status_value(host_state: &Path) -> Value {
     // regenerable directories.
     let checkouts = super::checkout_counts(host_state);
     let scratch = super::session_scratch_usage(host_state);
+    let archive_usage = super::recovery_archive_usage(host_state);
     let mut classes = serde_json::to_value(&classes).unwrap_or_else(|_| json!({}));
+    // Recovery archives by location: the pool's volume (new archives) and
+    // host state (older ones), as the retirement lane last measured them.
+    if !archive_usage.is_empty()
+        && let Some(object) = classes.as_object_mut()
+    {
+        let sum = |pick: fn(&super::RecoveryArchiveUsage) -> &super::ArchiveLocationUsage| {
+            json!({
+                "archives": archive_usage.values().map(|usage| pick(usage).archives).sum::<usize>(),
+                "bytes": archive_usage.values().map(|usage| pick(usage).bytes).sum::<u64>(),
+            })
+        };
+        object.insert(
+            "recovery_archives_by_location".into(),
+            json!({
+                "pool": sum(|usage| &usage.pool),
+                "host_state": sum(|usage| &usage.host_state),
+                "over_bound": archive_usage.values().filter(|usage| usage.over_bound).count(),
+                "unique_kept_over_bound": archive_usage.values().map(|usage| usage.unique_kept_over_bound).sum::<usize>(),
+                "evicted_total": archive_usage.values().map(|usage| usage.evicted_total).sum::<usize>(),
+                "evicted_bytes_total": archive_usage.values().map(|usage| usage.evicted_bytes_total).sum::<u64>(),
+                "partial": archive_usage.values().any(|usage| usage.partial),
+                "repositories": archive_usage,
+                "why_not": "measured by checkout retirement; over [cleanup] recovery_archive_bound_gib only fully landed archives are removed",
+            }),
+        );
+    }
     // Session scratch directories live in the worktree pools and go with
     // their session (checkout retirement); the class reports what the
     // retirement lane measured.
@@ -388,6 +429,98 @@ fn status(json_output: bool) -> u8 {
     crate::exit_status::SUCCESS
 }
 
+/// One kept-at-age archive: its session, how to restore it and how to
+/// dismiss it.
+fn unlanded_at_age_line(host_state: &Path, id: &str) -> String {
+    let manifest: Option<Value> = archive_path(host_state, id)
+        .ok()
+        .and_then(|path| std::fs::read(path.join("manifest.json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let session = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.get("session_id"))
+        .and_then(Value::as_i64)
+        .map_or_else(
+            || "session unknown".to_string(),
+            |id| format!("session {id}"),
+        );
+    let restore = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.get("worktree_path"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "restore: see the archive's README.md".to_string(),
+            |path| {
+                format!(
+                    "restore: {}",
+                    crate::broker::restore_command(Path::new(path))
+                )
+            },
+        );
+    format!(
+        "recovery archive {id} ({session}) holds unlanded work; {restore}; dismiss: aethyme storage keep-archive {id} --dismiss"
+    )
+}
+
+/// Advice for repositories whose recovery archives stay over their bound
+/// because the archives hold work that exists nowhere else (never removed
+/// for size).
+pub(crate) fn recovery_archive_bound_advice(
+    usage: &BTreeMap<String, super::RecoveryArchiveUsage>,
+) -> Option<crate::StatusAdvice> {
+    let over: Vec<&super::RecoveryArchiveUsage> = usage
+        .values()
+        .filter(|usage| usage.over_bound && usage.unique_kept_over_bound > 0)
+        .collect();
+    if over.is_empty() {
+        return None;
+    }
+    let unique: usize = over.iter().map(|usage| usage.unique_kept_over_bound).sum();
+    let sessions: Vec<i64> = over
+        .iter()
+        .flat_map(|usage| usage.unique_kept_sessions.iter().copied())
+        .collect();
+    Some(crate::StatusAdvice {
+        id: "storage.recovery-archives-over-bound",
+        severity: crate::StatusAdviceSeverity::Warning,
+        reason: "recovery archives holding work that exists nowhere else are never removed for size; restore and land that work, or raise [cleanup] recovery_archive_bound_gib",
+        summary: format!(
+            "{} repositor{} over the recovery archive bound with {unique} archive(s) of unique work kept",
+            over.len(),
+            if over.len() == 1 { "y" } else { "ies" }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: over
+            .iter()
+            .map(|usage| {
+                format!(
+                    "pool {} archive(s) {}, host state {} archive(s) {}, bound {}",
+                    usage.pool.archives,
+                    human(usage.pool.bytes),
+                    usage.host_state.archives,
+                    human(usage.host_state.bytes),
+                    human(usage.bound_bytes)
+                )
+            })
+            .chain((!sessions.is_empty()).then(|| {
+                format!(
+                    "sessions holding unique work: {}",
+                    sessions
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }))
+            .collect(),
+        commands: vec![
+            "aethyme storage archives".into(),
+            "aethyme storage status --json".into(),
+        ],
+    })
+}
+
 /// How many unlanded recovery archives `storage.over-budget` names one by one.
 const UNLANDED_ARCHIVE_EXAMPLES: usize = 5;
 
@@ -511,6 +644,29 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
     if let Some(entry) = session_scratch_advice(&scratch) {
         advice.push(entry);
     }
+    advice.extend(recovery_archive_bound_advice(
+        &super::recovery_archive_usage(host_state),
+    ));
+    if !summary.unlanded_archives_at_age.is_empty() {
+        advice.push(crate::StatusAdvice {
+            id: "storage.unlanded-archives-at-age",
+            severity: crate::StatusAdviceSeverity::Warning,
+            reason: "a recovery archive holding unlanded commits or uncommitted changes reached its retention age; it is kept, never expired by age alone, until its owner restores the work or dismisses it",
+            summary: format!(
+                "{} recovery archive(s) with unlanded work kept past their retention age",
+                summary.unlanded_archives_at_age.len()
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: summary
+                .unlanded_archives_at_age
+                .iter()
+                .take(UNLANDED_ARCHIVE_EXAMPLES)
+                .map(|id| unlanded_at_age_line(host_state, id))
+                .collect(),
+            commands: vec!["aethyme storage archives".into()],
+        });
+    }
     let refused: usize = scratch.values().map(|usage| usage.refused).sum();
     if refused > 0 {
         advice.push(crate::StatusAdvice {
@@ -593,7 +749,11 @@ pub fn archive_path(host_state: &Path, id: &str) -> Result<std::path::PathBuf, S
     let id = id.strip_prefix("recovery-archives/").unwrap_or(id);
     let parts: Vec<&str> = id.split('/').collect();
     let plain = |part: &str| {
-        !part.is_empty() && part != "." && part != ".." && !part.ends_with(super::KEEP_SUFFIX)
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.ends_with(super::KEEP_SUFFIX)
+            && !part.ends_with(super::DISMISS_SUFFIX)
     };
     if parts.len() != 2 || !parts.iter().all(|part| plain(part)) {
         return Err(format!("{id:?} is not an archive id (<pool>/<archive>)"));
@@ -606,6 +766,31 @@ pub fn archive_path(host_state: &Path, id: &str) -> Result<std::path::PathBuf, S
     if !path.join("manifest.json").is_file() {
         return Err(format!("{id} has no manifest; not a recovery archive"));
     }
+    Ok(path)
+}
+
+/// Write an archive's dismissal marker: its owner lets it expire at its
+/// retention age although it holds unlanded work.
+pub fn dismiss_archive(host_state: &Path, id: &str) -> Result<std::path::PathBuf, String> {
+    let path = archive_path(host_state, id)?;
+    let marker = super::dismiss_marker(&path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o644);
+    }
+    match options.open(&marker) {
+        Ok(mut file) => std::io::Write::write_all(
+            &mut file,
+            b"Dismissed by `aethyme storage keep-archive --dismiss`: may expire by age.\n",
+        )
+        .map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    crate::phase_telemetry::add("storage_archive_dismissed", std::time::Duration::ZERO);
     Ok(path)
 }
 

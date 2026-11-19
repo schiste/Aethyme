@@ -1220,6 +1220,8 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     // The recorder is installed above, so the attempt's phases reach this
     // command's metric line.
     maybe_fast_forward_main_checkout(args, &mode);
+    // Only a refusal of this command may attach its structured action.
+    crate::session_auto_close::clear_refusal_action();
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
@@ -1307,13 +1309,19 @@ fn render_cli_error(
             // second JSON value could not repair the first one.
             return ErrorRendering::Diagnostic(message.to_string());
         }
+        let mut error = serde_json::json!({
+            "code": code,
+            "message": message,
+        });
+        // A refusal with a structured next step (a closed session whose
+        // checkout must be restored first) carries it as data.
+        if let Some(action) = crate::session_auto_close::take_refusal_action() {
+            error["action"] = action;
+        }
         ErrorRendering::Json(
             serde_json::json!({
                 "schema": "aethyme.broker-error/v1",
-                "error": {
-                    "code": code,
-                    "message": message,
-                },
+                "error": error,
             })
             .to_string(),
         )

@@ -831,6 +831,7 @@ impl Broker {
             &changed,
             Some(session_id),
             crate::gates::GateExecutionContext {
+                comparison_base: None,
                 cache_policy,
                 progress,
             },

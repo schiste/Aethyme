@@ -294,3 +294,8 @@ push_session_branches = true
 [collaboration]
 capture = "advisory"
 project = "proj-yphigqgbnleotk2lkce4rm366y"
+
+[cleanup]
+auto_remove = true
+strict = false
+ignored_directory_sweep = true

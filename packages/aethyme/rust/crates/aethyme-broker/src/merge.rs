@@ -295,16 +295,33 @@ pub(crate) fn repository_config_checked(
     main_root: &Path,
 ) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
     crate::status_reads::configuration(main_root, || {
-        if let Some(text) = committed_config_text(main_root)? {
-            return Ok(Some((text, "committed")));
-        }
-        aethyme_config::read_config_text(&main_root.join(aethyme_config::CONFIG_DIR), "config")?
-            .map(|text| {
-                text.toml_text()
-                    .map(|toml| (toml.into_owned(), "working_copy"))
-            })
-            .transpose()
+        repository_config_with_fallback(main_root, committed_config_text(main_root)?)
     })
+}
+
+fn repository_config_with_fallback(
+    main_root: &Path,
+    committed: Option<String>,
+) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
+    if let Some(text) = committed {
+        return Ok(Some((text, "committed")));
+    }
+    aethyme_config::read_config_text(&main_root.join(aethyme_config::CONFIG_DIR), "config")?
+        .map(|text| {
+            text.toml_text()
+                .map(|toml| (toml.into_owned(), "working_copy"))
+        })
+        .transpose()
+}
+
+pub(crate) fn repository_config_from_default_observation(
+    repo: &GitRepo,
+    observation: &Result<Option<(String, String)>, crate::GitError>,
+) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
+    repository_config_with_fallback(
+        repo.root(),
+        committed_config_from_default(repo, observation)?,
+    )
 }
 
 /// `.aethyme/config` as committed on the fetched default branch, if there
@@ -344,16 +361,25 @@ fn committed_config_text_uncached(
     // without another discovery process; ref and content reads remain fresh
     // for each command-local observation.
     let repo = GitRepo::at_known_root(main_root);
-    let Some((_, commit)) = repo.upstream_default_checked().map_err(|error| {
-        aethyme_config::ConfigSourceError::Read {
-            path: main_root.join(aethyme_config::CONFIG_DIR).join("config"),
-            message: format!("could not resolve the fetched default branch: {error}"),
-        }
-    })?
+    committed_config_from_default(&repo, &repo.upstream_default_checked())
+}
+
+fn committed_config_from_default(
+    repo: &GitRepo,
+    observation: &Result<Option<(String, String)>, crate::GitError>,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
+    let main_root = repo.root();
+    let Some((_, commit)) =
+        observation
+            .as_ref()
+            .map_err(|error| aethyme_config::ConfigSourceError::Read {
+                path: main_root.join(aethyme_config::CONFIG_DIR).join("config"),
+                message: format!("could not resolve the fetched default branch: {error}"),
+            })?
     else {
         return Ok(None);
     };
-    match repo.config_at_resolved_commit_checked(&commit, "config") {
+    match repo.config_at_resolved_commit_checked(commit, "config") {
         Ok(Some(text)) => Ok(Some(text.toml_text()?.into_owned())),
         Ok(None) => Ok(None),
         Err(crate::GitError::Config(error)) => Err(*error),
@@ -2009,6 +2035,7 @@ impl Broker {
             &sim_worktree,
             &gates,
             &changed,
+            verify_base,
             Some(entry.session_id),
             cache_policy,
             progress,

@@ -1048,6 +1048,15 @@ where
         if !metadata.is_dir() {
             continue;
         }
+        // A retired checkout's tombstone is not a directory to account for:
+        // its session is recorded and its work saved.
+        if super::tombstone::is_checkout_tombstone(&path) {
+            crate::phase_telemetry::add(
+                "worktree_reconcile_tombstone_skipped",
+                std::time::Duration::ZERO,
+            );
+            continue;
+        }
         let git_marker = match std::fs::metadata(path.join(".git")) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -6624,6 +6633,29 @@ mod worktree_inventory_scan_tests {
         assert!(!observed[0].git_marker);
     }
 
+    /// A retired checkout's tombstone is not listed as a directory the
+    /// reconcile lane must account for; a plain directory still is.
+    #[test]
+    fn a_tombstone_is_not_an_observed_worktree_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let tombstone = root.path().join("retired");
+        std::fs::create_dir(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join("ARCHIVED-SESSION.txt"),
+            "aethyme: retired session checkout\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("plain")).unwrap();
+        let mut observed = Vec::new();
+        collect_worktree_directory_entries(
+            std::fs::read_dir(root.path()).unwrap(),
+            &mut observed,
+            None,
+        );
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert!(observed[0].path.ends_with("plain"));
+    }
+
     #[test]
     fn expired_deadline_stops_before_a_stream_of_entry_errors() {
         let mut observed = Vec::new();
@@ -6957,6 +6989,34 @@ mod generic_guarded_exec_tests {
                 .unwrap();
             file.set_modified(old_time).unwrap();
         }
+        // Changed files count as activity too (deep edits): date them and
+        // their directories back as well.
+        fn age_tree(dir: &Path, then: std::time::SystemTime) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    age_tree(&path, then);
+                }
+                if !kind.is_symlink()
+                    && let Ok(file) = std::fs::File::open(&path)
+                {
+                    crate::warn_unrecorded("age a fixture file", file.set_modified(then));
+                }
+            }
+            if let Ok(file) = std::fs::File::open(dir) {
+                crate::warn_unrecorded("age a fixture directory", file.set_modified(then));
+            }
+        }
+        age_tree(worktree, old_time);
         broker
             .store()
             .connection()

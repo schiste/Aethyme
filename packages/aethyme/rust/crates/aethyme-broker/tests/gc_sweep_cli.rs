@@ -354,6 +354,40 @@ fn age_worktree_indexes(repo: &Path) {
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index) {
             file.set_modified(then).unwrap();
         }
+        // Changed files count as activity too: date the checkout's files
+        // and directories (small fixtures) back with the index.
+        if let Ok(pointer) = std::fs::read_to_string(entry.path().join("gitdir"))
+            && let Some(worktree) = Path::new(pointer.trim()).parent()
+        {
+            age_tree(worktree, then);
+        }
+    }
+}
+
+/// Date every file and directory under `dir` (not `.git`) to `then`.
+fn age_tree(dir: &Path, then: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            age_tree(&path, then);
+        }
+        if !kind.is_symlink()
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            let _ = file.set_modified(then);
+        }
+    }
+    if let Ok(file) = std::fs::File::open(dir) {
+        let _ = file.set_modified(then);
     }
 }
 
@@ -2774,10 +2808,17 @@ fn session_status(repo: &Path, id: i64) -> String {
 /// agent has been quiet for longer than the legacy idle window.
 #[test]
 fn an_idle_open_sessions_build_output_is_preserved_and_the_session_stays_open() {
-    let (repo, container) =
-        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (repo, container) = fixture(
+        "[retention]\nsession_abandoned_after_hours = 72\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    );
     let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
-    enable_sweep(repo.path());
+    // The sweep enabled, with the abandonment window this test was written
+    // against (30 h idle is past the 24 h default, which would close it).
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nsession_abandoned_after_hours = 72\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
 
     let report = sweep(repo.path(), container.path());
     assert!(

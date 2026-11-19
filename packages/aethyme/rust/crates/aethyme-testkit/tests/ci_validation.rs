@@ -1259,15 +1259,45 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{}\n", path.display())).unwrap();
     };
+    let workspace = repo.join("packages/aethyme/rust");
+    let manifest = |relative: &str, contents: &str| {
+        let path = workspace.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    manifest(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/c\", \"crates/k\", \"crates/cli\"]\n",
+    );
+    manifest(
+        "crates/c/Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nautotests = false\n\
+         [[test]]\nname = \"it\"\n[[test]]\nname = \"own\"\n",
+    );
+    manifest("crates/c/src/lib.rs", "");
+    manifest("crates/c/tests/it.rs", "");
+    manifest("crates/c/tests/own.rs", "");
+    manifest(
+        "crates/k/Cargo.toml",
+        "[package]\nname = \"k\"\nversion = \"0.1.0\"\n",
+    );
+    manifest("crates/k/src/lib.rs", "");
+    manifest("crates/k/tests/lint.rs", "");
+    manifest(
+        "crates/cli/Cargo.toml",
+        "[package]\nname = \"cli-package\"\nversion = \"0.1.0\"\n\
+         [[bin]]\nname = \"worker\"\npath = \"src/main.rs\"\n",
+    );
+    manifest("crates/cli/src/main.rs", "fn main() {}");
     let data = repo.join("data.json");
     std::fs::write(
         &data,
         r#"{
   "budget_seconds": 10,
-  "always_binaries": ["k::lint"],
+  "always_binaries": ["k::lint", "removed::lint"],
   "always_modules": [{"binary": "c", "module": "hot", "failing_runs": 9}],
   "modules": {"k::lint a": 1, "c hot": 1, "c small": 2, "c big": 20, "c::it suite": 3, "c::own x": 1},
-  "slow_tests": [{"binary": "k::lint", "test": "slow::one", "seconds": 9}]
+  "slow_tests": [{"binary": "k::lint", "test": "slow::one", "seconds": 9}, {"binary": "removed::test", "test": "slow", "seconds": 9}]
 }"#,
     )
     .unwrap();
@@ -1276,14 +1306,22 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
     git(&["branch", "base"]);
-    let select = |base: &str| {
-        let output = std::process::Command::new("bash")
+    let select = |base: Option<&str>, verified: Option<&str>| {
+        let mut command = std::process::Command::new("bash");
+        command
             .arg(&script)
-            .args(["--base", base, "--data"])
+            .arg("--data")
             .arg(&data)
-            .current_dir(repo)
-            .output()
-            .unwrap();
+            .current_dir(repo);
+        if let Some(base) = base {
+            command.args(["--base", base]);
+        }
+        if let Some(verified) = verified {
+            command.env("AETHYME_GATE_BASE_COMMIT", verified);
+        } else {
+            command.env_remove("AETHYME_GATE_BASE_COMMIT");
+        }
+        let output = command.output().unwrap();
         (
             output.status.code(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1295,8 +1333,10 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     let slow = " & !((binary_id(k::lint) & test(=slow::one)))";
 
     // No change: the always-run suites alone.
-    let (status, stdout, _) = select("base");
-    assert_eq!(status, Some(0));
+    let (status, stdout, stderr) = select(Some("base"), None);
+    assert_eq!(status, Some(0), "{stderr}");
+    assert!(stderr.contains("historical binary no longer built: removed::lint"));
+    assert!(stderr.contains("historical binary no longer built: removed::test"));
     assert_eq!(stdout, format!("({always}){slow}\n"));
 
     for path in [
@@ -1312,7 +1352,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
         write(&format!("packages/aethyme/rust/crates/c/{path}"));
     }
     write("docs/guide.md");
-    let (status, stdout, stderr) = select("base");
+    let (status, stdout, stderr) = select(Some("base"), None);
     assert_eq!(status, Some(0), "{stderr}");
     // 2 s always-run + 0 (new) + 1 (own binary) + 2 (small) + 3 (suite) = 8 of
     // 10; big (20 s) does not fit. The crate root, shared test support and the
@@ -1332,8 +1372,31 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
         "{stderr}"
     );
 
+    // The fetched ref can move after the broker materializes a candidate.
+    // Only the verified commit determines the diff inside a submit gate.
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "upstream changes"]);
+    let upstream = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    let upstream = std::str::from_utf8(&upstream.stdout).unwrap().trim();
+    write("packages/aethyme/rust/crates/cli/src/session.rs");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "candidate change"]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (status, stdout, stderr) = select(None, Some(upstream));
+    assert_eq!(status, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "({always} | (binary_id(cli-package::bin/worker) & test(/^session(::|$)/))){slow}\n"
+        )
+    );
+
     // Without a merge base the always-run suites still run.
-    let (status, stdout, stderr) = select("no-such-ref");
+    let (status, stdout, stderr) = select(Some("no-such-ref"), None);
     assert_eq!(status, Some(0));
     assert_eq!(stdout, format!("({always}){slow}\n"));
     assert!(stderr.contains("no merge base"), "{stderr}");
