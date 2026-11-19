@@ -7898,8 +7898,10 @@ impl GitRepo {
                 .unwrap_or_default()
         ));
         let result = self.seeded_working_tree_hash_in(&index_dir, &tmp, writers_quiescent);
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(lock);
+        // Best effort, as for the full hash's private index: a leftover is a
+        // stray file in the broker's index directory, never broker state.
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_file(lock).ok();
         result
     }
 
