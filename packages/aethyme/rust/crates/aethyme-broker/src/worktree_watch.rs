@@ -498,7 +498,7 @@ mod imp {
         let age = now_ms()
             .checked_sub(answer.recorded_at_ms)
             .map(Duration::from_millis);
-        if !age.is_some_and(|age| age < ANSWER_MAX_AGE) {
+        if age.is_none_or(|age| age >= ANSWER_MAX_AGE) {
             return Err(Miss::AnswerExpired);
         }
         Ok(answer.files)
