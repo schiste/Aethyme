@@ -8911,12 +8911,19 @@ impl Broker {
         #[cfg(test)]
         tests::ARTIFACT_WORKER_ADMISSION_ATTEMPTS
             .with(|attempts| attempts.borrow_mut().push(pressure_request));
-        self.reconcile_checkout_cleanup_outbox()?;
+        {
+            let _span = crate::phase_telemetry::span("worker_admission_cleanup_outbox");
+            self.reconcile_checkout_cleanup_outbox()?;
+        }
         let root = self.main_root().to_path_buf();
         if crate::host_state::path_is_ephemeral(&root) || artifact_worker_process_is_suppressed() {
             return Ok(());
         }
-        self.reconcile_compact_checkout_backfill()?;
+        {
+            let _span = crate::phase_telemetry::span("worker_admission_compact_backfill");
+            self.reconcile_compact_checkout_backfill()?;
+        }
+        let due_checks = crate::phase_telemetry::span("worker_admission_due_checks");
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
@@ -8970,6 +8977,8 @@ impl Broker {
         {
             return Ok(());
         }
+        drop(due_checks);
+        let _launch = crate::phase_telemetry::span("worker_admission_launch");
         let Some((router, _engine)) = artifact_worker_binaries() else {
             if steady_removal_due {
                 self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
@@ -20719,6 +20728,29 @@ mod tests {
             ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
             vec![false],
             "normal open must retain its artifact-sweep worker admission"
+        );
+    }
+
+    /// Worker admission is the largest share of a writable open's recovery
+    /// work, so its first step is named on the metric line too.
+    #[test]
+    fn worker_admission_records_its_cleanup_outbox_step() {
+        let (_temporary, root, storage, _journal_path) = repository_with_pending_gc_journal();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            let _broker = storage.open(&root).expect("normal writable open");
+        }
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("open_gc_worker_admission"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get("worker_admission_cleanup_outbox"),
+            Some(&1),
+            "{counts:?}"
         );
     }
 

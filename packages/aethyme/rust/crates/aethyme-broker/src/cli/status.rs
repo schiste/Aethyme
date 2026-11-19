@@ -207,6 +207,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     };
     let open_ms = opened.elapsed().as_millis() as u64;
     let session_id = if form == StatusForm::Compact && parsed.session.is_none() {
+        let _span = crate::phase_telemetry::span("status_session_lookup");
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
         let checkout = crate::GitRepo::discover(&cwd)
@@ -219,15 +220,24 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         parsed.session
     };
     if let Some(session_id) = session_id {
-        let coordination = crate::agent_hook::session_coordination(&broker, Some(session_id));
-        let mut block =
-            super::status_extras::routine_session_block(&broker, session_id, &coordination)?;
+        let coordination = {
+            let _span = crate::phase_telemetry::span("status_session_coordination");
+            crate::agent_hook::session_coordination(&broker, Some(session_id))
+        };
+        let mut block = {
+            let _span = crate::phase_telemetry::span("status_session_block");
+            super::status_extras::routine_session_block(&broker, session_id, &coordination)?
+        };
         // Where the session's build output and temporary files belong
         // (read-only: status never creates one).
-        let scratch_dir = broker.session_scratch_dir(session_id);
+        let scratch_dir = {
+            let _span = crate::phase_telemetry::span("status_session_scratch_dir");
+            broker.session_scratch_dir(session_id)
+        };
         if let Some(object) = block.as_object_mut() {
             object.insert("scratch_dir".into(), serde_json::json!(scratch_dir));
         }
+        let lease_requests = crate::phase_telemetry::span("status_session_lease_requests");
         let requests = broker.session_pending_lease_release_requests(session_id)?;
         let count = requests.len();
         let records: Vec<_> = requests.into_iter().take(10)
@@ -235,19 +245,29 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 "request_id": request.request_id, "requester_session_id": request.requester_session_id,
                 "holder_session_id": request.holder_session_id, "path": request.path
             })).collect();
-        let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
+        drop(lease_requests);
+        let peers = {
+            let _span = crate::phase_telemetry::span("status_session_peers");
+            crate::agent_hook::session_peer_view(&broker, session_id)?
+        };
         // The primary checkout's sync state and its advice: the session view
         // is what `status --json` shows from a checkout with a session,
         // including a session adopted on the primary checkout itself.
+        let main_checkout_span = crate::phase_telemetry::span("status_main_checkout");
         let main_checkout = crate::main_checkout_sync::load_state(broker.store_ref());
         let main_checkout_advice = crate::main_checkout_sync::status_advice(
             broker.store_ref(),
             broker.main_root(),
             now_ms(),
         );
+        drop(main_checkout_span);
         // Parent, children, recorded PR states and one next action, when the
         // session is part of a stack.
-        let stack = broker.session_stack_view(session_id);
+        let stack = {
+            let _span = crate::phase_telemetry::span("status_session_stack");
+            broker.session_stack_view(session_id)
+        };
+        let _render = crate::phase_telemetry::span("status_session_render");
         if parsed.json {
             let mut snapshot = serde_json::json!({
                 "schema": "aethyme.broker-session-view/v2",

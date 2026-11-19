@@ -2636,6 +2636,7 @@ impl Broker {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_item(
         &self,
         session: &Session,

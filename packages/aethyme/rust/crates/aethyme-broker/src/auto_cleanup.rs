@@ -12505,6 +12505,54 @@ mod tests {
         assert!(marker_path.exists());
     }
 
+    /// `finish` walks the checkout for the size it reports before it takes
+    /// the repository-wide lifecycle claim, so no other session's start,
+    /// finish or cleanup waits on the walk, and still reports that size.
+    #[cfg(unix)]
+    #[test]
+    fn finish_sizes_the_checkout_before_taking_the_lifecycle_claim() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        let walks_at_claim = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&walks_at_claim);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |_| {
+            let counts = crate::phase_telemetry::active()
+                .map(|recorder| recorder.totals().1)
+                .unwrap_or_default();
+            observed.lock().unwrap().push(
+                counts
+                    .get("finish_size_walk_unlocked")
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.finish(session.id).unwrap()
+        };
+        assert!(
+            report.cleanup.completed && report.cleanup.worktree_removed,
+            "{report:#?}"
+        );
+        assert!(
+            report.cleanup.reclaimed_bytes > 0,
+            "the walked size is still the reported one: {report:#?}"
+        );
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("finish_size_walk_unlocked"),
+            Some(&1),
+            "{counts:?}"
+        );
+        let walks_at_claim = walks_at_claim.lock().unwrap();
+        // The removal's claim is the last one finish takes.
+        assert_eq!(
+            walks_at_claim.last(),
+            Some(&1),
+            "the walk finished before the removal's lifecycle claim: {walks_at_claim:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn removed_spawn_history_does_not_block_a_fresh_instance_at_the_same_path() {
