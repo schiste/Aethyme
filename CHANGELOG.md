@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.137] - 2026-11-19
+
+### Fixed
+
+- `submit` no longer re-hashes every tracked file of the verification checkout to report a graph check that is turned off. When the repository's graph policy does not enforce committed fragments, the check returned `disabled` only after building a temporary index and hashing the whole freshly created checkout; on the busiest repository that was 3 to 8 minutes per submission before any gate started. The disabled outcome now carries the tree the checkout was created from, which `submit` already knows, and reads no files. An enforced policy, or an environment that refuses graph verification, takes the full verification as before. Gate selection is unchanged (#1849).
+
+### Added
+
+- Spans `submit_selection_policy_load`, `submit_graph_integrity` and `submit_gate_definitions_load`; counters `graph_integrity_disabled_known_tree` and `graph_integrity_full_verification` (#1849).
+
+### Upgrade notes
+
+- For a disabled graph check, the reported `tree_hash` is the merge candidate's tree rather than a hash of the checkout's files. They differ only where Git renormalizes content on add (line-ending conversion, a non-idempotent clean filter) or in a sparse checkout. Nothing reads the value for a decision.
+
+### Known issues
+
+- Gate execution still hashes the whole verification checkout once before the gates run.
+
 ## [0.8.136] - 2026-11-19
 
 ### Fixed
