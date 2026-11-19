@@ -3425,7 +3425,8 @@ impl Broker {
         };
         let wall = process_started.elapsed().as_secs_f64();
         let drain_share_pct = if wall > 0.0 {
-            (drain_time.as_secs_f64() * 100.0 / wall).round() as u64
+            (crate::checkout_trash::drain_time_this_process().as_secs_f64() * 100.0 / wall).round()
+                as u64
         } else {
             0
         };

@@ -263,23 +263,25 @@ mod tests {
     /// lowers CPU niceness instead; a refused policy call is reported.
     #[test]
     fn the_trash_deleter_asks_for_unthrottled_process_io() {
-        let mut calls = Vec::new();
+        let calls = std::cell::RefCell::new(Vec::new());
         let priority = raise_for_trash_deleter_with(
             |band| {
-                calls.push(format!("darwin_bg {band}"));
+                calls.borrow_mut().push(format!("darwin_bg {band}"));
                 true
             },
             |scope, policy| {
-                calls.push(format!("iopolicy scope {scope} policy {policy}"));
+                calls
+                    .borrow_mut()
+                    .push(format!("iopolicy scope {scope} policy {policy}"));
                 true
             },
             |nice| {
-                calls.push(format!("nice {nice}"));
+                calls.borrow_mut().push(format!("nice {nice}"));
                 true
             },
         );
         assert_eq!(
-            calls,
+            calls.into_inner(),
             vec!["darwin_bg 0", "iopolicy scope 0 policy 1", "nice 10"]
         );
         assert_eq!(priority.io_policy, "important");
