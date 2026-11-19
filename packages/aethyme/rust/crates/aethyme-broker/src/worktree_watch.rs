@@ -2117,7 +2117,7 @@ mod tests {
     #[test]
     fn watching_another_worktree_on_its_own_stream_keeps_this_answer() {
         let mut fixture = Fixture::new();
-        fixture.start_watcher_with(OWN_STREAM_CAP.max(2));
+        fixture.start_watcher_with(2);
         assert!(fixture.ask_until(Source::Reused).is_empty());
         // A second worktree is asked about: the watcher starts its stream.
         let other = Fixture::new();
