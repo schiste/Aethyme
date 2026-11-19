@@ -104,6 +104,52 @@ const RETIRE_IDLE_RECHECK_MS: i64 = 10 * 60 * 1_000;
 const RETIRE_BUSY_RECHECK_MS: i64 = 60 * 1_000;
 /// Runs in a row without shrinking before `broker status` says so.
 pub(crate) const RETIRE_STALLED_RUNS: u32 = 3;
+/// Runs in a row in which the trash grew before `broker status` says so.
+pub(crate) const TRASH_GROWING_RUNS_ADVICE_AT: u32 = 3;
+
+/// The share of a retirement run's window kept for the trash drain, as
+/// `(numerator, denominator)`: a third normally, half while the trash is
+/// behind ([`crate::checkout_trash::TrashBacklog::behind`]). The phases
+/// before the drain share the rest (each keeps its own floor), so the drain
+/// never runs on whatever they left, and they never get less than half.
+const fn trash_drain_share(behind: bool) -> (u32, u32) {
+    if behind { (1, 2) } else { (1, 3) }
+}
+
+/// When the phases before the drain must end: the window less the drain's
+/// share.
+fn retirement_sweep_deadline(
+    started: Instant,
+    window: std::time::Duration,
+    behind: bool,
+) -> Instant {
+    let (numerator, denominator) = trash_drain_share(behind);
+    started + window - window * numerator / denominator
+}
+
+/// The drain's deadline: the lane's own, or its full share from `now` when
+/// the phases before it ran past their deadline (a phase's floor may), so
+/// the drain always gets its budget and never more than that past the lane.
+fn trash_drain_deadline(
+    deadline: Instant,
+    now: Instant,
+    window: std::time::Duration,
+    behind: bool,
+) -> Instant {
+    let (numerator, denominator) = trash_drain_share(behind);
+    deadline.max(now + window * numerator / denominator)
+}
+
+/// Runs in a row in which the trash grew: one more when `pending` is above
+/// `previous_pending`, reset when it fell, kept when unchanged.
+fn next_trash_growing_runs(previous_runs: u32, previous_pending: usize, pending: usize) -> u32 {
+    match pending.cmp(&previous_pending) {
+        std::cmp::Ordering::Greater => previous_runs.saturating_add(1),
+        std::cmp::Ordering::Less => 0,
+        std::cmp::Ordering::Equal => previous_runs,
+    }
+}
+
 /// A remembered keep is judged again after this long, by attempt: 1 h, then
 /// 6 h, then every 24 h. A changed HEAD or index is judged at once.
 const RETIRE_KEEP_BACKOFF_MS: [i64; 3] = [3_600_000, 6 * 3_600_000, 24 * 3_600_000];
@@ -830,6 +876,14 @@ pub(crate) struct CheckoutRetirementProgress {
     /// still used them.
     #[serde(default)]
     pub trash_entries_in_use: usize,
+    /// When the oldest trash entry still recorded after the last run was
+    /// moved in (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_oldest_entry_ms: Option<i64>,
+    /// Runs in a row after which more trash entries were recorded than after
+    /// the run before.
+    #[serde(default)]
+    pub trash_growing_runs: u32,
     /// The last run's inspection that failed or timed out (session and the
     /// failing Git step), retried on the next run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2317,8 +2371,9 @@ impl Broker {
     }
 
     /// The worker lane: judge closed sessions that still have a checkout,
-    /// by session-id cursor, until `deadline` (two thirds of the time), then
-    /// drain the trash with the rest.
+    /// by session-id cursor, until `deadline` less the drain's share (two
+    /// thirds of the time, half while the trash is behind), then drain the
+    /// trash with at least its share ([`trash_drain_deadline`]).
     pub(crate) fn run_checkout_retirement(
         &mut self,
         deadline: Instant,
@@ -2329,7 +2384,9 @@ impl Broker {
         let _inventory = crate::git::WorktreeInventoryRunScope::enter();
         let started = Instant::now();
         let window = deadline.saturating_duration_since(started);
-        let sweep_deadline = started + window * 2 / 3;
+        let trash_behind = crate::checkout_trash::TrashBacklog::of(&self.checkout_trash_rows())
+            .behind(crate::clock::epoch_ms());
+        let sweep_deadline = retirement_sweep_deadline(started, window, trash_behind);
         let mut report = CheckoutRetirementReport::default();
         let mut last_inspection_failure = None;
         // Resolving the open sessions' paths may use a third of the window,
@@ -2403,7 +2460,14 @@ impl Broker {
                 std::time::Duration::ZERO,
             );
         }
-        report.trash = self.drain_checkout_trash(deadline);
+        let drain_deadline = trash_drain_deadline(deadline, Instant::now(), window, trash_behind);
+        if drain_deadline > deadline {
+            crate::phase_telemetry::add(
+                "checkout_trash_drain_budget_extended",
+                drain_deadline.saturating_duration_since(deadline),
+            );
+        }
+        report.trash = self.drain_checkout_trash(drain_deadline);
         self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
@@ -2491,6 +2555,12 @@ impl Broker {
             process_use_unavailable: report.process_use_unavailable
                 || report.trash.process_use_unknown,
             trash_entries_in_use: report.trash.entries_in_use,
+            trash_oldest_entry_ms: report.trash.oldest_pending_created_ms,
+            trash_growing_runs: next_trash_growing_runs(
+                previous.trash_growing_runs,
+                previous.trash_pending,
+                report.trash.entries_pending,
+            ),
             last_inspection_failure,
             strip: self.next_checkout_strip_progress(&previous.strip, &report),
         };
@@ -2771,15 +2841,24 @@ impl Broker {
             crate::phase_telemetry::add("checkout_trash_deleter_busy", std::time::Duration::ZERO);
             return crate::checkout_trash::TrashDrainReport {
                 entries_pending: pending,
+                oldest_pending_created_ms: crate::checkout_trash::TrashBacklog::of(&rows)
+                    .oldest_created_ms,
                 ..crate::checkout_trash::TrashDrainReport::default()
             };
         };
         let before = rows.clone();
-        let pace = crate::checkout_trash::DeleterPace::for_host(
+        let now_ms = crate::clock::epoch_ms();
+        let backlog = crate::checkout_trash::TrashBacklog::of(&rows);
+        let need = crate::checkout_trash::DrainNeed::of(
             self.checkout_trash_below_headroom(&first),
-            crate::checkout_trash::host_loaded(),
+            backlog.behind(now_ms),
         );
-        let mut report = crate::checkout_trash::drain_trash(&mut rows, deadline, pace);
+        let mut pacer = crate::checkout_trash::DrainPacer::for_need(
+            need,
+            crate::checkout_trash::sample_host_pressure,
+        );
+        let drain_started = Instant::now();
+        let mut report = crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut pacer);
         // Entries recorded by another process during the drain are kept:
         // only what this run removed, forgot, confirmed or counted is
         // applied, atomically.
@@ -2809,11 +2888,52 @@ impl Broker {
             },
         );
         crate::warn_unrecorded("record the checkout trash drain", applied);
-        report.entries_pending = self
-            .checkout_trash_rows()
-            .values()
-            .map(std::collections::BTreeMap::len)
-            .sum();
+        let after = self.checkout_trash_rows();
+        report.entries_pending = after.values().map(std::collections::BTreeMap::len).sum();
+        report.oldest_pending_created_ms =
+            crate::checkout_trash::TrashBacklog::of(&after).oldest_created_ms;
+        let elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let pace = report
+            .pace
+            .unwrap_or(crate::checkout_trash::DeleterPace::Steady);
+        let observed_rate = u64::try_from(report.unlinks)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1_000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(0);
+        let backlog_oldest_age_s = backlog.oldest_age_ms(now_ms).map(|age| age / 1_000);
+        let final_pace = report
+            .final_pace
+            .map(crate::checkout_trash::DeleterPace::as_str);
+        let oldest_pending_age_s = report
+            .oldest_pending_created_ms
+            .map(|created| now_ms.saturating_sub(created).max(0) / 1_000);
+        crate::phase_telemetry::attach(
+            "checkout_trash_drain",
+            serde_json::json!({
+                "backlog_entries": backlog.entries,
+                "backlog_oldest_age_s": backlog_oldest_age_s,
+                "need": need.as_str(),
+                "pace": pace.as_str(),
+                "unlinks_per_second": pace.unlinks_per_second(),
+                "final_pace": final_pace,
+                "pace_changes": report.pace_changes,
+                "entries_removed": report.entries_removed,
+                "unlinks": report.unlinks,
+                "bytes": report.bytes,
+                "elapsed_ms": elapsed_ms,
+                "unlinks_per_second_observed": observed_rate,
+                "passed_over": {
+                    "in_use": report.entries_in_use,
+                    "failed": report.failed.len(),
+                    "unrecognized": report.unrecognized,
+                },
+                "budget_stopped": report.budget_stopped,
+                "process_use_unknown": report.process_use_unknown,
+                "entries_pending": report.entries_pending,
+                "oldest_pending_age_s": oldest_pending_age_s,
+            }),
+        );
         report
     }
 
@@ -3461,6 +3581,148 @@ mod tests {
             Some(1),
             "the rename reused the run's observation"
         );
+    }
+
+    /// An entry a process still uses is passed over, not waited on: the
+    /// entries behind it are deleted in the same run, and it is deleted by a
+    /// later run once nothing uses it (its row stays recorded meanwhile).
+    #[test]
+    fn an_entry_in_use_never_blocks_the_entries_behind_it() {
+        let (owner, _storage, mut broker) = fixture();
+        let mut moved = Vec::new();
+        for label in ["first in use", "second free"] {
+            let (session, worktree) = closed(&mut broker, label, |_| {});
+            let current = broker.store_ref().session(session.id).unwrap();
+            let _lane = super::RetirementLaneScope::enter();
+            broker
+                .remove_checkout_through_trash(&current, &worktree, true)
+                .unwrap();
+            moved.push(session.id);
+        }
+        let entries = broker
+            .checkout_trash_rows()
+            .into_iter()
+            .flat_map(|(dir, entries)| {
+                entries
+                    .into_iter()
+                    .filter(|(_, row)| !row.stripped)
+                    .map(move |(name, row)| (dir.join(name), row.session_id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        // Rows are ordered by name, which is the drain's order: the first
+        // is the one the drain reaches first.
+        let (first, _) = entries[0].clone();
+        let (second, _) = entries[1].clone();
+        let inside = std::fs::canonicalize(&first).unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "shell".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: inside.clone(),
+            }]),
+        ));
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let far = Instant::now() + Duration::from_secs(600);
+
+        let passed_over = broker.drain_checkout_trash_with_lock(Some(&lock), far);
+        assert_eq!(
+            (passed_over.entries_in_use, passed_over.entries_pending),
+            (1, 1),
+            "{passed_over:?}"
+        );
+        assert!(passed_over.failed.is_empty(), "{passed_over:?}");
+        assert!(inside.exists(), "the entry in use is kept");
+        assert!(!second.exists(), "the entry behind it went in the same run");
+
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let retried = broker.drain_checkout_trash_with_lock(Some(&lock), far);
+        assert_eq!(retried.entries_pending, 0, "{retried:?}");
+        assert!(!inside.exists(), "retried once nothing uses it");
+        assert_eq!(moved.len(), 2);
+    }
+
+    /// The drain has its own share of the run: a third, half while the
+    /// trash is behind. Phases that ran to the lane's deadline still leave
+    /// it that whole share, and phases that end early leave it the rest.
+    #[test]
+    fn the_drain_keeps_its_own_budget() {
+        let window = Duration::from_secs(180);
+        let started = Instant::now();
+        let deadline = started + window;
+        assert_eq!(
+            super::retirement_sweep_deadline(started, window, false),
+            started + window * 2 / 3
+        );
+        assert_eq!(
+            super::retirement_sweep_deadline(started, window, true),
+            started + window / 2,
+            "behind, the phases before the drain get half"
+        );
+        assert_eq!(
+            super::trash_drain_deadline(deadline, started + Duration::from_secs(30), window, true),
+            deadline,
+            "phases that ended early leave the drain the rest of the lane"
+        );
+        assert_eq!(
+            super::trash_drain_deadline(deadline, deadline, window, false),
+            deadline + window / 3,
+            "phases that overran still leave the drain its share"
+        );
+        assert_eq!(
+            super::trash_drain_deadline(deadline, deadline, window, true),
+            deadline + window / 2
+        );
+        assert_eq!(super::next_trash_growing_runs(2, 10, 11), 3);
+        assert_eq!(super::next_trash_growing_runs(2, 10, 10), 2);
+        assert_eq!(super::next_trash_growing_runs(2, 10, 9), 0);
+    }
+
+    /// `broker status` names a trash backlog a day old, or one that grew
+    /// for several runs in a row, and stays quiet otherwise.
+    #[test]
+    fn status_names_a_trash_backlog_that_is_old_or_growing() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut has_advice = |progress: &CheckoutRetirementProgress| {
+            broker
+                .store_ref()
+                .meta_set(
+                    CHECKOUT_RETIREMENT_PROGRESS_KEY,
+                    &serde_json::to_string(progress).unwrap(),
+                )
+                .unwrap();
+            broker
+                .status(crate::clock::epoch_ms())
+                .unwrap()
+                .advice
+                .iter()
+                .any(|advice| advice.id == "cleanup.trash-backlog")
+        };
+        let now = crate::clock::epoch_ms();
+        let recent = CheckoutRetirementProgress {
+            trash_pending: 40,
+            trash_oldest_entry_ms: Some(now - 60_000),
+            trash_growing_runs: 1,
+            ..CheckoutRetirementProgress::default()
+        };
+        assert!(!has_advice(&recent));
+        assert!(has_advice(&CheckoutRetirementProgress {
+            trash_oldest_entry_ms: Some(now - crate::checkout_trash::TRASH_BACKLOG_AGE_MS - 1),
+            ..recent.clone()
+        }));
+        assert!(has_advice(&CheckoutRetirementProgress {
+            trash_growing_runs: super::TRASH_GROWING_RUNS_ADVICE_AT,
+            ..recent.clone()
+        }));
+        assert!(!has_advice(&CheckoutRetirementProgress {
+            trash_pending: 0,
+            trash_growing_runs: super::TRASH_GROWING_RUNS_ADVICE_AT,
+            ..recent
+        }));
     }
 
     /// The deleter leaves an entry alone while a process still has its

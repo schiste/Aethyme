@@ -3213,6 +3213,66 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    push_trash_backlog_advice(view, progress, crate::clock::epoch_ms());
+}
+
+/// A trash whose deletion does not keep up: entries over a day old, or more
+/// entries after each of several runs in a row. Space moved into the trash
+/// is not free until the deleter removes it.
+fn push_trash_backlog_advice(
+    view: &mut StatusView,
+    progress: &retire::CheckoutRetirementProgress,
+    now_ms: i64,
+) {
+    if progress.trash_pending == 0 {
+        return;
+    }
+    let oldest_age_ms = progress
+        .trash_oldest_entry_ms
+        .map(|created| now_ms.saturating_sub(created).max(0));
+    let old = oldest_age_ms.is_some_and(|age| age >= crate::checkout_trash::TRASH_BACKLOG_AGE_MS);
+    let growing = progress.trash_growing_runs >= retire::TRASH_GROWING_RUNS_ADVICE_AT;
+    if !old && !growing {
+        return;
+    }
+    let mut evidence = vec![format!(
+        "{} entr(y/ies) recorded in the checkout trash",
+        progress.trash_pending
+    )];
+    if let Some(age) = oldest_age_ms {
+        evidence.push(format!(
+            "the oldest was moved in {} hour(s) ago",
+            age / 3_600_000
+        ));
+    }
+    if growing {
+        evidence.push(format!(
+            "the trash grew after each of the last {} retirement runs",
+            progress.trash_growing_runs
+        ));
+    }
+    if progress.trash_entries_in_use > 0 {
+        evidence.push(format!(
+            "{} trash entr(y/ies) left alone because a process still uses them",
+            progress.trash_entries_in_use
+        ));
+    }
+    evidence.push(
+        "the deleter raises its rate while the trash is behind; the metric line's checkout_trash_drain field shows the pace it used and why".into(),
+    );
+    view.advice.push(StatusAdvice {
+        id: "cleanup.trash-backlog",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "stripped directories and retired checkouts are moved into the pool's checkout trash and only free their space once the background deleter removes them; it is not keeping up",
+        summary: format!(
+            "{} checkout trash entr(y/ies) waiting for deletion",
+            progress.trash_pending
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: Vec::new(),
+    });
 }
 
 /// The `status` row naming sessions whose landed proof timed out even with
