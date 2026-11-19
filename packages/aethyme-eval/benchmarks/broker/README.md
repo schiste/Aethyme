@@ -265,3 +265,51 @@ broker command metrics, and summaries for solo and concurrent work. Median and
 nearest-rank p90 use tasks that completed in both arms. Concurrent-task elapsed
 time includes any wait for the preceding candidate to integrate. Keep raw
 transcripts local and publish only aggregate findings.
+
+Use `--concurrent` to replace the solo work with three additional disjoint
+pairs, giving six independent groups and twelve assignments per arm. Each
+group and arm has its own repository, bare origin, worktrees and broker
+state. Use `--hook-home <path>` with an isolated Codex home containing the
+installed Aethyme plugin and its existing trust records. Preserve both
+`trusted_hash` and `trusted_content_hash` where present. The runner disables
+the plugin for the direct Git arm and requires recorded broker activity
+from each hook-enabled worker. Pin the same release binary on the hook PATH
+and smoke-test receipt of the real startup message before collecting timings.
+
+If the sandbox protects linked Git metadata, add `--coordinator-publish` in
+both arms. Workers author and test inside the original workspace-write
+sandbox. The coordinator verifies the unchanged checkout head and assignment
+paths, stages the owned edits and publishes with direct Git or `broker
+advance`. It applies the same checks on repair turns. Task timing includes
+the coordinator's publication and integration. Counts distinguish first
+attempts, actual repair turns, and tasks that failed final verification.
+
+```sh
+.venv/bin/python benchmarks/broker/paired_live.py \
+  --binary "$(command -v aethyme)" --model gpt-6-sol --seed 19 \
+  --concurrent --coordinator-publish --hook-home /path/to/isolated-codex-home \
+  --scratch /private/tmp --output /private/tmp/aethyme-live-paired-hooks
+```
+
+### Shared verification
+
+The live task fixture measures avoided repair turns and observed duplicate
+closures. Different task trees do not guarantee that any two gate requests
+can share a result. Use the separate exact-tree probe to measure replay of
+the same unit suite. It pairs two simultaneous checks in each arm on four
+isolated worktrees per sample. Both arms receive the same tree for each
+sample. Direct Git runs the suite twice. Broker receipts identify fresh and
+reused verdicts, producing run IDs, execution duration and wait duration.
+
+```sh
+python3 benchmarks/broker/paired_verification.py stage \
+  --binary /path/to/pinned/aethyme --root /private/tmp/paired-verification
+cd /private/tmp/paired-verification/repository
+AETHYME_HOST_STATE_DIR=/private/tmp/paired-verification/state \
+  /path/to/pinned/aethyme broker advanced trust
+```
+
+After an operator approves the displayed test command, run the same probe
+with `run` from the eval package. It retains `results.json` at the fixture
+root and requires a fresh staged fixture for another cold comparison.
+Report child executions avoided separately from command wall time.
