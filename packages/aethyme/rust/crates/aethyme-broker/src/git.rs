@@ -3674,7 +3674,9 @@ const TREE_HASH_SEED_ENV: &str = "AETHYME_TREE_HASH_SEED";
 /// Settings every seeded tree-hash Git command runs with, whatever the
 /// repository or user configures: stat matching as strict as Git's default,
 /// and no source of "unchanged" other than the stat data itself.
-const SEEDED_GIT_CONFIG: [&str; 8] = [
+const SEEDED_GIT_CONFIG: [&str; 10] = [
+    "-c",
+    "core.ignoreStat=false",
     "-c",
     "core.trustctime=true",
     "-c",
@@ -3693,6 +3695,10 @@ pub(crate) enum SeedFallback {
     Unreadable,
     /// The index changed while it was copied.
     IndexMoving,
+    /// The copy's modification time could not be made the original's: a
+    /// later one would stop Git re-reading entries edited in the second the
+    /// original was written.
+    TimestampNotKept,
     /// An entry is assume-unchanged or skip-worktree.
     EntryFlags,
     /// The index names another tree than HEAD (staged changes).
@@ -3709,6 +3715,7 @@ impl SeedFallback {
             Self::SwitchedOff => "tree_hash_seed_fallback_switched_off",
             Self::Unreadable => "tree_hash_seed_fallback_unreadable",
             Self::IndexMoving => "tree_hash_seed_fallback_index_moving",
+            Self::TimestampNotKept => "tree_hash_seed_fallback_timestamp_not_kept",
             Self::EntryFlags => "tree_hash_seed_fallback_entry_flags",
             Self::IndexNotHead => "tree_hash_seed_fallback_index_not_head",
             Self::ContentConversion => "tree_hash_seed_fallback_content_conversion",
@@ -3737,7 +3744,15 @@ fn copy_index_with_its_timestamp(index: &Path, destination: &Path) -> Result<(),
         .write(true)
         .open(destination)
         .and_then(|file| file.set_modified(modified))
-        .map_err(|_| SeedFallback::Unreadable)?;
+        .map_err(|_| SeedFallback::TimestampNotKept)?;
+    // The racy-clean rule judges entries against this timestamp: a copy that
+    // reads back later than the original would trust entries Git must re-read.
+    let kept = std::fs::metadata(destination)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|_| SeedFallback::TimestampNotKept)?;
+    if kept > modified {
+        return Err(SeedFallback::TimestampNotKept);
+    }
     Ok(())
 }
 
@@ -7845,8 +7860,8 @@ impl GitRepo {
     /// whose stat data no longer matches or that Git's racy-clean rule
     /// (entry mtime not older than the index timestamp) makes suspect, as
     /// `git status` would. Git compares mtime, ctime, size, inode and owner;
-    /// trusting ctime and the default stat check is forced, and fsmonitor and
-    /// the untracked cache are disabled. It answers only when it can prove
+    /// stat checking, trusting ctime and the default stat check are forced,
+    /// and fsmonitor and the untracked cache are disabled. It answers only when it can prove
     /// the seeded index equals a fresh `read-tree HEAD` apart from stat data,
     /// and that no attribute or setting converts content between the files
     /// and Git (where a fresh checkout can re-hash to a different tree than
@@ -14620,6 +14635,51 @@ mod seeded_tree_hash_tests {
         std::fs::write(slot.path("dir/b.txt"), "BRAVO\n").unwrap();
         set_modified(&slot.path("dir/b.txt"), slot.index_modified());
         slot.assert_seeded_matches("same size, mtime of the index");
+    }
+
+    #[test]
+    fn the_index_copy_keeps_the_original_timestamp() {
+        let holder = tempfile::tempdir().unwrap();
+        let original = holder.path().join("index");
+        let copy = holder.path().join("copy");
+        std::fs::write(&original, b"DIRC index bytes").unwrap();
+        // An old timestamp with a sub-second part, unlike the copy's own.
+        let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        set_modified(&original, stamp);
+        let original_time = std::fs::metadata(&original).unwrap().modified().unwrap();
+        super::copy_index_with_its_timestamp(&original, &copy).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"DIRC index bytes");
+        let copy_time = std::fs::metadata(&copy).unwrap().modified().unwrap();
+        // Equal to the precision the file system keeps, and never later.
+        assert!(
+            copy_time <= original_time,
+            "{copy_time:?} > {original_time:?}"
+        );
+        assert_eq!(copy_time, original_time);
+    }
+
+    #[test]
+    fn an_edit_in_the_index_write_second_is_hashed() {
+        // On a file system with sub-second timestamps the changed inode time
+        // also reveals this edit, so the timestamp guard is pinned by the
+        // copy test above; this one checks the end-to-end outcome.
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        let path = slot.path("a.txt");
+        let original = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "ALPHA\n").unwrap();
+        set_modified(&path, original);
+        let written = slot.index_modified();
+        while SystemTime::now()
+            .duration_since(written)
+            .is_ok_and(|elapsed| elapsed < std::time::Duration::from_millis(1100))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(
+            slot.assert_seeded_matches("edit in the index-write second"),
+            fresh
+        );
     }
 
     #[test]

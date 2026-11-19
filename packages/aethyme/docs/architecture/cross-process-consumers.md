@@ -418,8 +418,9 @@ are re-read, the way `git status` decides.
 - **Seeded hash (submit verification slot only).** The private index is a
   copy of the slot's index, with the copy's modification time set to the
   original's so Git's racy-clean rule is unchanged. A copy taken while the
-  index was being rewritten is refused. Every seeded Git command runs with
-  `core.trustctime=true`, `core.checkStat=default`, `core.fsmonitor=false`
+  index was being rewritten, or whose timestamp reads back later than the
+  original's, is refused. Every seeded Git command runs with
+  `core.ignoreStat=false`, `core.trustctime=true`, `core.checkStat=default`, `core.fsmonitor=false`
   and `core.untrackedCache=false`. The seeded result is used only when all of
   these hold, each checked rather than assumed:
   - no entry is assume-unchanged or skip-worktree (`ls-files -v`);
@@ -443,7 +444,7 @@ are re-read, the way `git status` decides.
   `graph_integrity_tree_hash`.
 - **Counters (introduced).** `tree_hash_seeded`, or one of
   `tree_hash_seed_fallback_<reason>` with `<reason>` one of `switched_off`,
-  `unreadable`, `index_moving`, `entry_flags`, `index_not_head`,
+  `unreadable`, `index_moving`, `timestamp_not_kept`, `entry_flags`, `index_not_head`,
   `content_conversion` or `git_failed`.
 - **Attachment (introduced).** `tree_hash_files` on the command's metric line:
   `hashes`, `tracked_entries` and `untracked_files`, totals over the command.
