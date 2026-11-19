@@ -3668,6 +3668,186 @@ pub struct RemoteDefaultBranch {
 pub const BROKER_WORKTREE_LOCK_REASON: &str =
     "aethyme: worktree on a configured, possibly removable root";
 
+/// Set `AETHYME_TREE_HASH_SEED=off` to always take the full tree hash.
+const TREE_HASH_SEED_ENV: &str = "AETHYME_TREE_HASH_SEED";
+
+/// Settings every seeded tree-hash Git command runs with, whatever the
+/// repository or user configures: stat matching as strict as Git's default,
+/// and no source of "unchanged" other than the stat data itself.
+const SEEDED_GIT_CONFIG: [&str; 10] = [
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.trustctime=true",
+    "-c",
+    "core.checkStat=default",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+];
+
+/// Why the seeded tree hash gave way to the full one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedFallback {
+    SwitchedOff,
+    /// The checkout's index or Git directory could not be read or copied.
+    Unreadable,
+    /// The index changed while it was copied.
+    IndexMoving,
+    /// The copy's modification time could not be made the original's: a
+    /// later one would stop Git re-reading entries edited in the second the
+    /// original was written.
+    TimestampNotKept,
+    /// An entry is assume-unchanged or skip-worktree.
+    EntryFlags,
+    /// The index names another tree than HEAD (staged changes).
+    IndexNotHead,
+    /// An attribute or setting converts content between files and Git.
+    ContentConversion,
+    /// A Git command failed or printed something unexpected.
+    GitFailed,
+}
+
+impl SeedFallback {
+    pub(crate) fn counter(self) -> &'static str {
+        match self {
+            Self::SwitchedOff => "tree_hash_seed_fallback_switched_off",
+            Self::Unreadable => "tree_hash_seed_fallback_unreadable",
+            Self::IndexMoving => "tree_hash_seed_fallback_index_moving",
+            Self::TimestampNotKept => "tree_hash_seed_fallback_timestamp_not_kept",
+            Self::EntryFlags => "tree_hash_seed_fallback_entry_flags",
+            Self::IndexNotHead => "tree_hash_seed_fallback_index_not_head",
+            Self::ContentConversion => "tree_hash_seed_fallback_content_conversion",
+            Self::GitFailed => "tree_hash_seed_fallback_git_failed",
+        }
+    }
+}
+
+/// Copy `index` to `destination` and give the copy the original's
+/// modification time, so Git's racy-clean rule judges the copy's entries
+/// against the moment the original was written. A copy taken while the
+/// index was being rewritten is refused.
+fn copy_index_with_its_timestamp(index: &Path, destination: &Path) -> Result<(), SeedFallback> {
+    let before = std::fs::metadata(index).map_err(|_| SeedFallback::Unreadable)?;
+    let modified = before.modified().map_err(|_| SeedFallback::Unreadable)?;
+    let bytes = std::fs::read(index).map_err(|_| SeedFallback::Unreadable)?;
+    let after = std::fs::metadata(index).map_err(|_| SeedFallback::Unreadable)?;
+    if bytes.len() as u64 != before.len()
+        || after.len() != before.len()
+        || after.modified().ok() != Some(modified)
+    {
+        return Err(SeedFallback::IndexMoving);
+    }
+    std::fs::write(destination, &bytes).map_err(|_| SeedFallback::Unreadable)?;
+    std::fs::File::options()
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.set_modified(modified))
+        .map_err(|_| SeedFallback::TimestampNotKept)?;
+    // The racy-clean rule judges entries against this timestamp: a copy that
+    // reads back later than the original would trust entries Git must re-read.
+    let kept = std::fs::metadata(destination)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|_| SeedFallback::TimestampNotKept)?;
+    if kept > modified {
+        return Err(SeedFallback::TimestampNotKept);
+    }
+    Ok(())
+}
+
+/// Whether any tracked path has an attribute that makes Git convert content
+/// on its way in or out (`text`, `eol`, `crlf`, `filter`, `ident`,
+/// `working-tree-encoding`): set, or set to a value. Unspecified and unset
+/// (`-text`, `binary`) convert nothing. Git resolves every attribute source
+/// (the tree's files, `info/attributes`, the user's and the system's).
+fn attributes_convert_content(
+    root: &Path,
+    index_file: &str,
+    paths: &[u8],
+) -> Result<bool, SeedFallback> {
+    let _span = crate::phase_telemetry::span("tree_hash_seed_attributes");
+    let mut command = git_command();
+    command
+        .args([
+            "check-attr",
+            "--stdin",
+            "-z",
+            "text",
+            "eol",
+            "crlf",
+            "filter",
+            "ident",
+            "working-tree-encoding",
+        ])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().map_err(|_| SeedFallback::GitFailed)?;
+    let mut stdin = child.stdin.take().ok_or(SeedFallback::GitFailed)?;
+    let input = paths.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|_| SeedFallback::GitFailed)?;
+    let written = writer.join().map_err(|_| SeedFallback::GitFailed)?;
+    if written.is_err() || !output.status.success() {
+        return Err(SeedFallback::GitFailed);
+    }
+    // `-z` output: <path> NUL <attribute> NUL <value> NUL, repeated.
+    let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+    let records = fields.len() / 3;
+    if records == 0 && !output.stdout.is_empty() {
+        return Err(SeedFallback::GitFailed);
+    }
+    for record in 0..records {
+        let value = fields[record * 3 + 2];
+        if value != b"unspecified" && value != b"unset" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The entry count in an index file's header (bytes 8 to 12, big-endian).
+fn index_entry_count(index: &Path) -> Option<u64> {
+    let mut header = [0_u8; 12];
+    let mut file = std::fs::File::open(index).ok()?;
+    file.read_exact(&mut header).ok()?;
+    header
+        .starts_with(b"DIRC")
+        .then_some(u64::from(u32::from_be_bytes([
+            header[8], header[9], header[10], header[11],
+        ])))
+}
+
+fn count_nul_records(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|byte| **byte == 0).count() as u64
+}
+
+static TREE_HASH_TRACKED_FILES: AtomicU64 = AtomicU64::new(0);
+static TREE_HASH_UNTRACKED_FILES: AtomicU64 = AtomicU64::new(0);
+static TREE_HASHES: AtomicU64 = AtomicU64::new(0);
+
+/// Add one tree hash's file counts to the command's `tree_hash_files`
+/// attachment (totals for the whole command, so the last write is complete).
+fn record_tree_hash_files(tracked: u64, untracked: u64) {
+    let tracked = TREE_HASH_TRACKED_FILES.fetch_add(tracked, Ordering::Relaxed) + tracked;
+    let untracked = TREE_HASH_UNTRACKED_FILES.fetch_add(untracked, Ordering::Relaxed) + untracked;
+    let hashes = TREE_HASHES.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::phase_telemetry::attach(
+        "tree_hash_files",
+        serde_json::json!({
+            "hashes": hashes,
+            "tracked_entries": tracked,
+            "untracked_files": untracked,
+        }),
+    );
+}
+
 /// Completion evidence is separate from the hash result: a failed operation
 /// can still prove that its repository-selected child processes were stopped.
 #[derive(Debug)]
@@ -7662,6 +7842,194 @@ impl GitRepo {
         }
     }
 
+    /// [`Self::working_tree_hash`] timed as the span `site`, so each caller's
+    /// share of tree hashing shows in the command's phases.
+    pub(crate) fn working_tree_hash_at(&self, site: &'static str) -> Result<String, GitError> {
+        let _span = crate::phase_telemetry::span(site);
+        self.working_tree_hash()
+    }
+
+    /// The same tree as [`Self::working_tree_hash_observation`], for a
+    /// checkout the broker itself just created from a commit and that only
+    /// the broker has touched since (a submit verification slot).
+    ///
+    /// The full hash re-reads every tracked file because its private index
+    /// starts from `read-tree HEAD`, with no stat data. This one starts the
+    /// private index from a copy of the checkout's own index, with the copy's
+    /// timestamp set to the original's, so `add -u` re-reads only entries
+    /// whose stat data no longer matches or that Git's racy-clean rule
+    /// (entry mtime not older than the index timestamp) makes suspect, as
+    /// `git status` would. Git compares mtime, ctime, size, inode and owner;
+    /// stat checking, trusting ctime and the default stat check are forced,
+    /// and fsmonitor and the untracked cache are disabled. It answers only when it can prove
+    /// the seeded index equals a fresh `read-tree HEAD` apart from stat data,
+    /// and that no attribute or setting converts content between the files
+    /// and Git (where a fresh checkout can re-hash to a different tree than
+    /// the commit's): every other case, and any error, takes the full hash.
+    /// Each outcome is counted (`tree_hash_seeded`,
+    /// `tree_hash_seed_fallback_<reason>`).
+    pub(crate) fn working_tree_hash_observation_for_fresh_checkout(
+        &self,
+    ) -> WorkingTreeHashObservation {
+        let mut writers_quiescent = true;
+        let result = match self.seeded_working_tree_hash(&mut writers_quiescent) {
+            Ok(tree) => {
+                crate::phase_telemetry::add("tree_hash_seeded", Duration::ZERO);
+                Ok(tree)
+            }
+            Err(reason) => {
+                crate::phase_telemetry::add(reason.counter(), Duration::ZERO);
+                self.working_tree_hash_with_quiescence(&mut writers_quiescent)
+            }
+        };
+        WorkingTreeHashObservation {
+            result,
+            writers_quiescent,
+        }
+    }
+
+    fn seeded_working_tree_hash(
+        &self,
+        writers_quiescent: &mut bool,
+    ) -> Result<String, SeedFallback> {
+        if std::env::var_os(TREE_HASH_SEED_ENV).is_some_and(|value| value == "off") {
+            return Err(SeedFallback::SwitchedOff);
+        }
+        let _span = crate::phase_telemetry::span("tree_hash_seeded_total");
+        let index_dir = self
+            .git_common_dir()
+            .map_err(|_| SeedFallback::Unreadable)?
+            .join("aethyme-broker/indexes");
+        std::fs::create_dir_all(&index_dir).map_err(|_| SeedFallback::Unreadable)?;
+        let tmp = index_dir.join(format!(
+            "index-{}-{}.seed.tmp",
+            std::process::id(),
+            NEXT_PRIVATE_INDEX_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let lock = tmp.with_file_name(format!(
+            "{}.lock",
+            tmp.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        ));
+        let result = self.seeded_working_tree_hash_in(&index_dir, &tmp, writers_quiescent);
+        // Best effort, as for the full hash's private index: a leftover is a
+        // stray file in the broker's index directory, never broker state.
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_file(lock).ok();
+        result
+    }
+
+    fn seeded_working_tree_hash_in(
+        &self,
+        index_dir: &Path,
+        tmp: &Path,
+        writers_quiescent: &mut bool,
+    ) -> Result<String, SeedFallback> {
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        let git = |args: &[&str], quiescent: &mut bool| -> Result<Vec<u8>, SeedFallback> {
+            let mut full: Vec<&str> = SEEDED_GIT_CONFIG.to_vec();
+            full.extend_from_slice(args);
+            run_git_bytes_with_index_for_tree_hash(&self.root, &tmp_str, &full, quiescent)
+                .map_err(|_| SeedFallback::GitFailed)
+        };
+        {
+            let _span = crate::phase_telemetry::span("tree_hash_seed_index");
+            let index = run_git(&self.root, &["rev-parse", "--git-path", "index"])
+                .map_err(|_| SeedFallback::Unreadable)?;
+            let index = {
+                let path = PathBuf::from(index.trim());
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.root.join(path)
+                }
+            };
+            copy_index_with_its_timestamp(&index, tmp)?;
+        }
+        let checks = crate::phase_telemetry::span("tree_hash_seed_checks");
+        // Entry flags: an assume-unchanged (lowercase tag) or skip-worktree
+        // (`S`) entry is never refreshed by `add -u`.
+        let listed = git(&["ls-files", "-v", "-z"], writers_quiescent)?;
+        let mut paths: Vec<u8> = Vec::with_capacity(listed.len());
+        let mut tracked = 0_u64;
+        for record in listed
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let (Some(tag), Some(b' ')) = (record.first(), record.get(1)) else {
+                return Err(SeedFallback::GitFailed);
+            };
+            if tag.is_ascii_lowercase() || *tag == b'S' {
+                return Err(SeedFallback::EntryFlags);
+            }
+            paths.extend_from_slice(&record[2..]);
+            paths.push(0);
+            tracked += 1;
+        }
+        // Staged content: the seeded index must name exactly HEAD's tree.
+        let index_tree = git(&["write-tree"], writers_quiescent)?;
+        let head_tree = run_git(&self.root, &["rev-parse", "HEAD^{tree}"])
+            .map_err(|_| SeedFallback::GitFailed)?;
+        if String::from_utf8_lossy(&index_tree).trim() != head_tree.trim() {
+            return Err(SeedFallback::IndexNotHead);
+        }
+        // Content conversion: with any of these, a file Git checked out can
+        // re-hash to a different blob than the one recorded.
+        let autocrlf = run_git(&self.root, &["config", "--get", "core.autocrlf"]).ok();
+        if autocrlf
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty() && value != "false")
+        {
+            return Err(SeedFallback::ContentConversion);
+        }
+        if tracked > 0 && attributes_convert_content(&self.root, &tmp_str, &paths)? {
+            return Err(SeedFallback::ContentConversion);
+        }
+        drop(checks);
+        {
+            let _span = crate::phase_telemetry::span("tree_hash_tracked_rehash");
+            git(&["add", "-u", "--", "."], writers_quiescent)?;
+        }
+        let untracked = {
+            let _span = crate::phase_telemetry::span("tree_hash_untracked_walk");
+            git(
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+                writers_quiescent,
+            )?
+        };
+        let pathspecs =
+            untracked_hash_pathspecs(&untracked).map_err(|_| SeedFallback::GitFailed)?;
+        record_tree_hash_files(tracked, count_nul_records(&pathspecs));
+        if !pathspecs.is_empty() {
+            let _span = crate::phase_telemetry::span("tree_hash_untracked_add");
+            let mut pathspec_file =
+                tempfile::NamedTempFile::new_in(index_dir).map_err(|_| SeedFallback::Unreadable)?;
+            pathspec_file
+                .write_all(&pathspecs)
+                .map_err(|_| SeedFallback::Unreadable)?;
+            let pathspec_arg = format!("--pathspec-from-file={}", pathspec_file.path().display());
+            git(
+                &[
+                    "--literal-pathspecs",
+                    "add",
+                    "-A",
+                    &pathspec_arg,
+                    "--pathspec-file-nul",
+                ],
+                writers_quiescent,
+            )?;
+        }
+        let _span = crate::phase_telemetry::span("tree_hash_write_tree");
+        let tree = git(&["write-tree"], writers_quiescent)?;
+        let tree = String::from_utf8_lossy(&tree).trim().to_string();
+        if tree.is_empty() {
+            return Err(SeedFallback::GitFailed);
+        }
+        Ok(tree)
+    }
+
     fn working_tree_hash_with_quiescence(
         &self,
         writers_quiescent: &mut bool,
@@ -7684,12 +8052,16 @@ impl GitRepo {
                 .unwrap_or_default()
         ));
         let result = (|| {
-            run_git_with_index_for_tree_hash(
-                &self.root,
-                &tmp_str,
-                &["read-tree", "HEAD"],
-                writers_quiescent,
-            )?;
+            {
+                let _span = crate::phase_telemetry::span("tree_hash_index_build");
+                run_git_with_index_for_tree_hash(
+                    &self.root,
+                    &tmp_str,
+                    &["read-tree", "HEAD"],
+                    writers_quiescent,
+                )?;
+            }
+            let tracked = index_entry_count(&tmp).unwrap_or(0);
             // Capture tracked edits and deletions first, including anything
             // intentionally tracked beneath a runtime path. Enumerate only
             // Git-visible untracked files for the second pass, then filter
@@ -7697,20 +8069,28 @@ impl GitRepo {
             // can make Git report an ignored parent directory such as
             // `.aethyme` itself, even when every ignored runtime child is
             // excluded.
-            run_git_with_index_for_tree_hash(
-                &self.root,
-                &tmp_str,
-                &["add", "-u", "--", "."],
-                writers_quiescent,
-            )?;
-            let untracked = run_git_bytes_with_index_for_tree_hash(
-                &self.root,
-                &tmp_str,
-                &["ls-files", "--others", "--exclude-standard", "-z"],
-                writers_quiescent,
-            )?;
+            {
+                let _span = crate::phase_telemetry::span("tree_hash_tracked_rehash");
+                run_git_with_index_for_tree_hash(
+                    &self.root,
+                    &tmp_str,
+                    &["add", "-u", "--", "."],
+                    writers_quiescent,
+                )?;
+            }
+            let untracked = {
+                let _span = crate::phase_telemetry::span("tree_hash_untracked_walk");
+                run_git_bytes_with_index_for_tree_hash(
+                    &self.root,
+                    &tmp_str,
+                    &["ls-files", "--others", "--exclude-standard", "-z"],
+                    writers_quiescent,
+                )?
+            };
             let pathspecs = untracked_hash_pathspecs(&untracked)?;
+            record_tree_hash_files(tracked, count_nul_records(&pathspecs));
             if !pathspecs.is_empty() {
+                let _span = crate::phase_telemetry::span("tree_hash_untracked_add");
                 let mut pathspec_file =
                     tempfile::NamedTempFile::new_in(&index_dir).map_err(|source| {
                         GitError::Spawn {
@@ -7739,6 +8119,7 @@ impl GitRepo {
                     writers_quiescent,
                 )?;
             }
+            let _span = crate::phase_telemetry::span("tree_hash_write_tree");
             run_git_with_index_for_tree_hash(
                 &self.root,
                 &tmp_str,
@@ -14093,6 +14474,247 @@ mod object_batch_bound_tests {
             error,
             GitError::TimedOut { ref args, .. } if args.contains("cat-file")
         ));
+    }
+}
+
+#[cfg(test)]
+mod seeded_tree_hash_tests {
+    use super::{GitRepo, SeedFallback};
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    fn git(root: &Path, args: &[&str]) {
+        super::run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    /// A repository and a slot checked out from its HEAD, as submit does.
+    struct Slot {
+        _holder: tempfile::TempDir,
+        repo: GitRepo,
+        slot: GitRepo,
+    }
+
+    impl Slot {
+        fn new(attributes: Option<&str>) -> Self {
+            let holder = tempfile::tempdir().unwrap();
+            let root = holder.path().join("repository");
+            std::fs::create_dir_all(root.join("dir")).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.name", "Seeded hash test"]);
+            git(&root, &["config", "user.email", "seeded@example.invalid"]);
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+            std::fs::write(root.join("dir/b.txt"), "bravo\n").unwrap();
+            std::fs::write(root.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+            if let Some(attributes) = attributes {
+                std::fs::write(root.join(".gitattributes"), attributes).unwrap();
+            }
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-qm", "initial"]);
+            let repo = GitRepo::discover(&root).unwrap();
+            let head = repo.head_commit().unwrap();
+            let slot = repo
+                .worktree_add_detached(&holder.path().join("slot"), &head)
+                .unwrap();
+            Self {
+                _holder: holder,
+                repo,
+                slot,
+            }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.slot.root().join(relative)
+        }
+
+        fn seeded(&self) -> Result<String, SeedFallback> {
+            let mut quiescent = true;
+            self.slot.seeded_working_tree_hash(&mut quiescent)
+        }
+
+        fn full(&self) -> String {
+            self.slot.working_tree_hash().unwrap()
+        }
+
+        /// The seeded shortcut answered, and with the full hash's tree.
+        fn assert_seeded_matches(&self, case: &str) -> String {
+            let full = self.full();
+            assert_eq!(self.seeded(), Ok(full.clone()), "{case}");
+            let public = self
+                .slot
+                .working_tree_hash_observation_for_fresh_checkout()
+                .result
+                .unwrap();
+            assert_eq!(public, full, "{case}");
+            full
+        }
+
+        /// The shortcut declined for `reason`, and the public call still
+        /// returns the full hash.
+        fn assert_falls_back(&self, reason: SeedFallback) {
+            assert_eq!(self.seeded(), Err(reason));
+            let public = self
+                .slot
+                .working_tree_hash_observation_for_fresh_checkout()
+                .result
+                .unwrap();
+            assert_eq!(public, self.full());
+        }
+
+        fn index_modified(&self) -> SystemTime {
+            let index =
+                super::run_git(self.slot.root(), &["rev-parse", "--git-path", "index"]).unwrap();
+            let index = PathBuf::from(index.trim());
+            let index = if index.is_absolute() {
+                index
+            } else {
+                self.slot.root().join(index)
+            };
+            std::fs::metadata(index).unwrap().modified().unwrap()
+        }
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fresh_slot_hashes_to_the_commit_tree() {
+        let slot = Slot::new(None);
+        let tree = slot.assert_seeded_matches("fresh slot");
+        let head = slot.repo.head_commit().unwrap();
+        assert_eq!(tree, slot.repo.commit_tree_id(&head).unwrap());
+    }
+
+    #[test]
+    fn a_tracked_file_modified_after_checkout_is_hashed() {
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        std::fs::write(slot.path("a.txt"), "alpha, longer now\n").unwrap();
+        let changed = slot.assert_seeded_matches("modified file");
+        assert_ne!(changed, fresh);
+    }
+
+    #[test]
+    fn an_untracked_file_added_after_checkout_is_hashed() {
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        std::fs::write(slot.path("dir/new.txt"), "new\n").unwrap();
+        assert_ne!(slot.assert_seeded_matches("untracked file"), fresh);
+    }
+
+    #[test]
+    fn a_deleted_tracked_file_is_hashed() {
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        std::fs::remove_file(slot.path("dir/b.txt")).unwrap();
+        assert_ne!(slot.assert_seeded_matches("deleted file"), fresh);
+    }
+
+    #[test]
+    fn a_same_size_change_in_the_same_second_is_hashed() {
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        let original = std::fs::metadata(slot.path("a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Same size, and the modification time put back: only the inode
+        // change time and the racy-clean rule can tell.
+        std::fs::write(slot.path("a.txt"), "ALPHA\n").unwrap();
+        set_modified(&slot.path("a.txt"), original);
+        assert_ne!(slot.assert_seeded_matches("same size, same mtime"), fresh);
+
+        // Same size, with the modification time equal to the index's: a
+        // racily clean entry, which Git must re-read.
+        std::fs::write(slot.path("dir/b.txt"), "BRAVO\n").unwrap();
+        set_modified(&slot.path("dir/b.txt"), slot.index_modified());
+        slot.assert_seeded_matches("same size, mtime of the index");
+    }
+
+    #[test]
+    fn the_index_copy_keeps_the_original_timestamp() {
+        let holder = tempfile::tempdir().unwrap();
+        let original = holder.path().join("index");
+        let copy = holder.path().join("copy");
+        std::fs::write(&original, b"DIRC index bytes").unwrap();
+        // An old timestamp with a sub-second part, unlike the copy's own.
+        let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        set_modified(&original, stamp);
+        let original_time = std::fs::metadata(&original).unwrap().modified().unwrap();
+        super::copy_index_with_its_timestamp(&original, &copy).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"DIRC index bytes");
+        let copy_time = std::fs::metadata(&copy).unwrap().modified().unwrap();
+        // Equal to the precision the file system keeps, and never later.
+        assert!(
+            copy_time <= original_time,
+            "{copy_time:?} > {original_time:?}"
+        );
+        assert_eq!(copy_time, original_time);
+    }
+
+    #[test]
+    fn an_edit_in_the_index_write_second_is_hashed() {
+        // On a file system with sub-second timestamps the changed inode time
+        // also reveals this edit, so the timestamp guard is pinned by the
+        // copy test above; this one checks the end-to-end outcome.
+        let slot = Slot::new(None);
+        let fresh = slot.full();
+        let path = slot.path("a.txt");
+        let original = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "ALPHA\n").unwrap();
+        set_modified(&path, original);
+        let written = slot.index_modified();
+        while SystemTime::now()
+            .duration_since(written)
+            .is_ok_and(|elapsed| elapsed < std::time::Duration::from_millis(1100))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(
+            slot.assert_seeded_matches("edit in the index-write second"),
+            fresh
+        );
+    }
+
+    #[test]
+    fn staged_content_falls_back_to_the_full_hash() {
+        let slot = Slot::new(None);
+        std::fs::write(slot.path("a.txt"), "staged\n").unwrap();
+        git(slot.slot.root(), &["add", "a.txt"]);
+        std::fs::write(slot.path("a.txt"), "alpha\n").unwrap();
+        slot.assert_falls_back(SeedFallback::IndexNotHead);
+    }
+
+    #[test]
+    fn an_assume_unchanged_entry_falls_back_to_the_full_hash() {
+        let slot = Slot::new(None);
+        git(
+            slot.slot.root(),
+            &["update-index", "--assume-unchanged", "a.txt"],
+        );
+        std::fs::write(slot.path("a.txt"), "hidden from status\n").unwrap();
+        slot.assert_falls_back(SeedFallback::EntryFlags);
+    }
+
+    #[test]
+    fn content_converting_attributes_fall_back_to_the_full_hash() {
+        // The committed CRLF blob re-hashes to an LF blob through `text`.
+        let slot = Slot::new(Some("*.txt text=auto\n"));
+        slot.assert_falls_back(SeedFallback::ContentConversion);
+        let slot = Slot::new(Some("*.txt filter=anything\n"));
+        slot.assert_falls_back(SeedFallback::ContentConversion);
+    }
+
+    #[test]
+    fn attributes_that_convert_nothing_keep_the_shortcut() {
+        let slot = Slot::new(Some("*.json merge=union\n*.png binary\n*.txt -text\n"));
+        slot.assert_seeded_matches("merge and unset attributes only");
     }
 }
 

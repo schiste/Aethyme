@@ -983,6 +983,10 @@ struct GateRuntimeContext<'a> {
     deadline: Option<Instant>,
     comparison_base: Option<&'a str>,
     storage: GateStorageLocations,
+    /// The checkout is a submit verification slot the broker just
+    /// materialized and nothing has written to yet, so its tree may be hashed
+    /// with [`GitRepo::working_tree_hash_observation_for_fresh_checkout`].
+    fresh_checkout: bool,
 }
 
 pub(crate) fn heartbeat_interval() -> Duration {
@@ -2136,19 +2140,24 @@ pub(crate) fn run_affected_for_submit_in(
         Some(progress) => progress,
         None => &StderrGateProgressSink,
     };
-    run_affected_with_progress_in(
+    // The verification slot was materialized from the merge commit just
+    // before, and only the disabled graph check (which reads nothing) ran
+    // in it since.
+    run_selections(
         store,
         main_root,
         checkout,
-        gates,
-        changed,
+        select_gates(gates, changed),
         session_id,
-        GateExecutionContext {
-            cache_policy,
-            comparison_base: Some(comparison_base),
+        cache_policy,
+        GateRuntimeContext {
             progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: None,
+            comparison_base: Some(comparison_base),
+            storage,
+            fresh_checkout: true,
         },
-        storage,
     )
 }
 
@@ -2195,6 +2204,7 @@ pub(crate) fn run_affected_bounded_in(
         None,
         CachePolicy::Bypass,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: Some(Instant::now() + allowance),
@@ -2224,6 +2234,7 @@ pub(crate) fn run_affected_with_progress_in(
         session_id,
         context.cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: context.progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
@@ -2306,6 +2317,7 @@ pub(crate) fn run_all_with_progress_in(
         session_id,
         cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
@@ -2376,6 +2388,7 @@ pub(crate) fn run_named_in(
         session_id,
         cache_policy,
         GateRuntimeContext {
+            fresh_checkout: false,
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
@@ -3546,7 +3559,14 @@ where
         .as_mut()
         .expect("invocation marker was just created")
         .dispatch_attempted();
-    let hash = checkout.working_tree_hash_observation();
+    let hash = {
+        let _span = crate::phase_telemetry::span("gate_inputs_tree_hash");
+        if runtime.fresh_checkout {
+            checkout.working_tree_hash_observation_for_fresh_checkout()
+        } else {
+            checkout.working_tree_hash_observation()
+        }
+    };
     if hash.writers_quiescent {
         invocation_artifact_use
             .as_mut()
@@ -3711,7 +3731,10 @@ where
                         .as_mut()
                         .expect("verdict wait has an artifact marker");
                     marker.dispatch_attempted();
-                    let observation = checkout.working_tree_hash_observation();
+                    let observation = {
+                        let _span = crate::phase_telemetry::span("gate_shared_wait_tree_hash");
+                        checkout.working_tree_hash_observation()
+                    };
                     if observation.writers_quiescent {
                         marker.confirm_no_spawn_or_quiescence();
                     }
@@ -6314,6 +6337,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -6436,6 +6460,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &SequencedAdmissionHost::new(vec![None]),
                 deadline: None,
@@ -6517,6 +6542,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -6583,6 +6609,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -6633,6 +6660,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -6751,6 +6779,7 @@ mod tests {
             Some(session_id),
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -6834,6 +6863,7 @@ mod tests {
                 None,
                 CachePolicy::Bypass,
                 GateRuntimeContext {
+                    fresh_checkout: false,
                     progress: &progress,
                     admission_host: &admission_host,
                     deadline: None,
@@ -7012,6 +7042,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -7113,6 +7144,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -7182,6 +7214,7 @@ mod tests {
             Some(session.id),
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
@@ -7430,6 +7463,7 @@ mod tests {
             None,
             CachePolicy::Bypass,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
@@ -7984,6 +8018,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
@@ -8027,6 +8062,7 @@ mod tests {
             None,
             CachePolicy::Use,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &recovered_host,
                 deadline: None,
@@ -8075,6 +8111,7 @@ mod tests {
             None,
             CachePolicy::Bypass,
             GateRuntimeContext {
+                fresh_checkout: false,
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,

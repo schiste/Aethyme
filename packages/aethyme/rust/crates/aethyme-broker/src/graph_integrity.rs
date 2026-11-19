@@ -191,7 +191,7 @@ pub(crate) fn verify_disposable_checkout(
     if !policy.enforces_committed_fragments() {
         return verify_generation_checkout(checkout, policy);
     }
-    let tree = match checkout.working_tree_hash() {
+    let tree = match checkout.working_tree_hash_at("graph_integrity_tree_hash") {
         Ok(tree) => tree,
         Err(error) => return graph_error(String::new(), policy.digest(), None, error.to_string()),
     };
@@ -230,7 +230,7 @@ pub(crate) fn verify_disposable_checkout(
         })?;
         let generated =
             checkout.isolated_checkout_at(&temporary.path().join("repository"), &commit)?;
-        if generated.working_tree_hash()? != tree {
+        if generated.working_tree_hash_at("graph_integrity_tree_hash")? != tree {
             return Err(crate::BrokerError::Io {
                 path: generated.root().to_path_buf(),
                 source: std::io::Error::new(
@@ -291,7 +291,7 @@ fn verify_generation_checkout(
     policy: &GraphIntegrityPolicy,
 ) -> GraphIntegrityOutcome {
     let policy_digest = policy.digest();
-    let tree_hash = match checkout.working_tree_hash() {
+    let tree_hash = match checkout.working_tree_hash_at("graph_integrity_tree_hash") {
         Ok(tree) => tree,
         Err(error) => {
             return GraphIntegrityOutcome {
@@ -440,7 +440,7 @@ fn verify_generation_checkout(
         );
     }
 
-    let regenerated_tree = match checkout.working_tree_hash() {
+    let regenerated_tree = match checkout.working_tree_hash_at("graph_integrity_tree_hash") {
         Ok(tree) => tree,
         Err(error) => {
             return graph_error(
@@ -579,7 +579,7 @@ pub(crate) fn verify_checkout_without_mutation_with_worktree_root_plan(
     if !policy.enforces_committed_fragments() {
         return Ok(verify_disposable_checkout(checkout, policy));
     }
-    let tree = checkout.working_tree_hash()?;
+    let tree = checkout.working_tree_hash_at("graph_integrity_tree_hash")?;
     let head = checkout.head_commit()?;
     let commit = checkout.commit_tree(
         &tree,
