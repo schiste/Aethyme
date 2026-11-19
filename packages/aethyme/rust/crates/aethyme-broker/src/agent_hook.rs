@@ -66,7 +66,7 @@ impl HookEvent {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
             Self::UserPromptSubmit => "UserPromptSubmit",
@@ -141,6 +141,15 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
         return 0;
     };
 
+    let measurement = crate::cli::hook_metrics_enabled().then(|| {
+        (
+            std::time::Instant::now(),
+            crate::phase_telemetry::Recorder::default(),
+        )
+    });
+    let _recording = measurement
+        .as_ref()
+        .map(|(_, spans)| crate::phase_telemetry::install(spans.clone()));
     let repo = parse_repo_flag(&args[1..]);
     let mut payload = String::new();
     // Drain stdin before any early return: the caller writes the event
@@ -149,7 +158,11 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
     let event_json: serde_json::Value =
         serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
-    match decide(event, repo.as_deref(), &event_json, running_build_banner) {
+    let outcome = {
+        let _span = crate::phase_telemetry::span("hook_dispatch");
+        decide(event, repo.as_deref(), &event_json, running_build_banner)
+    };
+    let (bytes, delivery) = match outcome {
         Some(outcome) => {
             if let Some(envelope) = outcome.envelope(event) {
                 let stdout = std::io::stdout();
@@ -159,12 +172,25 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
                     .is_ok()
                 {
                     acknowledge_peer_views();
+                    let delivery = if matches!(outcome, HookOutcome::Deny(_)) {
+                        "denied"
+                    } else {
+                        "context"
+                    };
+                    (envelope.len() as u64 + 1, delivery)
+                } else {
+                    (0, "output_error")
                 }
+            } else {
+                (0, "silent")
             }
-            0
         }
-        None => 0,
+        None => (0, "unavailable"),
+    };
+    if let Some((started, spans)) = measurement {
+        crate::cli::record_hook_metric(repo.as_deref(), event, started, bytes, delivery, &spans);
     }
+    0
 }
 
 fn parse_repo_flag(rest: &[String]) -> Option<String> {

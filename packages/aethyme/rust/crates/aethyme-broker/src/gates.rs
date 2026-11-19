@@ -3770,6 +3770,7 @@ where
             ));
         }
         if let Some(hit) = cached_result {
+            let shared_wait_ms = shared_wait.then(|| wait_started.elapsed().as_millis() as i64);
             drop(verdict_claim);
             if shared_wait {
                 let _span = crate::phase_telemetry::span("gate_verdict_joined");
@@ -3802,16 +3803,13 @@ where
                     store.append_event(
                         crate::events::GATE_CACHED,
                         session_id,
-                        Some(&crate::events::gate_cached_payload(
-                            &gate.name,
-                            &tree,
-                            saved_ms,
-                            hit.status,
+                        Some(&crate::events::gate_cache_hit_payload(
+                            &hit,
                             cached_failure_class(hit.status),
-                            hit.id,
                             cache_provenance
                                 .as_ref()
                                 .expect("profile-backed cache lookup has provenance"),
+                            shared_wait_ms,
                         )),
                     ),
                 );
@@ -3831,11 +3829,7 @@ where
                 cached: true,
                 exit_code: hit.exit_code,
                 duration_ms: hit.duration_ms,
-                wait_duration_ms: Some(if shared_wait {
-                    wait_started.elapsed().as_millis() as i64
-                } else {
-                    0
-                }),
+                wait_duration_ms: Some(shared_wait_ms.unwrap_or_default()),
                 first_output_ms: hit.first_output_ms,
                 output_bytes: hit.output_bytes,
                 log_path: hit.log_path,
