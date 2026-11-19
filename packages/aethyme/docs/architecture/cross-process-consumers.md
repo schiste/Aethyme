@@ -404,6 +404,44 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Worktree watch streams and changed-path reuse counts (2026-11-19)
+
+A lease scan asks Git which files each session changed unless the host
+worktree watcher shows the worktree unchanged since a stored answer
+(`worktree_watch.rs`). With one file-system stream for every worktree, a
+flagged event loss or a watch-set change outdated every stored answer; on the
+busiest repository `agents` reused 970 of 10,184 answers in a day. On macOS the
+watcher now gives each worktree its own stream, so a loss, an error or a
+watch-set change outdates only the worktree it concerns. Other platforms keep
+one shared stream, because there a stream costs a per-user inotify instance.
+What counts as a change, the claim protocol, the answer's key (counter,
+baseline commit, index identity, maximum age) and the commands allowed to
+reuse (`agents`, `status`) are unchanged; `submit` and every other deciding
+command still always ask Git.
+
+- **Phase counters (introduced).** One zero-length occurrence each in the
+  command's `phase_counts` (and `phase_timings_ms`, always 0), per lease-scan
+  question: `changed_files_reused` (existing) on a hit; on a miss exactly one
+  `changed_files_miss_<reason>` with `<reason>` one of `symbolic_base`,
+  `worktree_unreadable`, `no_watcher`, `no_counter`, `index_unreadable`,
+  `no_answer`, `counter_moved`, `base_changed`, `index_changed`,
+  `answer_expired` or `unsupported`; when reuse is not attempted, one of
+  `changed_files_reuse_switched_off` (`AETHYME_WORKTREE_WATCH=off`),
+  `changed_files_reuse_not_allowed` (a deciding command such as `submit`) or
+  `changed_files_reuse_no_host_state`; and `changed_files_claim_failed` when a
+  miss could not claim its counter, so its answer is not stored. Git time stays
+  in the existing `changed_files_asked_git` span. Hit rate:
+  `changed_files_reused / (changed_files_reused + changed_files_asked_git)`.
+- **Watcher status fields (introduced).** `status.json` in the
+  `worktree-watch-v2` host-state directory gains `stream_per_worktree`
+  (boolean), `rescans_scoped` (errors and flagged losses confined to one
+  worktree's own stream), `watch_set_changes` (reviews that started or stopped
+  watching a worktree) and `watch_failures` (watches that could not start;
+  that worktree is asked of Git). `rescans` now counts only invalidations of
+  every watched worktree: shared-stream losses, errors and watch-set changes.
+  The directory's on-disk protocol is unchanged, so its version suffix is too.
+  Readers must tolerate missing fields from older watchers.
+
 ## Gate cache miss events (2026-11-16)
 
 The gate runner recorded a verdict reuse (`gate.cached`) and a forced re-run

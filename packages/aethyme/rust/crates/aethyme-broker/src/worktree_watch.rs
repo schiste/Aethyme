@@ -24,7 +24,18 @@
 //!   or any mismatch means "unknown", and the command asks Git as before.
 //!   File events on an external volume do get dropped under bursts (8 of 5,000
 //!   in one probe on 2026-11-12), but the system flags the loss, and a flagged
-//!   loss counts as a change to every worktree.
+//!   loss counts as a change to every worktree that stream watches.
+//! - **One stream per worktree where streams are cheap.** A flagged loss
+//!   covers every directory of the stream that lost events, and restarting a
+//!   shared stream to add a worktree loses events for all of them. With one
+//!   shared stream, a few worktrees installing dependencies made every other
+//!   worktree look changed: on the busiest repository on 2026-11-19 the
+//!   watcher counted 29 losses a second and more of them than rounds, and
+//!   `agents` reused 970 of 10,184 answers in a day. On macOS each worktree
+//!   therefore gets its own stream, so a loss, an error or a watch-set change
+//!   outdates only the worktree it concerns (one process held 797 streams in
+//!   a probe). Elsewhere a stream costs a per-user inotify instance, which
+//!   other programs need too, so one shared stream stays.
 //! - **No event filtering.** Every non-read event counts, including build
 //!   output and the Git directory: ignore rules (`.gitignore`, `info/exclude`,
 //!   `core.excludesFile`) decide what `ls-files --others --exclude-standard`
@@ -114,6 +125,11 @@ const WANTED_ACTIVE: Duration = Duration::from_secs(600);
 #[cfg_attr(not(unix), allow(dead_code))]
 const WANTED_REFRESH: Duration = Duration::from_secs(60);
 
+/// Whether the watcher gives each worktree its own file-system stream; see
+/// the module documentation.
+#[cfg_attr(not(unix), allow(dead_code))]
+const STREAM_PER_WORKTREE: bool = cfg!(target_os = "macos");
+
 /// Set `AETHYME_WORKTREE_WATCH=off` to always ask Git.
 const SWITCH_ENV: &str = "AETHYME_WORKTREE_WATCH";
 
@@ -135,10 +151,16 @@ pub(crate) fn directory() -> Option<PathBuf> {
 /// watcher shows the worktree unchanged and this command allowed reuse.
 pub(crate) fn changed_files(checkout: &GitRepo, base: &str) -> Result<Vec<String>, GitError> {
     let switched_off = std::env::var_os(SWITCH_ENV).is_some_and(|value| value == "off");
-    if switched_off || !REUSE_ALLOWED.load(Ordering::Relaxed) {
+    if switched_off {
+        count("changed_files_reuse_switched_off");
+        return checkout.changed_files(base);
+    }
+    if !REUSE_ALLOWED.load(Ordering::Relaxed) {
+        count("changed_files_reuse_not_allowed");
         return checkout.changed_files(base);
     }
     let Some(directory) = directory() else {
+        count("changed_files_reuse_no_host_state");
         return checkout.changed_files(base);
     };
     let (files, source) = changed_files_in(&directory, checkout, base)?;
@@ -158,6 +180,61 @@ pub(crate) enum Source {
     Reused,
 }
 
+/// Why a stored answer could not be reused, so Git was asked. Each reason is
+/// counted as its own phase, `changed_files_miss_<reason>`, so a low reuse
+/// rate can be attributed from the metrics log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum Miss {
+    /// This platform has no watcher.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unsupported,
+    /// The baseline is a name such as `HEAD`, not a commit id.
+    SymbolicBase,
+    /// The worktree path could not be resolved.
+    WorktreeUnreadable,
+    /// No watcher holds `ready.lock`.
+    NoWatcher,
+    /// The watcher has published no counter for this worktree in its epoch.
+    NoCounter,
+    /// The worktree's index file could not be read.
+    IndexUnreadable,
+    /// No readable answer is stored for this worktree.
+    NoAnswer,
+    /// A change arrived after the stored answer's command claimed its counter.
+    CounterMoved,
+    /// The stored answer was computed against another baseline.
+    BaseChanged,
+    /// The index file changed since the stored answer.
+    IndexChanged,
+    /// The stored answer is older than its maximum age.
+    AnswerExpired,
+}
+
+impl Miss {
+    /// The phase counter this miss adds one occurrence to.
+    pub(crate) fn counter(self) -> &'static str {
+        match self {
+            Miss::Unsupported => "changed_files_miss_unsupported",
+            Miss::SymbolicBase => "changed_files_miss_symbolic_base",
+            Miss::WorktreeUnreadable => "changed_files_miss_worktree_unreadable",
+            Miss::NoWatcher => "changed_files_miss_no_watcher",
+            Miss::NoCounter => "changed_files_miss_no_counter",
+            Miss::IndexUnreadable => "changed_files_miss_index_unreadable",
+            Miss::NoAnswer => "changed_files_miss_no_answer",
+            Miss::CounterMoved => "changed_files_miss_counter_moved",
+            Miss::BaseChanged => "changed_files_miss_base_changed",
+            Miss::IndexChanged => "changed_files_miss_index_changed",
+            Miss::AnswerExpired => "changed_files_miss_answer_expired",
+        }
+    }
+}
+
+/// Add one zero-length occurrence of `name`: a count in `phase_counts`.
+fn count(name: &'static str) {
+    crate::phase_telemetry::add(name, Duration::ZERO);
+}
+
 /// [`changed_files`] against an explicit watch directory.
 pub(crate) fn changed_files_in(
     directory: &Path,
@@ -165,18 +242,27 @@ pub(crate) fn changed_files_in(
     base: &str,
 ) -> Result<(Vec<String>, Source), GitError> {
     let before = imp::observe(directory, checkout.root(), base);
-    if let Some(observed) = &before
-        && let Some(files) = imp::read_answer(directory, observed)
-    {
-        crate::phase_telemetry::add("changed_files_reused", Duration::ZERO);
-        return Ok((files, Source::Reused));
+    let reused = before
+        .as_ref()
+        .map_err(|miss| *miss)
+        .and_then(|observed| imp::read_answer(directory, observed));
+    match reused {
+        Ok(files) => {
+            count("changed_files_reused");
+            return Ok((files, Source::Reused));
+        }
+        Err(miss) => count(miss.counter()),
     }
+    let before = before.ok();
     // The claim must land before Git runs: the watcher moves the counter on
     // a later change only if it finds the claim, and a change it saw before
     // the claim landed is one Git sees too. No claim, no stored answer.
     let claimed = before
         .as_ref()
         .is_some_and(|observed| imp::claim(directory, observed));
+    if before.is_some() && !claimed {
+        count("changed_files_claim_failed");
+    }
     let files = {
         let _span = crate::phase_telemetry::span("changed_files_asked_git");
         checkout.changed_files(base)?
@@ -193,13 +279,15 @@ pub(crate) fn changed_files_in(
 mod imp {
     use std::path::Path;
 
+    use super::Miss;
+
     pub(super) struct Observed;
 
-    pub(super) fn observe(_: &Path, _: &Path, _: &str) -> Option<Observed> {
-        None
+    pub(super) fn observe(_: &Path, _: &Path, _: &str) -> Result<Observed, Miss> {
+        Err(Miss::Unsupported)
     }
-    pub(super) fn read_answer(_: &Path, _: &Observed) -> Option<Vec<String>> {
-        None
+    pub(super) fn read_answer(_: &Path, _: &Observed) -> Result<Vec<String>, Miss> {
+        Err(Miss::Unsupported)
     }
     pub(super) fn claim(_: &Path, _: &Observed) -> bool {
         false
@@ -224,8 +312,9 @@ mod imp {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ANSWER_MAX_AGE, ANSWERS, CLAIMS, COALESCE, EPOCH, FLUSH_EVERY, LOCK, READY, SEEN,
-        STALE_TEMPORARY, STATUS, STATUS_EVERY, WANTED, WANTED_ACTIVE, WANTED_KEEP, WANTED_REFRESH,
+        ANSWER_MAX_AGE, ANSWERS, CLAIMS, COALESCE, EPOCH, FLUSH_EVERY, LOCK, Miss, READY, SEEN,
+        STALE_TEMPORARY, STATUS, STATUS_EVERY, STREAM_PER_WORKTREE, WANTED, WANTED_ACTIVE,
+        WANTED_KEEP, WANTED_REFRESH,
     };
     use crate::environments::supervisor::{SupervisorWork, TickOutcome};
     use crate::file_lock::{ExclusiveFileLock, SharedFileLock, open_lock_file};
@@ -359,43 +448,60 @@ mod imp {
         hint(write_atomically(&path, text.as_bytes()));
     }
 
-    pub(super) fn observe(directory: &Path, worktree: &Path, base: &str) -> Option<Observed> {
+    pub(super) fn observe(directory: &Path, worktree: &Path, base: &str) -> Result<Observed, Miss> {
         // A symbolic baseline such as `HEAD` names a different commit later.
         if !is_commit_id(base) {
-            return None;
+            return Err(Miss::SymbolicBase);
         }
-        let canonical = fs::canonicalize(worktree).ok()?;
+        let canonical = fs::canonicalize(worktree).map_err(|_| Miss::WorktreeUnreadable)?;
         let key = key_for(&canonical);
         request_watch(directory, &key, &canonical);
         // Order matters: the lock is checked first and the counter read
         // after, so a counter is never trusted from before a watcher's death.
         if !watcher_is_alive(directory) {
-            return None;
+            return Err(Miss::NoWatcher);
         }
-        let epoch = fs::read_to_string(directory.join(EPOCH)).ok()?;
-        let seen = fs::read_to_string(directory.join(SEEN).join(&key)).ok()?;
-        let (seen_epoch, counter) = seen.trim().split_once(':')?;
-        if epoch.trim().is_empty() || seen_epoch != epoch.trim() {
-            return None;
-        }
-        counter.parse::<u64>().ok()?;
-        Some(Observed {
+        let token = (|| {
+            let epoch = fs::read_to_string(directory.join(EPOCH)).ok()?;
+            let seen = fs::read_to_string(directory.join(SEEN).join(&key)).ok()?;
+            let (seen_epoch, counter) = seen.trim().split_once(':')?;
+            if epoch.trim().is_empty() || seen_epoch != epoch.trim() {
+                return None;
+            }
+            counter.parse::<u64>().ok()?;
+            Some(seen.trim().to_string())
+        })()
+        .ok_or(Miss::NoCounter)?;
+        Ok(Observed {
             key,
-            token: seen.trim().to_string(),
+            token,
             base: base.to_string(),
-            index: index_stamp(&canonical)?,
+            index: index_stamp(&canonical).ok_or(Miss::IndexUnreadable)?,
         })
     }
 
-    pub(super) fn read_answer(directory: &Path, observed: &Observed) -> Option<Vec<String>> {
-        let text = fs::read(directory.join(ANSWERS).join(&observed.key)).ok()?;
-        let answer: Answer = serde_json::from_slice(&text).ok()?;
-        let age = Duration::from_millis(now_ms().checked_sub(answer.recorded_at_ms)?);
-        let same = answer.token == observed.token
-            && answer.base == observed.base
-            && answer.index == observed.index
-            && age < ANSWER_MAX_AGE;
-        same.then_some(answer.files)
+    pub(super) fn read_answer(directory: &Path, observed: &Observed) -> Result<Vec<String>, Miss> {
+        let text =
+            fs::read(directory.join(ANSWERS).join(&observed.key)).map_err(|_| Miss::NoAnswer)?;
+        let answer: Answer = serde_json::from_slice(&text).map_err(|_| Miss::NoAnswer)?;
+        // Checked in this order so the counter names the most common cause
+        // first: a change in the worktree.
+        if answer.token != observed.token {
+            return Err(Miss::CounterMoved);
+        }
+        if answer.base != observed.base {
+            return Err(Miss::BaseChanged);
+        }
+        if answer.index != observed.index {
+            return Err(Miss::IndexChanged);
+        }
+        let age = now_ms()
+            .checked_sub(answer.recorded_at_ms)
+            .map(Duration::from_millis);
+        if !age.is_some_and(|age| age < ANSWER_MAX_AGE) {
+            return Err(Miss::AnswerExpired);
+        }
+        Ok(answer.files)
     }
 
     /// The claim file for one published counter of one worktree.
@@ -552,8 +658,16 @@ mod imp {
         pub(crate) events_coalesced: AtomicU64,
         /// Reads, which never move a counter.
         pub(crate) events_ignored: AtomicU64,
-        /// Errors, flagged losses and watch-set changes: every worktree changed.
+        /// Errors, flagged losses and watch-set changes of the shared stream:
+        /// every worktree changed.
         pub(crate) rescans: AtomicU64,
+        /// Errors and flagged losses of one worktree's own stream: only that
+        /// worktree changed.
+        pub(crate) rescans_scoped: AtomicU64,
+        /// Reviews that started or stopped watching a worktree.
+        pub(crate) watch_set_changes: AtomicU64,
+        /// Worktrees whose watch could not be started.
+        pub(crate) watch_failures: AtomicU64,
         pub(crate) rounds: AtomicU64,
         pub(crate) reviews: AtomicU64,
         /// A newly watched worktree's first counter.
@@ -571,15 +685,19 @@ mod imp {
             counter.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn to_json(&self, epoch: &str) -> serde_json::Value {
+        fn to_json(&self, epoch: &str, stream_per_worktree: bool) -> serde_json::Value {
             let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
             serde_json::json!({
                 "epoch": epoch,
                 "updated_at_ms": now_ms(),
+                "stream_per_worktree": stream_per_worktree,
                 "events_received": read(&self.events_received),
                 "events_coalesced": read(&self.events_coalesced),
                 "events_ignored": read(&self.events_ignored),
                 "rescans": read(&self.rescans),
+                "rescans_scoped": read(&self.rescans_scoped),
+                "watch_set_changes": read(&self.watch_set_changes),
+                "watch_failures": read(&self.watch_failures),
                 "rounds": read(&self.rounds),
                 "reviews": read(&self.reviews),
                 "published_initial": read(&self.published_initial),
@@ -650,13 +768,34 @@ mod imp {
             }
         }
 
-        pub(crate) fn record(&mut self, event: notify::Result<notify::Event>) {
+        /// Mark one worktree changed, if it is still watched.
+        fn change(&mut self, key: &str) {
+            if let Some(watched) = self.watching.get_mut(key) {
+                watched.changed = true;
+            }
+        }
+
+        /// Take one event. `source` names the worktree whose own stream
+        /// reported it, or is `None` for the stream shared by every worktree.
+        pub(crate) fn record(
+            &mut self,
+            source: Option<&str>,
+            event: notify::Result<notify::Event>,
+        ) {
             Stats::bump(&self.stats.events_received);
             let event = match event {
                 Ok(event) if !event.need_rescan() => event,
-                // An error or a flagged loss: nothing is known about any worktree.
+                // An error or a flagged loss: nothing is known about anything
+                // the stream watches. A flagged loss covers the directories of
+                // the stream that lost events, never another stream's.
                 _ => {
-                    self.change_all();
+                    match source {
+                        Some(key) => {
+                            Stats::bump(&self.stats.rescans_scoped);
+                            self.change(key);
+                        }
+                        None => self.change_all(),
+                    }
                     return;
                 }
             };
@@ -664,6 +803,12 @@ mod imp {
             // scan itself reads the worktree: only changes move a counter.
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 Stats::bump(&self.stats.events_ignored);
+                return;
+            }
+            // A worktree's own stream reports changes under that worktree
+            // only, whatever path form the event carries.
+            if let Some(key) = source {
+                self.change(key);
                 return;
             }
             for path in &event.paths {
@@ -899,23 +1044,27 @@ mod imp {
     /// Watch until `stop` is set. Returns at once when another watcher holds
     /// the lock.
     pub(crate) fn run(directory: &Path, stop: &AtomicBool) -> io::Result<()> {
-        run_with_stats(directory, stop, Arc::new(Stats::default()))
+        run_with(
+            directory,
+            stop,
+            Arc::new(Stats::default()),
+            STREAM_PER_WORKTREE,
+        )
     }
 
-    /// [`run`], counting into `stats`.
-    pub(crate) fn run_with_stats(
+    /// [`run`], counting into `stats` and choosing whether each worktree gets
+    /// its own stream.
+    pub(crate) fn run_with(
         directory: &Path,
         stop: &AtomicBool,
         stats: Arc<Stats>,
+        stream_per_worktree: bool,
     ) -> io::Result<()> {
         let Some(started) = start(directory, stop)? else {
             return Ok(());
         };
         let (sender, events) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            hint(sender.send(event));
-        })
-        .map_err(io::Error::other)?;
+        let mut streams = Streams::new(sender, stream_per_worktree)?;
         let mut core = Core::new(started.epoch.clone(), stats);
         let mut next_review = Instant::now();
         let mut next_status = Instant::now();
@@ -923,11 +1072,11 @@ mod imp {
         while !stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_review {
                 next_review = Instant::now() + Duration::from_secs(1);
-                review(directory, &mut watcher, &mut core);
+                review(directory, &mut streams, &mut core);
             }
             match events.recv_timeout(FLUSH_EVERY) {
-                Ok(event) => {
-                    core.record(event);
+                Ok((source, event)) => {
+                    core.record(source.as_deref(), event);
                     coalesce(&events, &mut core)?;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -940,13 +1089,81 @@ mod imp {
             if Instant::now() >= next_status {
                 next_status = Instant::now() + STATUS_EVERY;
                 core.sweep_claims(directory);
-                write_status(directory, &core);
+                write_status(directory, &core, streams.per_worktree());
             }
         }
         Ok(())
     }
 
-    type Events = mpsc::Receiver<notify::Result<notify::Event>>;
+    /// An event, with the worktree whose own stream reported it, or `None`
+    /// when the stream shared by every worktree did.
+    type Tagged = (Option<Arc<str>>, notify::Result<notify::Event>);
+    type Events = mpsc::Receiver<Tagged>;
+
+    /// The file-system streams behind the watcher: one per worktree, or one
+    /// shared by all of them.
+    struct Streams {
+        sender: mpsc::Sender<Tagged>,
+        /// The shared stream, when worktrees do not get their own.
+        shared: Option<notify::RecommendedWatcher>,
+        own: HashMap<String, notify::RecommendedWatcher>,
+    }
+
+    impl Streams {
+        fn new(sender: mpsc::Sender<Tagged>, per_worktree: bool) -> io::Result<Self> {
+            let shared = if per_worktree {
+                None
+            } else {
+                let sender = sender.clone();
+                let watcher =
+                    notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                        hint(sender.send((None, event)));
+                    })
+                    .map_err(io::Error::other)?;
+                Some(watcher)
+            };
+            Ok(Self {
+                sender,
+                shared,
+                own: HashMap::new(),
+            })
+        }
+
+        fn per_worktree(&self) -> bool {
+            self.shared.is_none()
+        }
+
+        /// Start watching one worktree. False when its watch could not start.
+        fn watch(&mut self, key: &str, path: &Path) -> bool {
+            if let Some(shared) = &mut self.shared {
+                return shared.watch(path, RecursiveMode::Recursive).is_ok();
+            }
+            let sender = self.sender.clone();
+            let source: Arc<str> = Arc::from(key);
+            let Ok(mut watcher) =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    hint(sender.send((Some(Arc::clone(&source)), event)));
+                })
+            else {
+                return false;
+            };
+            if watcher.watch(path, RecursiveMode::Recursive).is_err() {
+                return false;
+            }
+            self.own.insert(key.to_string(), watcher);
+            true
+        }
+
+        /// Stop watching one worktree. Dropping its own stream stops it.
+        fn unwatch(&mut self, key: &str, path: &Path) {
+            match &mut self.shared {
+                Some(shared) => hint(shared.unwatch(path)),
+                None => {
+                    self.own.remove(key);
+                }
+            }
+        }
+    }
 
     /// Keep taking events for [`COALESCE`] after the first one of a round.
     /// A round therefore lasts at least that long while events keep coming,
@@ -959,9 +1176,9 @@ mod imp {
                 return Ok(());
             }
             match events.recv_timeout(remaining) {
-                Ok(event) => {
+                Ok((source, event)) => {
                     Stats::bump(&core.stats.events_coalesced);
-                    core.record(event);
+                    core.record(source.as_deref(), event);
                 }
                 Err(RecvTimeoutError::Timeout) => return Ok(()),
                 Err(RecvTimeoutError::Disconnected) => {
@@ -971,27 +1188,30 @@ mod imp {
         }
     }
 
-    fn write_status(directory: &Path, core: &Core) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(&core.stats.to_json(&core.epoch)) {
+    fn write_status(directory: &Path, core: &Core, stream_per_worktree: bool) {
+        let status = core.stats.to_json(&core.epoch, stream_per_worktree);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&status) {
             hint(write_atomically(&directory.join(STATUS), &bytes));
         }
     }
 
     /// Start watching newly requested worktrees and stop watching forgotten ones.
-    fn review(directory: &Path, watcher: &mut notify::RecommendedWatcher, core: &mut Core) {
+    fn review(directory: &Path, streams: &mut Streams, core: &mut Core) {
         Stats::bump(&core.stats.reviews);
         let wanted = wanted(directory);
         let mut changed_watch_set = false;
         for (key, path, age) in &wanted {
             let keep = *age < WANTED_KEEP && path.is_dir();
             if keep && !core.watching.contains_key(key) {
-                if watcher.watch(path, RecursiveMode::Recursive).is_ok() {
+                if streams.watch(key, path) {
                     core.watch(key.clone(), path.clone());
                     changed_watch_set = true;
+                } else {
+                    Stats::bump(&core.stats.watch_failures);
                 }
             } else if !keep {
                 if let Some(path) = core.forget(key) {
-                    hint(watcher.unwatch(&path));
+                    streams.unwatch(key, &path);
                     changed_watch_set = true;
                 }
                 // Its claims go with the next sweep.
@@ -1000,10 +1220,15 @@ mod imp {
                 }
             }
         }
-        // Changing the watch set can restart the underlying event stream, and
-        // events in that gap are lost: treat every worktree as changed.
         if changed_watch_set {
-            core.change_all();
+            Stats::bump(&core.stats.watch_set_changes);
+            // Changing what the shared stream watches can restart it, and
+            // events in that gap are lost: treat every worktree as changed.
+            // Starting or stopping one worktree's own stream leaves every
+            // other stream running.
+            if !streams.per_worktree() {
+                core.change_all();
+            }
         }
     }
 }
@@ -1069,12 +1294,16 @@ mod tests {
         }
 
         fn start_watcher(&mut self) {
+            self.start_watcher_with(STREAM_PER_WORKTREE);
+        }
+
+        fn start_watcher_with(&mut self, stream_per_worktree: bool) {
             let directory = self.directory.clone();
             let stop = Arc::clone(&self.stop);
             let stats = Arc::clone(&self.stats);
             self.stop.store(false, Ordering::Relaxed);
             self.watcher = Some(std::thread::spawn(move || {
-                imp::run_with_stats(&directory, &stop, stats).unwrap();
+                imp::run_with(&directory, &stop, stats, stream_per_worktree).unwrap();
             }));
         }
 
@@ -1335,7 +1564,7 @@ mod tests {
             let event =
                 notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
                     .add_path(path);
-            self.core.record(Ok(event));
+            self.core.record(None, Ok(event));
         }
 
         fn flush(&mut self) {
@@ -1545,6 +1774,244 @@ mod tests {
         assert_eq!(load(&stats.published_initial), 1);
         assert_eq!(load(&stats.published_claimed), 0);
         assert_eq!(load(&stats.skipped_unclaimed), 3);
+    }
+
+    /// A second worktree watched by `driven`'s watcher, with its own
+    /// repository and baseline.
+    struct Other {
+        fixture: Fixture,
+        key: String,
+        root: PathBuf,
+    }
+
+    impl Other {
+        fn watched_by(driven: &mut Driven) -> Self {
+            let fixture = Fixture::new();
+            let root = std::fs::canonicalize(fixture.checkout.root()).unwrap();
+            let key = imp::key_for(&root);
+            driven.core.watch(key.clone(), root.clone());
+            driven.flush();
+            Self { fixture, key, root }
+        }
+
+        fn seen(&self, driven: &Driven) -> String {
+            std::fs::read_to_string(driven.fixture.directory.join(SEEN).join(&self.key)).unwrap()
+        }
+
+        /// Observe, claim, ask Git and store the answer, as a command does.
+        fn answer(&self, driven: &Driven) {
+            let observed = imp::observe(&driven.fixture.directory, &self.root, &self.fixture.base)
+                .expect("a live watcher with a published counter");
+            assert!(imp::claim(&driven.fixture.directory, &observed));
+            let files = self
+                .fixture
+                .checkout
+                .changed_files(&self.fixture.base)
+                .unwrap();
+            imp::write_answer(&driven.fixture.directory, &observed, &files);
+        }
+
+        fn ask(&self, driven: &Driven) -> Source {
+            changed_files_in(
+                &driven.fixture.directory,
+                &self.fixture.checkout,
+                &self.fixture.base,
+            )
+            .unwrap()
+            .1
+        }
+    }
+
+    fn rescan() -> notify::Result<notify::Event> {
+        Ok(notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan))
+    }
+
+    #[test]
+    fn a_loss_on_one_worktrees_own_stream_outdates_only_that_worktree() {
+        let mut driven = Driven::new();
+        let other = Other::watched_by(&mut driven);
+        let observed = driven.observe();
+        driven.claim(&observed);
+        driven.answer(&observed, &driven.git());
+        other.answer(&driven);
+        let (mine_before, other_before) = (driven.seen(), other.seen(&driven));
+
+        // A flagged loss and an error, both from this worktree's own stream.
+        let key = driven.key.clone();
+        driven.core.record(Some(key.as_str()), rescan());
+        driven
+            .core
+            .record(Some(key.as_str()), Err(notify::Error::generic("lost")));
+        driven.flush();
+
+        assert_ne!(
+            driven.seen(),
+            mine_before,
+            "the losing stream's counter must move"
+        );
+        assert_eq!(driven.fixture.ask().1, Source::Git);
+        assert_eq!(
+            other.seen(&driven),
+            other_before,
+            "another stream's counter moved"
+        );
+        assert_eq!(other.ask(&driven), Source::Reused);
+        assert_eq!(load(&driven.core.stats.rescans_scoped), 2);
+        assert_eq!(load(&driven.core.stats.rescans), 0);
+    }
+
+    #[test]
+    fn a_change_on_one_worktrees_own_stream_outdates_only_that_worktree() {
+        let mut driven = Driven::new();
+        let other = Other::watched_by(&mut driven);
+        let observed = driven.observe();
+        driven.claim(&observed);
+        driven.answer(&observed, &driven.git());
+        other.answer(&driven);
+        let other_before = other.seen(&driven);
+
+        // The event names a path in neither worktree: a worktree's own
+        // stream is trusted to report only its worktree, whatever form the
+        // path takes.
+        let key = driven.key.clone();
+        std::fs::write(driven.root.join("new.txt"), "x\n").unwrap();
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/elsewhere/new.txt"));
+        driven.core.record(Some(key.as_str()), Ok(event));
+        driven.flush();
+
+        let (files, source) = driven.fixture.ask();
+        assert_eq!(source, Source::Git);
+        assert_eq!(files, ["new.txt"]);
+        assert_eq!(other.seen(&driven), other_before);
+        assert_eq!(other.ask(&driven), Source::Reused);
+    }
+
+    #[test]
+    fn a_loss_on_the_shared_stream_outdates_every_worktree() {
+        let mut driven = Driven::new();
+        let other = Other::watched_by(&mut driven);
+        let observed = driven.observe();
+        driven.claim(&observed);
+        driven.answer(&observed, &driven.git());
+        other.answer(&driven);
+
+        driven.core.record(None, rescan());
+        driven.flush();
+
+        assert_eq!(driven.fixture.ask().1, Source::Git);
+        assert_eq!(other.ask(&driven), Source::Git);
+        assert_eq!(load(&driven.core.stats.rescans), 1);
+    }
+
+    #[test]
+    fn each_reason_to_ask_git_is_told_apart() {
+        let mut driven = Driven::new();
+        let directory = driven.fixture.directory.clone();
+        let observed = driven.observe();
+        assert_eq!(
+            imp::read_answer(&directory, &observed).unwrap_err(),
+            Miss::NoAnswer
+        );
+        driven.claim(&observed);
+        driven.answer(&observed, &driven.git());
+        // Nothing changed: the stored answer is reused.
+        assert_eq!(
+            imp::read_answer(&directory, &driven.observe()),
+            Ok(Vec::new())
+        );
+
+        // Another baseline.
+        let other_base = "0".repeat(40);
+        let elsewhere = imp::observe(&directory, &driven.root, &other_base).unwrap();
+        assert_eq!(
+            imp::read_answer(&directory, &elsewhere).unwrap_err(),
+            Miss::BaseChanged
+        );
+
+        // A symbolic baseline is never observed.
+        assert_eq!(
+            imp::observe(&directory, &driven.root, "HEAD").err(),
+            Some(Miss::SymbolicBase)
+        );
+
+        // A new commit rewrites the index, before any file event arrives.
+        std::fs::write(driven.root.join("tracked.txt"), "two\n").unwrap();
+        git(&driven.root, &["commit", "-q", "-am", "second"]);
+        assert_eq!(
+            imp::read_answer(&directory, &driven.observe()).unwrap_err(),
+            Miss::IndexChanged
+        );
+
+        // A reported change after the claim moves the counter.
+        driven.change("new.txt");
+        driven.flush();
+        assert_eq!(
+            imp::read_answer(&directory, &driven.observe()).unwrap_err(),
+            Miss::CounterMoved
+        );
+
+        // An unreadable index is never guessed at.
+        std::fs::remove_file(driven.root.join(".git").join("index")).unwrap();
+        assert_eq!(
+            imp::observe(&directory, &driven.root, &driven.fixture.base).err(),
+            Some(Miss::IndexUnreadable)
+        );
+        assert_eq!(driven.fixture.ask().1, Source::Git);
+
+        // No watcher, no reuse.
+        driven._started = None;
+        assert_eq!(
+            imp::observe(&directory, &driven.root, &driven.fixture.base).err(),
+            Some(Miss::NoWatcher)
+        );
+    }
+
+    #[test]
+    fn watching_another_worktree_on_its_own_stream_keeps_this_answer() {
+        let mut fixture = Fixture::new();
+        fixture.start_watcher_with(true);
+        assert!(fixture.ask_until(Source::Reused).is_empty());
+        // A second worktree is asked about: the watcher starts its stream.
+        let other = Fixture::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, source) =
+                changed_files_in(&fixture.directory, &other.checkout, &other.base).unwrap();
+            if source == Source::Reused {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the second worktree was never answered from its stored answer"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // With a shared stream that watch-set change would have outdated the
+        // first worktree's claimed counter.
+        assert_eq!(fixture.ask().1, Source::Reused);
+        assert_eq!(load(&fixture.stats.rescans), 0);
+        assert!(load(&fixture.stats.watch_set_changes) >= 2);
+    }
+
+    #[test]
+    fn a_shared_stream_still_outdates_every_answer_when_the_watch_set_changes() {
+        let mut fixture = Fixture::new();
+        fixture.start_watcher_with(false);
+        assert!(fixture.ask_until(Source::Reused).is_empty());
+        let rescans = load(&fixture.stats.rescans);
+        let other = Fixture::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while load(&fixture.stats.rescans) == rescans {
+            let _ = changed_files_in(&fixture.directory, &other.checkout, &other.base).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "the second worktree was never watched"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The flush after the review moves the claimed counter.
+        fixture.ask_until(Source::Git);
     }
 
     #[test]
