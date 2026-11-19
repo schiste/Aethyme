@@ -8,6 +8,7 @@
 //! subsystem, and only one of the two lanes enforced it.
 
 use std::path::Path;
+use std::time::Duration;
 
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 #[cfg(test)]
@@ -249,6 +250,39 @@ pub(crate) fn verify_disposable_checkout(
             None,
             format!("cannot isolate exact graph verification source: {error}"),
         ),
+    }
+}
+
+/// [`verify_disposable_checkout`] for a checkout the caller just
+/// materialized from a commit whose tree is `tree`, and has not changed since.
+///
+/// With graph fragments not authoritative the verdict is `Disabled` whatever
+/// the checkout holds; the only thing the full path computed for it was the
+/// tree hash, by re-hashing every file of the checkout through a fresh index.
+/// On the busiest repository that was the whole of submit's 3 to 8 minute
+/// `graph_and_gate_selection` phase. The tree the checkout was made from is
+/// that hash. An enforced policy, or an environment that refuses graph
+/// verification, takes the full path unchanged.
+pub(crate) fn verify_disposable_checkout_of_tree(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    tree: &str,
+) -> GraphIntegrityOutcome {
+    if policy.enforces_committed_fragments()
+        || crate::git::graph_verification_environment_refusal().is_some()
+    {
+        crate::phase_telemetry::add("graph_integrity_full_verification", Duration::ZERO);
+        return verify_disposable_checkout(checkout, policy);
+    }
+    crate::phase_telemetry::add("graph_integrity_disabled_known_tree", Duration::ZERO);
+    GraphIntegrityOutcome {
+        status: GraphIntegrityStatus::Disabled,
+        enforced: false,
+        tree_hash: tree.to_string(),
+        policy_digest: policy.digest(),
+        engine_version: None,
+        changed_paths: Vec::new(),
+        reason: "repository does not declare committed graph fragments authoritative".into(),
     }
 }
 
@@ -998,6 +1032,59 @@ mod tests {
         );
         let error = GraphIntegrityPolicy::load(repo.path()).unwrap_err();
         assert!(error.to_string().contains("contain no ':'"));
+    }
+
+    #[test]
+    fn a_disabled_policy_reports_the_known_tree_without_hashing_the_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let checkout = graph_less_checkout(repo.path());
+        let policy = GraphIntegrityPolicy::default();
+        assert!(!policy.enforces_committed_fragments());
+        let full = verify_disposable_checkout(&checkout, &policy);
+        let head_tree = checkout
+            .commit_tree_id(&checkout.head_commit().unwrap())
+            .unwrap();
+        assert_eq!(full.tree_hash, head_tree);
+        // The checkout is not hashed: the tree it was made from is reported.
+        // A different value proves nothing re-derived it from the files.
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let known = verify_disposable_checkout_of_tree(&checkout, &policy, marker);
+        assert_eq!(known.tree_hash, marker);
+        let with_head_tree = verify_disposable_checkout_of_tree(&checkout, &policy, &head_tree);
+        assert_eq!(with_head_tree, full, "same outcome as the full path");
+    }
+
+    #[test]
+    fn an_enforced_policy_still_verifies_the_checkout_in_full() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let outcome = verify_disposable_checkout_of_tree(&checkout, &policy, marker);
+        assert_eq!(outcome, verify_disposable_checkout(&checkout, &policy));
+        assert_eq!(outcome.status, GraphIntegrityStatus::Passed);
+        assert_ne!(outcome.tree_hash, marker);
+    }
+
+    /// A committed checkout with no graph policy.
+    fn graph_less_checkout(root: &Path) -> crate::GitRepo {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        crate::GitRepo::discover(root).unwrap()
     }
 
     #[test]

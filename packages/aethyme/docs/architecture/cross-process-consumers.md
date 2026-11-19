@@ -404,6 +404,27 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Submit's graph check reports the simulated tree when graphs are not authoritative (2026-11-19)
+
+Submit's `graph_and_gate_selection` phase took 3 to 8 minutes on the busiest
+repository, before any gate ran. The phase loads the graph and gate policies
+at the base, which takes seconds, and runs the graph-integrity check on the
+verification slot. That repository does not declare committed graph fragments
+authoritative, so the check's verdict is always `disabled`. Its only work was
+computing the outcome's `tree_hash` by re-hashing every file of the freshly
+materialized slot through a fresh index. Submit now reports the simulated
+merge tree that the slot was materialized from, which is that hash, without
+reading the files. An enforced policy, or an environment that refuses graph
+verification, takes the full path unchanged. Gate selection and gate execution
+are unchanged; the graph check never fed gate selection.
+
+- **Phase counters (introduced).** `graph_integrity_disabled_known_tree`
+  (verdict `disabled`, reported from the known tree) or
+  `graph_integrity_full_verification` (full path).
+- **Spans (introduced).** Inside `graph_and_gate_selection`:
+  `submit_selection_policy_load`, `submit_graph_integrity` and
+  `submit_gate_definitions_load`.
+
 ## Worker admission skips its due checks while the worker runs (2026-11-19)
 
 Every broker open admits the detached maintenance worker: it reads eight
