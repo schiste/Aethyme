@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.132] - 2026-11-19
+
+### Fixed
+
+- The checkout trash drain keeps up with what cleanup moves into it. Everything cleanup removes is first moved to the pool's trash and deleted later by the background worker; that deletion ran at 2,000 unlinks per second (200 whenever the one-minute load was above the core count) in whatever time a retirement run had left. On the busiest repository 7 entries were deleted while 64 arrived, and the trash reached 736 entries, the oldest 16 days old, so removed checkouts and dependencies never gave their space back. Now, when the trash is behind (16 or more deletable entries, or one a day old), the deleter runs at up to 8,000 unlinks per second on a quiet host, 4,000 under load, I/O pressure or a memory warning, and 200 under critical memory pressure, re-reading host pressure every 2 s. The drain has its own share of each run (a third, half when behind). The rate is a ceiling over short intervals: after a stall at most 250 ms of work goes through unpaced. What is deleted is unchanged: recorded trash entries only, one deleter per host, no links followed (#1829).
+- An entry that failed to delete is tried after the others; an entry still in use is passed over, retried on later runs, and no longer keeps the trash counted as behind (#1829).
+- The recovery archive size pass runs before the trash drain, so it is no longer left without time on a busy repository (#1829).
+
+### Added
+
+- `[cleanup] unattended_unlinks_per_second`, when a repository sets it explicitly, is a ceiling for the trash deleter's paced modes. Left unset, the rates above apply. Below the storage headroom the deleter stays unpaced, as before (#1829).
+- Advice `cleanup.trash-backlog` when the trash holds an entry a day old or has grown for three runs in a row. Telemetry attachment `checkout_trash_drain` reports backlog, oldest age, pace, observed rate, entries and unlinks removed, and entries passed over by reason (#1829).
+
+### Upgrade notes
+
+- Consumers of the `checkout_trash_drain` attachment read `initial_pace` and `initial_unlinks_per_second` in place of `pace` and `unlinks_per_second`.
+- A repository that wants a quieter deleter sets `[cleanup] unattended_unlinks_per_second`.
+
+### Known issues
+
+- A worker run can last longer than before while the trash is behind: the archive pass and the drain may each extend it by their own bounded budgets.
+- The deleter is single-threaded and re-checks each ancestor directory before each unlink; the catch-up rates may not be reached on a slow volume. `unlinks_per_second_observed` shows the real rate.
+
 ## [0.8.131] - 2026-11-19
 
 ### Fixed
