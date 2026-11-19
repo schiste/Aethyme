@@ -250,7 +250,7 @@ impl ExecutionProfile {
             bound.update(digest.as_bytes());
             bound.update(b"\0");
             bound.update(base.as_bytes());
-            self.digest = Some(format!("{:x}", bound.finalize()));
+            self.digest = Some(format!("sha256:{:x}", bound.finalize()));
         }
         self
     }
@@ -383,6 +383,7 @@ mod tests {
         let original = ExecutionProfile::fixture_complete();
         let a = original.clone().bind_comparison_base(Some("base-a"));
         let b = original.clone().bind_comparison_base(Some("base-b"));
+        assert!(a.digest().unwrap().starts_with("sha256:"));
         assert_ne!(a.digest(), b.digest());
         assert_ne!(a.digest(), original.digest());
         assert_eq!(
