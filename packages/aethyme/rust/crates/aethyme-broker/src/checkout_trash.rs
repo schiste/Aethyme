@@ -1822,10 +1822,11 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
         merged.entries_removed += part.entries_removed;
         merged.entries_interrupted += part.entries_interrupted;
         merged.unlinks = merged.unlinks.saturating_add(part.unlinks);
-        merged.bytes = merged.bytes.saturating_add(part.bytes);
-        merged.stripped_bytes = merged.stripped_bytes.saturating_add(part.stripped_bytes);
+        // Each thread's per-entry bytes are the volume's change while the
+        // other threads delete too: summing them counts the same space up
+        // to `threads` times. The caller measures the slice once instead,
+        // and stripped and scratch bytes stay out of the ledger.
         merged.stripped_entries_removed += part.stripped_entries_removed;
-        merged.scratch_bytes = merged.scratch_bytes.saturating_add(part.scratch_bytes);
         merged.scratch_entries_removed += part.scratch_entries_removed;
         merged.failed.extend(part.failed);
         merged.reported.extend(part.reported);
@@ -1846,21 +1847,43 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
     merged
 }
 
+/// Bytes available to this user, summed over the distinct volumes holding
+/// the trash directories `dirs`; `None` when any cannot be read.
+pub(crate) fn trash_volumes_available(dirs: &[PathBuf]) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0_u64;
+    for dir in dirs {
+        let metadata = std::fs::metadata(dir).ok()?;
+        if !seen.insert(metadata.dev()) {
+            continue;
+        }
+        let trash = open_dir_nofollow(dir).ok()?;
+        total = total.saturating_add(volume_available_bytes(trash.as_raw_fd())?);
+    }
+    Some(total)
+}
+
 /// Drain `rows` with `threads` deleter threads, each over its own part
 /// ([`partition_rows`]) with a pacer from `pacer` (give each its share of
 /// the rate, [`DrainPacer::with_share`]). One open-file observation is
 /// taken for all of them (`process_use`, or a fresh one); each thread
 /// records into this thread's telemetry. A thread that panics leaves its
 /// part's rows as they were. `rows` is updated as [`drain_trash_paced`]
-/// updates it.
+/// updates it. `bytes` is the change in `available` (bytes free on the
+/// trash volumes) from before the threads start to after they join,
+/// measured once for the slice; `stripped_bytes` and `scratch_bytes` stay
+/// zero.
 pub(crate) fn drain_trash_parallel(
     rows: &mut TrashRows,
     deadline: Instant,
     pacer: impl Fn() -> DrainPacer,
     threads: u32,
     process_use: Option<crate::reclaim::OpenFileSnapshot>,
+    available: impl Fn() -> Option<u64>,
 ) -> TrashDrainReport {
     let started = Instant::now();
+    let available_before = available();
     let process_use = process_use.unwrap_or_else(|| {
         let budget = deadline
             .saturating_duration_since(Instant::now())
@@ -1921,6 +1944,9 @@ pub(crate) fn drain_trash_parallel(
     merged_rows.retain(|_, entries| !entries.is_empty());
     *rows = merged_rows;
     let mut report = merge_drain_reports(reports, threads);
+    report.bytes = available_before
+        .zip(available())
+        .map_or(0, |(before, after)| after.saturating_sub(before));
     report.entries_pending = rows.values().map(BTreeMap::len).sum();
     DRAIN_NANOS_THIS_PROCESS.fetch_add(
         u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -2578,14 +2604,26 @@ mod tests {
             Some(DELETER_CATCHUP_UNLINKS_PER_SECOND / 3)
         );
 
+        // The slice's free-space change is measured once, before the
+        // threads start and after they join: here a scripted 1,000 then
+        // 5,000 bytes, whatever each thread's per-entry deltas were.
+        let readings = std::cell::Cell::new(0_u64);
         let report = drain_trash_parallel(
             &mut rows,
             Instant::now() + Duration::from_secs(600),
             || DrainPacer::fixed(DeleterPace::Unpaced),
             3,
             Some(in_use),
+            || {
+                readings.set(readings.get() + 1);
+                Some(if readings.get() == 1 { 1_000 } else { 5_000 })
+            },
         );
 
+        assert_eq!(readings.get(), 2, "measured once before and once after");
+        assert_eq!(report.bytes, 4_000, "{report:?}");
+        assert_eq!(report.stripped_bytes, 0, "{report:?}");
+        assert_eq!(report.scratch_bytes, 0, "{report:?}");
         assert_eq!(report.threads, 3);
         assert_eq!(report.entries_removed, 4, "{report:?}");
         assert_eq!(report.entries_in_use, 1, "{report:?}");
