@@ -1216,13 +1216,15 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
     std::fs::write(
         tmp.path().join(".aethyme/gates.toml"),
         format!(
-            "[[gate]]\nname='exact-tree'\ncommand=\"echo run >> '{}'\"\ntriggers=['tracked.txt']\n",
+            "[[gate]]\nname='exact-tree'\ncommand=\"echo $AETHYME_GATE_BASE_COMMIT >> '{}'\"\ntriggers=['tracked.txt']\n",
             counter.display()
         ),
     )
     .unwrap();
     git(tmp.path(), &["add", ".aethyme/gates.toml"]);
     git(tmp.path(), &["commit", "-qm", "configure exact-tree gate"]);
+
+    let base = git_output(tmp.path(), &["rev-parse", "HEAD"]);
 
     let root = bind_fixture_worktree_root(tmp.path(), tmp.owner_path());
     let worktree = root.join("exact-tree");
@@ -1276,7 +1278,42 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
         submission["gate_outcomes"][0]["tree_hash"],
         preflight[0]["tree_hash"]
     );
-    assert_eq!(run_count(&counter), 1);
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap(),
+        format!("{base}\n")
+    );
+
+    // The same candidate tree must not reuse a proof from a different base.
+    git(
+        tmp.path(),
+        &["commit", "--allow-empty", "-qm", "advance default"],
+    );
+    let next_base = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    git(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &next_base],
+    );
+    let named = stdout(run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &[
+            "advanced",
+            "gates",
+            "run",
+            "--only",
+            "exact-tree",
+            "--session",
+            &session_id,
+            "--json",
+        ],
+    ));
+    let named: serde_json::Value = serde_json::from_str(&named).unwrap();
+    assert_eq!(named[0]["cached"], false);
+    assert_eq!(named[0]["tree_hash"], preflight[0]["tree_hash"]);
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap(),
+        format!("{base}\n{next_base}\n")
+    );
 }
 
 #[test]

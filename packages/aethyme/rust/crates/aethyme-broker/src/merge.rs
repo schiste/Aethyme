@@ -1073,22 +1073,7 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let session_head = checkout.head_commit()?;
-        let base = match (
-            self.upstream_verification_base(),
-            self.integration_ahead_of_local_default(),
-        ) {
-            (Some(base), _) => base,
-            (None, Some(ahead)) => ahead.verification_base(),
-            (None, None) => {
-                let (reference, commit) = self.integration_head_snapshot()?;
-                VerificationBase {
-                    source: VERIFIED_AGAINST_INTEGRATION,
-                    reference,
-                    commit,
-                    fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
-                }
-            }
-        };
+        let base = self.submission_base_snapshot()?;
         let mut plan = self.build_submission_plan(&session, &session_head, &base.commit)?;
         let replay = self.replay_submission_plan(&plan)?;
         if replay.conflicts.is_empty() {
@@ -1147,6 +1132,25 @@ impl Broker {
             )),
         )?;
         Ok((config.branch, head))
+    }
+
+    /// Resolve the locally observed submission base without refreshing or
+    /// creating refs. A later submission independently pins its own base.
+    pub(crate) fn submission_base_snapshot(&self) -> Result<VerificationBase, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("submission_base_snapshot");
+        if let Some(base) = self.upstream_verification_base() {
+            return Ok(base);
+        }
+        if let Some(ahead) = self.integration_ahead_of_local_default() {
+            return Ok(ahead.verification_base());
+        }
+        let (reference, commit) = self.integration_head_snapshot()?;
+        Ok(VerificationBase {
+            source: VERIFIED_AGAINST_INTEGRATION,
+            reference,
+            commit,
+            fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
+        })
     }
 
     /// The base a submission is simulated and gated against.
