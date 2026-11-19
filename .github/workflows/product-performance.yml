@@ -42,6 +42,7 @@ jobs:
           python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p 'test_broker_reuse.py'
 
       - name: Compare the recorded product revision with this checkout
+        id: product_comparison
         run: |
           set -euo pipefail
           report=packages/aethyme/docs/reports/product-performance-baseline-2026-10-08.md
@@ -91,6 +92,46 @@ jobs:
         with:
           name: broker-latency-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/broker-latency
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Compare concurrent verification on identical Playground trees
+        if: ${{ !cancelled() && steps.product_comparison.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bench=packages/aethyme-eval/benchmarks/broker/paired_verification.py
+          binary="$CARGO_TARGET_DIR/release/aethyme"
+          fixture="$(mktemp -d)/playground"
+          artifacts="$RUNNER_TEMP/broker-shared-verification"
+          mkdir -p "$artifacts"
+          collect() {
+            local status=$?
+            local metrics="$fixture/repository/.aethyme/logs/command-metrics.jsonl"
+            if [[ -f "$fixture/results.json" ]]; then
+              cp "$fixture/results.json" "$artifacts/"
+            fi
+            if [[ -f "$metrics" ]]; then
+              cp "$metrics" "$artifacts/"
+            fi
+            if [[ "$status" != 0 ]]; then
+              echo "::warning::Shared verification comparison could not complete. Inspect this step and its partial receipts."
+            fi
+          }
+          trap collect EXIT
+          python3 -B "$bench" stage --binary "$binary" --root "$fixture"
+          # Stage writes the fixed test policy in a new system-temp repository.
+          # Only this fixture gets a trust record, in its own host state.
+          AETHYME_HOST_STATE_DIR="$fixture/state" AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS=1 \
+            "$binary" broker advanced trust --repo "$fixture/repository" --json > "$artifacts/trust.json"
+          python3 -B "$bench" run --binary "$binary" --root "$fixture" --samples 6
+
+      - name: Upload paired verification receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: broker-shared-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/broker-shared-verification
           if-no-files-found: warn
           retention-days: 14
 
