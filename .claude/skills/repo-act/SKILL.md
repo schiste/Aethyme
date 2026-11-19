@@ -93,18 +93,20 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   control too.
 
 - Before timing broker session startup hooks, put the pinned build first on
-  the fixture's PATH and inspect the actual `SessionStart` payload. For
-  comparisons of coordination, set `AETHYME_UPDATE_CHECK=off` in every arm to
-  keep release checks out of the measurement. For linked worktrees, verify
-  the agent can stage in its own fixture Git index in both the initial and
-  conflict-repair turns.
+  the fixture's PATH and verify the actual `SessionStart` payload arrives in
+  the worker. Preserve the installed plugin's trust records, including
+  `trusted_content_hash` where present, in an isolated Codex profile. Set
+  `AETHYME_UPDATE_CHECK=off` in both arms.
 
 - For concurrent-agent comparisons, register both worktrees and their task
   scopes before launching either worker. Use the same ordered integration and
   repair rules in every arm, then verify both features on the final tree. A
   scripted peer applied after publication measures conflict repair only.
-  Keep the setup coordinator from becoming the worker's session holder, and
-  verify each real worker can publish from its own sandbox before timing.
+  Keep the setup coordinator from becoming the worker's session holder. Smoke
+  test actual staging and publication in the worker sandbox, including the
+  repair path. If the sandbox protects linked Git metadata, keep authoring
+  sandboxed and have the coordinator stage only verified owned paths and
+  publish in both arms. Include that work in the elapsed time.
 
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
