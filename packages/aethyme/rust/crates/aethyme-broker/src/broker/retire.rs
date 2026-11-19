@@ -2650,8 +2650,8 @@ impl Broker {
                 drain_deadline.saturating_duration_since(deadline),
             );
         }
-        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
-        report.trash = self.retirement_trash_drain(host_dir.as_deref(), drain_deadline);
+        let host_dir = self.storage_context().host_state_dir.as_deref();
+        report.trash = self.retirement_trash_drain(host_dir, drain_deadline);
         self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
