@@ -473,7 +473,8 @@ fn hook_output_and_silence_are_attributed_only_when_opted_in() {
     let invoke = |event, opted_in| {
         fixture
             .command(&tree)
-            .args(["hook", event])
+            .args(["hook", event, "--repo"])
+            .arg(&tree)
             .env("AETHYME_MEASURE_OUTPUT", if opted_in { "1" } else { "0" })
             .stdin(Stdio::null())
             .output()
@@ -491,14 +492,25 @@ fn hook_output_and_silence_are_attributed_only_when_opted_in() {
             })
             .collect::<Vec<_>>()
     };
-    let silent = invoke("PostToolUse", false);
-    assert!(silent.status.success() && silent.stdout.is_empty());
+    let unmeasured_start = invoke("SessionStart", false);
+    let startup = context(
+        std::str::from_utf8(&unmeasured_start.stdout)
+            .unwrap()
+            .trim(),
+    );
+    assert!(
+        unmeasured_start.status.success() && startup.contains(&format!("Aethyme session {id}")),
+        "{unmeasured_start:?}"
+    );
     assert!(hook_metrics().is_empty());
 
     let delivered = invoke("SessionStart", true);
     assert!(delivered.status.success() && !delivered.stdout.is_empty());
     let silent = invoke("PostToolUse", true);
-    assert!(silent.status.success() && silent.stdout.is_empty());
+    assert!(
+        silent.status.success() && silent.stdout.is_empty(),
+        "{silent:?}"
+    );
     let observed = hook_metrics();
     assert_eq!(observed.len(), 2);
     assert_eq!(observed[0]["command"], "hook.SessionStart");
