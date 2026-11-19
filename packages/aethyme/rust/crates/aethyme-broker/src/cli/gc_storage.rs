@@ -1817,15 +1817,15 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         "sweep" => {
             let sweep = broker.gc_sweep_artifacts();
             #[cfg(target_os = "macos")]
-            if let Err(error) = &sweep {
-                if let Some(tick) = managed_tick.as_ref() {
-                    crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
-                        .map_err(|receipt_error| {
-                            UsageError::Message(format!(
-                                "GC sweep failed ({error}); writing its managed tick receipt failed: {receipt_error}"
-                            ))
-                        })?;
-                }
+            if let Err(error) = &sweep
+                && let Some(tick) = managed_tick.as_ref()
+            {
+                crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
+                    .map_err(|receipt_error| {
+                        UsageError::Message(format!(
+                            "GC sweep failed ({error}); writing its managed tick receipt failed: {receipt_error}"
+                        ))
+                    })?;
             }
             let report = sweep?;
             #[cfg(target_os = "macos")]
