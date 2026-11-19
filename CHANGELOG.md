@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.131] - 2026-11-19
+
+### Fixed
+
+- The idle strip re-examines sessions it handled under older rules. A handled session was remembered until it became active again, so a session stripped by an earlier version never got the removals a later version added. The memo now records the rules it was written under (`checkout_strip.idle_done_rules`); when they change, each idle session is examined once more (`checkout_idle_strip_memo_outdated`) (#1826).
+- Leaked artifact-use markers no longer keep an idle checkout busy forever. On the busiest repository, markers left weeks earlier by commands whose processes were gone refused the idle strip on almost half of the idle sessions. The idle strip now passes a marker only when its producer is proven exited: running phase, recorded process identity and start token, process absent or its identity reused (observed twice), process group absent. A live or unprovable marker refuses as `checkout_marker_live`; `checkout_busy` now means the checkout lock itself is held. The lock is still taken and held across proof and removal. Markers are not removed (#1827).
+- An idle session whose `git status` cannot finish in time is no longer always kept as `activity_unknown`. A bounded walk of file modification times decides instead (at most 5 s and 200,000 entries, inside the pass deadline): a recent time means active, a finished walk with none means idle, an unfinished walk keeps the session. The walk leaves out only `.git`, the broker's runtime paths, and directories the strip itself accepts as regenerable (#1827).
+
+### Changed
+
+- The counter for an environment kept because preparation is not proven to create it is renamed from `checkout_idle_strip_refused_environment_root_creation_unproven` to `checkout_idle_strip_kept_environment_root_creation_unproven`: it counts kept directories, not refused sessions (#1826).
+
+### Upgrade notes
+
+- Consumers of the renamed counter must read the new name.
+- After upgrading, every idle session is examined once more over the following worker runs.
+
+### Known issues
+
+- An idle session holding an operation left `running` by a process that is gone is still refused as `operation_unresolved`.
+- Leaked artifact-use markers of open sessions are passed over but not removed.
+- A producer on another host or in another process namespace sharing the volume is not visible to the exited-producer proof.
+
 ## [0.8.130] - 2026-11-18
 
 ### Changed
