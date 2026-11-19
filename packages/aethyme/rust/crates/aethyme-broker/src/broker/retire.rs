@@ -199,6 +199,9 @@ struct DrainOptions {
     yield_on_memory_critical: bool,
     /// The host-pressure reading.
     sample: fn() -> crate::checkout_trash::HostPressure,
+    /// Deleter threads, each over its own entries and at its share of the
+    /// rate (1: the sequential drain).
+    threads: u32,
 }
 
 impl Default for DrainOptions {
@@ -207,6 +210,7 @@ impl Default for DrainOptions {
             lock_wait: std::time::Duration::ZERO,
             yield_on_memory_critical: false,
             sample: crate::checkout_trash::sample_host_pressure,
+            threads: 1,
         }
     }
 }
@@ -2949,6 +2953,7 @@ impl Broker {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_checkout_trash_with_lock(
         &self,
         lock_path: Option<&Path>,
@@ -2997,15 +3002,26 @@ impl Broker {
             self.checkout_trash_below_headroom(&first),
             backlog.behind(now_ms),
         );
-        let mut pacer = crate::checkout_trash::DrainPacer::for_need(need, options.sample)
-            .with_ceiling(crate::gc::unattended_pacing::explicit_unlink_limit(
-                self.main_root(),
-            ));
-        if options.yield_on_memory_critical {
-            pacer = pacer.yielding_on_memory_critical();
-        }
+        let ceiling = crate::gc::unattended_pacing::explicit_unlink_limit(self.main_root());
+        let threads = options.threads.max(1);
+        let make_pacer = || {
+            let pacer = crate::checkout_trash::DrainPacer::for_need(need, options.sample)
+                .with_ceiling(ceiling)
+                .with_share(threads);
+            if options.yield_on_memory_critical {
+                pacer.yielding_on_memory_critical()
+            } else {
+                pacer
+            }
+        };
         let drain_started = Instant::now();
-        let mut report = crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut pacer);
+        let mut report = if threads > 1 {
+            crate::checkout_trash::drain_trash_parallel(
+                &mut rows, deadline, make_pacer, threads, None,
+            )
+        } else {
+            crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut make_pacer())
+        };
         // Entries recorded by another process during the drain are kept:
         // only what this run removed, forgot, confirmed or counted is
         // applied, atomically.
@@ -3090,6 +3106,7 @@ impl Broker {
                 "budget_stopped": report.budget_stopped,
                 "process_use_unknown": report.process_use_unknown,
                 "end_reason": report.end_reason(),
+                "threads": threads,
                 "entries_pending": report.entries_pending,
                 "oldest_pending_age_s": oldest_pending_age_s,
             }),
@@ -3172,6 +3189,7 @@ impl Broker {
                     lock_wait: std::time::Duration::ZERO,
                     yield_on_memory_critical: true,
                     sample,
+                    threads: crate::checkout_trash::TRASH_CATCHUP_THREADS,
                 },
             );
             if drained.deleter_busy {
@@ -3983,6 +4001,7 @@ mod tests {
                 lock_wait: Duration::ZERO,
                 yield_on_memory_critical: true,
                 sample: critical_memory,
+                threads: 1,
             },
         );
         assert!(drained.yielded_to_pressure, "{drained:?}");

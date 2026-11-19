@@ -1124,12 +1124,16 @@ mod unix {
             const { std::cell::Cell::new(None) };
     }
 
+    #[cfg(not(test))]
     fn effective_listed_kind(listed: ListedKind) -> ListedKind {
-        #[cfg(test)]
-        let forced = FORCE_LISTED_KIND.with(std::cell::Cell::get);
-        #[cfg(not(test))]
-        let forced: Option<ListedKind> = None;
-        forced.unwrap_or(listed)
+        listed
+    }
+
+    #[cfg(test)]
+    fn effective_listed_kind(listed: ListedKind) -> ListedKind {
+        FORCE_LISTED_KIND
+            .with(std::cell::Cell::get)
+            .unwrap_or(listed)
     }
 
     fn ensure_bindings(
