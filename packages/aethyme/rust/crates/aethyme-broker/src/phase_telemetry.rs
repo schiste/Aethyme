@@ -106,6 +106,7 @@ fn record(name: &'static str, start: Instant, end: Instant) {
                     | "install_slot_wait"
                     | "shared_cache_wait_exhausted"
                     | "operation_outcome_record_wait"
+                    | "gate_verdict_wait"
             ) {
                 accumulated.intervals.push((start, end, false));
             }
@@ -261,11 +262,12 @@ mod tests {
         record("subprocess_other", ms(3), ms(9));
         record("process_spawn_lock_wait", ms(2), ms(4));
         record("repository_write_lock_wait", ms(8), ms(12));
+        record("gate_verdict_wait", ms(0), ms(1));
         add("push_remote_tip_redecided", Duration::ZERO);
         let costs = recorder.attribution(start, ms(10));
         assert_eq!(costs["child_command_ms"], 5);
-        assert_eq!(costs["queue_wait_ms"], 4);
-        assert_eq!(costs["broker_and_unattributed_ms"], 1);
+        assert_eq!(costs["queue_wait_ms"], 5);
+        assert_eq!(costs["broker_and_unattributed_ms"], 0);
         assert_eq!(costs["retries"], 1);
     }
 

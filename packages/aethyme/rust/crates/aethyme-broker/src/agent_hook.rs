@@ -66,7 +66,7 @@ impl HookEvent {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
             Self::UserPromptSubmit => "UserPromptSubmit",
@@ -141,6 +141,15 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
         return 0;
     };
 
+    let measurement = crate::cli::hook_metrics_enabled().then(|| {
+        (
+            std::time::Instant::now(),
+            crate::phase_telemetry::Recorder::default(),
+        )
+    });
+    let _recording = measurement
+        .as_ref()
+        .map(|(_, spans)| crate::phase_telemetry::install(spans.clone()));
     let repo = parse_repo_flag(&args[1..]);
     let mut payload = String::new();
     // Drain stdin before any early return: the caller writes the event
@@ -149,7 +158,11 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
     let event_json: serde_json::Value =
         serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
-    match decide(event, repo.as_deref(), &event_json, running_build_banner) {
+    let outcome = {
+        let _span = crate::phase_telemetry::span("hook_dispatch");
+        decide(event, repo.as_deref(), &event_json, running_build_banner)
+    };
+    let (bytes, delivery) = match outcome {
         Some(outcome) => {
             if let Some(envelope) = outcome.envelope(event) {
                 let stdout = std::io::stdout();
@@ -159,12 +172,25 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
                     .is_ok()
                 {
                     acknowledge_peer_views();
+                    let delivery = if matches!(outcome, HookOutcome::Deny(_)) {
+                        "denied"
+                    } else {
+                        "context"
+                    };
+                    (envelope.len() as u64 + 1, delivery)
+                } else {
+                    (0, "output_error")
                 }
+            } else {
+                (0, "silent")
             }
-            0
         }
-        None => 0,
+        None => (0, "unavailable"),
+    };
+    if let Some((started, spans)) = measurement {
+        crate::cli::record_hook_metric(repo.as_deref(), event, started, bytes, delivery, &spans);
     }
+    0
 }
 
 fn parse_repo_flag(rest: &[String]) -> Option<String> {
@@ -464,7 +490,10 @@ pub(crate) fn session_peer_view(
     let leases = broker
         .store_ref()
         .session_peer_lease_overlaps(session_id, now_ms())?;
-    let scopes = broker.store_ref().session_peer_scopes(session_id)?;
+    let scopes = {
+        let _span = crate::phase_telemetry::span("peer_view_scopes");
+        broker.store_ref().session_peer_scopes(session_id)?
+    };
     // Both store queries return rows ordered by peer session ID. Read only
     // the earliest relevant assignment and keep the same priority on both
     // sides of an overlap, so two sessions cannot both decide to wait.
@@ -474,7 +503,10 @@ pub(crate) fn session_peer_view(
         .into_iter()
         .chain(scopes.first().map(|entry| entry.0))
         .min();
-    let decision = pre_edit_decision(broker, session_id, earliest)?;
+    let decision = {
+        let _span = crate::phase_telemetry::span("peer_view_pre_edit");
+        pre_edit_decision(broker, session_id, earliest)?
+    };
     let all = serde_json::json!({"leases": leases, "scopes": scopes, "pre_edit": decision});
     let hash = format!(
         "{:x}",
@@ -586,25 +618,32 @@ pub(crate) fn session_coordination(
         .into_iter()
         .filter(|blocker| blocker.scope != crate::BlockerScope::Session)
         .collect();
-    if let Some(session_id) = session_id
-        && let Ok(Some(notice)) = broker.session_action_required_blocker(session_id)
-    {
-        actions.insert(0, notice);
+    if let Some(session_id) = session_id {
+        let _span = crate::phase_telemetry::span("coordination_action_notice");
+        if let Ok(Some(notice)) = broker.session_action_required_blocker(session_id) {
+            actions.insert(0, notice);
+        }
     }
     let mut warnings_by_kind = std::collections::BTreeMap::new();
     for warning in &other {
         *warnings_by_kind.entry(warning.kind.as_str()).or_insert(0) += 1;
     }
-    if broker
-        .collaboration_fence_state(crate::broker::FenceTrigger::Open)
-        .is_some()
-    {
+    let fenced = {
+        let _span = crate::phase_telemetry::span("coordination_collaboration_fence");
+        broker
+            .collaboration_fence_state(crate::broker::FenceTrigger::Open)
+            .is_some()
+    };
+    if fenced {
         warnings_by_kind.insert("collaboration_fence", 1);
     }
-    let stale = broker
-        .store_ref()
-        .recorded_stale_session_count(session_id)
-        .ok();
+    let stale = {
+        let _span = crate::phase_telemetry::span("coordination_stale_count");
+        broker
+            .store_ref()
+            .recorded_stale_session_count(session_id)
+            .ok()
+    };
     let information = serde_json::json!({
         "count": warnings_by_kind.values().sum::<usize>(),
         "warnings_by_kind": warnings_by_kind,
@@ -613,6 +652,7 @@ pub(crate) fn session_coordination(
         "recovery_checks": "not_inspected",
     });
     let waiters = session_id.map_or_else(Vec::new, |id| {
+        let _span = crate::phase_telemetry::span("coordination_waiters");
         crate::waiters::current_session_waiters(broker.main_root(), now_ms(), id)
             .into_iter()
             .filter(|waiter| waiter.alive)

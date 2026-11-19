@@ -26,6 +26,12 @@ fn take_command_metric_details() -> Option<serde_json::Map<String, serde_json::V
 /// session ids, task text) can never leak into the metrics file. Best
 /// effort — any failure is silently ignored.
 pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
+    "hook",
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
     "adopt",
     "commit",
     "start",
@@ -119,6 +125,10 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "capture",
     "cleanup",
     "gc",
+    // `gc __trash-catchup` (the worker's trash catch-up lane process) and
+    // `gc trash drain`.
+    "__trash-catchup",
+    "trash",
     "storage",
     // `gc reclaim` resolves to `reclaim`. A plan attaches its phase timings
     // and counts, which is what records it; see `command_records_metric`.
@@ -171,6 +181,7 @@ pub(super) fn idle_delivery_poll(exit: u8) -> bool {
 }
 
 thread_local! {
+    static METRIC_REPOSITORY: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     static METRIC_SESSION_ID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
     static WRAPPED_COMMAND_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -184,6 +195,11 @@ pub(super) fn mark_wrapped_command_failure() {
 
 pub(super) fn set_metric_session(id: i64) {
     METRIC_SESSION_ID.with(|slot| slot.set(Some(id)));
+}
+
+/// Preserve the repository context of a command that can remove its own cwd.
+pub(super) fn set_metric_repository(root: &std::path::Path) {
+    METRIC_REPOSITORY.with(|path| *path.borrow_mut() = Some(root.to_path_buf()));
 }
 
 fn metric_session() -> Option<i64> {
@@ -209,7 +225,9 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
     let Some(surface) = safe_command_surface(args) else {
         return;
     };
-    let Ok(cwd) = std::env::current_dir() else {
+    let Ok(cwd) =
+        METRIC_REPOSITORY.with(|path| path.borrow().clone().map_or_else(std::env::current_dir, Ok))
+    else {
         return;
     };
     let Ok(repo) = crate::GitRepo::discover(&cwd) else {
@@ -350,6 +368,7 @@ pub(super) fn record_command_metric(
     spans: &crate::phase_telemetry::Recorder,
 ) {
     let session_id = METRIC_SESSION_ID.with(|slot| slot.take());
+    let repository = METRIC_REPOSITORY.with(|path| path.take());
     let duration_ms = (ended - started).as_millis() as i64;
     let details = take_command_metric_details();
     // Inspection commands are contractually side-effect free: the CLI documents
@@ -368,7 +387,7 @@ pub(super) fn record_command_metric(
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
     let mut details = with_spans(details.unwrap_or_default(), spans);
-    let Ok(cwd) = std::env::current_dir() else {
+    let Ok(cwd) = repository.map_or_else(std::env::current_dir, Ok) else {
         return;
     };
     let Ok(repo) = crate::GitRepo::discover(&cwd) else {
@@ -383,6 +402,9 @@ pub(super) fn record_command_metric(
             .flatten()?;
         session_for_metric(args, &store, &repo)
     });
+    if args.first().is_some_and(|command| command == "hook") && session_id.is_none() {
+        return;
+    }
     details.insert("session_id".into(), serde_json::json!(session_id));
     details.insert("attribution".into(), spans.attribution(started, ended));
     details.insert(
@@ -415,6 +437,30 @@ pub(super) fn record_command_metric(
         &main_root,
         &dir.join("command-metrics.jsonl"),
         line.as_bytes(),
+    );
+}
+
+/// Record the actual hook transport result without changing its exit or stdout.
+pub(crate) fn record_hook_metric(
+    repo: Option<&str>,
+    event: crate::agent_hook::HookEvent,
+    started: std::time::Instant,
+    output_bytes: u64,
+    delivery: &'static str,
+    spans: &crate::phase_telemetry::Recorder,
+) {
+    let ended = std::time::Instant::now();
+    if let Some(repo) = repo {
+        set_metric_repository(std::path::Path::new(repo));
+    }
+    set_command_metric_details(serde_json::json!({ "hook_delivery": delivery }));
+    record_command_metric(
+        &["hook".into(), event.as_str().into()],
+        0,
+        started,
+        ended,
+        output_bytes,
+        spans,
     );
 }
 
@@ -474,7 +520,7 @@ fn object_field<'a>(
 /// Off by default so inspection stays side-effect free. `AETHYME_MEASURE_OUTPUT`
 /// is read per invocation rather than cached, so enabling it needs no restart of
 /// anything and a wrapper can scope it to a single command.
-pub(super) fn output_measurement_opted_in() -> bool {
+pub(crate) fn output_measurement_opted_in() -> bool {
     std::env::var_os("AETHYME_MEASURE_OUTPUT")
         .map(|value| {
             let value = value.to_string_lossy().to_ascii_lowercase();
@@ -523,10 +569,13 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         // The detached artifact worker writes one phase-timing line per run,
         // so its removal slices leave timing evidence.
-        Some("gc") => matches!(
-            args.get(1).map(String::as_str),
-            Some("apply" | "sweep" | "__continue-artifacts")
-        ),
+        // The trash catch-up lane process and the operator's `gc trash
+        // drain` record their lane (`checkout_trash_catchup`) and drains.
+        Some("gc") => match args.get(1).map(String::as_str) {
+            Some("apply" | "sweep" | "__continue-artifacts" | "__trash-catchup") => true,
+            Some("trash") => args.get(2).map(String::as_str) == Some("drain"),
+            _ => false,
+        },
         // A reclaim plan is an observation and writes no outcome event; it
         // records its timing line by attaching phase details once it has run,
         // so a refused selector still leaves no telemetry behind. An apply
@@ -625,7 +674,8 @@ fn command_records_outcome(args: &[String]) -> bool {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("gates"), Some("affected")) | (Some("gc"), Some("__continue-artifacts"))
+        (Some("gates"), Some("affected"))
+            | (Some("gc"), Some("__continue-artifacts" | "__trash-catchup"))
     ) && command_records_metric(args)
 }
 
@@ -797,6 +847,24 @@ mod tests {
         let worker = ["gc", "__continue-artifacts", "/repository"].map(str::to_string);
         assert!(command_records_metric(&worker));
         assert!(!command_records_outcome(&worker));
+    }
+
+    /// The trash catch-up lane process writes its own row (labelled, no
+    /// outcome event, like the worker), and so does `gc trash drain`.
+    #[test]
+    fn the_trash_catchup_lane_and_gc_trash_drain_write_metric_rows() {
+        let lane = ["gc", "__trash-catchup", "/repository"].map(str::to_string);
+        assert!(command_records_metric(&lane));
+        assert!(!command_records_outcome(&lane));
+        assert_eq!(
+            safe_command_surface(&lane).as_deref(),
+            Some("gc.__trash-catchup")
+        );
+        let drain = ["gc", "trash", "drain", "--json"].map(str::to_string);
+        assert!(command_records_metric(&drain));
+        assert_eq!(safe_command_surface(&drain).as_deref(), Some("gc.trash"));
+        let other = ["gc", "trash", "list"].map(str::to_string);
+        assert!(!command_records_metric(&other));
     }
 
     #[test]

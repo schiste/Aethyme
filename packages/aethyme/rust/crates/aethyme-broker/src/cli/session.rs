@@ -88,18 +88,28 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     /// Other sessions that look like the same work; omitted when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     duplicate_work: &'a [crate::DuplicateWork],
-    /// Scope collisions involving this session; an empty array means no match.
-    /// Omitted when the scope is unavailable; see the warning below.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope_overlaps: Option<&'a [crate::ScopeOverlap]>,
-    /// Why this session's scope overlaps could not be determined.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope_overlaps_warning: Option<&'a str>,
+    #[serde(flatten)]
+    scopes: Option<&'a SessionScopeOutput>,
     /// Cached, path-only advisory for explicit planned leases.
     #[serde(skip_serializing_if = "Option::is_none")]
     planned_path_pr_overlaps: Option<&'a crate::PlannedPathPrOverlapCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase_timings_ms: Option<&'a std::collections::BTreeMap<String, u64>>,
+}
+
+#[derive(serde::Serialize)]
+struct SessionScopeOutput {
+    /// Omitted when the scope is unavailable; an empty array means no match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_overlaps: Option<Vec<crate::ScopeOverlap>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_overlaps_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_context: Option<crate::broker::TaskContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_patch: Option<crate::broker::semantic_patch::SemanticPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_patch_warning: Option<String>,
 }
 
 /// `[authorization]` as `broker start --json` reports it: each key, and the
@@ -168,8 +178,7 @@ fn session_action_json<T: serde::Serialize>(
     tab_rename: &crate::chau7_mcp::SessionTabRename,
     guidance: Option<&crate::session_guidance::SessionGuidance>,
     duplicate_work: &[crate::DuplicateWork],
-    scope_overlaps: Option<&[crate::ScopeOverlap]>,
-    scope_overlaps_warning: Option<&str>,
+    scopes: Option<&SessionScopeOutput>,
     planned_path_pr_overlaps: Option<&crate::PlannedPathPrOverlapCheck>,
     phase_timings_ms: Option<&std::collections::BTreeMap<String, u64>>,
     scratch: Option<&crate::broker::SessionScratch>,
@@ -187,8 +196,7 @@ fn session_action_json<T: serde::Serialize>(
         scratch_dir: scratch.map(|scratch| scratch.path.as_deref()),
         scratch_dir_note: scratch.map(|scratch| scratch.note.as_str()),
         duplicate_work,
-        scope_overlaps,
-        scope_overlaps_warning,
+        scopes,
         planned_path_pr_overlaps,
         phase_timings_ms,
     })
@@ -814,13 +822,13 @@ pub(super) fn resolve_handoff_worktree(path: &std::path::Path) -> Result<PathBuf
 /// than leaving one half-described. Reported in the same breath because a
 /// silent capture would make "no collisions" and "nothing recorded"
 /// indistinguishable.
-pub(super) fn capture_declared_scopes(
+fn capture_declared_scopes(
     broker: &mut crate::Broker,
     session_id: i64,
     task: Option<&str>,
     declared: &[String],
     quiet: bool,
-) -> Result<(Option<Vec<crate::ScopeOverlap>>, Option<String>), UsageError> {
+) -> Result<SessionScopeOutput, UsageError> {
     let mut parsed = Vec::with_capacity(declared.len());
     for text in declared {
         let (kind, value, operation) =
@@ -882,7 +890,48 @@ pub(super) fn capture_declared_scopes(
             out!("Scope: none recorded — {reason}");
         }
     }
-    Ok((scope_overlaps, scope_overlaps_warning))
+    if !quiet && let Some(context) = &report.task_context {
+        if !context.paths.is_empty() {
+            out!("Suggested starting paths: {:?}", context.paths);
+        }
+        for anchor in &context.source_anchors {
+            let source = &anchor.source;
+            out!(
+                "Start at {}:{} ({})",
+                source.path,
+                source.line,
+                source.symbol
+            );
+            for caller in &anchor.callers {
+                out!(
+                    "  Caller at {}:{} ({})",
+                    caller.path,
+                    caller.line,
+                    caller.symbol
+                );
+            }
+        }
+        for result in &context.observed_baseline {
+            out!(
+                "Last observed baseline {} {} (run {})",
+                result.gate,
+                result.status.as_str(),
+                result.run_id
+            );
+        }
+        if let Some(gates) = &context.suggested_gates
+            && !gates.is_empty()
+        {
+            out!("Suggested gates: {gates:?}");
+        }
+    }
+    Ok(SessionScopeOutput {
+        scope_overlaps,
+        scope_overlaps_warning,
+        task_context: report.task_context,
+        semantic_patch: None,
+        semantic_patch_warning: None,
+    })
 }
 
 /// Print the worktree report: what holds work that exists nowhere else, first.
@@ -1352,7 +1401,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.json {
         // Scope is recorded in both output modes: `--json` is the form
         // agents use, so skipping capture there drops it for most callers.
-        let (scope_overlaps, scope_overlaps_warning) = capture_declared_scopes(
+        let scopes = capture_declared_scopes(
             &mut broker,
             session.id,
             parsed.task.as_deref(),
@@ -1365,8 +1414,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             &tab_rename,
             Some(&guidance),
             &duplicates,
-            scope_overlaps.as_deref(),
-            scope_overlaps_warning.as_deref(),
+            Some(&scopes),
             planned_path_pr_overlaps.as_ref(),
             None,
             Some(&scratch),
@@ -1690,14 +1738,31 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         &report.planned_explicit_leases,
         crate::clock::epoch_ms(),
     );
+    let recipe = crate::broker::semantic_patch::recipe_name(&task).map(|name| {
+        if report.start_base.evidence != crate::SessionStartBaseEvidence::FetchedDefaultBranch {
+            return Err(
+                "semantic patches require a session based on the fetched default branch".into(),
+            );
+        }
+        let scratch_dir = scratch
+            .path
+            .as_deref()
+            .ok_or("no session scratch directory")?;
+        broker.prepare_semantic_patch(session, name, scratch_dir)
+    });
     if parsed.json {
-        let (scope_overlaps, scope_overlaps_warning) = capture_declared_scopes(
+        let mut scopes = capture_declared_scopes(
             &mut broker,
             session.id,
             Some(task.as_str()),
             &parsed.declared_scopes,
             true,
         )?;
+        match recipe {
+            Some(Ok(candidate)) => scopes.semantic_patch = Some(candidate),
+            Some(Err(warning)) => scopes.semantic_patch_warning = Some(warning),
+            None => {}
+        }
         let duplicates = broker.duplicate_work_for(session);
         record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
         let rendered = session_action_json(
@@ -1705,8 +1770,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &tab_rename,
             Some(&guidance),
             &duplicates,
-            scope_overlaps.as_deref(),
-            scope_overlaps_warning.as_deref(),
+            Some(&scopes),
             planned_path_pr_overlaps.as_ref(),
             Some(&phase_timings_ms),
             Some(&scratch),
@@ -1737,6 +1801,23 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             false,
         )?;
+        match recipe {
+            Some(Ok(candidate)) => {
+                out!(
+                    "Semantic patch {:?} rewrote {} calls in {} files. Verification {}. Review {:?}",
+                    candidate.recipe,
+                    candidate.replacements,
+                    candidate.files.len(),
+                    candidate.gate_status,
+                    candidate.patch_file,
+                );
+                if let Some(diagnostic) = candidate.gate_diagnostic {
+                    out!("Warning: semantic patch verification unavailable ({diagnostic:?})");
+                }
+            }
+            Some(Err(warning)) => out!("Warning: semantic patch unavailable ({warning:?})"),
+            None => {}
+        }
         render_start_base(&report.start_base);
         if let (Some(stack), Some(plan)) = (&stack, &stack_plan) {
             out!(
@@ -1859,7 +1940,6 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
                 &tab_rename,
                 None,
                 &duplicates,
-                None,
                 None,
                 None,
                 Some(&phase_timings_ms),
@@ -2162,6 +2242,7 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     // machine, not on this session, and would otherwise spend the budget
     // before the first finish check runs.
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    telemetry::set_metric_repository(broker.main_root());
     let options = crate::FinishOptions {
         keep_worktree: parsed.keep_worktree,
     };
@@ -3018,18 +3099,9 @@ mod scratch_output_tests {
             )),
             note: crate::broker::scratch_instruction().into(),
         };
-        let text = super::session_action_json(
-            &report,
-            &tab,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Some(&scratch),
-        )
-        .unwrap();
+        let text =
+            super::session_action_json(&report, &tab, None, &[], None, None, None, Some(&scratch))
+                .unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["scratch_dir"], "/pool/.aethyme-session-scratch/s1-1");
         assert!(
@@ -3043,26 +3115,16 @@ mod scratch_output_tests {
             path: None,
             note: "the session is closed".into(),
         };
-        let text = super::session_action_json(
-            &report,
-            &tab,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Some(&none),
-        )
-        .unwrap();
+        let text =
+            super::session_action_json(&report, &tab, None, &[], None, None, None, Some(&none))
+                .unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(value["scratch_dir"].is_null());
         assert!(value.as_object().unwrap().contains_key("scratch_dir"));
         assert_eq!(value["scratch_dir_note"], "the session is closed");
 
         let text =
-            super::session_action_json(&report, &tab, None, &[], None, None, None, None, None)
-                .unwrap();
+            super::session_action_json(&report, &tab, None, &[], None, None, None, None).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(!value.as_object().unwrap().contains_key("scratch_dir"));
     }

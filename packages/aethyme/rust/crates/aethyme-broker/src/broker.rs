@@ -3213,6 +3213,21 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    if progress.archive_denials_consecutive >= retire::ARCHIVE_DENIAL_ADVICE_AT {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-archive-denied",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "creating a recovery archive was refused by its destination (a permission error creating the archive directory: a worker that inherited a sandbox, or a read-only archive volume); closed checkouts that need an archive wait, and archives are retried with a growing back-off",
+            summary: format!(
+                "{} archive attempt(s) in a row refused by the archive destination",
+                progress.archive_denials_consecutive
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: Vec::new(),
+        });
+    }
     push_trash_backlog_advice(view, progress, crate::clock::epoch_ms());
 }
 
@@ -3821,7 +3836,12 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
-pub(crate) use retire::{restore_incomplete_reason, take_last_checkout_restore};
+#[cfg(test)]
+pub(crate) use retire::TRASH_CATCHUP_LOCK_FILE;
+pub(crate) use retire::{
+    TRASH_CATCHUP_MAX_LAPS, TrashCatchupBounds, TrashCatchupEnd, restore_incomplete_reason,
+    take_last_checkout_restore,
+};
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]
 pub(crate) use scratch::scratch_instruction;
@@ -3831,8 +3851,10 @@ mod scope_capture;
 mod status;
 mod status_helpers;
 
-pub use scope_capture::ScopeCaptureReport;
-use scope_capture::derive_scopes_from_task;
+use scope_capture::derive_task_context;
+mod context_warmup;
+pub(crate) mod semantic_patch;
+pub use scope_capture::{ScopeCaptureReport, TaskContext};
 pub(super) use status_helpers::*;
 
 #[cfg(test)]

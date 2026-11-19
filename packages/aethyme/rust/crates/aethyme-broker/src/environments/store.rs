@@ -402,10 +402,11 @@ impl EnvironmentStore {
     /// normal additive schema migration. The queried fields exist in schema
     /// v1 and v2; an absent database is represented by an empty in-memory
     /// reader and never created under host state.
-    pub(crate) fn open_default_cache_gc_read_only(
+    pub(crate) fn open_cache_gc_read_only_in(
+        host_state: &Path,
         deadline: Option<Instant>,
     ) -> Result<Self, StoreError> {
-        let path = default_store_path()?;
+        let path = host_state.join(ENVIRONMENTS_DB);
         match Self::open_cache_gc_read_only_until(&path, deadline)? {
             Some(store) => Ok(store),
             None => {

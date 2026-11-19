@@ -1062,7 +1062,7 @@ impl Checkout {
         let discovered = GitRepo::discover(&source)?;
         if discovered.head_commit()? != spec.commit
             || physical_snapshot(&source)?.id() != manifest.id()
-            || discovered.working_tree_hash()? != spec.tree
+            || discovered.working_tree_hash_at("native_gate_tree_hash")? != spec.tree
         {
             return Err(NativeGateError::Mismatch);
         }
@@ -1291,6 +1291,7 @@ fn run_inner(
             &p.gates,
             &changed,
             Duration::from_secs(job.spec.execution_allowance_seconds),
+            None,
             storage,
         )?;
         let status = if !p.present {
@@ -1311,7 +1312,10 @@ fn run_inner(
         // A gate modifying source or metadata invalidates its observations.
         if checkout.repo.head_commit()? != candidate.commit
             || physical_snapshot(checkout.repo.root())?.id() != snapshot(&job.spec.subject)?
-            || checkout.repo.working_tree_hash()? != candidate.tree
+            || checkout
+                .repo
+                .working_tree_hash_at("native_gate_tree_hash")?
+                != candidate.tree
         {
             return Err(NativeGateError::Mismatch);
         }

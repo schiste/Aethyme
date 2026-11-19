@@ -404,6 +404,226 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## No committed graph: nothing to regenerate (2026-11-19)
+
+A repository can declare `[graph] authority = "committed_fragments"` without
+ever committing `.aethyme/graph/`. Every verification of such a tree then
+regenerated every fragment (316 to 439 s per submit on the busiest repository)
+to reach the only possible verdict, `stale`. Regeneration always writes
+`.aethyme/graph/.gitattributes` and `.aethyme/graph/manifest.json`, which the
+source tree lacks. The event also listed all regenerated paths (about 26,500).
+
+The verifier now checks for that case first, with one object lookup:
+`ls-tree <treeish> -- .aethyme/graph`. When the case holds, it returns at once
+without isolating, indexing, linking or hashing a regenerated copy. The case
+holds when all of these do:
+
+- the verified commit has no `.aethyme/graph`;
+- for a working state, the index and working tree also have no hashed path
+  under it (`ls-files -co --exclude-standard`), and an on-disk engine pin is
+  one Git would hash;
+- `.aethyme/graph/manifest.json` is not ignored.
+
+The status stays `stale`, because older readers drop unknown statuses. The
+reason is `no committed graph fragments in tree; nothing to verify`, and
+`changed_paths` holds only `.aethyme/graph`. Its readers (the `broker report`
+graph section, submit's printed "stale graph paths", the
+`graph.integrity_checked` payload) only display it. The advice now says the
+repository declares fragments but has none committed, and how to generate
+them or disable the policy.
+
+Precedence is unchanged:
+- an environment that refuses graph verification is `error`;
+- a missing or empty engine pin is `incompatible`, with the full path's
+  reason;
+- otherwise the outcome is `stale`.
+
+Any other case takes the full verification. The lanes covered are submit (the
+known-tree path), the general disposable path (brokered pull-request advice,
+native gates), `gates run` and session gate runs (the working-state path,
+before any slot is created). The default-branch context warmup also returns
+quietly, with no deferred warning each tick, when the commit has no committed
+graph.
+
+- **Span (introduced).** `graph_integrity_absent_check`.
+- **Counters (introduced).** `graph_integrity_absent_tree`, and
+  `start_context_warmup_no_graph` for the warmup.
+
+## Submit's enforced graph verification skips the slot hash (2026-11-19)
+
+On the busiest repository, the policy at the submission base declares
+committed graph fragments authoritative. Its `graph.integrity_checked` events
+show `enforced: true`, mostly with status `stale`. So the known-tree shortcut
+for disabled policies never applied there, and `submit_graph_integrity` still
+took about 208 s of real verification.
+
+That path used to hash the verification slot only to decide which commit to
+verify: HEAD when the hash equals HEAD's tree, otherwise a synthetic commit of
+the dirty state. Submit now checks that HEAD's tree is the simulated tree it
+materialized the slot from, which is one object lookup, and verifies HEAD
+without re-reading the slot. On a mismatch the general path runs. The isolated
+copy in which fragments are regenerated is created and written only by the
+verification, so its two hashes (source check and regenerated tree) use the
+stat-seeded hash, which falls back to the full hash whenever it cannot prove
+equality. Verdicts are unchanged: tests compare the outcome with the general
+path's, field for field, for a passing and a stale graph.
+
+- **Counters (introduced).** Why the full path ran:
+  `graph_integrity_full_enforced` (the policy enforces fragments) or
+  `graph_integrity_full_environment_refused` (inherited Git routing variables;
+  the outcome is an immediate `error`). Both are counted alongside the
+  existing `graph_integrity_full_verification`.
+  `graph_integrity_known_tree_mismatch` counts a slot whose HEAD did not
+  carry the simulated tree, where the general path ran.
+- **Spans (introduced).** Inside `submit_graph_integrity`:
+  `graph_integrity_isolate` (inventory, storage check, isolated checkout and
+  source check), `graph_integrity_source_check`, `graph_integrity_index`,
+  `graph_integrity_link` and `graph_integrity_compare` (regenerated tree hash
+  and changed paths). `graph_integrity_tree_hash` keeps timing each hash.
+
+## Tree hash spans, and a stat-seeded hash for submit's verification slot (2026-11-19)
+
+The working-tree hash (the gate cache key and the writer-quiescence proof)
+builds a private index from `read-tree HEAD`, which has no stat data, so
+`add -u` re-reads every tracked file, and then walks untracked files. Its
+cost was inferred, not measured. It is now split into spans wherever it runs,
+and submit's gate run on its freshly materialized verification slot seeds the
+private index from the slot's own index instead. With the seeded index,
+unchanged files are matched by stat data, and changed or racily clean entries
+are re-read, the way `git status` decides.
+
+- **Seeded hash (submit verification slot only).** The private index is a
+  copy of the slot's index, with the copy's modification time set to the
+  original's so Git's racy-clean rule is unchanged. A copy taken while the
+  index was being rewritten, or whose timestamp reads back later than the
+  original's, is refused. Every seeded Git command runs with
+  `core.ignoreStat=false`, `core.trustctime=true`, `core.checkStat=default`, `core.fsmonitor=false`
+  and `core.untrackedCache=false`. The seeded result is used only when all of
+  these hold, each checked rather than assumed:
+  - no entry is assume-unchanged or skip-worktree (`ls-files -v`);
+  - the copied index's `write-tree` equals `HEAD^{tree}`, so nothing is
+    staged and the entries are those of a fresh `read-tree HEAD`;
+  - `core.autocrlf` is unset or false;
+  - `check-attr` reports `text`, `eol`, `crlf`, `filter`, `ident` and
+    `working-tree-encoding` as unspecified or unset on every tracked path.
+
+  Any other case, and any error, takes the full hash. Session gate runs, the
+  shared-verdict recheck, native gates, semantic-patch preview and graph
+  integrity keep the full hash. `AETHYME_TREE_HASH_SEED=off` disables the
+  seeded hash.
+- **Spans (introduced).** Inside every hash: `tree_hash_index_build` (full
+  path only), `tree_hash_tracked_rehash`, `tree_hash_untracked_walk`,
+  `tree_hash_untracked_add` and `tree_hash_write_tree`. In the seeded path:
+  `tree_hash_seeded_total`, `tree_hash_seed_index`, `tree_hash_seed_checks`
+  and `tree_hash_seed_attributes`. Per call site: `gate_inputs_tree_hash`,
+  `gate_shared_wait_tree_hash`, `session_gate_tree_hash`,
+  `native_gate_tree_hash`, `semantic_patch_tree_hash` and
+  `graph_integrity_tree_hash`.
+- **Counters (introduced).** `tree_hash_seeded`, or one of
+  `tree_hash_seed_fallback_<reason>` with `<reason>` one of `switched_off`,
+  `unreadable`, `index_moving`, `timestamp_not_kept`, `entry_flags`, `index_not_head`,
+  `content_conversion` or `git_failed`.
+- **Attachment (introduced).** `tree_hash_files` on the command's metric line:
+  `hashes`, `tracked_entries` and `untracked_files`, totals over the command.
+  `tracked_entries` counts index entries. The full path re-reads all of them;
+  the seeded path re-reads only the ones whose stat data changed, which is not
+  counted.
+
+## Submit's graph check reports the simulated tree when graphs are not authoritative (2026-11-19)
+
+Submit's `graph_and_gate_selection` phase took 3 to 8 minutes on the busiest
+repository, before any gate ran. The phase loads the graph and gate policies
+at the base, which takes seconds, and runs the graph-integrity check on the
+verification slot. That repository does not declare committed graph fragments
+authoritative, so the check's verdict is always `disabled`. Its only work was
+computing the outcome's `tree_hash` by re-hashing every file of the freshly
+materialized slot through a fresh index. Submit now reports the simulated
+merge tree that the slot was materialized from, which is that hash, without
+reading the files. An enforced policy, or an environment that refuses graph
+verification, takes the full path unchanged. Gate selection and gate execution
+are unchanged; the graph check never fed gate selection.
+
+- **Phase counters (introduced).** `graph_integrity_disabled_known_tree`
+  (verdict `disabled`, reported from the known tree) or
+  `graph_integrity_full_verification` (full path).
+- **Spans (introduced).** Inside `graph_and_gate_selection`:
+  `submit_selection_policy_load`, `submit_graph_integrity` and
+  `submit_gate_definitions_load`.
+
+## Worker admission skips its due checks while the worker runs (2026-11-19)
+
+Every broker open admits the detached maintenance worker: it reads eight
+"is work due" sources (about 57 ms median on the busiest repository, 0.8.134)
+and only then tries the worker's singleton lock. On that repository the worker
+was almost always running, so nearly every open read everything only to count
+a coalesced request. The open now probes the singleton lock first. When the
+worker holds it, the open counts the coalesced request (as before) and skips
+the due checks; work that is due stays durable for the first open after the
+worker exits, as it did when the lock was found held after the checks. The
+probe holds the lock only for the instant of the check, so an admission that
+goes on to launch takes it again exactly as before. The main-checkout sync
+timer slot is no longer claimed while the worker runs; it is claimed by the
+first open after the worker exits, which then launches the worker that runs
+the timer lane.
+
+- **Phase counters (introduced).** In the command's `phase_counts`:
+  `worker_admission_skipped_live_worker` (the worker held its lock; the due
+  checks did not run) or `worker_admission_due_checks_run` (they did). The
+  probe's time is the span `worker_admission_live_worker_probe`; the existing
+  `worker_admission_due_checks` span now appears only when the checks run.
+  `gc.artifact_sweep.*.coalesced_requests` now counts every open that found
+  the worker running, not only those that had found work due first.
+
+## Worktree watch streams and changed-path reuse counts (2026-11-19)
+
+A lease scan asks Git which files each session changed unless the host
+worktree watcher shows the worktree unchanged since a stored answer
+(`worktree_watch.rs`). With one file-system stream for every worktree, a
+flagged event loss or a watch-set change outdated every stored answer; on the
+busiest repository `agents` reused 970 of 10,184 answers in a day. On macOS the
+watcher now gives up to 128 worktrees their own stream, the most recently asked
+about first, so a loss, an error or a watch-set change outdates only the
+worktree it concerns. Worktrees past the cap, or whose own stream does not
+start, share one stream; its losses and watch-set changes outdate only the
+worktrees on it. A placement is kept until the worktree is forgotten. Other
+platforms put every worktree on the shared stream, because there a stream costs
+a per-user inotify instance. A worktree whose watch starts nowhere is retried
+after 1 s, doubling to 240 s, instead of every second. Expected idle cost of an
+own stream on macOS: one thread (2 MiB of stack reserved, a few pages touched),
+one run loop and an fseventsd client over Mach ports; no file descriptor.
+What counts as a change, the claim protocol, the answer's key (counter,
+baseline commit, index identity, maximum age) and the commands allowed to
+reuse (`agents`, `status`) are unchanged; `submit` and every other deciding
+command still always ask Git.
+
+- **Phase counters (introduced).** One zero-length occurrence each in the
+  command's `phase_counts` (and `phase_timings_ms`, always 0), per lease-scan
+  question: `changed_files_reused` (existing) on a hit; on a miss exactly one
+  `changed_files_miss_<reason>` with `<reason>` one of `symbolic_base`,
+  `worktree_unreadable`, `no_watcher`, `no_counter`, `index_unreadable`,
+  `no_answer`, `counter_moved`, `base_changed`, `index_changed`,
+  `answer_expired` or `unsupported`; when reuse is not attempted, one of
+  `changed_files_reuse_switched_off` (`AETHYME_WORKTREE_WATCH=off`),
+  `changed_files_reuse_not_allowed` (a deciding command such as `submit`) or
+  `changed_files_reuse_no_host_state`; and `changed_files_claim_failed` when a
+  miss could not claim its counter, so its answer is not stored. Git time stays
+  in the existing `changed_files_asked_git` span. Hit rate:
+  `changed_files_reused / (changed_files_reused + changed_files_asked_git)`.
+- **Watcher status fields (introduced).** `status.json` in the
+  `worktree-watch-v2` host-state directory gains the gauges `own_stream_cap`,
+  `own_streams`, `shared_streams` (0 or 1), `watched_on_shared` and
+  `stream_threads` (own plus shared streams, one event-loop thread each), and
+  the counters `rescans_scoped` (errors and flagged losses confined to one
+  worktree's own stream), `watch_set_changes` (reviews that started or stopped
+  watching a worktree), `watch_failures` (watches that could not start
+  anywhere; that worktree is asked of Git), `watch_fell_back_to_shared`
+  (worktrees put on the shared stream although own streams were allowed) and
+  `watch_retries_deferred` (reviews that skipped a worktree waiting for its
+  retry). `rescans` now counts invalidations of the worktrees on the shared
+  stream: its losses, errors and watch-set changes.
+  The directory's on-disk protocol is unchanged, so its version suffix is too.
+  Readers must tolerate missing fields from older watchers.
+
 ## Gate cache miss events (2026-11-16)
 
 The gate runner recorded a verdict reuse (`gate.cached`) and a forced re-run
@@ -431,6 +651,87 @@ keys, lookup and reuse are unchanged.
   `gates.cache_hit_rate`, null with no recorded miss; text: a `cache misses N,
   hit rate P` line under Gates) reports both over the same window as
   `gates.cached`.
+
+## Prepared session context and semantic patches
+
+The repository's existing `aethyme broker advanced watch pr tick` scheduler warms
+navigation for the locally observed remote default commit when committed
+graph authority is enabled. It reads exact Git objects, validates both the
+source and fragment digests, and atomically publishes a derived store under
+`.aethyme/run/start-context`. A known current commit skips materialization.
+The warmup does no remote fetch and runs no repository commands. It reuses a
+host graph artifact when available without waiting for another cache writer.
+The `start_context_warmup`, `start_context_warmup_inputs`, and
+`start_context_warmup_materialize` spans attribute the scheduler's work.
+
+`broker start --json` and adopt responses can carry `task_context` with
+`source_commit`, up to eight suggested `paths` and `symbols`, and
+`suggested_gates` when gate policy can be parsed. The source commit must
+match the recorded start or adoption revision. Up to four
+`source_anchors` point to symbols by path and line, each with up to two
+indexed callers. `observed_baseline` shows the last conclusive local gate
+result with the exact baseline tree and current gate definition when one is
+available. These historical observations do not verify the task candidate
+or claim that the current host environment matches the recorded run.
+Suggested gate names use the navigation paths. Missing context leaves the
+existing scope warning. `start_task_context` measures the lookup and query.
+
+A repository can commit declarative recipes in
+`.aethyme/semantic-patches.toml`:
+
+```toml
+[[recipe]]
+name = "new-api"
+kind = "rust_call"
+paths = ["src/**/*.rs"]
+from = "crate::legacy::request"
+to = "crate::api::request"
+```
+
+`aethyme broker start --task recipe:new-api --json` selects the named recipe
+from the fetched default branch. The Rust parser matches direct,
+crate-qualified calls in the declared scope. The broker writes a patch file
+under session scratch and evaluates the selected gates in a separate
+checkout using the existing gate trust decision. Gates see a synthetic
+candidate commit with the recorded base as its parent and as
+`AETHYME_GATE_BASE_COMMIT`. It reports
+`semantic_patch` (base commit, candidate commit and tree, patch path, changed files,
+replacement count, gate status and outcomes) or `semantic_patch_warning`
+when it could not make a candidate. Paths to evidence are present when gate
+logs were produced or retained for diagnosis. Status
+`selected_gates_passed` describes the preview tree and is independent of the
+ordinary submission gates. `no_gates_selected`, `selected_gate_failed`,
+`candidate_changed`, and `unavailable` carry the remaining outcomes. The
+preview store cannot supply cache evidence for a submission. Recipe phases
+are `semantic_patch_prepare`, `semantic_patch_candidate`, and
+`semantic_patch_verify`.
+
+From the session checkout at the reported base, inspect the patch with
+`git apply --check -- <patch_file>`. A user or agent can then apply it and
+review the working diff before committing the migration.
+
+## Concurrent gate verdict reuse
+
+Cache-eligible local gates with a complete execution profile check the existing
+repository verdict store. On a miss, a repository-local advisory lock gives one
+producer the right to execute. The producer holds the lock through durable
+verdict recording. A waiter re-observes its tree, then checks the same exact
+cache identity. It can use the recorded result, take over when no reusable
+verdict exists, or report resource contention if the shared wait reaches 60
+seconds or the native deadline. Cache bypass and incomplete profiles still
+execute separately. The lock names use 4,096 stable shards to bound runtime
+files. Collisions may wait but never share a verdict across different keys.
+
+The `gate_verdict_wait` phase measures contested lock time. The
+`gate_verdict_joined` phase count measures completed handoffs. A reused
+`GateRunOutcome` keeps the producer's run ID and duration. Its
+`wait_duration_ms` records contention on the receiving command when present
+and remains zero for an immediate cache hit. This is local to the shared
+broker state and uses the existing tree and execution profile trust contract.
+The comparison base is not part of that identity: a gate that reads
+`AETHYME_GATE_BASE_COMMIT` must set `cache = false` (see "Diff-dependent gate
+commands"), so a session's verdict for a tree satisfies a submission of the
+same tree.
 
 ## Git wrapper probe verdict cache (2026-11-15)
 
@@ -2534,7 +2835,14 @@ foreground sweep, and `open_gc_worker_admission` measures admission for
 the detached worker. The zero-duration `open_gc_inline_cadence_skip` event
 marks an open that uses recent sweep progress to skip headroom sampling.
 Confirmed-journal-only opens omit the sweep, worker, and rotation probes.
-Subphases are nested in their enclosing durations.
+Subphases are nested in their enclosing durations. Since 2026-11-19 worker
+admission nests `worker_admission_cleanup_outbox` (queueing a due post-close
+checkout cleanup), `worker_admission_compact_backfill`,
+`worker_admission_due_checks` (the recorded reads that decide whether any
+lane is due; absent, like the backfill, when the checkout is ephemeral or
+the worker is suppressed) and
+`worker_admission_launch` (runtime checks, the worker lock and the spawn;
+only when a lane is due).
 
 Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
 lookup, the initial worktree snapshot, receipt and admission;
@@ -2544,6 +2852,57 @@ command metrics include these timings plus `broker_open`, without child
 arguments. Timings are wall-clock milliseconds and do not sum to the full
 duration: startup, rendering and final bookkeeping are outside these phases.
 Failures before a report is returned have no phase breakdown.
+
+Introduced 2026-11-19. Guarded exec also records `precheck`,
+`command_and_supervision` and `postcheck` as spans, so `broker commit` and
+preparation, which wrap guarded exec without naming phases, carry them on
+their metric lines; `broker exec` keeps the values it names itself. Nested
+spans split the two checks: `exec_precheck_session` (session row and checkout
+discovery), `exec_precheck_census` (the dirty and untracked path snapshot and
+path identities), `exec_precheck_receipt` (receipt and helper observation
+rows), `exec_precheck_artifact_use` (artifact-use admission);
+`exec_postcheck_receipt` (outcome rows), `exec_postcheck_census` (the second
+snapshot and identity comparison), `exec_postcheck_audit` (the ownership
+audit and its receipt row) and `exec_postcheck_overlap_changes` (overlap
+content attached to warned leases). `broker commit` adds `commit_preflight`
+(session verification, path census and ownership audit before dispatch) and
+`commit_post_audit` (history shape, committed-path census and ownership audit
+after the command); the Git command and its hooks are inside
+`command_and_supervision`.
+
+Introduced 2026-11-19. The session view of `broker status` (`--session`, or
+compact status from a session checkout) adds spans `status_session_lookup`
+(finding the session for the current checkout), `status_session_coordination`,
+`status_session_block`, `status_session_scratch_dir`,
+`status_session_lease_requests`, `status_session_peers`,
+`status_main_checkout` (sync state and its advice), `status_session_stack` and
+`status_session_render` (revisioned rendering and output).
+
+Introduced 2026-11-19. `finish` measures the checkout it is about to remove
+before it takes the repository lifecycle claim, recorded as
+`finish_size_walk_unlocked` (the walk inside it is still `size_walk`). The
+figure it reports as `cleanup.reclaimed_bytes` is that measurement, as before.
+An already-closed session that `finish` only judges for cleanup eligibility is
+no longer walked at all.
+
+Introduced 2026-11-19 (second round). The session peer view nests
+`peer_view_own_leases`, `peer_view_lease_overlaps` (the indexed overlap
+lookups; their rows and order are unchanged), `peer_view_scopes` and
+`peer_view_pre_edit`. Session coordination nests
+`coordination_action_notice`, `coordination_collaboration_fence`,
+`coordination_stale_count` and `coordination_waiters`. `blockers` nests one
+span per source: `blockers_operations`, `blockers_host_operations`,
+`blockers_resource_leases` (with `blockers_resource_lease_owners`, mapping
+lease worktree fingerprints to sessions, and the zero-duration count
+`blockers_resource_lease_owner_canonicalized`, one per recorded checkout
+that still exists and is resolved), `blockers_gate_cache`,
+`blockers_pidfiles` and `blockers_action_required`. `finish` splits its time
+under the lifecycle claim into `finish_claim_cleanup_plan` (the eligibility
+plan), `finish_claim_recovery_proof` (the recovery proof, ownership re-proof
+and the durable cleanup intent) and `finish_claim_removal` (the removal
+itself). Every Git worktree removal adds `worktree_remove_environments`
+(destroying the checkout's environments) and `git_worktree_remove` (the
+`git worktree remove` child, whose time is also in `subprocess_git`).
 
 CLI exec also commits an opaque receipt before command dispatch and adds its id
 to the final text/JSON report. `broker advanced exec-status --session <id>`
@@ -3142,6 +3501,23 @@ Introduced 2026-11-17. Changes consumers may see:
   - New continuing catch-up lane: after its other lanes, with its worker lock already released, the detached worker keeps draining while the trash is behind, in slices of 30 s (`TRASH_CATCHUP_SLICE`) with a 1 s gap, for at most 20 minutes (`TRASH_CATCHUP_MAX`). It is still the single host-wide deleter (each slice takes `checkout-trash-deleter.lock`), still paced and re-reading pressure every 2 s, and a slice stops at once, resumably, at a reading of critical memory pressure (counter `checkout_trash_yielded_to_pressure`; drain report field `yielded_to_pressure`). One lane per host (`checkout-trash-catchup.lock` in the host state directory). Each catch-up slice uses 3 deleter threads (`TRASH_CATCHUP_THREADS`), each over its own entries (dealt round-robin in drain order; pending rows and foreign names stay with the first, which alone confirms pending rows and counts unrecognized names), each pacing itself at a third of the rate, with one open-file observation for all and this process's telemetry recorder; a thread that panics leaves its entries' rows as they were (counter `checkout_trash_thread_panicked`). Spans recorded inside the threads (`checkout_trash_drain`) add up the threads' time. A retirement run's drain stays single-threaded. A retirement run's drain now waits up to 35 s for the deleter lock (polling every 100 ms) so it gets a turn between slices. The lane ends `caught_up`, `cap`, `pressure`, `no_progress` (a slice with time left removed nothing), `deleter_busy` (lock held elsewhere for 2 minutes) or `lane_busy`; counters `checkout_trash_catchup_end_<reason>`, span `checkout_trash_catchup`.
   - New metric attachment `checkout_trash_catchup`: `end_reason`, `slices`, `entries_removed`, `unlinks`, `bytes`, `drain_ms`, `elapsed_ms`, `files_per_second_observed`, `busy_retries`, `worker_drain_share_pct` (this worker process's time in drains, retirement and catch-up, as a share of its wall time). The `checkout_trash_drain` attachment adds `threads` and `end_reason` (`finished` | `deadline` | `pressure` | `process_use_unknown` | `deleter_busy`).
 - Changed 2026-11-19 (trash deleter follow-ups). In the listing-type mode the ancestors are re-checked every 256 unlinks or every 50 ms (`LISTED_TYPE_BINDING_CHECK_INTERVAL`), whichever comes first, so on a slow volume a directory moved out mid-removal loses at most the unlinks of about 50 ms. A parallel catch-up drain measures the trash volumes' available space once before its threads start and once after they join, and reports that change as the slice's `bytes`; its `stripped_bytes` and `scratch_bytes` are zero, so the strip ledger takes bytes only from single-threaded drains (per-entry volume deltas, approximate).
+- Changed 2026-11-19 (trash catch-up starts with the worker). Measured on 0.8.133: after a restart, with the external volume idle and ~1,020 trash entries, the detached worker ran its other lanes for 6+ minutes before one catch-up slice, and quiet-volume deletion (2,297 files/s) is what those minutes waste. Now:
+  - Whenever the trash holds entries, the detached worker starts the catch-up lane at the start of its life as a detached process of its own (`broker gc __trash-catchup <root>`, environment `AETHYME_TRASH_CATCHUP_WORKER_STARTED_MS` = the worker's start, epoch ms), or after its other lanes when the trash only filled during the run (attachment `checkout_trash_catchup_spawn`: `when` = `worker_start` | `worker_end`, `after_worker_start_ms`; counters `checkout_trash_catchup_lane_spawned`, `_lane_spawn_failed`, `_lane_runtime_unverified`, `_lane_storage_context`). A process, not a thread, because the worker runs at `IOPOL_THROTTLE` in the `PRIO_DARWIN_BG` band at process scope (`gc/background_priority.rs`, `lower_current_process`) and XNU takes a thread's effective I/O tier as the most throttled of its own and its task's, so no thread can lift itself out. The lane process raises itself: it leaves the background band, sets process-scope `IOPOL_IMPORTANT` (never throttled) and lowers CPU niceness to 10 instead; on Linux it keeps the inherited idle I/O class (`SCHED_IDLE`, `IOPRIO_CLASS_IDLE`), left unchanged because the measured starvation was macOS throttling. It opens its own broker without unrelated startup GC maintenance, drains until no entry is deletable, is still the single host-wide lane (`checkout-trash-catchup.lock`) and deleter (`checkout-trash-deleter.lock` per slice), with the same pacing, ceiling, 2 s pressure re-reads, memory-critical yield and 20-minute lap cap, and holds no repository lock. Measured just before: a lap of 20 minutes removed 21,896 files (25/s, 3 threads blocked in `unlinkat`) while `rm -rf` on the same volume did ~12,000 operations/s.
+  - A lap that ends at its cap is followed at once by the next, at most 3 laps (`TRASH_CATCHUP_MAX_LAPS`) and 60 minutes per worker; any other end stops (counter `checkout_trash_catchup_next_lap`, and `checkout_trash_catchup_back_to_back` once per worker that ran more than one lap).
+  - A starting lane retries the lane lock for 1 s, so a retirement run's momentary probe of it never turns a lane away. While a lane is live, a retirement run skips its own drain instead of waiting up to 35 s for the deleter lock (counter `checkout_trash_retirement_drain_skipped`; drain report field `skipped_for_catchup_lane`, `end_reason` `skipped_for_catchup_lane`); such a run does not count as stalled.
+  - `checkout_trash_catchup` is recorded on the lane process's own metric row: `end_reason` (the last lap's), `io_policy` (what the process set: `important`, `inherited` or `unchanged`), `catchup_start_delay_ms` (the worker's start to the first slice; null when none ran), `laps`, and the sums of `slices`, `entries_removed`, `unlinks`, `bytes`, `drain_ms`, `busy_retries`, with `elapsed_ms`, `files_per_second_observed` and `drain_share_pct` (drain time as a share of the process's wall time). `checkout_trash_drain` adds `io_policy`, the process's disk I/O policy at the drain (macOS `throttle` | `utility` | `standard` | `important` | `passive` | `default`, Linux `idle` | `best_effort` | `realtime` | `none`, or `unknown`). `gc trash drain` JSON adds `io_policy`. The lane process also records `checkout_trash_catchup_priority`: `io_policy` (the policy read back after raising, the effective one), `requested`, `darwin_bg_cleared`, `cpu_niced`; a read-back still `throttle` counts `checkout_trash_catchup_priority_not_raised`. The lane process (`gc.__trash-catchup`, no outcome event) and `gc trash drain` (`gc.trash`) write command-metric rows. The hidden action runs the worker entry's invocation checks (worker environment, one repository path that is its own main checkout, writable state, not a test or build environment, not an ephemeral volume, aligned runtime binaries) before opening anything. One lane process per repository: it holds `checkout-trash-catchup-<repository key>.lock` (host state directory; key = 16 hex digits of the SHA-256 of the canonical main root) for its whole life, holding the host lane or waiting for it; a second one ends at once (counter `checkout_trash_catchup_repository_lane_present`), and a worker starts none while it is held. A worker starts a lane process only for a deletable entry (not for unconfirmed, failing or last-seen-in-use rows alone). In a process that raised its priority, below the artifact-sweep headroom the drain is held to the catch-up rate (8,000/s, and the configured ceiling) instead of running unpaced (`initial_unlinks_per_second` is then set while `initial_pace` is `unpaced`); the worker's own throttled drains keep the unpaced mode.
+  - New operator command `aethyme broker gc trash drain [--max-minutes <n>] [--json]`: the same lane in the foreground for this repository's pools, until no entry is deletable (not only while behind) or `--max-minutes` (default 20, 1 to 60) pass, in laps as above. Refused while another lane is live on the host. JSON: `end_reason`, `laps`, `slices`, `entries_removed`, `unlinks`, `bytes`, `drain_ms`, `files_per_second`, `entries_remaining`, `oldest_remaining_age_hours`.
+  - Review fixes. The lane lock's holder line names the repository (`repository <main root>`), so a live lane is told apart as this repository's or another's. A retirement run skips its drain only for this repository's own lane; with another repository's lane live it drains as before (waiting up to 35 s for the deleter lock), and only an own-lane skip counts as not stalled. A worker starts its lane unless its own repository's lane is live; a lane that finds another repository's lane retries every 45 s within its 60-minute bound (counter `checkout_trash_catchup_lane_retry`; lap field `lane_held_by_own_repository`) and names its repository in `checkout-trash-catchup.waiting` beside the lock; a holder that sees a fresh note (under 2 minutes) from another repository ends after its current lap instead of chaining the next (counter `checkout_trash_catchup_yielded_to_waiter`); a lane removes its own repository's note when it starts. `gc trash drain` does not retry; it refuses. A drain writes back only the row fields it changed (failures, pending) relative to the rows it read, so a confirmation stored meanwhile is not reverted. `gc trash drain` runs at the caller's priority (not throttled).
+- Changed 2026-11-19 (trash lane waits for any holder). Under 0.8.134 on the busiest repository the lane process ended `lane_busy` after ~1 s twice, deleting nothing: the host lane lock's holder line named no repository (written by another repository worker's probe, which took the lock to look at it), and a lane retried only a holder line naming another repository. Now:
+  - Probes never write a catch-up lane lock's holder line. Whose lane is live (`checkout_trash_catchup_lane_state`, used by the retirement skip and the worker's spawn decision) and whether a repository's lane process is alive come from `probe_catchup_lane_lock`: a non-blocking take that writes nothing and is released at once; a free lock means no lane, whatever its line says (a lane killed without running its drop leaves its line behind), and only while the lock is held is the holder line read. A missing directory reads as free, any other failure as held. A lane lock (`CatchupLaneLock`, the host lane and the per-repository lane-process lock) writes `pid <n> since <ms>` and `repository <main root>` when taken and empties its line, still under the lock, when let go. A lane that could not take the host lane concludes that its own repository's live lane holds it only when two probes 200 ms apart both find it held, naming this repository and a live process other than itself; otherwise it waits and retries.
+  - A lane that finds the host lane held waits and retries (every 45 s in the worker, within its 60-minute bound) unless the holder is this repository's own live lane, whatever else the line says (another repository, no repository, empty). The lap field is now `lane_held_by_own_repository`.
+  - `checkout_trash_catchup` adds `lane_started_after_worker_ms`: when the lane process started, relative to the worker's start (set whenever the worker's start reached the lane). `catchup_start_delay_ms` stays null when no slice ran.
+Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
+
+- Changed 2026-11-19 (retirement reaches its backlog). Measured on the busiest repository over a day: 174 retirement runs judged 775 closed checkouts (median 3 a run) in a closed lap of about 31 s a run, out of a 205 s run, and retired 140; the pool holds about 308 closed checkouts not retired. Now:
+  - An archive whose destination refused creating a directory with a permission error (`EPERM`/`EACCES` from creating the archive parent, root or staging directory, decided at that call site, never from the error's words: all 15 of the day's `archive_failed` keeps were such refusals, from two worker runs that had inherited a sandboxed caller's sandbox) is kept as `archive_environment_denied` (counter `checkout_retirement_kept_archive_environment_denied`), not remembered, and no further archive is attempted in that run. Repeated denials back off per repository: the first is retried by the next run, then archives wait 10 minutes, doubling to 6 hours (meta key `checkout_retirement.archive_denied`: `consecutive`, `until_ms`; counter `checkout_retirement_archive_denied_waiting`); an archive that is written resets it. Progress field `archive_denials_consecutive`; status advice `cleanup.retire-archive-denied` (Warning) from 3 in a row. Any other archive failure, a checkout file the archive cannot read included, stays `archive_failed`, remembered with the existing back-off.
+  - Expiring retired-commit pins runs at most every 30 minutes (meta key `checkout_retirement.pins_pruned_at_ms`; counter `checkout_retirement_prune_pins_not_due` when skipped) instead of using its whole 20 s budget on every run.
+  - While the last strip pass counted 50 or more closed checkouts on disk, the closed lap's floor is 45 s instead of 20 s (still bounded by the lane's deadline); counter `checkout_retirement_closed_lap_backlog_floor` when it applies, and the `checkout_retirement` attachment adds `closed_backlog` and `closed_lap_floor_ms`.
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
 
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
@@ -3427,6 +3803,26 @@ resolves it. To explicitly record an intervention that prevented duplicate work,
 use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
 This requires the broker's current live duplicate-work evidence and a clean,
 unchanged checkout. Ordinary overlap warnings remain a separate count.
+
+`costs` in each task row and `completed_task_totals` also record
+`gate_cache_hits`, `gate_execution_ms_avoided`, `shared_gate_verdicts` and
+`shared_gate_wait_ms`. The counters use session-attributed `gate.cached`
+events in the reporting window. An event with `shared_wait_ms` records a
+successful reuse after waiting for a producer. Older cache events contribute
+only to total hits and recorded execution avoided. The source run's recorded
+duration measures reused child work. The waiting duration is observed
+separately and cannot be subtracted from the source duration to infer a task
+wall-time saving. The existing `gate_verdict_wait` span contributes to the
+command's queue partition. Finish retains the command's repository identity
+through checkout removal so it can still append the timing and outcome.
+
+With `AETHYME_MEASURE_OUTPUT` enabled, recognized agent hooks in a registered
+worktree add `hook.<event>` rows to the same ledger. `hook_dispatch` names
+the broker work. `hook_delivery` is `context`, `denied`, `silent`,
+`unavailable` or `output_error`. `output_bytes` includes the emitted
+envelope's trailing newline and is zero for no successful delivery.
+The hook's wire format and exit contract are unchanged. The row measures
+the native invocation, excluding the host's process launch and shim time.
 
 ### Session scratch directories
 

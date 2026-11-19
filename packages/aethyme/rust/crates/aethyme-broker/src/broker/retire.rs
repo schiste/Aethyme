@@ -91,6 +91,31 @@ pub(crate) const CHECKOUT_RETIREMENT_SUPERSEDED_KEY: &str = "checkout_retirement
 const RETIRE_SUPERSEDED_MAX: usize = 16_384;
 /// The longest a retirement run spends expiring retired-commit pins.
 const RETIRE_PIN_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Expiring retired-commit pins runs at most this often (ms).
+const RETIRE_PIN_PRUNE_INTERVAL_MS: i64 = 30 * 60 * 1_000;
+/// When pins were last expired (epoch ms).
+const CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY: &str = "checkout_retirement.pins_pruned_at_ms";
+/// Closed checkouts on disk at or above which the closed lap gets
+/// [`RETIRE_LAP_BACKLOG_MIN_SHARE`] instead of [`RETIRE_LAP_MIN_SHARE`].
+const RETIRE_LAP_BACKLOG_AT: usize = 50;
+const RETIRE_LAP_BACKLOG_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether expiring retired-commit pins is due: never done, or done at least
+/// [`RETIRE_PIN_PRUNE_INTERVAL_MS`] ago (a clock that went back counts as
+/// due).
+fn retire_pin_prune_due(last_ms: Option<i64>, now_ms: i64) -> bool {
+    last_ms.is_none_or(|last| now_ms < last || now_ms - last >= RETIRE_PIN_PRUNE_INTERVAL_MS)
+}
+
+/// The closed lap's floor: larger while many closed checkouts wait (still
+/// bounded by the lane's deadline).
+fn closed_lap_floor(closed_folders: usize) -> std::time::Duration {
+    if closed_folders >= RETIRE_LAP_BACKLOG_AT {
+        RETIRE_LAP_BACKLOG_MIN_SHARE
+    } else {
+        RETIRE_LAP_MIN_SHARE
+    }
+}
 /// The least time a retirement run gives the strip pass, the closed lap
 /// and the cleaned lap, whatever the phases before them used (bounded by
 /// the lane's own deadline).
@@ -124,8 +149,67 @@ const TRASH_CATCHUP_GAP: std::time::Duration = std::time::Duration::from_secs(1)
 /// How long the catch-up lane keeps retrying a deleter lock held elsewhere
 /// before it ends.
 const TRASH_CATCHUP_BUSY_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a starting lane retries the lane lock, so a retirement run's
+/// momentary probe of it never turns a lane away.
+const TRASH_CATCHUP_LANE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Back-to-back laps one worker (or one `gc trash drain`) runs at most,
+/// each up to `checkout_trash::TRASH_CATCHUP_MAX`.
+pub(crate) const TRASH_CATCHUP_MAX_LAPS: usize = 3;
+/// How often a worker's lane retries a host lane held by another
+/// repository's lane.
+const TRASH_CATCHUP_LANE_RETRY: std::time::Duration = std::time::Duration::from_secs(45);
+/// File beside the lane lock in which a waiting lane names its repository.
+pub(crate) const TRASH_CATCHUP_WAITER_FILE: &str = "checkout-trash-catchup.waiting";
+/// A waiter note older than this is ignored (a waiter refreshes it at
+/// every retry).
+const TRASH_CATCHUP_WAITER_FRESH: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long apart a lane that could not take the host lane probes it twice
+/// before concluding its own repository's live lane holds it.
+const TRASH_CATCHUP_OWN_RECHECK: std::time::Duration = std::time::Duration::from_millis(200);
 /// File name of the host-wide lock that keeps a second catch-up lane out.
 pub(crate) const TRASH_CATCHUP_LOCK_FILE: &str = "checkout-trash-catchup.lock";
+
+/// How long, and how many laps, catch-up runs back to back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrashCatchupBounds {
+    /// Wall time for all laps together.
+    pub(crate) total: std::time::Duration,
+    /// Wall time for one lap.
+    pub(crate) lap_max: std::time::Duration,
+    pub(crate) max_laps: usize,
+    /// Keep draining while any entry is deletable (the operator's command),
+    /// not only while the trash is behind.
+    pub(crate) until_empty: bool,
+    /// When the host lane is held by another repository's lane, try again
+    /// this often within `total` (the worker), instead of ending.
+    pub(crate) lane_retry: Option<std::time::Duration>,
+}
+
+impl TrashCatchupBounds {
+    /// The worker's lane process: up to [`TRASH_CATCHUP_MAX_LAPS`] laps of
+    /// `checkout_trash::TRASH_CATCHUP_MAX`, until no entry is deletable
+    /// (the worker starts it whenever the trash holds entries, so all of
+    /// its trash deletion runs unthrottled), waiting for another
+    /// repository's lane every [`TRASH_CATCHUP_LANE_RETRY`].
+    pub(crate) fn worker() -> Self {
+        let lap_max = crate::checkout_trash::TRASH_CATCHUP_MAX;
+        Self {
+            total: lap_max * TRASH_CATCHUP_MAX_LAPS as u32,
+            lap_max,
+            max_laps: TRASH_CATCHUP_MAX_LAPS,
+            until_empty: true,
+            lane_retry: Some(TRASH_CATCHUP_LANE_RETRY),
+        }
+    }
+}
+
+/// Whose catch-up lane holds the host lane lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchupLaneState {
+    Free,
+    ThisRepository,
+    OtherRepository,
+}
 
 /// Why a continuing catch-up lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +256,12 @@ pub(crate) struct TrashCatchupReport {
     pub(crate) elapsed: std::time::Duration,
     /// Slices that found the deleter lock held elsewhere.
     pub(crate) busy_retries: u32,
+    /// When the first slice started (`None`: none did).
+    pub(crate) first_slice_at: Option<Instant>,
+    /// The lap found the host lane held by another repository's lane.
+    /// The lap found the host lane held by this repository's own lane
+    /// (any other holder, whatever its holder line says, is waited for).
+    pub(crate) lane_held_by_own_repository: bool,
 }
 
 impl TrashCatchupReport {
@@ -185,6 +275,8 @@ impl TrashCatchupReport {
             drain_time: std::time::Duration::ZERO,
             elapsed: std::time::Duration::ZERO,
             busy_retries: 0,
+            first_slice_at: None,
+            lane_held_by_own_repository: false,
         }
     }
 }
@@ -617,6 +709,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "trash_refused" => "checkout_retirement_kept_trash_refused",
         "archive_too_large" => "checkout_retirement_kept_archive_too_large",
         "archive_failed" => "checkout_retirement_kept_archive_failed",
+        "archive_environment_denied" => "checkout_retirement_kept_archive_environment_denied",
         "archive_cleanup_failed" => "checkout_retirement_kept_archive_cleanup_failed",
         "deadline" => "checkout_retirement_kept_deadline",
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
@@ -626,6 +719,54 @@ fn kept_counter(code: &'static str) -> &'static str {
         "holder_unknown" => "checkout_retirement_kept_holder_unknown",
         "leftover_superseded" => "checkout_retirement_kept_leftover_superseded",
         _ => "checkout_retirement_kept_other",
+    }
+}
+
+/// Consecutive archive-destination denials in this repository, and until
+/// when archives are not attempted (epoch ms). Measured on the busiest
+/// repository, all 15 of a day's `archive_failed` keeps were the archive
+/// destination refusing `mkdir` (`Operation not permitted`) in two worker
+/// runs that had inherited a sandboxed caller's sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ArchiveDenialBackoff {
+    pub(crate) consecutive: u32,
+    pub(crate) until_ms: i64,
+}
+
+/// Meta key of [`ArchiveDenialBackoff`].
+const CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY: &str = "checkout_retirement.archive_denied";
+/// The first back-off after repeated destination denials, doubling to
+/// [`ARCHIVE_DENIAL_BACKOFF_MAX_MS`].
+const ARCHIVE_DENIAL_BACKOFF_FIRST_MS: i64 = 10 * 60 * 1_000;
+const ARCHIVE_DENIAL_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
+/// Consecutive denials at or above which `broker status` says so.
+pub(crate) const ARCHIVE_DENIAL_ADVICE_AT: u32 = 3;
+
+impl ArchiveDenialBackoff {
+    /// After one more destination denial at `now_ms`: the first is retried
+    /// by the next run; from the second on, archives wait 10 minutes,
+    /// doubling to 6 hours.
+    pub(crate) fn after_denial(self, now_ms: i64) -> Self {
+        let consecutive = self.consecutive.saturating_add(1);
+        let until_ms = if consecutive < 2 {
+            0
+        } else {
+            let doublings = (consecutive - 2).min(16);
+            now_ms.saturating_add(
+                ARCHIVE_DENIAL_BACKOFF_FIRST_MS
+                    .saturating_mul(1_i64 << doublings)
+                    .min(ARCHIVE_DENIAL_BACKOFF_MAX_MS),
+            )
+        };
+        Self {
+            consecutive,
+            until_ms,
+        }
+    }
+
+    /// Archives wait at `now_ms`.
+    pub(crate) fn waiting(self, now_ms: i64) -> bool {
+        now_ms < self.until_ms
     }
 }
 
@@ -690,6 +831,10 @@ pub(crate) struct RetireRun {
     /// The last inspection this run could not complete (session and the
     /// failing step), retried next run rather than remembered.
     last_inspection_failure: Option<String>,
+    /// The environment refused an archive write this run (`EPERM` or
+    /// `EACCES`: this worker inherited a sandboxed caller's sandbox, or a
+    /// volume refused writes): no further archive is attempted this run.
+    archive_environment_denied: bool,
 }
 
 impl RetireRun {
@@ -992,6 +1137,10 @@ pub(crate) struct CheckoutRetirementProgress {
     /// the run before.
     #[serde(default)]
     pub trash_growing_runs: u32,
+    /// Consecutive archive-destination denials (`archive_environment_denied`)
+    /// in this repository; reset by an archive that is written.
+    #[serde(default)]
+    pub archive_denials_consecutive: u32,
     /// Names of the trash entries the last deleter run passed over because
     /// a process still used them (at most 256). The next run leaves them out
     /// of its backlog decision.
@@ -1825,6 +1974,7 @@ impl Broker {
             ),
             keep_detail: None,
             last_inspection_failure: None,
+            archive_environment_denied: false,
         }))
     }
 
@@ -2331,6 +2481,20 @@ impl Broker {
         {
             return Ok(Kept("archive_deferred"));
         }
+        // The archive destination refused this run, or refused repeatedly
+        // and archives wait out their back-off: the checkout waits, not
+        // remembered (it says nothing about the checkout).
+        if run.archive_environment_denied
+            || self
+                .archive_denial_backoff()
+                .waiting(crate::clock::epoch_ms())
+        {
+            crate::phase_telemetry::add(
+                "checkout_retirement_archive_denied_waiting",
+                std::time::Duration::ZERO,
+            );
+            return Ok(Kept("archive_environment_denied"));
+        }
         let digest = plan.digest.clone();
         drop(git_deadline);
         let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
@@ -2341,8 +2505,16 @@ impl Broker {
         // failure keeps the checkout and the archive. A failure the lane's
         // deadline caused is retried next run (the verified archive is
         // reused), not remembered for an hour.
+        crate::cleanup_resolve::take_archive_destination_denied();
         let applied = self.cleanup_resolve_retirement_apply(session_id, &digest, false);
+        // Decided where the archive destination is created, never from the
+        // error's words: a checkout file the archive cannot read is the
+        // checkout's fault and stays `archive_failed`.
+        let destination_denied = crate::cleanup_resolve::take_archive_destination_denied();
         let out_of_time = Instant::now() >= run.archive_deadline;
+        if applied.is_ok() {
+            self.record_archive_denial_backoff(ArchiveDenialBackoff::default());
+        }
         match applied {
             Ok(outcome) if outcome.worktree_removed => Ok(RetireOutcome::RetiredArchived { bytes }),
             Ok(outcome) => {
@@ -2355,6 +2527,17 @@ impl Broker {
             }
             Err(error) => {
                 run.keep_detail = Some(error.to_string());
+                if destination_denied && !out_of_time {
+                    // The destination refused a write (a sandbox this worker
+                    // inherited, a read-only volume): no further archive
+                    // this run, and repeated denials back off.
+                    run.archive_environment_denied = true;
+                    self.record_archive_denial_backoff(
+                        self.archive_denial_backoff()
+                            .after_denial(crate::clock::epoch_ms()),
+                    );
+                    return Ok(Kept("archive_environment_denied"));
+                }
                 Ok(Kept(if out_of_time {
                     "deadline"
                 } else {
@@ -2362,6 +2545,24 @@ impl Broker {
                 }))
             }
         }
+    }
+
+    /// This repository's archive-destination denial back-off.
+    pub(crate) fn archive_denial_backoff(&self) -> ArchiveDenialBackoff {
+        self.meta_json(CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY)
+    }
+
+    fn record_archive_denial_backoff(&self, backoff: ArchiveDenialBackoff) {
+        if backoff == self.archive_denial_backoff() {
+            return;
+        }
+        crate::warn_unrecorded(
+            "record the archive-destination denial back-off",
+            self.store_ref().meta_set(
+                CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY,
+                &serde_json::to_string(&backoff).unwrap_or_default(),
+            ),
+        );
     }
 
     /// Retire the checkout of a closed session whose merge, rebase,
@@ -2502,6 +2703,13 @@ impl Broker {
             .behind(crate::clock::epoch_ms());
         let sweep_deadline = retirement_sweep_deadline(started, window, trash_behind);
         let mut report = CheckoutRetirementReport::default();
+        // Closed checkouts still on disk, as the last strip pass counted
+        // them: a large backlog gets the closed lap a larger floor.
+        let closed_backlog = self
+            .checkout_retirement_progress()
+            .strip
+            .backlog
+            .closed_folders;
         let mut last_inspection_failure = None;
         // Resolving the open sessions' paths may use a third of the window,
         // never the phases after it.
@@ -2557,7 +2765,14 @@ impl Broker {
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other.
-            let closed_deadline = share(1, 2, RETIRE_LAP_MIN_SHARE);
+            let closed_floor = closed_lap_floor(closed_backlog);
+            if closed_floor > RETIRE_LAP_MIN_SHARE {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_closed_lap_backlog_floor",
+                    std::time::Duration::ZERO,
+                );
+            }
+            let closed_deadline = share(1, 2, closed_floor);
             run.deadline = closed_deadline;
             report.lap_complete =
                 self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
@@ -2588,7 +2803,8 @@ impl Broker {
                 drain_deadline.saturating_duration_since(deadline),
             );
         }
-        report.trash = self.drain_checkout_trash(drain_deadline);
+        let host_dir = self.storage_context().host_state_dir.as_deref();
+        report.trash = self.retirement_trash_drain(host_dir, drain_deadline);
         self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
@@ -2621,16 +2837,40 @@ impl Broker {
                 super::retire_operation::sweep_stale_partials(&root);
             }
         }
-        let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
-        let retired_pins =
+        // Expiring pins is not urgent (a pin only keeps a commit longer)
+        // and used its whole budget on every run: it runs at most every
+        // `RETIRE_PIN_PRUNE_INTERVAL_MS`, so the runs in between end sooner
+        // and the next run, with its laps, starts sooner.
+        let retired_pins = if retire_pin_prune_due(
+            self.store_ref()
+                .meta_get(CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse().ok()),
+            crate::clock::epoch_ms(),
+        ) {
+            let _prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
+            crate::warn_unrecorded(
+                "record when retired-commit pins were expired",
+                self.store_ref().meta_set(
+                    CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY,
+                    &crate::clock::epoch_ms().to_string(),
+                ),
+            );
             match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
                 Ok(remaining) => remaining,
                 Err(error) => {
                     crate::warn_unrecorded::<(), _>("expire retired-commit pins", Err(error));
                     self.checkout_retirement_progress().retired_pins
                 }
-            };
-        drop(prune_span);
+            }
+        } else {
+            crate::phase_telemetry::add(
+                "checkout_retirement_prune_pins_not_due",
+                std::time::Duration::ZERO,
+            );
+            self.checkout_retirement_progress().retired_pins
+        };
         let _record_span = crate::phase_telemetry::span("checkout_retirement_record_progress");
         let kept = report.kept.values().sum::<usize>();
         crate::phase_telemetry::attach(
@@ -2644,16 +2884,20 @@ impl Broker {
                 "archive_bytes": report.archive_bytes,
                 "kept": report.kept,
                 "trash_entries_removed": report.trash.entries_removed,
+                "closed_backlog": closed_backlog,
+                "closed_lap_floor_ms": u64::try_from(closed_lap_floor(closed_backlog).as_millis())
+                    .unwrap_or(u64::MAX),
                 "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             }),
         );
         let previous = self.checkout_retirement_progress();
-        let shrinking =
-            report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
+        let shrinking = report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
                 || report.strip.directories_stripped > 0
                 || report.idle_strip.strip.directories_stripped > 0
                 || report.scratch.retired > 0
                 || report.trash.entries_removed > 0
+                // A live catch-up lane drains the trash meanwhile.
+                || report.trash.skipped_for_catchup_lane
                 || (report.trash.entries_pending == 0 && kept == 0);
         let progress = CheckoutRetirementProgress {
             trash_pending: report.trash.entries_pending,
@@ -2675,6 +2919,7 @@ impl Broker {
             trash_entries_in_use: report.trash.entries_in_use,
             trash_in_use_entries: report.trash.in_use_names.clone(),
             trash_oldest_entry_ms: report.trash.oldest_pending_created_ms,
+            archive_denials_consecutive: self.archive_denial_backoff().consecutive,
             trash_growing_runs: next_trash_growing_runs(
                 previous.trash_growing_runs,
                 previous.trash_pending,
@@ -2941,8 +3186,11 @@ impl Broker {
         &self,
         deadline: Instant,
     ) -> crate::checkout_trash::TrashDrainReport {
-        let lock_path = crate::host_state::resolve_host_state_dir()
-            .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
+        let lock_path = self
+            .storage_context()
+            .host_state_dir
+            .as_deref()
+            .map(|dir| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
         self.drain_checkout_trash_with(
             lock_path.as_deref(),
             deadline,
@@ -3034,26 +3282,7 @@ impl Broker {
         let applied = self.update_meta_json(
             CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
             |current: &mut crate::checkout_trash::TrashRows| {
-                for (dir, entries) in &before {
-                    for name in entries.keys() {
-                        match rows.get(dir).and_then(|after| after.get(name)) {
-                            Some(row) => {
-                                if let Some(stored) =
-                                    current.get_mut(dir).and_then(|stored| stored.get_mut(name))
-                                {
-                                    stored.failures = row.failures;
-                                    stored.pending = row.pending;
-                                }
-                            }
-                            None => {
-                                if let Some(stored) = current.get_mut(dir) {
-                                    stored.remove(name);
-                                }
-                            }
-                        }
-                    }
-                }
-                current.retain(|_, entries| !entries.is_empty());
+                crate::checkout_trash::apply_drain_rows(current, &before, &rows);
             },
         );
         crate::warn_unrecorded("record the checkout trash drain", applied);
@@ -3113,6 +3342,7 @@ impl Broker {
                 "process_use_unknown": report.process_use_unknown,
                 "end_reason": report.end_reason(),
                 "threads": threads,
+                "io_policy": crate::gc::current_io_policy(),
                 "entries_pending": report.entries_pending,
                 "oldest_pending_age_s": oldest_pending_age_s,
             }),
@@ -3123,7 +3353,7 @@ impl Broker {
     /// The backlog the deleter can work on: `rows` less the entries the last
     /// run passed over because a process still used them (they stay in the
     /// advice evidence, not in the pace or share decision).
-    fn checkout_trash_deletable_backlog(
+    pub(crate) fn checkout_trash_deletable_backlog(
         &self,
         rows: &crate::checkout_trash::TrashRows,
     ) -> crate::checkout_trash::TrashBacklog {
@@ -3146,23 +3376,49 @@ impl Broker {
     /// lock: the detached worker runs it after releasing its worker lock,
     /// so the next worker run (and its strip and retirement) starts as
     /// usual, and that run's drain takes the deleter lock between slices.
+    #[cfg(test)]
     pub(crate) fn run_checkout_trash_catchup(
         &self,
         host_dir: Option<&Path>,
         cap: std::time::Duration,
         sample: fn() -> crate::checkout_trash::HostPressure,
     ) -> TrashCatchupReport {
+        self.run_checkout_trash_catchup_lap(host_dir, cap, sample, false)
+    }
+
+    /// One catch-up lap, as described above; `until_empty` (the operator's
+    /// `gc trash drain`) keeps draining while any entry is deletable, not
+    /// only while the trash is behind.
+    pub(crate) fn run_checkout_trash_catchup_lap(
+        &self,
+        host_dir: Option<&Path>,
+        cap: std::time::Duration,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+        until_empty: bool,
+    ) -> TrashCatchupReport {
         let _span = crate::phase_telemetry::span("checkout_trash_catchup");
         let started = Instant::now();
         let end_at = started + cap;
         let mut report = TrashCatchupReport::new();
+        // A retirement run probes the lane lock to see whether a lane is
+        // live; a lane starting at that instant waits the probe out.
         let lane_lock = host_dir.and_then(|dir| {
-            crate::checkout_trash::try_deleter_lock(&dir.join(TRASH_CATCHUP_LOCK_FILE))
-                .ok()
-                .flatten()
+            let path = dir.join(TRASH_CATCHUP_LOCK_FILE);
+            let wait_until = Instant::now() + TRASH_CATCHUP_LANE_LOCK_WAIT;
+            loop {
+                match crate::checkout_trash::try_catchup_lane_lock(&path, self.main_root()) {
+                    Ok(Some(lock)) => break Some(lock),
+                    Ok(None) if Instant::now() < wait_until => {
+                        std::thread::sleep(DELETER_LOCK_POLL);
+                    }
+                    Ok(None) | Err(_) => break None,
+                }
+            }
         });
         let (Some(dir), Some(_lane_lock)) = (host_dir, lane_lock) else {
             report.end = TrashCatchupEnd::LaneBusy;
+            report.lane_held_by_own_repository =
+                host_dir.is_some_and(|dir| self.checkout_trash_catchup_own_lane_live(dir));
             report.elapsed = started.elapsed();
             crate::phase_telemetry::add(
                 "checkout_trash_catchup_end_lane_busy",
@@ -3170,6 +3426,7 @@ impl Broker {
             );
             return report;
         };
+        self.clear_own_catchup_lane_waiter(dir);
         let deleter_lock = dir.join(crate::checkout_trash::DELETER_LOCK_FILE);
         let mut busy_since: Option<Instant> = None;
         report.end = loop {
@@ -3178,16 +3435,20 @@ impl Broker {
                 break TrashCatchupEnd::Cap;
             }
             let rows = self.checkout_trash_rows();
-            if !self
-                .checkout_trash_deletable_backlog(&rows)
-                .behind(crate::clock::epoch_ms())
-            {
+            let deletable = self.checkout_trash_deletable_backlog(&rows);
+            let done = if until_empty {
+                deletable.entries == 0
+            } else {
+                !deletable.behind(crate::clock::epoch_ms())
+            };
+            if done {
                 break TrashCatchupEnd::CaughtUp;
             }
             if sample().memory_critical {
                 break TrashCatchupEnd::Pressure;
             }
             let slice_started = Instant::now();
+            report.first_slice_at.get_or_insert(slice_started);
             let drained = self.drain_checkout_trash_with(
                 Some(&deleter_lock),
                 (slice_started + TRASH_CATCHUP_SLICE).min(end_at),
@@ -3242,6 +3503,371 @@ impl Broker {
             std::time::Duration::ZERO,
         );
         report
+    }
+
+    /// Catch-up laps back to back: a lap that ends at its cap (`lap_max`)
+    /// is followed at once by the next, at most `max_laps` laps and `total`
+    /// wall time in all, so no gap opens until the next worker. Any other
+    /// end (caught up, pressure, no progress, busy) stops.
+    pub(crate) fn run_checkout_trash_catchup_laps(
+        &self,
+        host_dir: Option<&Path>,
+        bounds: TrashCatchupBounds,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+    ) -> Vec<TrashCatchupReport> {
+        let started = Instant::now();
+        let mut laps: Vec<TrashCatchupReport> = Vec::new();
+        loop {
+            let remaining = bounds.total.saturating_sub(started.elapsed());
+            let lap = self.run_checkout_trash_catchup_lap(
+                host_dir,
+                remaining.min(bounds.lap_max),
+                sample,
+                bounds.until_empty,
+            );
+            let time_left = !bounds.total.saturating_sub(started.elapsed()).is_zero();
+            let drained_laps = laps
+                .iter()
+                .filter(|lap| lap.end != TrashCatchupEnd::LaneBusy)
+                .count();
+            let mut wait = None;
+            let mut again = false;
+            if lap.end == TrashCatchupEnd::Cap && drained_laps + 1 < bounds.max_laps && time_left {
+                // Another repository waiting for the lane gets it now
+                // rather than after a further lap.
+                if host_dir.is_some_and(|dir| self.another_repository_waits_for_catchup_lane(dir)) {
+                    crate::phase_telemetry::add(
+                        "checkout_trash_catchup_yielded_to_waiter",
+                        std::time::Duration::ZERO,
+                    );
+                } else {
+                    again = true;
+                    crate::phase_telemetry::add(
+                        "checkout_trash_catchup_next_lap",
+                        std::time::Duration::ZERO,
+                    );
+                }
+            } else if lap.end == TrashCatchupEnd::LaneBusy
+                && !lap.lane_held_by_own_repository
+                && time_left
+                && let (Some(retry), Some(dir)) = (bounds.lane_retry, host_dir)
+            {
+                // Held by anything but this repository's own lane (another
+                // repository's lane, or a holder line naming no repository):
+                // wait for a turn within the bound, and say so, so a lane
+                // holder hands over between laps.
+                self.note_catchup_lane_waiter(dir);
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_lane_retry",
+                    std::time::Duration::ZERO,
+                );
+                wait = Some(retry.min(bounds.total.saturating_sub(started.elapsed())));
+                again = true;
+            }
+            laps.push(lap);
+            if !again {
+                break;
+            }
+            if let Some(wait) = wait {
+                std::thread::sleep(wait);
+            }
+        }
+        laps
+    }
+
+    /// The body of the worker's catch-up lane process: its laps, then
+    /// `checkout_trash_catchup` on this process's metric row, with the
+    /// delay from `worker_started_ms` (the starting worker's start, epoch
+    /// ms) to the first slice and the disk I/O policy the process set.
+    pub(crate) fn run_checkout_trash_catchup_process(
+        &self,
+        host_dir: Option<&Path>,
+        worker_started_ms: Option<i64>,
+        io_policy: &'static str,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+    ) -> Vec<TrashCatchupReport> {
+        let process_started = Instant::now();
+        // One lane process per repository, holding or waiting: a second one
+        // (another worker run while the first still waits for another
+        // repository's lane) ends at once.
+        let repository_lock = host_dir.map(|dir| {
+            crate::checkout_trash::try_catchup_lane_lock(
+                &self.checkout_trash_repository_lane_lock_path(dir),
+                self.main_root(),
+            )
+        });
+        let _repository_lock = match repository_lock {
+            Some(Ok(Some(lock))) => Some(lock),
+            Some(Ok(None)) => {
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_repository_lane_present",
+                    std::time::Duration::ZERO,
+                );
+                return Vec::new();
+            }
+            Some(Err(_)) | None => None,
+        };
+        let laps =
+            self.run_checkout_trash_catchup_laps(host_dir, TrashCatchupBounds::worker(), sample);
+        let sum = |pick: fn(&TrashCatchupReport) -> u64| {
+            laps.iter().map(pick).fold(0_u64, u64::saturating_add)
+        };
+        let drain_time = laps
+            .iter()
+            .map(|lap| lap.drain_time)
+            .fold(std::time::Duration::ZERO, |total, time| {
+                total.saturating_add(time)
+            });
+        let unlinks = sum(|lap| lap.unlinks as u64);
+        let files_per_second = if drain_time.as_secs_f64() > 0.0 {
+            (unlinks as f64 / drain_time.as_secs_f64()).round() as u64
+        } else {
+            0
+        };
+        let wall = process_started.elapsed().as_secs_f64();
+        let drain_share_pct = if wall > 0.0 {
+            (crate::checkout_trash::drain_time_this_process().as_secs_f64() * 100.0 / wall).round()
+                as u64
+        } else {
+            0
+        };
+        let now = crate::clock::epoch_ms();
+        let start_delay_ms = laps
+            .iter()
+            .find_map(|lap| lap.first_slice_at)
+            .zip(worker_started_ms)
+            .map(|(first, started)| {
+                let first_ms = now
+                    .saturating_sub(i64::try_from(first.elapsed().as_millis()).unwrap_or(i64::MAX));
+                first_ms.saturating_sub(started).max(0)
+            });
+        // When this process started, relative to the worker that started it:
+        // set whenever the worker's start reached the lane, even when no
+        // slice ran (then `catchup_start_delay_ms` is null).
+        let started_after_worker_ms = worker_started_ms.map(|started| {
+            now.saturating_sub(
+                i64::try_from(process_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            )
+            .saturating_sub(started)
+            .max(0)
+        });
+        if laps
+            .iter()
+            .filter(|lap| lap.end != TrashCatchupEnd::LaneBusy)
+            .count()
+            > 1
+        {
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_back_to_back",
+                std::time::Duration::ZERO,
+            );
+        }
+        crate::phase_telemetry::attach(
+            "checkout_trash_catchup",
+            serde_json::json!({
+                "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
+                "io_policy": io_policy,
+                "catchup_start_delay_ms": start_delay_ms,
+                "lane_started_after_worker_ms": started_after_worker_ms,
+                "laps": laps.len(),
+                "slices": sum(|lap| u64::from(lap.slices)),
+                "entries_removed": sum(|lap| lap.entries_removed as u64),
+                "unlinks": unlinks,
+                "bytes": sum(|lap| lap.bytes),
+                "drain_ms": u64::try_from(drain_time.as_millis()).unwrap_or(u64::MAX),
+                "elapsed_ms": u64::try_from(process_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                "files_per_second_observed": files_per_second,
+                "busy_retries": sum(|lap| u64::from(lap.busy_retries)),
+                "drain_share_pct": drain_share_pct,
+            }),
+        );
+        laps
+    }
+
+    /// This repository's lane-process lock in `host_dir`: held for the whole
+    /// life of its catch-up lane process, holding the host lane or waiting
+    /// for it, so a worker never starts a second one.
+    fn checkout_trash_repository_lane_lock_path(&self, host_dir: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let root = std::fs::canonicalize(self.main_root())
+            .unwrap_or_else(|_| self.main_root().to_path_buf());
+        let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        let key = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        host_dir.join(format!("checkout-trash-catchup-{key}.lock"))
+    }
+
+    /// Whether a catch-up lane process of this repository is alive (holding
+    /// the host lane or waiting for it): its lane-process lock is held. The
+    /// probe takes the lock for an instant without writing anything; a line
+    /// left by a lane that died is ignored while the lock is free.
+    pub(crate) fn checkout_trash_lane_process_present(&self, host_dir: &Path) -> bool {
+        matches!(
+            crate::checkout_trash::probe_catchup_lane_lock(
+                &self.checkout_trash_repository_lane_lock_path(host_dir)
+            ),
+            crate::checkout_trash::CatchupLaneProbe::Held(_)
+        )
+    }
+
+    /// Whether the worker should start a catch-up lane process for this
+    /// repository (the environment gates aside): an entry the deleter can
+    /// delete (not only unconfirmed, failing or in-use ones), and no lane
+    /// process of this repository alive, holding or waiting.
+    pub(crate) fn checkout_trash_catchup_needed(&self, host_dir: Option<&Path>) -> bool {
+        let rows = self.checkout_trash_rows();
+        if rows.is_empty() || self.checkout_trash_deletable_backlog(&rows).entries == 0 {
+            return false;
+        }
+        !host_dir.is_some_and(|dir| {
+            self.checkout_trash_lane_process_present(dir)
+                || self.checkout_trash_catchup_lane_state(dir) == CatchupLaneState::ThisRepository
+        })
+    }
+
+    /// Whose catch-up lane, if any, is live on this host, read from the
+    /// lane lock's holder line without taking the lock (a lane empties the
+    /// line when it lets go): a line naming a live process is a live lane,
+    /// this repository's when it names this repository. A line naming no
+    /// repository counts as another's.
+    pub(crate) fn checkout_trash_catchup_lane_state(&self, host_dir: &Path) -> CatchupLaneState {
+        match crate::checkout_trash::probe_catchup_lane_lock(
+            &host_dir.join(TRASH_CATCHUP_LOCK_FILE),
+        ) {
+            crate::checkout_trash::CatchupLaneProbe::Free => CatchupLaneState::Free,
+            crate::checkout_trash::CatchupLaneProbe::Held(holder) => {
+                if holder
+                    .and_then(|holder| holder.repository)
+                    .is_some_and(|repository| self.is_this_repository(&repository))
+                {
+                    CatchupLaneState::ThisRepository
+                } else {
+                    CatchupLaneState::OtherRepository
+                }
+            }
+        }
+    }
+
+    /// The host lane is held by this repository's own live lane, as a
+    /// lane that could not take it judges before giving up: held, naming
+    /// this repository and a live process other than this one, on two
+    /// probes [`TRASH_CATCHUP_OWN_RECHECK`] apart, so neither a probe's
+    /// momentary take nor a line left by a dead lane passes.
+    fn checkout_trash_catchup_own_lane_live(&self, host_dir: &Path) -> bool {
+        let path = host_dir.join(TRASH_CATCHUP_LOCK_FILE);
+        let own_live = || match crate::checkout_trash::probe_catchup_lane_lock(&path) {
+            crate::checkout_trash::CatchupLaneProbe::Held(Some(holder)) => {
+                holder.alive()
+                    && holder.pid != i64::from(std::process::id())
+                    && holder
+                        .repository
+                        .as_deref()
+                        .is_some_and(|repository| self.is_this_repository(repository))
+            }
+            _ => false,
+        };
+        own_live() && {
+            std::thread::sleep(TRASH_CATCHUP_OWN_RECHECK);
+            own_live()
+        }
+    }
+
+    fn is_this_repository(&self, path: &Path) -> bool {
+        let root = self.main_root();
+        path == root
+            || std::fs::canonicalize(path)
+                .ok()
+                .zip(std::fs::canonicalize(root).ok())
+                .is_some_and(|(path, root)| path == root)
+    }
+
+    /// Record that this repository's lane waits for the host lane
+    /// ([`TRASH_CATCHUP_WAITER_FILE`]); the holder hands over between laps.
+    fn note_catchup_lane_waiter(&self, host_dir: &Path) {
+        crate::warn_unrecorded(
+            "note a waiting checkout trash catch-up lane",
+            std::fs::write(
+                host_dir.join(TRASH_CATCHUP_WAITER_FILE),
+                format!("repository {}\n", self.main_root().display()),
+            ),
+        );
+    }
+
+    /// Whether a lane of another repository noted, within
+    /// [`TRASH_CATCHUP_WAITER_FRESH`], that it waits for the host lane.
+    fn another_repository_waits_for_catchup_lane(&self, host_dir: &Path) -> bool {
+        let path = host_dir.join(TRASH_CATCHUP_WAITER_FILE);
+        let fresh = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= TRASH_CATCHUP_WAITER_FRESH);
+        fresh
+            && std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("repository ").map(PathBuf::from))
+                })
+                .is_some_and(|waiter| !self.is_this_repository(&waiter))
+    }
+
+    /// Forget this repository's waiter note once its lane runs.
+    fn clear_own_catchup_lane_waiter(&self, host_dir: &Path) {
+        let path = host_dir.join(TRASH_CATCHUP_WAITER_FILE);
+        let own = std::fs::read_to_string(&path).ok().is_some_and(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("repository ").map(PathBuf::from))
+                .is_some_and(|waiter| self.is_this_repository(&waiter))
+        });
+        if own {
+            crate::warn_unrecorded(
+                "forget this repository's checkout trash catch-up waiter note",
+                std::fs::remove_file(path),
+            );
+        }
+    }
+
+    /// The retirement run's drain: skipped (and counted) while a catch-up
+    /// lane is live on this host, which drains this trash anyway and would
+    /// only make the run wait for the deleter lock; otherwise the ordinary
+    /// drain, waiting for that lock at most `DELETER_LOCK_WAIT`.
+    fn retirement_trash_drain(
+        &self,
+        host_dir: Option<&Path>,
+        deadline: Instant,
+    ) -> crate::checkout_trash::TrashDrainReport {
+        // Only this repository's own lane stands in for its drain: another
+        // repository's lane does not touch this trash, so the drain takes
+        // its turns on the deleter lock as before.
+        if host_dir.is_some_and(|dir| {
+            self.checkout_trash_catchup_lane_state(dir) == CatchupLaneState::ThisRepository
+        }) {
+            crate::phase_telemetry::add(
+                "checkout_trash_retirement_drain_skipped",
+                std::time::Duration::ZERO,
+            );
+            let rows = self.checkout_trash_rows();
+            return crate::checkout_trash::TrashDrainReport {
+                entries_pending: rows.values().map(std::collections::BTreeMap::len).sum(),
+                oldest_pending_created_ms: crate::checkout_trash::TrashBacklog::of(&rows)
+                    .oldest_created_ms,
+                skipped_for_catchup_lane: true,
+                ..crate::checkout_trash::TrashDrainReport::default()
+            };
+        }
+        let lock_path = host_dir.map(|dir| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
+        self.drain_checkout_trash_with(
+            lock_path.as_deref(),
+            deadline,
+            DrainOptions {
+                lock_wait: DELETER_LOCK_WAIT,
+                ..DrainOptions::default()
+            },
+        )
     }
 
     /// Whether the volume holding `trash` is below the artifact-sweep
@@ -3558,11 +4184,15 @@ mod tests {
     /// cleaned and the branch ref kept.
     #[test]
     fn a_clean_contained_checkout_is_retired_without_an_archive() {
-        let (_owner, _storage, mut broker) = fixture();
+        let (_owner, storage, mut broker) = fixture();
         let (session, worktree) = closed(&mut broker, "clean", |_| {});
 
         let report = run(&mut broker);
 
+        let fixture_lock = storage
+            .host_state_dir()
+            .join(crate::checkout_trash::DELETER_LOCK_FILE);
+        assert!(fixture_lock.is_file(), "{fixture_lock:?}");
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
@@ -3990,6 +4620,411 @@ mod tests {
         assert!(caught_up.entries_removed >= 1, "{caught_up:?}");
         assert!(!entry.exists());
         assert!(caught_up.elapsed < Duration::from_secs(60));
+    }
+
+    /// The lane process's body drains this repository's trash until no
+    /// entry is deletable (the worker starts it whenever the trash holds
+    /// entries), ends caught up, and reports a start delay measured from the
+    /// worker's start; with this repository's own lane already live it ends
+    /// at once, removing nothing.
+    #[test]
+    fn the_catchup_lane_process_drains_until_empty_from_the_workers_start() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "process");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        // Another live process's lane of this repository (pid 1 stands in
+        // for it) holds the host lane.
+        let own = crate::checkout_trash::try_deleter_lock(&lane_path)
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            &lane_path,
+            format!(
+                "pid 1 since 0\nrepository {}\n",
+                broker.main_root().display()
+            ),
+        )
+        .unwrap();
+        let busy = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(crate::clock::epoch_ms()),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(busy.len(), 1, "own lane live: no retry ({busy:?})");
+        assert_eq!(busy[0].end, super::TrashCatchupEnd::LaneBusy);
+        assert!(busy[0].lane_held_by_own_repository);
+        assert!(entry.exists());
+        drop(own);
+        std::fs::write(&lane_path, "").unwrap();
+
+        let worker_started_ms = crate::clock::epoch_ms() - 5_000;
+        let laps = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(worker_started_ms),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(laps.len(), 1, "{laps:?}");
+        assert_eq!(laps[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(laps[0].first_slice_at.is_some());
+        assert!(!entry.exists());
+        assert!(super::TrashCatchupBounds::worker().until_empty);
+    }
+
+    /// The worker's spawn decision: a lane process is wanted for a
+    /// deletable entry, not for unconfirmed rows alone, and never while a
+    /// lane process of this repository is alive (one waiter per
+    /// repository); a second process for the repository ends at once.
+    #[test]
+    fn one_lane_process_per_repository_and_only_for_deletable_entries() {
+        let (owner, _storage, mut broker) = fixture();
+        let host = owner.path();
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "empty trash"
+        );
+
+        let (session, worktree) = closed(&mut broker, "pending only", |_| {});
+        let pool = worktree.parent().unwrap().to_path_buf();
+        let common = broker.main_git_common_dir().unwrap();
+        let repo = crate::git::GitRepo::discover(broker.main_root()).unwrap();
+        let mut pending = None;
+        let trashed = crate::checkout_trash::move_worktree_to_trash(
+            &repo,
+            &common,
+            &pool,
+            &worktree,
+            session.id,
+            &mut |_, _, row| {
+                pending = Some(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        broker
+            .record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, pending.unwrap())
+            .unwrap();
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "an unconfirmed row alone costs no process"
+        );
+
+        let entry = trashed_day_old_entry(&mut broker, "deletable");
+        assert!(broker.checkout_trash_catchup_needed(Some(host)));
+        let waiter = crate::checkout_trash::try_catchup_lane_lock(
+            &broker.checkout_trash_repository_lane_lock_path(host),
+            broker.main_root(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(broker.checkout_trash_lane_process_present(host));
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "a lane process of this repository is alive"
+        );
+        let second =
+            broker.run_checkout_trash_catchup_process(Some(host), None, "important", no_pressure);
+        assert!(second.is_empty(), "{second:?}");
+        assert!(entry.exists());
+        drop(waiter);
+        assert!(!broker.checkout_trash_lane_process_present(host));
+        assert!(broker.checkout_trash_catchup_needed(Some(host)));
+    }
+
+    /// Reproduces 0.8.134 on the busiest repository: the host lane lock
+    /// held by something that is not a lane (a probe of an older release,
+    /// whose holder line is `pid <n> since <ms>` with no repository) while
+    /// a lane starts. The lane must not end `lane_busy`: it waits, retries,
+    /// and drains once the lock is free.
+    #[test]
+    fn a_lane_waits_out_a_holder_that_names_no_repository_and_then_drains() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "probe holder");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let probe = crate::checkout_trash::try_deleter_lock(&lane_path)
+            .unwrap()
+            .unwrap();
+        let holder = crate::checkout_trash::catchup_lane_holder(&lane_path).unwrap();
+        assert_eq!(holder.repository, None, "{holder:?}");
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::OtherRepository
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_500));
+            drop(probe);
+        });
+
+        let laps = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_secs(30),
+                lap_max: Duration::from_secs(20),
+                max_laps: 3,
+                until_empty: true,
+                lane_retry: Some(Duration::from_millis(300)),
+            },
+            no_pressure,
+        );
+        release.join().unwrap();
+
+        assert!(laps.len() >= 2, "it waited and retried: {laps:?}");
+        assert_eq!(laps[0].end, super::TrashCatchupEnd::LaneBusy);
+        assert!(!laps[0].lane_held_by_own_repository);
+        let last = laps.last().unwrap();
+        assert_eq!(last.end, super::TrashCatchupEnd::CaughtUp, "{laps:?}");
+        assert!(last.entries_removed >= 1, "{laps:?}");
+        assert!(!entry.exists());
+        // A lane empties its holder line when it lets go, so a lock-free
+        // reader sees the lane gone.
+        assert_eq!(
+            crate::checkout_trash::catchup_lane_holder(&lane_path),
+            None,
+            "the lane cleared its line"
+        );
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::Free
+        );
+    }
+
+    /// A lane killed without running its drop (SIGKILL, a crash, a reboot)
+    /// leaves `pid X ... repository A` in the host lane file and in A's
+    /// lane-process file. With the locks free, a live unrelated process
+    /// that now has pid X must not stop A's deletion: the probes read a free
+    /// lock as no lane, so the retirement drain runs, a lane is wanted, and
+    /// the lane drains.
+    #[test]
+    fn a_stale_own_line_with_a_live_unrelated_pid_does_not_stop_deletion() {
+        let (owner, _storage, mut broker) = fixture();
+        let host = owner.path();
+        let stale = format!(
+            "pid 1 since 0\nrepository {}\n",
+            broker.main_root().display()
+        );
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let process_path = broker.checkout_trash_repository_lane_lock_path(host);
+        std::fs::write(&lane_path, &stale).unwrap();
+        std::fs::write(&process_path, &stale).unwrap();
+        assert!(
+            crate::checkout_trash::catchup_lane_holder(&lane_path)
+                .unwrap()
+                .alive()
+        );
+
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::Free
+        );
+        assert!(!broker.checkout_trash_lane_process_present(host));
+        let drained_by_retirement = trashed_day_old_entry(&mut broker, "retired");
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(!drained_by_retirement.exists());
+
+        std::fs::write(&lane_path, &stale).unwrap();
+        let entry = trashed_day_old_entry(&mut broker, "lane");
+        assert!(
+            broker.checkout_trash_catchup_needed(Some(host)),
+            "a lane is wanted"
+        );
+        let laps = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(crate::clock::epoch_ms()),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(laps.len(), 1, "{laps:?}");
+        assert_eq!(laps[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(!entry.exists());
+    }
+
+    /// Laps follow one another only after a lap that hit its cap, and never
+    /// more than the bound.
+    #[test]
+    fn back_to_back_catchup_laps_are_bounded() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "laps");
+        let capped = |max_laps| super::TrashCatchupBounds {
+            total: Duration::from_secs(60),
+            lap_max: Duration::ZERO,
+            max_laps,
+            until_empty: false,
+            lane_retry: None,
+        };
+        let laps =
+            broker.run_checkout_trash_catchup_laps(Some(owner.path()), capped(3), no_pressure);
+        assert_eq!(laps.len(), 3, "{laps:?}");
+        assert!(
+            laps.iter()
+                .all(|lap| lap.end == super::TrashCatchupEnd::Cap)
+        );
+        let one =
+            broker.run_checkout_trash_catchup_laps(Some(owner.path()), capped(1), no_pressure);
+        assert_eq!(one.len(), 1);
+        let no_time = broker.run_checkout_trash_catchup_laps(
+            Some(owner.path()),
+            super::TrashCatchupBounds {
+                total: Duration::ZERO,
+                ..capped(3)
+            },
+            no_pressure,
+        );
+        assert_eq!(no_time.len(), 1, "the total bounds the laps too");
+        assert!(entry.exists());
+        // A lap that is not capped (caught up) ends the run.
+        let drained = broker.run_checkout_trash_catchup_laps(
+            Some(owner.path()),
+            super::TrashCatchupBounds {
+                lap_max: Duration::from_secs(60),
+                ..capped(3)
+            },
+            no_pressure,
+        );
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert_eq!(drained[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(!entry.exists());
+        assert_eq!(
+            super::TrashCatchupBounds::worker().max_laps,
+            super::TRASH_CATCHUP_MAX_LAPS
+        );
+    }
+
+    /// While this repository's catch-up lane is live, the retirement run
+    /// skips its own drain (counted, the trash left to the lane) instead of
+    /// waiting for the deleter lock. Another repository's live lane does not
+    /// serve this trash: the drain runs as before.
+    #[test]
+    fn the_retirement_drain_is_skipped_only_for_this_repositorys_lane() {
+        let (owner, _storage, mut broker) = fixture();
+        let other = trashed_day_old_entry(&mut broker, "other lane");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let foreign_root = owner.path().join("another-repository");
+
+        let foreign = crate::checkout_trash::try_catchup_lane_lock(&lane_path, &foreign_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::OtherRepository
+        );
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(
+            !other.exists(),
+            "drained although another repository's lane is live"
+        );
+        drop(foreign);
+
+        let entry = trashed_day_old_entry(&mut broker, "own lane");
+        let own = crate::checkout_trash::try_catchup_lane_lock(&lane_path, broker.main_root())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::ThisRepository
+        );
+        let started = Instant::now();
+        let skipped =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(skipped.skipped_for_catchup_lane, "{skipped:?}");
+        assert_eq!(skipped.end_reason(), "skipped_for_catchup_lane");
+        assert_eq!(skipped.entries_removed, 0);
+        assert!(skipped.entries_pending >= 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no wait for the deleter lock"
+        );
+        assert!(entry.exists());
+        drop(own);
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::Free
+        );
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(!entry.exists());
+    }
+
+    /// A worker's lane that finds another repository's lane live notes that
+    /// it waits and retries within its time bound instead of giving up; a
+    /// holder that sees another repository waiting hands the lane over
+    /// between laps instead of chaining the next one.
+    #[test]
+    fn a_lane_waits_for_another_repositorys_lane_and_the_holder_hands_over() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "waiting");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let waiter_path = host.join(super::TRASH_CATCHUP_WAITER_FILE);
+        let foreign_root = owner.path().join("another-repository");
+
+        let foreign = crate::checkout_trash::try_catchup_lane_lock(&lane_path, &foreign_root)
+            .unwrap()
+            .unwrap();
+        let waited = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_millis(2_500),
+                lap_max: Duration::from_secs(60),
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: Some(Duration::from_millis(200)),
+            },
+            no_pressure,
+        );
+        assert!(waited.len() >= 2, "retried: {waited:?}");
+        assert!(waited.iter().all(|lap| {
+            lap.end == super::TrashCatchupEnd::LaneBusy && !lap.lane_held_by_own_repository
+        }));
+        let note = std::fs::read_to_string(&waiter_path).unwrap();
+        assert!(
+            note.contains(&broker.main_root().display().to_string()),
+            "{note}"
+        );
+        assert!(entry.exists());
+        drop(foreign);
+
+        // Its own lane clears its note; another repository's note makes a
+        // capped lap the last one.
+        let done = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_secs(60),
+                lap_max: Duration::ZERO,
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: None,
+            },
+            no_pressure,
+        );
+        assert_eq!(done.len(), 3, "{done:?}");
+        assert!(!waiter_path.exists(), "the lane cleared its own note");
+        std::fs::write(
+            &waiter_path,
+            format!("repository {}\n", foreign_root.display()),
+        )
+        .unwrap();
+        let handed_over = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_secs(60),
+                lap_max: Duration::ZERO,
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: None,
+            },
+            no_pressure,
+        );
+        assert_eq!(handed_over.len(), 1, "{handed_over:?}");
+        assert_eq!(handed_over[0].end, super::TrashCatchupEnd::Cap);
     }
 
     /// A catch-up slice stops at once, resumably, at a reading of critical
@@ -7321,5 +8356,124 @@ mod tests {
         .unwrap();
         assert_eq!(pass(&mut broker).strip.checkouts_examined, 0);
         assert!(worktree.join("node_modules").exists());
+    }
+
+    /// Destination denials back off per repository: the first is retried
+    /// by the next run, then archives wait 10 minutes, doubling to 6 hours;
+    /// the keep is never remembered and `archive_failed` still is.
+    #[test]
+    fn archive_destination_denials_back_off_and_are_not_remembered() {
+        let now = 1_800_000_000_000_i64;
+        let first = super::ArchiveDenialBackoff::default().after_denial(now);
+        assert_eq!(first.consecutive, 1);
+        assert!(!first.waiting(now), "the first denial is retried next run");
+        let second = first.after_denial(now);
+        assert!(second.waiting(now + 9 * 60_000));
+        assert!(!second.waiting(now + 10 * 60_000));
+        let third = second.after_denial(now);
+        assert_eq!(third.until_ms, now + 20 * 60_000);
+        let mut many = third;
+        for _ in 0..40 {
+            many = many.after_denial(now);
+        }
+        assert_eq!(many.until_ms, now + 6 * 3_600_000, "capped");
+        assert!(!remembered_keep("archive_environment_denied"));
+        assert!(remembered_keep("archive_failed"));
+        assert_eq!(
+            kept_counter("archive_environment_denied"),
+            "checkout_retirement_kept_archive_environment_denied"
+        );
+    }
+
+    /// A file of the checkout the archive cannot read is the checkout's
+    /// fault: its archive fails as a remembered keep, never as an
+    /// environment denial, and the next checkout that needs an archive is
+    /// still archived in the same run.
+    #[test]
+    fn an_unreadable_checkout_file_is_an_archive_failure_not_a_denial() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_owner, _storage, mut broker) = fixture();
+        let mut unreadable = PathBuf::new();
+        let (first, first_worktree) = closed(&mut broker, "unreadable", |worktree| {
+            unreadable = worktree.join("locked-notes.txt");
+            std::fs::write(&unreadable, "untracked, unreadable\n").unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        if std::fs::read(&unreadable).is_ok() {
+            // A privileged runner reads it regardless; nothing to show.
+            return;
+        }
+        let (second, second_worktree) = closed(&mut broker, "readable", |worktree| {
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+
+        let report = run(&mut broker);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).ok();
+
+        assert!(
+            !report.kept.contains_key("archive_environment_denied"),
+            "{report:#?}"
+        );
+        assert_eq!(broker.archive_denial_backoff().consecutive, 0);
+        let keeps: std::collections::BTreeMap<String, RetireKeep> =
+            broker.meta_json("checkout_retirement.keeps");
+        let keep = keeps
+            .get(&first.id.to_string())
+            .unwrap_or_else(|| panic!("the failure is remembered: {report:#?}"));
+        assert!(
+            matches!(keep.reason.as_str(), "archive_failed" | "plan_refused"),
+            "{keep:?}"
+        );
+        assert!(first_worktree.exists());
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        assert!(retired_away(&second_worktree));
+        assert!(is_cleaned(&broker, second.id));
+    }
+
+    /// Expiring retired-commit pins runs at most every half hour (it used
+    /// its whole 20 s budget on every run), and a closed backlog of 50 or
+    /// more checkouts gives the closed lap a 45 s floor instead of 20 s.
+    #[test]
+    fn pin_expiry_is_paced_and_a_closed_backlog_widens_the_lap() {
+        let now = 1_800_000_000_000_i64;
+        assert!(super::retire_pin_prune_due(None, now));
+        assert!(!super::retire_pin_prune_due(Some(now - 60_000), now));
+        assert!(super::retire_pin_prune_due(
+            Some(now - super::RETIRE_PIN_PRUNE_INTERVAL_MS),
+            now
+        ));
+        assert!(
+            super::retire_pin_prune_due(Some(now + 60_000), now),
+            "clock went back"
+        );
+        assert_eq!(super::closed_lap_floor(0), super::RETIRE_LAP_MIN_SHARE);
+        assert_eq!(super::closed_lap_floor(49), super::RETIRE_LAP_MIN_SHARE);
+        assert_eq!(
+            super::closed_lap_floor(313),
+            super::RETIRE_LAP_BACKLOG_MIN_SHARE
+        );
+    }
+
+    /// A second retirement run within the interval does not expire pins
+    /// again.
+    #[test]
+    fn a_second_run_within_the_interval_skips_pin_expiry() {
+        let (_owner, _storage, mut broker) = fixture();
+        let _first = run(&mut broker);
+        let stamped = broker
+            .store_ref()
+            .meta_get(super::CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+            .unwrap()
+            .expect("the first run expired pins and stamped it");
+        let _second = run(&mut broker);
+        assert_eq!(
+            broker
+                .store_ref()
+                .meta_get(super::CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(stamped.as_str()),
+            "not expired again within the interval"
+        );
     }
 }

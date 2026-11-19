@@ -383,6 +383,68 @@ fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
     assert!(lines.iter().any(|line| line["command"] != "start"));
 }
 
+/// A session's status view named only `open` and `command_total`, so about
+/// half of its time had no name on the metric line.
+#[test]
+fn a_session_status_metric_line_names_each_step_of_the_view() {
+    let tmp = fixture();
+    let session = json(&run(
+        tmp.path(),
+        &["start", "--task", "session status telemetry", "--json"],
+    ));
+    let id = session["id"].as_i64().unwrap().to_string();
+    let view = json(&run(tmp.path(), &["status", "--session", &id, "--json"]));
+    assert_eq!(view["schema"], "aethyme.broker-session-view/v2", "{view:#}");
+
+    let metrics =
+        std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let status = metrics
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .rfind(|line| line["command"] == "status")
+        .unwrap();
+    for phase in [
+        "status_session_coordination",
+        "status_session_block",
+        "status_session_scratch_dir",
+        "status_session_lease_requests",
+        "status_session_peers",
+        "status_main_checkout",
+        "status_session_stack",
+        "status_session_render",
+    ] {
+        assert_eq!(
+            status["phase_counts"][phase].as_u64(),
+            Some(1),
+            "{phase}: {status}"
+        );
+        assert!(
+            status["phase_timings_ms"][phase].is_u64(),
+            "{phase}: {status}"
+        );
+    }
+    // Inside the peer view, coordination and blockers.
+    for phase in [
+        "peer_view_own_leases",
+        "peer_view_lease_overlaps",
+        "peer_view_scopes",
+        "peer_view_pre_edit",
+        "coordination_action_notice",
+        "coordination_collaboration_fence",
+        "coordination_stale_count",
+        "coordination_waiters",
+        "blockers_operations",
+        "blockers_host_operations",
+        "blockers_resource_leases",
+        "blockers_pidfiles",
+    ] {
+        assert!(
+            status["phase_counts"][phase].as_u64() >= Some(1),
+            "{phase}: {status}"
+        );
+    }
+}
+
 #[test]
 fn status_names_an_object_store_with_many_loose_objects() {
     let tmp = fixture();

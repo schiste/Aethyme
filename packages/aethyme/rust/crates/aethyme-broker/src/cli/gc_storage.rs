@@ -1596,6 +1596,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
+    if action == crate::gc::TRASH_CATCHUP_ACTION {
+        return run_trash_catchup_lane_process(parsed);
+    }
     // A managed sweep tick is a detached worker: its starved background lanes
     // may queue for the lifecycle lock (see `DetachedBackgroundWorker`).
     #[cfg(target_os = "macos")]
@@ -1606,6 +1609,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     }
     if action == "remote-branches" {
         return run_gc_remote_branches(parsed);
+    }
+    if action == "trash" {
+        return run_gc_trash(parsed);
     }
     if action == "storage" {
         if parsed.positional.get(1).map(String::as_str) != Some("maintenance-lock") {
@@ -1811,15 +1817,15 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         "sweep" => {
             let sweep = broker.gc_sweep_artifacts();
             #[cfg(target_os = "macos")]
-            if let Err(error) = &sweep {
-                if let Some(tick) = managed_tick.as_ref() {
-                    crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
-                        .map_err(|receipt_error| {
-                            UsageError::Message(format!(
-                                "GC sweep failed ({error}); writing its managed tick receipt failed: {receipt_error}"
-                            ))
-                        })?;
-                }
+            if let Err(error) = &sweep
+                && let Some(tick) = managed_tick.as_ref()
+            {
+                crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
+                    .map_err(|receipt_error| {
+                        UsageError::Message(format!(
+                            "GC sweep failed ({error}); writing its managed tick receipt failed: {receipt_error}"
+                        ))
+                    })?;
             }
             let report = sweep?;
             #[cfg(target_os = "macos")]
@@ -1866,6 +1872,184 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     }
     Ok(())
 }
+
+/// Default and largest `gc trash drain --max-minutes`.
+const GC_TRASH_DRAIN_DEFAULT_MINUTES: u32 = 20;
+const GC_TRASH_DRAIN_MAX_MINUTES: u32 = 60;
+
+/// `gc trash drain`: run the trash catch-up lane now, in the foreground.
+fn run_gc_trash(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 2 || parsed.positional[1] != "drain" {
+        return Err(UsageError::Message(
+            "gc trash accepts `drain [--max-minutes <n>] [--json]`".into(),
+        ));
+    }
+    let minutes = parsed.max_minutes.unwrap_or(GC_TRASH_DRAIN_DEFAULT_MINUTES);
+    if minutes == 0 || minutes > GC_TRASH_DRAIN_MAX_MINUTES {
+        return Err(UsageError::Message(format!(
+            "--max-minutes must be between 1 and {GC_TRASH_DRAIN_MAX_MINUTES}"
+        )));
+    }
+    let broker = open_broker(false)?;
+    let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+    let outcome = gc_trash_drain(
+        &broker,
+        host_dir.as_deref(),
+        std::time::Duration::from_secs(u64::from(minutes) * 60),
+        crate::checkout_trash::sample_host_pressure,
+    )?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        out!(
+            "Checkout trash drain: {} entr(y/ies) removed ({} files, {} files/s over {} lap(s)); ended: {}.",
+            outcome["entries_removed"],
+            outcome["unlinks"],
+            outcome["files_per_second"],
+            outcome["laps"],
+            outcome["end_reason"].as_str().unwrap_or("unknown"),
+        );
+        out!(
+            "  remaining: {} entr(y/ies){}",
+            outcome["entries_remaining"],
+            outcome["oldest_remaining_age_hours"]
+                .as_u64()
+                .map(|hours| format!(", the oldest moved in {hours} hour(s) ago"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// The lane `gc trash drain` runs, and what it reports; a refusal when
+/// another catch-up lane is live on this host.
+fn gc_trash_drain(
+    broker: &Broker,
+    host_dir: Option<&std::path::Path>,
+    total: std::time::Duration,
+    sample: fn() -> crate::checkout_trash::HostPressure,
+) -> Result<serde_json::Value, UsageError> {
+    let Some(host_dir) = host_dir else {
+        return Err(UsageError::Message(
+            "gc trash drain needs the host state directory, which could not be resolved".into(),
+        ));
+    };
+    let laps = broker.run_checkout_trash_catchup_laps(
+        Some(host_dir),
+        crate::broker::TrashCatchupBounds {
+            total,
+            lap_max: crate::checkout_trash::TRASH_CATCHUP_MAX,
+            max_laps: crate::broker::TRASH_CATCHUP_MAX_LAPS,
+            until_empty: true,
+            // The operator is told at once that another lane runs.
+            lane_retry: None,
+        },
+        sample,
+    );
+    if laps
+        .first()
+        .is_some_and(|lap| lap.end == crate::broker::TrashCatchupEnd::LaneBusy)
+    {
+        return Err(UsageError::Message(GC_TRASH_DRAIN_LANE_BUSY.into()));
+    }
+    let drain_secs: f64 = laps.iter().map(|lap| lap.drain_time.as_secs_f64()).sum();
+    let unlinks: usize = laps.iter().map(|lap| lap.unlinks).sum();
+    let rows = broker.checkout_trash_rows();
+    let remaining = crate::checkout_trash::TrashBacklog::of(&rows);
+    Ok(serde_json::json!({
+        "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
+        "laps": laps.len(),
+        "slices": laps.iter().map(|lap| u64::from(lap.slices)).sum::<u64>(),
+        "entries_removed": laps.iter().map(|lap| lap.entries_removed).sum::<usize>(),
+        "unlinks": unlinks,
+        "bytes": laps.iter().map(|lap| lap.bytes).sum::<u64>(),
+        "drain_ms": (drain_secs * 1_000.0).round() as u64,
+        "files_per_second": if drain_secs > 0.0 {
+            (unlinks as f64 / drain_secs).round() as u64
+        } else {
+            0
+        },
+        "entries_remaining": rows.values().map(std::collections::BTreeMap::len).sum::<usize>(),
+        "io_policy": crate::gc::current_io_policy(),
+        "oldest_remaining_age_hours": remaining
+            .oldest_age_ms(crate::clock::epoch_ms())
+            .map(|age| age / 3_600_000),
+    }))
+}
+
+/// The detached worker's trash catch-up lane process (`gc __trash-catchup
+/// <root>`): it raises its own disk I/O out of the worker's throttled
+/// policy, then runs the lane's laps for this repository.
+fn run_trash_catchup_lane_process(parsed: Parsed) -> Result<(), UsageError> {
+    // The same invocation checks as the worker entry, before anything opens.
+    validate_artifact_sweep_worker_invocation(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV)
+            .ok()
+            .as_deref(),
+        parsed.read_only_snapshot,
+        parsed.positional.len(),
+        artifact_worker_test_or_build_environment(),
+    )?;
+    let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot resolve the trash catch-up repository: {error}"
+        ))
+    })?;
+    let discovered = crate::GitRepo::discover(&requested_root)?;
+    let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
+    if repository_root != requested_root {
+        return Err(UsageError::Message(
+            "the trash catch-up repository does not match its main checkout".into(),
+        ));
+    }
+    if crate::host_state::path_is_ephemeral(&repository_root)
+        || !crate::gc::artifact_worker_runtime_is_aligned()
+    {
+        return Err(UsageError::Message(
+            "the trash catch-up runtime or repository is not eligible".into(),
+        ));
+    }
+    let priority = crate::gc::raise_trash_deleter_priority();
+    // What took effect, read back: a raise the platform ignored stays
+    // visible in the first reading.
+    let effective = crate::gc::current_io_policy();
+    if effective == "throttle" {
+        crate::phase_telemetry::add(
+            "checkout_trash_catchup_priority_not_raised",
+            std::time::Duration::ZERO,
+        );
+    }
+    if priority.io_policy == "important" && effective != "throttle" {
+        // Below the headroom the drain no longer has the OS throttle as a
+        // bound: it is held to the catch-up rate instead of running unpaced.
+        crate::checkout_trash::mark_priority_raised();
+    }
+    crate::phase_telemetry::attach(
+        "checkout_trash_catchup_priority",
+        serde_json::json!({
+            "io_policy": effective,
+            "requested": priority.io_policy,
+            "darwin_bg_cleared": priority.darwin_bg_cleared,
+            "cpu_niced": priority.cpu_niced,
+        }),
+    );
+    // No unrelated startup GC maintenance: this process only drains.
+    let broker = Broker::open_for_cleanup_resolve(&repository_root)?;
+    let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+    let worker_started_ms = std::env::var(crate::gc::TRASH_CATCHUP_WORKER_STARTED_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok());
+    broker.run_checkout_trash_catchup_process(
+        host_dir.as_deref(),
+        worker_started_ms,
+        effective,
+        crate::checkout_trash::sample_host_pressure,
+    );
+    Ok(())
+}
+
+/// The refusal of `gc trash drain` while another lane is live.
+const GC_TRASH_DRAIN_LANE_BUSY: &str = "another checkout trash catch-up lane is running on this host (a background worker's, or another `gc trash drain`); it is the one deleter allowed, so this run removed nothing. Try again once it ends.";
 
 /// `gc remote-branches plan`: preview the remote session-branch cleanup.
 fn run_gc_remote_branches(parsed: Parsed) -> Result<(), UsageError> {
@@ -3034,6 +3218,89 @@ mod artifact_worker_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
         (owner, storage, broker)
+    }
+
+    /// The lane process's body records `checkout_trash_catchup` (with the
+    /// I/O policy) into the command's recorder, which the command metric
+    /// row is built from; the hidden action is refused outside the worker.
+    #[test]
+    fn the_trash_catchup_lane_records_its_attachment_and_is_refused_in_tests() {
+        let (owner, _storage, broker) = worker_environment_fixture();
+        let host = owner.path().join("host-state");
+        std::fs::create_dir_all(&host).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.run_checkout_trash_catchup_process(
+                Some(&host),
+                Some(crate::clock::epoch_ms()),
+                "important",
+                crate::checkout_trash::HostPressure::default,
+            );
+        }
+        let attachments = recorder.attachments();
+        let lane = attachments
+            .get("checkout_trash_catchup")
+            .expect("the lane attaches its record");
+        assert_eq!(lane["io_policy"], "important", "{lane}");
+        assert_eq!(lane["end_reason"], "caught_up", "{lane}");
+        // The hidden action runs the worker entry's invocation checks: in a
+        // test (or build) environment it is refused before anything opens.
+        assert!(
+            validate_artifact_sweep_worker_invocation(
+                Some("1"),
+                false,
+                2,
+                artifact_worker_test_or_build_environment(),
+            )
+            .is_err()
+        );
+    }
+
+    /// `gc trash drain` refuses, removing nothing, while another catch-up
+    /// lane holds the host lock, and runs once it is free.
+    #[test]
+    fn gc_trash_drain_refuses_while_another_lane_is_live() {
+        let (owner, _storage, broker) = worker_environment_fixture();
+        let host = owner.path().join("host-state");
+        std::fs::create_dir_all(&host).unwrap();
+        let lane = crate::checkout_trash::try_deleter_lock(
+            &host.join(crate::broker::TRASH_CATCHUP_LOCK_FILE),
+        )
+        .unwrap()
+        .unwrap();
+        let no_pressure = crate::checkout_trash::HostPressure::default;
+        let refused = gc_trash_drain(
+            &broker,
+            Some(&host),
+            std::time::Duration::from_secs(60),
+            no_pressure,
+        );
+        match refused {
+            Err(UsageError::Message(message)) => {
+                assert_eq!(message, GC_TRASH_DRAIN_LANE_BUSY);
+            }
+            other => panic!("expected the lane-busy refusal, got {other:?}"),
+        }
+        drop(lane);
+        let ran = gc_trash_drain(
+            &broker,
+            Some(&host),
+            std::time::Duration::from_secs(60),
+            no_pressure,
+        )
+        .unwrap();
+        assert_eq!(ran["end_reason"], "caught_up", "{ran}");
+        assert_eq!(ran["entries_remaining"], 0, "{ran}");
+        assert!(
+            gc_trash_drain(
+                &broker,
+                None,
+                std::time::Duration::from_secs(60),
+                no_pressure
+            )
+            .is_err()
+        );
     }
 
     /// The worker entry point resolves the `[cleanup]` source before the
