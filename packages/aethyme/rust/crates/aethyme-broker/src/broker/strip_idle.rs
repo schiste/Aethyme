@@ -502,6 +502,7 @@ fn tracked_top_level_directories(worktree: &Path) -> Vec<String> {
 pub(crate) fn recent_file_activity(
     worktree: &Path,
     since: std::time::SystemTime,
+    deadline: Instant,
 ) -> Option<&'static str> {
     let newer = |path: &Path| {
         std::fs::metadata(path)
@@ -536,11 +537,17 @@ pub(crate) fn recent_file_activity(
         // `git status` could not finish (a large checkout on a slow
         // volume): a bounded walk of the checkout's modification times
         // decides instead; one that cannot finish keeps the session.
+        // Only what the strip catalogue itself accepts as regenerable (its
+        // witness) is left out of the walk; within the checkout's deadline.
         None => match crate::worktree_status_activity::recent_mtime_walk(
             worktree,
             since,
-            crate::worktree_status_activity::MTIME_WALK_BUDGET,
+            deadline.min(Instant::now() + crate::worktree_status_activity::MTIME_WALK_BUDGET),
             crate::worktree_status_activity::MTIME_WALK_ENTRIES,
+            &|path: &Path, name: &str| {
+                super::strip::StripKind::for_name(name)
+                    .is_some_and(|kind| kind.witness(path, &[]).is_ok())
+            },
         ) {
             Some(true) => Some("changed_file_walk"),
             Some(false) => None,
@@ -798,7 +805,7 @@ impl Broker {
         let since = std::time::SystemTime::now()
             .checked_sub(idle_after)
             .unwrap_or(std::time::UNIX_EPOCH);
-        let evidence = recent_file_activity(&worktree, since);
+        let evidence = recent_file_activity(&worktree, since, deadline);
         if evidence == Some(ACTIVITY_UNKNOWN) {
             return Refused("activity_unknown");
         }
@@ -1225,6 +1232,7 @@ mod tests {
     fn recent_modification_times_count_as_activity() {
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path();
+        let far = || Instant::now() + Duration::from_secs(60);
         let git = |args: &[&str]| {
             assert!(
                 crate::git::git_command()
@@ -1261,27 +1269,48 @@ mod tests {
             }
         };
         age_all();
-        assert_eq!(recent_file_activity(worktree, since), None);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
         set_mtime(&worktree.join(".git/index"), std::time::SystemTime::now());
-        assert_eq!(recent_file_activity(worktree, since), Some("git_index"));
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("git_index")
+        );
         age_all();
         set_mtime(&worktree.join("src"), std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("tracked_directory")
         );
         age_all();
         set_mtime(worktree, std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("checkout_directory")
         );
         // A deep edit: only the file itself is new.
         std::fs::write(worktree.join("src/lib.rs"), "y\n").unwrap();
         age_all();
-        assert_eq!(recent_file_activity(worktree, since), Some("changed_file"));
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file")
+        );
         set_mtime(&worktree.join("src/lib.rs"), old);
-        assert_eq!(recent_file_activity(worktree, since), None);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        // `git status` does not finish: the walk decides, proving idle,
+        // then seeing a fresh file; out of time it keeps the session.
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(true));
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        std::fs::write(worktree.join("src/lib.rs"), "z\n").unwrap();
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file_walk")
+        );
+        set_mtime(&worktree.join("src/lib.rs"), old);
+        assert_eq!(
+            recent_file_activity(worktree, since, Instant::now()),
+            Some(ACTIVITY_UNKNOWN)
+        );
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(false));
     }
 
     /// The notice is created only when absent: a conflict notice is never

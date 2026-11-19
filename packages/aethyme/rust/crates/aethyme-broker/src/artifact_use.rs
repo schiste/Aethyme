@@ -1002,6 +1002,42 @@ pub(crate) fn try_artifact_use_reclaimer_past_exited_producers(
     }
 }
 
+/// Write a `running` marker for `checkout` with `process` as its producer
+/// (tests only: a leaked or a live producer's marker). Returns its path.
+#[cfg(test)]
+pub(crate) fn write_running_marker_for_test(
+    primary_root: &Path,
+    checkout_root: &Path,
+    nonce: &str,
+    process: Option<ProcessStartIdentity>,
+) -> io::Result<PathBuf> {
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    locations.ensure_marker_dir()?;
+    let marker = ArtifactUseMarker {
+        schema_version: LEGACY_MARKER_SCHEMA_VERSION,
+        nonce: nonce.to_owned(),
+        primary_root: path_text(&locations.primary_root)?,
+        primary_device: locations.primary_identity.device,
+        primary_inode: locations.primary_identity.inode,
+        primary_volume_uuid: None,
+        checkout_root: path_text(&locations.checkout_root)?,
+        checkout_device: locations.checkout_identity.device,
+        checkout_inode: locations.checkout_identity.inode,
+        checkout_volume_uuid: None,
+        checkout_key: locations.checkout_key.clone(),
+        session_id: 1,
+        invocation_id: "guarded-exec:1:00".into(),
+        phase: ArtifactUsePhase::Running,
+        process,
+    };
+    let path = locations.marker_dir.join(format!("{nonce}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec(&marker).map_err(io::Error::other)?,
+    )?;
+    Ok(path)
+}
+
 /// Whether `marker`'s producer is proved gone (see
 /// [`try_artifact_use_reclaimer_past_exited_producers`]).
 fn producer_proved_exited(marker: &ArtifactUseMarker) -> bool {
