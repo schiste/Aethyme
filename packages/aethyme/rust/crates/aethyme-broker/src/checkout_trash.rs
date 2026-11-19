@@ -1247,13 +1247,27 @@ pub(crate) fn try_deleter_lock(path: &Path) -> std::io::Result<Option<DeleterLoc
     Ok(Some(DeleterLock { _lock: lock }))
 }
 
-/// Take the host-wide catch-up lane lock at `path` if nobody holds it,
-/// naming this process and `repository` in its holder line, so another
-/// process can tell whose lane is live ([`catchup_lane_holder_repository`]).
+/// A catch-up lane lock (the host lane, or a repository's lane-process
+/// lock). Its holder line names the process and repository while it is
+/// held, and is emptied, still under the lock, when it is dropped: a line
+/// that names a live process therefore means the lock is held, and other
+/// processes read it without ever taking the lock.
+pub(crate) struct CatchupLaneLock {
+    lock: crate::file_lock::ExclusiveFileLock,
+}
+
+impl Drop for CatchupLaneLock {
+    fn drop(&mut self) {
+        crate::warn_unrecorded("clear the catch-up lane holder", self.lock.clear_holder());
+    }
+}
+
+/// Take the catch-up lane lock at `path` if nobody holds it, naming this
+/// process and `repository` in its holder line ([`catchup_lane_holder`]).
 pub(crate) fn try_catchup_lane_lock(
     path: &Path,
     repository: &Path,
-) -> std::io::Result<Option<DeleterLock>> {
+) -> std::io::Result<Option<CatchupLaneLock>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1275,23 +1289,45 @@ pub(crate) fn try_catchup_lane_lock(
             repository.display()
         )),
     );
-    Ok(Some(DeleterLock { _lock: lock }))
+    Ok(Some(CatchupLaneLock { lock }))
 }
 
 /// Holder-line prefix naming the repository whose catch-up lane holds the
 /// lane lock.
 const CATCHUP_LANE_REPOSITORY_PREFIX: &str = "repository ";
 
-/// The repository named by the lane lock's holder line at `path`. Read only
-/// while the lock is held: a released lock keeps its last holder's line.
-pub(crate) fn catchup_lane_holder_repository(path: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix(CATCHUP_LANE_REPOSITORY_PREFIX)
-                .map(PathBuf::from)
-        })
+/// Who a catch-up lane lock's holder line names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatchupLaneHolder {
+    pub(crate) pid: i64,
+    /// `None` for a line written by something other than a lane (an older
+    /// release's probe wrote `pid <n> since <ms>` alone).
+    pub(crate) repository: Option<PathBuf>,
+}
+
+impl CatchupLaneHolder {
+    /// The named process still exists.
+    pub(crate) fn alive(&self) -> bool {
+        crate::blockers::process_alive(self.pid)
+    }
+}
+
+/// The holder line of the lane lock at `path`, read without taking the
+/// lock; `None` when it is empty, missing or unreadable.
+pub(crate) fn catchup_lane_holder(path: &Path) -> Option<CatchupLaneHolder> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid = text.lines().find_map(|line| {
+        line.strip_prefix("pid ")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })?;
+    let repository = text.lines().find_map(|line| {
+        line.strip_prefix(CATCHUP_LANE_REPOSITORY_PREFIX)
+            .map(PathBuf::from)
+    });
+    Some(CatchupLaneHolder { pid, repository })
 }
 
 /// Clear the user-immutable and append-only flags that make an unlink fail
