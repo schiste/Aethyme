@@ -2941,8 +2941,11 @@ impl Broker {
         &self,
         deadline: Instant,
     ) -> crate::checkout_trash::TrashDrainReport {
-        let lock_path = crate::host_state::resolve_host_state_dir()
-            .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
+        let lock_path = self
+            .storage_context()
+            .host_state_dir
+            .as_deref()
+            .map(|dir| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
         self.drain_checkout_trash_with(
             lock_path.as_deref(),
             deadline,
@@ -3558,11 +3561,15 @@ mod tests {
     /// cleaned and the branch ref kept.
     #[test]
     fn a_clean_contained_checkout_is_retired_without_an_archive() {
-        let (_owner, _storage, mut broker) = fixture();
+        let (_owner, storage, mut broker) = fixture();
         let (session, worktree) = closed(&mut broker, "clean", |_| {});
 
         let report = run(&mut broker);
 
+        let fixture_lock = storage
+            .host_state_dir()
+            .join(crate::checkout_trash::DELETER_LOCK_FILE);
+        assert!(fixture_lock.is_file(), "{fixture_lock:?}");
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
