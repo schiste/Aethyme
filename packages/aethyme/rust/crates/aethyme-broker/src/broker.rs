@@ -3213,6 +3213,21 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    if progress.archive_denials_consecutive >= retire::ARCHIVE_DENIAL_ADVICE_AT {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-archive-denied",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "creating a recovery archive was refused by its destination (a permission error creating the archive directory: a worker that inherited a sandbox, or a read-only archive volume); closed checkouts that need an archive wait, and archives are retried with a growing back-off",
+            summary: format!(
+                "{} archive attempt(s) in a row refused by the archive destination",
+                progress.archive_denials_consecutive
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: Vec::new(),
+        });
+    }
     push_trash_backlog_advice(view, progress, crate::clock::epoch_ms());
 }
 

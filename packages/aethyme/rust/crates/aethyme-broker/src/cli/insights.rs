@@ -206,6 +206,7 @@ fn assemble(
     ] {
         events.extend(store.events_after_filtered(0, i64::MAX, Some(kind))?);
     }
+    events.extend(cache_hits);
     events.sort_by_key(|event| (event.ts, event.id));
     let costs = attribution::collect(&root, since_ms, session_limit, &input, &events);
     Ok((report, costs))

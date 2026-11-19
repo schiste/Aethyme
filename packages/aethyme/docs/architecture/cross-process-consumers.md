@@ -3437,6 +3437,12 @@ Introduced 2026-11-17. Changes consumers may see:
   - `checkout_trash_catchup` adds `lane_started_after_worker_ms`: when the lane process started, relative to the worker's start (set whenever the worker's start reached the lane). `catchup_start_delay_ms` stays null when no slice ran.
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
 
+- Changed 2026-11-19 (retirement reaches its backlog). Measured on the busiest repository over a day: 174 retirement runs judged 775 closed checkouts (median 3 a run) in a closed lap of about 31 s a run, out of a 205 s run, and retired 140; the pool holds about 308 closed checkouts not retired. Now:
+  - An archive whose destination refused creating a directory with a permission error (`EPERM`/`EACCES` from creating the archive parent, root or staging directory, decided at that call site, never from the error's words: all 15 of the day's `archive_failed` keeps were such refusals, from two worker runs that had inherited a sandboxed caller's sandbox) is kept as `archive_environment_denied` (counter `checkout_retirement_kept_archive_environment_denied`), not remembered, and no further archive is attempted in that run. Repeated denials back off per repository: the first is retried by the next run, then archives wait 10 minutes, doubling to 6 hours (meta key `checkout_retirement.archive_denied`: `consecutive`, `until_ms`; counter `checkout_retirement_archive_denied_waiting`); an archive that is written resets it. Progress field `archive_denials_consecutive`; status advice `cleanup.retire-archive-denied` (Warning) from 3 in a row. Any other archive failure, a checkout file the archive cannot read included, stays `archive_failed`, remembered with the existing back-off.
+  - Expiring retired-commit pins runs at most every 30 minutes (meta key `checkout_retirement.pins_pruned_at_ms`; counter `checkout_retirement_prune_pins_not_due` when skipped) instead of using its whole 20 s budget on every run.
+  - While the last strip pass counted 50 or more closed checkouts on disk, the closed lap's floor is 45 s instead of 20 s (still bounded by the lane's deadline); counter `checkout_retirement_closed_lap_backlog_floor` when it applies, and the `checkout_retirement` attachment adds `closed_backlog` and `closed_lap_floor_ms`.
+Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
@@ -3720,6 +3726,26 @@ resolves it. To explicitly record an intervention that prevented duplicate work,
 use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
 This requires the broker's current live duplicate-work evidence and a clean,
 unchanged checkout. Ordinary overlap warnings remain a separate count.
+
+`costs` in each task row and `completed_task_totals` also record
+`gate_cache_hits`, `gate_execution_ms_avoided`, `shared_gate_verdicts` and
+`shared_gate_wait_ms`. The counters use session-attributed `gate.cached`
+events in the reporting window. An event with `shared_wait_ms` records a
+successful reuse after waiting for a producer. Older cache events contribute
+only to total hits and recorded execution avoided. The source run's recorded
+duration measures reused child work. The waiting duration is observed
+separately and cannot be subtracted from the source duration to infer a task
+wall-time saving. The existing `gate_verdict_wait` span contributes to the
+command's queue partition. Finish retains the command's repository identity
+through checkout removal so it can still append the timing and outcome.
+
+With `AETHYME_MEASURE_OUTPUT` enabled, recognized agent hooks in a registered
+worktree add `hook.<event>` rows to the same ledger. `hook_dispatch` names
+the broker work. `hook_delivery` is `context`, `denied`, `silent`,
+`unavailable` or `output_error`. `output_bytes` includes the emitted
+envelope's trailing newline and is zero for no successful delivery.
+The hook's wire format and exit contract are unchanged. The row measures
+the native invocation, excluding the host's process launch and shim time.
 
 ### Session scratch directories
 

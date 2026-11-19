@@ -908,8 +908,7 @@ pub fn gate_result_payload(
     payload.to_string()
 }
 
-/// `saved_ms` is the cached run's recorded duration — the execution time
-/// this cache hit avoided.
+/// `saved_ms` is the cached run's recorded duration.
 pub fn gate_cached_payload(
     gate: &str,
     tree: &str,
@@ -919,6 +918,27 @@ pub fn gate_cached_payload(
     run_id: i64,
     cache_provenance: &crate::GateCacheProvenance,
 ) -> String {
+    gate_cached_fields(
+        gate,
+        tree,
+        saved_ms,
+        cached_status,
+        failure_class,
+        run_id,
+        cache_provenance,
+    )
+    .to_string()
+}
+
+fn gate_cached_fields(
+    gate: &str,
+    tree: &str,
+    saved_ms: i64,
+    cached_status: crate::types::GateStatus,
+    failure_class: Option<crate::types::GateFailureClass>,
+    run_id: i64,
+    cache_provenance: &crate::GateCacheProvenance,
+) -> serde_json::Value {
     json!({
         "gate": gate,
         "tree": tree,
@@ -928,7 +948,27 @@ pub fn gate_cached_payload(
         "run_id": run_id,
         "cache_provenance": cache_provenance,
     })
-    .to_string()
+}
+
+pub(crate) fn gate_cache_hit_payload(
+    hit: &crate::types::GateResult,
+    failure_class: Option<crate::types::GateFailureClass>,
+    cache_provenance: &crate::GateCacheProvenance,
+    shared_wait_ms: Option<i64>,
+) -> String {
+    let mut payload = gate_cached_fields(
+        &hit.gate_name,
+        &hit.tree_hash,
+        hit.duration_ms.unwrap_or_default(),
+        hit.status,
+        failure_class,
+        hit.id,
+        cache_provenance,
+    );
+    if let Some(wait_ms) = shared_wait_ms {
+        payload["shared_wait_ms"] = json!(wait_ms);
+    }
+    payload.to_string()
 }
 
 pub fn gate_cache_bypassed_payload(gate: &str, tree: &str) -> String {
