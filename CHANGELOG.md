@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.136] - 2026-11-19
+
+### Fixed
+
+- `status` no longer scans every live lease to list overlapping sessions. The peer view joined the session's leases against all live leases with a test no index could serve; on the busiest repository that was about 17,000 leases and one second per call. It now searches the lease path index per path: the path itself, each directory prefix of it, and for a directory lease the range of paths under it. The rows returned are the same (#1844).
+- While a host resource lease is quarantined, `status` no longer resolves the checkout path of every recorded session; a path that does not exist is skipped (#1844).
+- Opening the broker no longer reads the eight sources of due background work when the background worker is already running. The open checks the worker's lock first and, if it is held, counts the request as coalesced as before. On the busiest repository the worker was already running in 416 of 418 measured opens, at about 57 ms each (#1842).
+
+### Added
+
+- Phase timings: one span per source of `blockers`, the steps of the session coordination and peer views, the steps `finish` runs under the lifecycle claim, and each Git worktree removal (#1844).
+- Counters `worker_admission_skipped_live_worker` and `worker_admission_due_checks_run`; span `worker_admission_live_worker_probe` (#1842).
+
+### Upgrade notes
+
+- `coalesced_requests` now also counts opens that found the worker running before reading what was due.
+- The main-checkout sync timer slot is claimed by the first open after the worker exits rather than while it runs.
+
+### Known issues
+
+- Nothing detects a background worker that hangs while holding its lock; opens count their request as coalesced and background work stops until that process exits.
+- `finish` still removes the checkout while holding the lifecycle claim.
+
 ## [0.8.135] - 2026-11-19
 
 ### Fixed
