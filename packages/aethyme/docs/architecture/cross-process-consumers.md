@@ -558,8 +558,10 @@ The `gate_verdict_wait` phase measures contested lock time. The
 `wait_duration_ms` records contention on the receiving command when present
 and remains zero for an immediate cache hit. This is local to the shared
 broker state and uses the existing tree and execution profile trust contract.
-Submit runs additionally bind their immutable comparison base to the profile
-digest. A verdict for one comparison base cannot satisfy another.
+The comparison base is not part of that identity: a gate that reads
+`AETHYME_GATE_BASE_COMMIT` must set `cache = false` (see "Diff-dependent gate
+commands"), so a session's verdict for a tree satisfies a submission of the
+same tree.
 
 ## Git wrapper probe verdict cache (2026-11-15)
 
