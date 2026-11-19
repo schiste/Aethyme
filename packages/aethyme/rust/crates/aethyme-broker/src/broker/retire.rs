@@ -722,16 +722,52 @@ fn kept_counter(code: &'static str) -> &'static str {
     }
 }
 
-/// Whether an archive error is the environment refusing a write (`EPERM`,
-/// `EACCES`), not anything about the checkout: measured on the busiest
-/// repository, all 15 of a day's `archive_failed` keeps were
-/// `Operation not permitted` from two worker runs that had inherited a
-/// sandboxed caller's sandbox (their process listings were denied too).
-fn archive_error_is_environment_denied(detail: &str) -> bool {
-    detail.contains("Operation not permitted")
-        || detail.contains("Permission denied")
-        || detail.contains("(os error 1)")
-        || detail.contains("(os error 13)")
+/// Consecutive archive-destination denials in this repository, and until
+/// when archives are not attempted (epoch ms). Measured on the busiest
+/// repository, all 15 of a day's `archive_failed` keeps were the archive
+/// destination refusing `mkdir` (`Operation not permitted`) in two worker
+/// runs that had inherited a sandboxed caller's sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ArchiveDenialBackoff {
+    pub(crate) consecutive: u32,
+    pub(crate) until_ms: i64,
+}
+
+/// Meta key of [`ArchiveDenialBackoff`].
+const CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY: &str = "checkout_retirement.archive_denied";
+/// The first back-off after repeated destination denials, doubling to
+/// [`ARCHIVE_DENIAL_BACKOFF_MAX_MS`].
+const ARCHIVE_DENIAL_BACKOFF_FIRST_MS: i64 = 10 * 60 * 1_000;
+const ARCHIVE_DENIAL_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
+/// Consecutive denials at or above which `broker status` says so.
+pub(crate) const ARCHIVE_DENIAL_ADVICE_AT: u32 = 3;
+
+impl ArchiveDenialBackoff {
+    /// After one more destination denial at `now_ms`: the first is retried
+    /// by the next run; from the second on, archives wait 10 minutes,
+    /// doubling to 6 hours.
+    pub(crate) fn after_denial(self, now_ms: i64) -> Self {
+        let consecutive = self.consecutive.saturating_add(1);
+        let until_ms = if consecutive < 2 {
+            0
+        } else {
+            let doublings = (consecutive - 2).min(16);
+            now_ms.saturating_add(
+                ARCHIVE_DENIAL_BACKOFF_FIRST_MS
+                    .saturating_mul(1_i64 << doublings)
+                    .min(ARCHIVE_DENIAL_BACKOFF_MAX_MS),
+            )
+        };
+        Self {
+            consecutive,
+            until_ms,
+        }
+    }
+
+    /// Archives wait at `now_ms`.
+    pub(crate) fn waiting(self, now_ms: i64) -> bool {
+        now_ms < self.until_ms
+    }
 }
 
 /// Keeps about the checkout's content or ownership, which only a change to
@@ -1101,6 +1137,10 @@ pub(crate) struct CheckoutRetirementProgress {
     /// the run before.
     #[serde(default)]
     pub trash_growing_runs: u32,
+    /// Consecutive archive-destination denials (`archive_environment_denied`)
+    /// in this repository; reset by an archive that is written.
+    #[serde(default)]
+    pub archive_denials_consecutive: u32,
     /// Names of the trash entries the last deleter run passed over because
     /// a process still used them (at most 256). The next run leaves them out
     /// of its backlog decision.
@@ -2441,9 +2481,18 @@ impl Broker {
         {
             return Ok(Kept("archive_deferred"));
         }
-        // An archive write the environment refused this run would be refused
-        // again: the checkout waits for the next run, not remembered.
-        if run.archive_environment_denied {
+        // The archive destination refused this run, or refused repeatedly
+        // and archives wait out their back-off: the checkout waits, not
+        // remembered (it says nothing about the checkout).
+        if run.archive_environment_denied
+            || self
+                .archive_denial_backoff()
+                .waiting(crate::clock::epoch_ms())
+        {
+            crate::phase_telemetry::add(
+                "checkout_retirement_archive_denied_waiting",
+                std::time::Duration::ZERO,
+            );
             return Ok(Kept("archive_environment_denied"));
         }
         let digest = plan.digest.clone();
@@ -2456,8 +2505,16 @@ impl Broker {
         // failure keeps the checkout and the archive. A failure the lane's
         // deadline caused is retried next run (the verified archive is
         // reused), not remembered for an hour.
+        crate::cleanup_resolve::take_archive_destination_denied();
         let applied = self.cleanup_resolve_retirement_apply(session_id, &digest, false);
+        // Decided where the archive destination is created, never from the
+        // error's words: a checkout file the archive cannot read is the
+        // checkout's fault and stays `archive_failed`.
+        let destination_denied = crate::cleanup_resolve::take_archive_destination_denied();
         let out_of_time = Instant::now() >= run.archive_deadline;
+        if applied.is_ok() {
+            self.record_archive_denial_backoff(ArchiveDenialBackoff::default());
+        }
         match applied {
             Ok(outcome) if outcome.worktree_removed => Ok(RetireOutcome::RetiredArchived { bytes }),
             Ok(outcome) => {
@@ -2469,24 +2526,43 @@ impl Broker {
                 }))
             }
             Err(error) => {
-                let detail = error.to_string();
-                // A refused write (a sandbox this worker inherited, a volume
-                // that refused it) says nothing about the checkout: it is
-                // retried by the next run, not remembered for an hour.
-                let denied = archive_error_is_environment_denied(&detail);
-                run.keep_detail = Some(detail);
-                if denied {
+                run.keep_detail = Some(error.to_string());
+                if destination_denied && !out_of_time {
+                    // The destination refused a write (a sandbox this worker
+                    // inherited, a read-only volume): no further archive
+                    // this run, and repeated denials back off.
                     run.archive_environment_denied = true;
+                    self.record_archive_denial_backoff(
+                        self.archive_denial_backoff()
+                            .after_denial(crate::clock::epoch_ms()),
+                    );
+                    return Ok(Kept("archive_environment_denied"));
                 }
                 Ok(Kept(if out_of_time {
                     "deadline"
-                } else if denied {
-                    "archive_environment_denied"
                 } else {
                     "archive_failed"
                 }))
             }
         }
+    }
+
+    /// This repository's archive-destination denial back-off.
+    pub(crate) fn archive_denial_backoff(&self) -> ArchiveDenialBackoff {
+        self.meta_json(CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY)
+    }
+
+    fn record_archive_denial_backoff(&self, backoff: ArchiveDenialBackoff) {
+        if backoff == self.archive_denial_backoff() {
+            return;
+        }
+        crate::warn_unrecorded(
+            "record the archive-destination denial back-off",
+            self.store_ref().meta_set(
+                CHECKOUT_RETIREMENT_ARCHIVE_DENIED_KEY,
+                &serde_json::to_string(&backoff).unwrap_or_default(),
+            ),
+        );
     }
 
     /// Retire the checkout of a closed session whose merge, rebase,
@@ -2689,7 +2765,14 @@ impl Broker {
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other.
-            let closed_deadline = share(1, 2, closed_lap_floor(closed_backlog));
+            let closed_floor = closed_lap_floor(closed_backlog);
+            if closed_floor > RETIRE_LAP_MIN_SHARE {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_closed_lap_backlog_floor",
+                    std::time::Duration::ZERO,
+                );
+            }
+            let closed_deadline = share(1, 2, closed_floor);
             run.deadline = closed_deadline;
             report.lap_complete =
                 self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
@@ -2801,6 +2884,9 @@ impl Broker {
                 "archive_bytes": report.archive_bytes,
                 "kept": report.kept,
                 "trash_entries_removed": report.trash.entries_removed,
+                "closed_backlog": closed_backlog,
+                "closed_lap_floor_ms": u64::try_from(closed_lap_floor(closed_backlog).as_millis())
+                    .unwrap_or(u64::MAX),
                 "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             }),
         );
@@ -2833,6 +2919,7 @@ impl Broker {
             trash_entries_in_use: report.trash.entries_in_use,
             trash_in_use_entries: report.trash.in_use_names.clone(),
             trash_oldest_entry_ms: report.trash.oldest_pending_created_ms,
+            archive_denials_consecutive: self.archive_denial_backoff().consecutive,
             trash_growing_runs: next_trash_growing_runs(
                 previous.trash_growing_runs,
                 previous.trash_pending,
@@ -8271,27 +8358,76 @@ mod tests {
         assert!(worktree.join("node_modules").exists());
     }
 
-    /// An archive write the environment refused (the measured case: a
-    /// worker that inherited a sandboxed caller's sandbox got `Operation not
-    /// permitted` creating its staging directory) is a keep retried by the
-    /// next run, never remembered like an archive that failed on the
-    /// checkout's content; a capacity refusal is not a denial.
+    /// Destination denials back off per repository: the first is retried
+    /// by the next run, then archives wait 10 minutes, doubling to 6 hours;
+    /// the keep is never remembered and `archive_failed` still is.
     #[test]
-    fn an_archive_refused_by_the_environment_is_retried_not_remembered() {
-        let measured = "the recovery archive for session 6485 failed verification, so its worktree was left in place: cannot exclusively create /pool/.aethyme-recovery-archives/repo/6485.retirement-v6.partial: Operation not permitted (os error 1)";
-        assert!(super::archive_error_is_environment_denied(measured));
-        assert!(super::archive_error_is_environment_denied(
-            "cannot create archive root: Permission denied (os error 13)"
-        ));
-        assert!(!super::archive_error_is_environment_denied(
-            "archive capacity preflight failed: archive destination has 7649083392 free bytes, below the 8623560966 bytes required"
-        ));
+    fn archive_destination_denials_back_off_and_are_not_remembered() {
+        let now = 1_800_000_000_000_i64;
+        let first = super::ArchiveDenialBackoff::default().after_denial(now);
+        assert_eq!(first.consecutive, 1);
+        assert!(!first.waiting(now), "the first denial is retried next run");
+        let second = first.after_denial(now);
+        assert!(second.waiting(now + 9 * 60_000));
+        assert!(!second.waiting(now + 10 * 60_000));
+        let third = second.after_denial(now);
+        assert_eq!(third.until_ms, now + 20 * 60_000);
+        let mut many = third;
+        for _ in 0..40 {
+            many = many.after_denial(now);
+        }
+        assert_eq!(many.until_ms, now + 6 * 3_600_000, "capped");
         assert!(!remembered_keep("archive_environment_denied"));
         assert!(remembered_keep("archive_failed"));
         assert_eq!(
             kept_counter("archive_environment_denied"),
             "checkout_retirement_kept_archive_environment_denied"
         );
+    }
+
+    /// A file of the checkout the archive cannot read is the checkout's
+    /// fault: its archive fails as a remembered keep, never as an
+    /// environment denial, and the next checkout that needs an archive is
+    /// still archived in the same run.
+    #[test]
+    fn an_unreadable_checkout_file_is_an_archive_failure_not_a_denial() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_owner, _storage, mut broker) = fixture();
+        let mut unreadable = PathBuf::new();
+        let (first, first_worktree) = closed(&mut broker, "unreadable", |worktree| {
+            unreadable = worktree.join("locked-notes.txt");
+            std::fs::write(&unreadable, "untracked, unreadable\n").unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        if std::fs::read(&unreadable).is_ok() {
+            // A privileged runner reads it regardless; nothing to show.
+            return;
+        }
+        let (second, second_worktree) = closed(&mut broker, "readable", |worktree| {
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+
+        let report = run(&mut broker);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).ok();
+
+        assert!(
+            !report.kept.contains_key("archive_environment_denied"),
+            "{report:#?}"
+        );
+        assert_eq!(broker.archive_denial_backoff().consecutive, 0);
+        let keeps: std::collections::BTreeMap<String, RetireKeep> =
+            broker.meta_json("checkout_retirement.keeps");
+        let keep = keeps
+            .get(&first.id.to_string())
+            .unwrap_or_else(|| panic!("the failure is remembered: {report:#?}"));
+        assert!(
+            matches!(keep.reason.as_str(), "archive_failed" | "plan_refused"),
+            "{keep:?}"
+        );
+        assert!(first_worktree.exists());
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        assert!(retired_away(&second_worktree));
+        assert!(is_cleaned(&broker, second.id));
     }
 
     /// Expiring retired-commit pins runs at most every half hour (it used
