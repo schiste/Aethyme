@@ -109,6 +109,111 @@ pub(crate) const TRASH_GROWING_RUNS_ADVICE_AT: u32 = 3;
 /// The least time the recovery-archive bound gets in a retirement run, even
 /// when the phases before it used the lane (it runs before the drain).
 const RETIRE_ARCHIVE_BOUND_RESERVE: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a retirement drain waits for the host-wide deleter lock: a
+/// little more than one catch-up slice ([`TRASH_CATCHUP_SLICE`]), which
+/// releases it between slices.
+const DELETER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(35);
+/// How often that wait tries the lock again: well under the catch-up
+/// lane's gap between slices.
+const DELETER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// One catch-up slice: the deleter lock is held this long at most, then
+/// released for [`TRASH_CATCHUP_GAP`] so another drain can take it.
+pub(crate) const TRASH_CATCHUP_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
+/// The gap between catch-up slices.
+const TRASH_CATCHUP_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long the catch-up lane keeps retrying a deleter lock held elsewhere
+/// before it ends.
+const TRASH_CATCHUP_BUSY_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+/// File name of the host-wide lock that keeps a second catch-up lane out.
+pub(crate) const TRASH_CATCHUP_LOCK_FILE: &str = "checkout-trash-catchup.lock";
+
+/// Why a continuing catch-up lane ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrashCatchupEnd {
+    /// The trash is no longer behind (or empty).
+    CaughtUp,
+    /// The lane's wall-clock cap was reached.
+    Cap,
+    /// Critical memory pressure.
+    Pressure,
+    /// A slice removed nothing although it had time (entries in use or
+    /// failing, or an incomplete open-file observation).
+    NoProgress,
+    /// The deleter lock stayed held elsewhere.
+    DeleterBusy,
+    /// Another catch-up lane runs on this host, or the host state directory
+    /// is unavailable.
+    LaneBusy,
+}
+
+impl TrashCatchupEnd {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CaughtUp => "caught_up",
+            Self::Cap => "cap",
+            Self::Pressure => "pressure",
+            Self::NoProgress => "no_progress",
+            Self::DeleterBusy => "deleter_busy",
+            Self::LaneBusy => "lane_busy",
+        }
+    }
+}
+
+/// What one continuing catch-up lane did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrashCatchupReport {
+    pub(crate) end: TrashCatchupEnd,
+    pub(crate) slices: u32,
+    pub(crate) entries_removed: usize,
+    pub(crate) unlinks: usize,
+    pub(crate) bytes: u64,
+    /// Time spent inside drains (the rest is gaps and lock waits).
+    pub(crate) drain_time: std::time::Duration,
+    pub(crate) elapsed: std::time::Duration,
+    /// Slices that found the deleter lock held elsewhere.
+    pub(crate) busy_retries: u32,
+}
+
+impl TrashCatchupReport {
+    fn new() -> Self {
+        Self {
+            end: TrashCatchupEnd::CaughtUp,
+            slices: 0,
+            entries_removed: 0,
+            unlinks: 0,
+            bytes: 0,
+            drain_time: std::time::Duration::ZERO,
+            elapsed: std::time::Duration::ZERO,
+            busy_retries: 0,
+        }
+    }
+}
+
+/// How one trash drain takes the deleter lock and paces itself.
+#[derive(Clone, Copy)]
+struct DrainOptions {
+    /// How long to wait for the host-wide deleter lock.
+    lock_wait: std::time::Duration,
+    /// Stop at the first reading of critical memory pressure (the
+    /// continuing catch-up lane) instead of slowing to the floor.
+    yield_on_memory_critical: bool,
+    /// The host-pressure reading.
+    sample: fn() -> crate::checkout_trash::HostPressure,
+    /// Deleter threads, each over its own entries and at its share of the
+    /// rate (1: the sequential drain).
+    threads: u32,
+}
+
+impl Default for DrainOptions {
+    fn default() -> Self {
+        Self {
+            lock_wait: std::time::Duration::ZERO,
+            yield_on_memory_critical: false,
+            sample: crate::checkout_trash::sample_host_pressure,
+            threads: 1,
+        }
+    }
+}
 
 /// The share of a retirement run's window kept for the trash drain, as
 /// `(numerator, denominator)`: a third normally, half while the trash is
@@ -2828,35 +2933,65 @@ impl Broker {
 
     /// Drain this repository's recorded trash entries until `deadline`, as
     /// the one host-wide deleter (the lock lives in the host state
-    /// directory). When that lock is held or cannot be taken, this run
-    /// deletes nothing: there is never a second deleter.
+    /// directory). The lock is waited for at most [`DELETER_LOCK_WAIT`]
+    /// (a continuing catch-up lane releases it between slices); when it
+    /// stays held or cannot be taken, this run deletes nothing: there is
+    /// never a second deleter.
     pub(crate) fn drain_checkout_trash(
         &self,
         deadline: Instant,
     ) -> crate::checkout_trash::TrashDrainReport {
         let lock_path = crate::host_state::resolve_host_state_dir()
             .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
-        self.drain_checkout_trash_with_lock(lock_path.as_deref(), deadline)
+        self.drain_checkout_trash_with(
+            lock_path.as_deref(),
+            deadline,
+            DrainOptions {
+                lock_wait: DELETER_LOCK_WAIT,
+                ..DrainOptions::default()
+            },
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_checkout_trash_with_lock(
         &self,
         lock_path: Option<&Path>,
         deadline: Instant,
+    ) -> crate::checkout_trash::TrashDrainReport {
+        self.drain_checkout_trash_with(lock_path, deadline, DrainOptions::default())
+    }
+
+    fn drain_checkout_trash_with(
+        &self,
+        lock_path: Option<&Path>,
+        deadline: Instant,
+        options: DrainOptions,
     ) -> crate::checkout_trash::TrashDrainReport {
         let mut rows = self.checkout_trash_rows();
         let pending = rows.values().map(std::collections::BTreeMap::len).sum();
         let Some(first) = rows.keys().next().cloned() else {
             return crate::checkout_trash::TrashDrainReport::default();
         };
-        let lock =
-            lock_path.and_then(|path| crate::checkout_trash::try_deleter_lock(path).ok().flatten());
+        let wait_until = deadline.min(Instant::now() + options.lock_wait);
+        let lock = lock_path.and_then(|path| {
+            loop {
+                match crate::checkout_trash::try_deleter_lock(path) {
+                    Ok(Some(lock)) => break Some(lock),
+                    Ok(None) if Instant::now() < wait_until => {
+                        std::thread::sleep(DELETER_LOCK_POLL);
+                    }
+                    Ok(None) | Err(_) => break None,
+                }
+            }
+        });
         let Some(_lock) = lock else {
             crate::phase_telemetry::add("checkout_trash_deleter_busy", std::time::Duration::ZERO);
             return crate::checkout_trash::TrashDrainReport {
                 entries_pending: pending,
                 oldest_pending_created_ms: crate::checkout_trash::TrashBacklog::of(&rows)
                     .oldest_created_ms,
+                deleter_busy: true,
                 ..crate::checkout_trash::TrashDrainReport::default()
             };
         };
@@ -2867,15 +3002,26 @@ impl Broker {
             self.checkout_trash_below_headroom(&first),
             backlog.behind(now_ms),
         );
-        let mut pacer = crate::checkout_trash::DrainPacer::for_need(
-            need,
-            crate::checkout_trash::sample_host_pressure,
-        )
-        .with_ceiling(crate::gc::unattended_pacing::explicit_unlink_limit(
-            self.main_root(),
-        ));
+        let ceiling = crate::gc::unattended_pacing::explicit_unlink_limit(self.main_root());
+        let threads = options.threads.max(1);
+        let make_pacer = || {
+            let pacer = crate::checkout_trash::DrainPacer::for_need(need, options.sample)
+                .with_ceiling(ceiling)
+                .with_share(threads);
+            if options.yield_on_memory_critical {
+                pacer.yielding_on_memory_critical()
+            } else {
+                pacer
+            }
+        };
         let drain_started = Instant::now();
-        let mut report = crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut pacer);
+        let mut report = if threads > 1 {
+            crate::checkout_trash::drain_trash_parallel(
+                &mut rows, deadline, make_pacer, threads, None,
+            )
+        } else {
+            crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut make_pacer())
+        };
         // Entries recorded by another process during the drain are kept:
         // only what this run removed, forgot, confirmed or counted is
         // applied, atomically.
@@ -2959,6 +3105,8 @@ impl Broker {
                 },
                 "budget_stopped": report.budget_stopped,
                 "process_use_unknown": report.process_use_unknown,
+                "end_reason": report.end_reason(),
+                "threads": threads,
                 "entries_pending": report.entries_pending,
                 "oldest_pending_age_s": oldest_pending_age_s,
             }),
@@ -2979,6 +3127,115 @@ impl Broker {
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         crate::checkout_trash::TrashBacklog::deletable(rows, &in_use)
+    }
+
+    /// The continuing catch-up lane: while the trash is behind, drain it in
+    /// slices of [`TRASH_CATCHUP_SLICE`] (the deleter lock held for one
+    /// slice at most, then released for [`TRASH_CATCHUP_GAP`]) until it is
+    /// no longer behind, `cap` is reached, a reading shows critical memory
+    /// pressure (each slice also stops at once on one), or a slice makes no
+    /// progress. Each slice is an ordinary paced drain: the single
+    /// host-wide deleter, re-reading pressure every 2 s. One lane per host
+    /// (`host_dir`'s [`TRASH_CATCHUP_LOCK_FILE`]). It holds no repository
+    /// lock: the detached worker runs it after releasing its worker lock,
+    /// so the next worker run (and its strip and retirement) starts as
+    /// usual, and that run's drain takes the deleter lock between slices.
+    pub(crate) fn run_checkout_trash_catchup(
+        &self,
+        host_dir: Option<&Path>,
+        cap: std::time::Duration,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+    ) -> TrashCatchupReport {
+        let _span = crate::phase_telemetry::span("checkout_trash_catchup");
+        let started = Instant::now();
+        let end_at = started + cap;
+        let mut report = TrashCatchupReport::new();
+        let lane_lock = host_dir.and_then(|dir| {
+            crate::checkout_trash::try_deleter_lock(&dir.join(TRASH_CATCHUP_LOCK_FILE))
+                .ok()
+                .flatten()
+        });
+        let (Some(dir), Some(_lane_lock)) = (host_dir, lane_lock) else {
+            report.end = TrashCatchupEnd::LaneBusy;
+            report.elapsed = started.elapsed();
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_end_lane_busy",
+                std::time::Duration::ZERO,
+            );
+            return report;
+        };
+        let deleter_lock = dir.join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let mut busy_since: Option<Instant> = None;
+        report.end = loop {
+            let now = Instant::now();
+            if now >= end_at {
+                break TrashCatchupEnd::Cap;
+            }
+            let rows = self.checkout_trash_rows();
+            if !self
+                .checkout_trash_deletable_backlog(&rows)
+                .behind(crate::clock::epoch_ms())
+            {
+                break TrashCatchupEnd::CaughtUp;
+            }
+            if sample().memory_critical {
+                break TrashCatchupEnd::Pressure;
+            }
+            let slice_started = Instant::now();
+            let drained = self.drain_checkout_trash_with(
+                Some(&deleter_lock),
+                (slice_started + TRASH_CATCHUP_SLICE).min(end_at),
+                DrainOptions {
+                    lock_wait: std::time::Duration::ZERO,
+                    yield_on_memory_critical: true,
+                    sample,
+                    threads: crate::checkout_trash::TRASH_CATCHUP_THREADS,
+                },
+            );
+            if drained.deleter_busy {
+                report.busy_retries = report.busy_retries.saturating_add(1);
+                let since = *busy_since.get_or_insert(slice_started);
+                if since.elapsed() >= TRASH_CATCHUP_BUSY_MAX {
+                    break TrashCatchupEnd::DeleterBusy;
+                }
+                std::thread::sleep(
+                    TRASH_CATCHUP_GAP.min(end_at.saturating_duration_since(Instant::now())),
+                );
+                continue;
+            }
+            busy_since = None;
+            report.slices = report.slices.saturating_add(1);
+            report.drain_time += slice_started.elapsed();
+            report.entries_removed = report
+                .entries_removed
+                .saturating_add(drained.entries_removed);
+            report.unlinks = report.unlinks.saturating_add(drained.unlinks);
+            report.bytes = report.bytes.saturating_add(drained.bytes);
+            if drained.yielded_to_pressure {
+                break TrashCatchupEnd::Pressure;
+            }
+            if drained.entries_removed == 0 && !drained.budget_stopped {
+                break TrashCatchupEnd::NoProgress;
+            }
+            // Let a retirement drain (this repository's next run, or
+            // another repository's) take the deleter lock.
+            std::thread::sleep(
+                TRASH_CATCHUP_GAP.min(end_at.saturating_duration_since(Instant::now())),
+            );
+        };
+        report.elapsed = started.elapsed();
+        crate::phase_telemetry::add(
+            match report.end {
+                TrashCatchupEnd::CaughtUp => "checkout_trash_catchup_end_caught_up",
+                TrashCatchupEnd::Cap => "checkout_trash_catchup_end_cap",
+                TrashCatchupEnd::Pressure => "checkout_trash_catchup_end_pressure",
+                TrashCatchupEnd::NoProgress => "checkout_trash_catchup_end_no_progress",
+                TrashCatchupEnd::DeleterBusy => "checkout_trash_catchup_end_deleter_busy",
+                TrashCatchupEnd::LaneBusy => "checkout_trash_catchup_end_lane_busy",
+            },
+            std::time::Duration::ZERO,
+        );
+        report
     }
 
     /// Whether the volume holding `trash` is below the artifact-sweep
@@ -3625,6 +3882,139 @@ mod tests {
             Some(1),
             "the rename reused the run's observation"
         );
+    }
+
+    /// Retire a closed checkout into the trash and age its entry past a
+    /// day, so the trash is behind; returns the entry's path.
+    fn trashed_day_old_entry(broker: &mut crate::Broker, label: &str) -> PathBuf {
+        let (session, worktree) = closed(broker, label, |_| {});
+        let current = broker.store_ref().session(session.id).unwrap();
+        {
+            let _lane = super::RetirementLaneScope::enter();
+            broker
+                .remove_checkout_through_trash(&current, &worktree, true)
+                .unwrap();
+        }
+        let (dir, name, row) = broker
+            .checkout_trash_rows()
+            .into_iter()
+            .flat_map(|(dir, entries)| {
+                entries
+                    .into_iter()
+                    .map(move |(name, row)| (dir.clone(), name, row))
+            })
+            .find(|(_, _, row)| row.session_id == session.id && !row.stripped)
+            .unwrap();
+        let old = format!("0000000000001-{}-1-1", session.id);
+        std::fs::rename(dir.join(&name), dir.join(&old)).unwrap();
+        broker
+            .update_meta_json(
+                CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+                |rows: &mut crate::checkout_trash::TrashRows| {
+                    if let Some(entries) = rows.get_mut(&dir) {
+                        entries.remove(&name);
+                        entries.insert(old.clone(), row);
+                    }
+                },
+            )
+            .unwrap();
+        dir.join(old)
+    }
+
+    fn no_pressure() -> crate::checkout_trash::HostPressure {
+        crate::checkout_trash::HostPressure::default()
+    }
+
+    fn critical_memory() -> crate::checkout_trash::HostPressure {
+        crate::checkout_trash::HostPressure {
+            memory_critical: true,
+            ..crate::checkout_trash::HostPressure::default()
+        }
+    }
+
+    /// The continuing catch-up lane drains while the trash is behind and
+    /// ends once it is not; it stops at its cap and at critical memory
+    /// pressure without deleting, and only one lane runs per host.
+    #[test]
+    fn the_catchup_lane_drains_until_caught_up_within_its_bounds() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "catch up");
+        let host = owner.path();
+        assert!(
+            broker
+                .checkout_trash_deletable_backlog(&broker.checkout_trash_rows())
+                .behind(crate::clock::epoch_ms())
+        );
+
+        let capped = broker.run_checkout_trash_catchup(Some(host), Duration::ZERO, no_pressure);
+        assert_eq!(capped.end, super::TrashCatchupEnd::Cap, "{capped:?}");
+        assert_eq!(capped.slices, 0);
+        assert!(entry.exists());
+
+        let pressured =
+            broker.run_checkout_trash_catchup(Some(host), Duration::from_secs(60), critical_memory);
+        assert_eq!(
+            pressured.end,
+            super::TrashCatchupEnd::Pressure,
+            "{pressured:?}"
+        );
+        assert!(entry.exists());
+
+        let lane =
+            crate::checkout_trash::try_deleter_lock(&host.join(super::TRASH_CATCHUP_LOCK_FILE))
+                .unwrap()
+                .unwrap();
+        let busy =
+            broker.run_checkout_trash_catchup(Some(host), Duration::from_secs(60), no_pressure);
+        assert_eq!(busy.end, super::TrashCatchupEnd::LaneBusy, "{busy:?}");
+        drop(lane);
+        let unavailable =
+            broker.run_checkout_trash_catchup(None, Duration::from_secs(60), no_pressure);
+        assert_eq!(unavailable.end, super::TrashCatchupEnd::LaneBusy);
+        assert!(entry.exists());
+
+        let caught_up =
+            broker.run_checkout_trash_catchup(Some(host), Duration::from_secs(60), no_pressure);
+        assert_eq!(
+            caught_up.end,
+            super::TrashCatchupEnd::CaughtUp,
+            "{caught_up:?}"
+        );
+        assert!(caught_up.slices >= 1, "{caught_up:?}");
+        assert!(caught_up.entries_removed >= 1, "{caught_up:?}");
+        assert!(!entry.exists());
+        assert!(caught_up.elapsed < Duration::from_secs(60));
+    }
+
+    /// A catch-up slice stops at once, resumably, at a reading of critical
+    /// memory pressure, instead of going on at the floor; the entry stays
+    /// recorded and is not counted as failing.
+    #[test]
+    fn a_catchup_slice_yields_at_once_to_critical_memory_pressure() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "yield");
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker.drain_checkout_trash_with(
+            Some(&lock),
+            Instant::now() + Duration::from_secs(60),
+            super::DrainOptions {
+                lock_wait: Duration::ZERO,
+                yield_on_memory_critical: true,
+                sample: critical_memory,
+                threads: 1,
+            },
+        );
+        assert!(drained.yielded_to_pressure, "{drained:?}");
+        assert_eq!(drained.end_reason(), "pressure");
+        assert!(drained.failed.is_empty(), "{drained:?}");
+        assert!(entry.exists());
+        let rows = broker.checkout_trash_rows();
+        let name = entry.file_name().unwrap().to_string_lossy().into_owned();
+        let row = rows
+            .values()
+            .find_map(|entries| entries.get(&name))
+            .unwrap();
+        assert_eq!(row.failures, 0);
     }
 
     /// An entry a process still uses is passed over, not waited on: the
@@ -4807,7 +5197,10 @@ mod tests {
         let drained = broker
             .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
         assert_eq!(drained.stripped_entries_removed, 2, "{drained:?}");
-        assert!(drained.stripped_bytes > 0, "{drained:?}");
+        // Bytes are the volume's free-space change across each removal (no
+        // per-file stat), which other writers on a shared test volume can
+        // hide for a tree this small, so the unlinks are checked instead.
+        assert!(drained.unlinks >= 8, "{drained:?}");
         // The pass remembers the checkout and does not list it again.
         let again = strip_pass(&broker);
         assert_eq!(again.checkouts_examined, 0, "{again:#?}");

@@ -65,6 +65,9 @@ pub(crate) const DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND: u32 = 4_000;
 pub(crate) const TRASH_BACKLOG_ENTRIES: usize = 16;
 /// Age of the oldest recorded entry at or above which the trash is behind.
 pub(crate) const TRASH_BACKLOG_AGE_MS: i64 = 24 * 3_600_000;
+/// The longest one continuing catch-up lane (the detached worker's, after
+/// its other lanes) drains the trash.
+pub(crate) const TRASH_CATCHUP_MAX: Duration = Duration::from_secs(20 * 60);
 /// How often a catching-up drain reads the host's pressure again.
 const DELETER_PACE_RESAMPLE_EVERY: Duration = Duration::from_secs(2);
 /// Unlinks between checks that an entry being deleted is still in the trash.
@@ -1005,6 +1008,14 @@ pub(crate) struct DrainPacer {
     /// `[cleanup] unattended_unlinks_per_second` when the repository sets
     /// it explicitly: the ceiling of every paced mode (never of unpaced).
     ceiling: Option<u32>,
+    /// Deleter threads sharing the rate: each paces itself at its share.
+    share: u32,
+    /// Stop the drain, resumably, as soon as a reading shows critical
+    /// memory pressure (the continuing catch-up lane), instead of going on
+    /// at the floor.
+    yield_on_memory_critical: bool,
+    /// The last reading showed critical memory pressure.
+    memory_critical: bool,
 }
 
 impl DrainPacer {
@@ -1016,17 +1027,43 @@ impl DrainPacer {
             sample: HostPressure::default,
             pace,
             ceiling: None,
+            share: 1,
+            yield_on_memory_critical: false,
+            memory_critical: false,
         }
     }
 
     /// The pace for `need`, from `sample` now and again during the drain.
     pub(crate) fn for_need(need: DrainNeed, sample: fn() -> HostPressure) -> Self {
+        let host = sample();
         Self {
             need: Some(need),
             sample,
-            pace: DeleterPace::for_need(need, sample()),
+            pace: DeleterPace::for_need(need, host),
             ceiling: None,
+            share: 1,
+            yield_on_memory_critical: false,
+            memory_critical: host.memory_critical,
         }
+    }
+
+    /// Pace one of `threads` deleter threads: its share of the rate, so the
+    /// threads together stay within it.
+    pub(crate) fn with_share(mut self, threads: u32) -> Self {
+        self.share = threads.max(1);
+        self
+    }
+
+    /// Stop at the first reading of critical memory pressure instead of
+    /// slowing to the floor.
+    pub(crate) fn yielding_on_memory_critical(mut self) -> Self {
+        self.yield_on_memory_critical = true;
+        self
+    }
+
+    /// Whether the drain must stop now for memory pressure.
+    fn must_yield(&self) -> bool {
+        self.yield_on_memory_critical && self.memory_critical
     }
 
     /// Hold every paced mode at or below `ceiling` unlinks a second (a
@@ -1054,11 +1091,14 @@ impl DrainPacer {
         self.pace
             .unlinks_per_second()
             .map(|rate| self.ceiling.map_or(rate, |ceiling| rate.min(ceiling)))
+            .map(|rate| (rate / self.share.max(1)).max(1))
     }
 
     fn resample(&mut self) -> DeleterPace {
         if let Some(need) = self.need {
-            self.pace = DeleterPace::for_need(need, (self.sample)());
+            let host = (self.sample)();
+            self.memory_critical = host.memory_critical;
+            self.pace = DeleterPace::for_need(need, host);
         }
         self.pace
     }
@@ -1136,7 +1176,9 @@ impl<'a> UnlinkLimiter<'a> {
         self.window = RateWindow::new(self.window.per_second, Instant::now());
     }
 
-    fn before_unlink(&mut self) {
+    /// Pace one unlink; `false` when the drain must stop now for memory
+    /// pressure (only a yielding pacer asks that).
+    fn before_unlink(&mut self) -> bool {
         if self.sampled.elapsed() >= DELETER_PACE_RESAMPLE_EVERY {
             self.sampled = Instant::now();
             self.pacer.resample();
@@ -1146,9 +1188,13 @@ impl<'a> UnlinkLimiter<'a> {
                 self.pace_changes = self.pace_changes.saturating_add(1);
             }
         }
+        if self.pacer.must_yield() {
+            return false;
+        }
         if let Some(ahead) = self.window.admit(Instant::now()) {
             std::thread::sleep(ahead);
         }
+        true
     }
 }
 
@@ -1279,6 +1325,60 @@ pub(crate) struct TrashDrainReport {
     /// Names of the entries passed over because a process used them (at
     /// most [`TRASH_IN_USE_NAMES_MAX`]).
     pub(crate) in_use_names: Vec<String>,
+    /// The run stopped, resumably, at a reading of critical memory pressure
+    /// (only a yielding pacer stops for it).
+    pub(crate) yielded_to_pressure: bool,
+    /// The host-wide deleter lock was held elsewhere: the run deleted
+    /// nothing.
+    pub(crate) deleter_busy: bool,
+    /// Deleter threads the run used (0 or 1: one).
+    pub(crate) threads: u32,
+}
+
+impl TrashDrainReport {
+    /// Why the run ended: `deleter_busy`, `process_use_unknown`,
+    /// `pressure`, `deadline`, or `finished` (every deletable entry was
+    /// attempted).
+    pub(crate) fn end_reason(&self) -> &'static str {
+        if self.deleter_busy {
+            "deleter_busy"
+        } else if self.process_use_unknown {
+            "process_use_unknown"
+        } else if self.yielded_to_pressure {
+            "pressure"
+        } else if self.budget_stopped {
+            "deadline"
+        } else {
+            "finished"
+        }
+    }
+}
+
+/// Wall time this process has spent in [`drain_trash_paced`], for the
+/// drain's share of a worker run.
+static DRAIN_NANOS_THIS_PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall time this process has spent draining the trash.
+pub(crate) fn drain_time_this_process() -> Duration {
+    Duration::from_nanos(DRAIN_NANOS_THIS_PROCESS.load(Ordering::Relaxed))
+}
+
+/// Bytes available to this user on the volume holding `fd`, or `None`
+/// when they cannot be read. The deleter measures what an entry freed as
+/// the change across its removal: with no per-file `stat` it cannot sum
+/// file lengths, and the volume's own figure is what matters. Other writers
+/// on the volume make it approximate; it never goes below zero.
+fn volume_available_bytes(fd: RawFd) -> Option<u64> {
+    // SAFETY: `statvfs` is a plain C struct whose zeroed representation is
+    // valid; `fstatvfs` fills it before any field is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live descriptor and `stat` is writable for the call.
+    if unsafe { libc::fstatvfs(fd, &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    let (available, fragment) = (u64::from(stat.f_bavail), stat.f_frsize as u64);
+    Some(available.saturating_mul(fragment))
 }
 
 /// In-use entry names one run reports and the next run leaves out of the
@@ -1327,6 +1427,41 @@ pub(crate) fn drain_trash_paced(
     deadline: Instant,
     pacer: &mut DrainPacer,
 ) -> TrashDrainReport {
+    drain_trash_in(rows, deadline, pacer, DrainContext::default())
+}
+
+/// How one drain over (part of) the trash runs.
+#[derive(Clone, Copy)]
+struct DrainContext<'a> {
+    /// Every recorded row, when `rows` holds only this thread's part: names
+    /// another part owns are not unrecognized.
+    known: Option<&'a TrashRows>,
+    /// Count names nobody recorded (only one of several threads does).
+    count_unrecognized: bool,
+    /// An open-file observation taken once for all threads.
+    process_use: Option<&'a crate::reclaim::OpenFileSnapshot>,
+    /// A worker thread of a parallel drain: the caller accounts its wall
+    /// time once.
+    worker_thread: bool,
+}
+
+impl Default for DrainContext<'_> {
+    fn default() -> Self {
+        Self {
+            known: None,
+            count_unrecognized: true,
+            process_use: None,
+            worker_thread: false,
+        }
+    }
+}
+
+fn drain_trash_in(
+    rows: &mut TrashRows,
+    deadline: Instant,
+    pacer: &mut DrainPacer,
+    context: DrainContext<'_>,
+) -> TrashDrainReport {
     let _span = crate::phase_telemetry::span("checkout_trash_drain");
     let pace = pacer.pace();
     let mut report = TrashDrainReport {
@@ -1365,7 +1500,7 @@ pub(crate) fn drain_trash_paced(
     // an entry a live process still has as its working directory, or holds
     // a file open in, is never deleted. An incomplete observation deletes
     // nothing this run.
-    let mut process_use: Option<crate::reclaim::OpenFileSnapshot> = None;
+    let mut process_use: Option<crate::reclaim::OpenFileSnapshot> = context.process_use.cloned();
     // The worker's unattended pacer would stop this deleter on memory
     // pressure; it paces itself instead.
     crate::gc::unattended_pacing::without_pacer(|| {
@@ -1394,8 +1529,13 @@ pub(crate) fn drain_trash_paced(
                 .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
                 .filter(|name| name != TRASH_MARKER)
                 .collect::<Vec<_>>();
-            for name in &listed {
-                if !is_broker_entry_name(name) || !entries.contains_key(name) {
+            let known_here = context.known.and_then(|known| known.get(trash_path));
+            for name in listed.iter().filter(|_| context.count_unrecognized) {
+                let recorded = known_here.map_or_else(
+                    || entries.contains_key(name),
+                    |known| known.contains_key(name),
+                );
+                if !is_broker_entry_name(name) || !recorded {
                     report.unrecognized += 1;
                     if report.unrecognized_names.len() < 20 {
                         report.unrecognized_names.push(name.clone());
@@ -1513,12 +1653,14 @@ pub(crate) fn drain_trash_paced(
                     continue;
                 }
                 let left_trash = std::cell::Cell::new(false);
+                let yielded = std::cell::Cell::new(false);
                 limiter.restart();
                 let mut since_check = 0_u32;
-                match pinned.remove_with_progress_and_observed_file_bytes_and_guard(
-                    None,
-                    Some(deadline),
-                    || {
+                let available_before = volume_available_bytes(trash_fd);
+                // Listing types, no per-file `stat`: the trash is private
+                // to the broker and nothing else writes into an entry.
+                let removed =
+                    pinned.remove_trusting_listing_types_with_guard(Some(deadline), || {
                         since_check += 1;
                         if since_check >= TRASH_LOCATION_CHECK_EVERY {
                             since_check = 0;
@@ -1527,10 +1669,16 @@ pub(crate) fn drain_trash_paced(
                                 return Err(std::io::Error::other("the entry left the trash"));
                             }
                         }
-                        limiter.before_unlink();
+                        if !limiter.before_unlink() {
+                            yielded.set(true);
+                            return Err(std::io::Error::other("critical memory pressure"));
+                        }
                         Ok(())
-                    },
-                ) {
+                    });
+                let bytes = available_before
+                    .zip(volume_available_bytes(trash_fd))
+                    .map_or(0, |(before, after)| after.saturating_sub(before));
+                match removed.map(|(outcome, unlinks)| (outcome, unlinks, bytes)) {
                     Ok((crate::gc::TreeRemoval::Complete, unlinks, bytes)) => {
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
@@ -1568,6 +1716,16 @@ pub(crate) fn drain_trash_paced(
                         );
                         break 'dirs;
                     }
+                    Err(error) if yielded.get() => {
+                        report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
+                        report.bytes = report.bytes.saturating_add(bytes);
+                        report.yielded_to_pressure = true;
+                        crate::phase_telemetry::add(
+                            "checkout_trash_yielded_to_pressure",
+                            Duration::ZERO,
+                        );
+                        break 'dirs;
+                    }
                     Err(error) if left_trash.get() => {
                         report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
                         report.unrecognized += 1;
@@ -1597,6 +1755,12 @@ pub(crate) fn drain_trash_paced(
         }
     });
     crate::phase_telemetry::add("checkout_trash_drain_time", started.elapsed());
+    if !context.worker_thread {
+        DRAIN_NANOS_THIS_PROCESS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
     if report.budget_stopped {
         crate::phase_telemetry::add("checkout_trash_budget_stops", Duration::ZERO);
     }
@@ -1604,6 +1768,164 @@ pub(crate) fn drain_trash_paced(
     report.final_pace = Some(limiter.pacer.pace());
     rows.retain(|_, entries| !entries.is_empty());
     report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    report
+}
+
+/// Deleter threads a catching-up drain uses, each over its own entries.
+/// The volume, not the CPU, bounds unlinks (the worker sat blocked in the
+/// kernel on an external USB volume); several outstanding unlinks on
+/// different directories let the device queue them.
+pub(crate) const TRASH_CATCHUP_THREADS: u32 = 3;
+
+/// Split `rows` into `parts` row sets: each directory's confirmed entries
+/// dealt round-robin in drain order (so every part starts with the oldest
+/// it can), and every other row (pending, foreign names) in the first part,
+/// which alone confirms pending rows.
+fn partition_rows(rows: &TrashRows, parts: usize) -> Vec<TrashRows> {
+    let parts = parts.max(1);
+    let mut split = vec![TrashRows::new(); parts];
+    for (dir, entries) in rows {
+        let order = drain_order(entries);
+        for (index, name) in order.iter().enumerate() {
+            if let Some(row) = entries.get(name) {
+                split[index % parts]
+                    .entry(dir.clone())
+                    .or_default()
+                    .insert(name.clone(), *row);
+            }
+        }
+        for (name, row) in entries {
+            if !order.contains(name) {
+                split[0]
+                    .entry(dir.clone())
+                    .or_default()
+                    .insert(name.clone(), *row);
+            }
+        }
+    }
+    split
+}
+
+/// One report for a parallel drain's parts.
+fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrainReport {
+    let mut merged = TrashDrainReport::default();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index == 0 {
+            merged.pace = part.pace;
+            merged.need = part.need;
+            merged.final_pace = part.final_pace;
+            merged.configured_ceiling = part.configured_ceiling;
+            merged.initial_unlinks_per_second = part
+                .initial_unlinks_per_second
+                .map(|rate| rate.saturating_mul(threads));
+        }
+        merged.entries_removed += part.entries_removed;
+        merged.entries_interrupted += part.entries_interrupted;
+        merged.unlinks = merged.unlinks.saturating_add(part.unlinks);
+        merged.bytes = merged.bytes.saturating_add(part.bytes);
+        merged.stripped_bytes = merged.stripped_bytes.saturating_add(part.stripped_bytes);
+        merged.stripped_entries_removed += part.stripped_entries_removed;
+        merged.scratch_bytes = merged.scratch_bytes.saturating_add(part.scratch_bytes);
+        merged.scratch_entries_removed += part.scratch_entries_removed;
+        merged.failed.extend(part.failed);
+        merged.reported.extend(part.reported);
+        merged.unrecognized += part.unrecognized;
+        merged.unrecognized_names.extend(part.unrecognized_names);
+        merged.stale_pending.extend(part.stale_pending);
+        merged.invalid_trash_dirs = merged.invalid_trash_dirs.max(part.invalid_trash_dirs);
+        merged.entries_in_use += part.entries_in_use;
+        merged.in_use_names.extend(part.in_use_names);
+        merged.process_use_unknown |= part.process_use_unknown;
+        merged.budget_stopped |= part.budget_stopped;
+        merged.yielded_to_pressure |= part.yielded_to_pressure;
+        merged.pace_changes = merged.pace_changes.saturating_add(part.pace_changes);
+    }
+    merged.unrecognized_names.truncate(20);
+    merged.in_use_names.truncate(TRASH_IN_USE_NAMES_MAX);
+    merged.threads = threads;
+    merged
+}
+
+/// Drain `rows` with `threads` deleter threads, each over its own part
+/// ([`partition_rows`]) with a pacer from `pacer` (give each its share of
+/// the rate, [`DrainPacer::with_share`]). One open-file observation is
+/// taken for all of them (`process_use`, or a fresh one); each thread
+/// records into this thread's telemetry. A thread that panics leaves its
+/// part's rows as they were. `rows` is updated as [`drain_trash_paced`]
+/// updates it.
+pub(crate) fn drain_trash_parallel(
+    rows: &mut TrashRows,
+    deadline: Instant,
+    pacer: impl Fn() -> DrainPacer,
+    threads: u32,
+    process_use: Option<crate::reclaim::OpenFileSnapshot>,
+) -> TrashDrainReport {
+    let started = Instant::now();
+    let process_use = process_use.unwrap_or_else(|| {
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(DELETER_PROCESS_USE_BUDGET);
+        let observed = crate::session_holder::trash_deleter_process_use_snapshot(budget);
+        crate::phase_telemetry::add("checkout_trash_process_snapshot", started.elapsed());
+        observed
+    });
+    let known = rows.clone();
+    let parts = partition_rows(rows, threads as usize);
+    let recorder = crate::phase_telemetry::active();
+    let results = std::thread::scope(|scope| {
+        let handles = parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut part)| {
+                let original = part.clone();
+                let mut pacer = pacer();
+                let known = &known;
+                let process_use = &process_use;
+                let recorder = recorder.clone();
+                let handle = scope.spawn(move || {
+                    let _telemetry = recorder.map(crate::phase_telemetry::install);
+                    let report = drain_trash_in(
+                        &mut part,
+                        deadline,
+                        &mut pacer,
+                        DrainContext {
+                            known: Some(known),
+                            count_unrecognized: index == 0,
+                            process_use: Some(process_use),
+                            worker_thread: true,
+                        },
+                    );
+                    (part, report)
+                });
+                (original, handle)
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(original, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    crate::phase_telemetry::add("checkout_trash_thread_panicked", Duration::ZERO);
+                    (original, TrashDrainReport::default())
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut merged_rows = TrashRows::new();
+    let mut reports = Vec::with_capacity(results.len());
+    for (part, report) in results {
+        for (dir, entries) in part {
+            merged_rows.entry(dir).or_default().extend(entries);
+        }
+        reports.push(report);
+    }
+    merged_rows.retain(|_, entries| !entries.is_empty());
+    *rows = merged_rows;
+    let mut report = merge_drain_reports(reports, threads);
+    report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    DRAIN_NANOS_THIS_PROCESS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     report
 }
 
@@ -2203,6 +2525,87 @@ mod tests {
         assert_eq!(deletable.entries, 1, "{deletable:?}");
         assert_eq!(deletable.oldest_age_ms(now), Some(60_000));
         assert!(!deletable.behind(now));
+    }
+
+    /// Several deleter threads each take their own entries: every recorded
+    /// entry goes, the one a process uses stays (and is retried), an
+    /// unrecorded name is counted once and left alone, no symlink is
+    /// followed, and each thread paces itself at its share of the rate.
+    #[test]
+    fn a_parallel_drain_splits_the_entries_and_keeps_every_guard() {
+        let fixture = Fixture::new();
+        let outside = fixture._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), "precious\n").unwrap();
+        let mut rows = TrashRows::new();
+        let mut trashed = Vec::new();
+        for index in 0..5 {
+            let checkout = fixture.checkout(&format!("parallel-{index}"));
+            std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+            std::fs::create_dir_all(checkout.join("node_modules/dep")).unwrap();
+            std::fs::write(checkout.join("node_modules/dep/index.js"), "x").unwrap();
+            let moved = fixture.trash(&checkout, index + 1).unwrap();
+            rows.entry(moved.trash_dir.clone())
+                .or_default()
+                .insert(moved.entry.clone(), moved.row);
+            trashed.push(moved);
+        }
+        let stranger = trashed[0].trash_dir.join("0000000000001-9-9-9");
+        std::fs::create_dir(&stranger).unwrap();
+        let held = std::fs::canonicalize(trashed[2].path()).unwrap();
+        let in_use =
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "shell".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: held.clone(),
+            }]);
+        let parts = partition_rows(&rows, 3);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.values().map(BTreeMap::len).sum::<usize>())
+                .sum::<usize>(),
+            5,
+            "every row in exactly one part"
+        );
+        assert_eq!(
+            DrainPacer::fixed(DeleterPace::Catchup)
+                .with_share(3)
+                .unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND / 3)
+        );
+
+        let report = drain_trash_parallel(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            || DrainPacer::fixed(DeleterPace::Unpaced),
+            3,
+            Some(in_use),
+        );
+
+        assert_eq!(report.threads, 3);
+        assert_eq!(report.entries_removed, 4, "{report:?}");
+        assert_eq!(report.entries_in_use, 1, "{report:?}");
+        assert_eq!(report.unrecognized, 1, "{report:?}");
+        assert_eq!(report.entries_pending, 1, "{report:?}");
+        assert!(held.exists());
+        assert!(stranger.exists());
+        for (index, moved) in trashed.iter().enumerate() {
+            assert_eq!(moved.path().exists(), index == 2, "{index}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+            "precious\n"
+        );
+        let left = rows
+            .values()
+            .flat_map(|entries| entries.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec![trashed[2].entry.clone()]);
     }
 
     /// A drain catching up still deletes only recorded entries and never
