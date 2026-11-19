@@ -138,6 +138,9 @@ pub(crate) const TRASH_CATCHUP_WAITER_FILE: &str = "checkout-trash-catchup.waiti
 /// A waiter note older than this is ignored (a waiter refreshes it at
 /// every retry).
 const TRASH_CATCHUP_WAITER_FRESH: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long apart a lane that could not take the host lane probes it twice
+/// before concluding its own repository's live lane holds it.
+const TRASH_CATCHUP_OWN_RECHECK: std::time::Duration = std::time::Duration::from_millis(200);
 /// File name of the host-wide lock that keeps a second catch-up lane out.
 pub(crate) const TRASH_CATCHUP_LOCK_FILE: &str = "checkout-trash-catchup.lock";
 
@@ -3235,9 +3238,8 @@ impl Broker {
         });
         let (Some(dir), Some(_lane_lock)) = (host_dir, lane_lock) else {
             report.end = TrashCatchupEnd::LaneBusy;
-            report.lane_held_by_own_repository = host_dir.is_some_and(|dir| {
-                self.checkout_trash_catchup_lane_state(dir) == CatchupLaneState::ThisRepository
-            });
+            report.lane_held_by_own_repository =
+                host_dir.is_some_and(|dir| self.checkout_trash_catchup_own_lane_live(dir));
             report.elapsed = started.elapsed();
             crate::phase_telemetry::add(
                 "checkout_trash_catchup_end_lane_busy",
@@ -3520,13 +3522,16 @@ impl Broker {
     }
 
     /// Whether a catch-up lane process of this repository is alive (holding
-    /// the host lane or waiting for it): the lane-process lock's holder line
-    /// names a live process. Read without taking the lock.
+    /// the host lane or waiting for it): its lane-process lock is held. The
+    /// probe takes the lock for an instant without writing anything; a line
+    /// left by a lane that died is ignored while the lock is free.
     pub(crate) fn checkout_trash_lane_process_present(&self, host_dir: &Path) -> bool {
-        crate::checkout_trash::catchup_lane_holder(
-            &self.checkout_trash_repository_lane_lock_path(host_dir),
+        matches!(
+            crate::checkout_trash::probe_catchup_lane_lock(
+                &self.checkout_trash_repository_lane_lock_path(host_dir)
+            ),
+            crate::checkout_trash::CatchupLaneProbe::Held(_)
         )
-        .is_some_and(|holder| holder.alive())
     }
 
     /// Whether the worker should start a catch-up lane process for this
@@ -3550,19 +3555,44 @@ impl Broker {
     /// this repository's when it names this repository. A line naming no
     /// repository counts as another's.
     pub(crate) fn checkout_trash_catchup_lane_state(&self, host_dir: &Path) -> CatchupLaneState {
-        match crate::checkout_trash::catchup_lane_holder(&host_dir.join(TRASH_CATCHUP_LOCK_FILE)) {
-            Some(holder) if holder.alive() => {
+        match crate::checkout_trash::probe_catchup_lane_lock(
+            &host_dir.join(TRASH_CATCHUP_LOCK_FILE),
+        ) {
+            crate::checkout_trash::CatchupLaneProbe::Free => CatchupLaneState::Free,
+            crate::checkout_trash::CatchupLaneProbe::Held(holder) => {
                 if holder
-                    .repository
-                    .as_deref()
-                    .is_some_and(|repository| self.is_this_repository(repository))
+                    .and_then(|holder| holder.repository)
+                    .is_some_and(|repository| self.is_this_repository(&repository))
                 {
                     CatchupLaneState::ThisRepository
                 } else {
                     CatchupLaneState::OtherRepository
                 }
             }
-            Some(_) | None => CatchupLaneState::Free,
+        }
+    }
+
+    /// The host lane is held by this repository's own live lane, as a
+    /// lane that could not take it judges before giving up: held, naming
+    /// this repository and a live process other than this one, on two
+    /// probes [`TRASH_CATCHUP_OWN_RECHECK`] apart, so neither a probe's
+    /// momentary take nor a line left by a dead lane passes.
+    fn checkout_trash_catchup_own_lane_live(&self, host_dir: &Path) -> bool {
+        let path = host_dir.join(TRASH_CATCHUP_LOCK_FILE);
+        let own_live = || match crate::checkout_trash::probe_catchup_lane_lock(&path) {
+            crate::checkout_trash::CatchupLaneProbe::Held(Some(holder)) => {
+                holder.alive()
+                    && holder.pid != i64::from(std::process::id())
+                    && holder
+                        .repository
+                        .as_deref()
+                        .is_some_and(|repository| self.is_this_repository(repository))
+            }
+            _ => false,
+        };
+        own_live() && {
+            std::thread::sleep(TRASH_CATCHUP_OWN_RECHECK);
+            own_live()
         }
     }
 
@@ -4419,11 +4449,19 @@ mod tests {
         let (owner, _storage, mut broker) = fixture();
         let entry = trashed_day_old_entry(&mut broker, "process");
         let host = owner.path();
-        let own = crate::checkout_trash::try_catchup_lane_lock(
-            &host.join(super::TRASH_CATCHUP_LOCK_FILE),
-            broker.main_root(),
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        // Another live process's lane of this repository (pid 1 stands in
+        // for it) holds the host lane.
+        let own = crate::checkout_trash::try_deleter_lock(&lane_path)
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            &lane_path,
+            format!(
+                "pid 1 since 0\nrepository {}\n",
+                broker.main_root().display()
+            ),
         )
-        .unwrap()
         .unwrap();
         let busy = broker.run_checkout_trash_catchup_process(
             Some(host),
@@ -4436,6 +4474,7 @@ mod tests {
         assert!(busy[0].lane_held_by_own_repository);
         assert!(entry.exists());
         drop(own);
+        std::fs::write(&lane_path, "").unwrap();
 
         let worker_started_ms = crate::clock::epoch_ms() - 5_000;
         let laps = broker.run_checkout_trash_catchup_process(
@@ -4567,6 +4606,58 @@ mod tests {
             broker.checkout_trash_catchup_lane_state(host),
             super::CatchupLaneState::Free
         );
+    }
+
+    /// A lane killed without running its drop (SIGKILL, a crash, a reboot)
+    /// leaves `pid X ... repository A` in the host lane file and in A's
+    /// lane-process file. With the locks free, a live unrelated process
+    /// that now has pid X must not stop A's deletion: the probes read a free
+    /// lock as no lane, so the retirement drain runs, a lane is wanted, and
+    /// the lane drains.
+    #[test]
+    fn a_stale_own_line_with_a_live_unrelated_pid_does_not_stop_deletion() {
+        let (owner, _storage, mut broker) = fixture();
+        let host = owner.path();
+        let stale = format!(
+            "pid 1 since 0\nrepository {}\n",
+            broker.main_root().display()
+        );
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let process_path = broker.checkout_trash_repository_lane_lock_path(host);
+        std::fs::write(&lane_path, &stale).unwrap();
+        std::fs::write(&process_path, &stale).unwrap();
+        assert!(
+            crate::checkout_trash::catchup_lane_holder(&lane_path)
+                .unwrap()
+                .alive()
+        );
+
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::Free
+        );
+        assert!(!broker.checkout_trash_lane_process_present(host));
+        let drained_by_retirement = trashed_day_old_entry(&mut broker, "retired");
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(!drained_by_retirement.exists());
+
+        std::fs::write(&lane_path, &stale).unwrap();
+        let entry = trashed_day_old_entry(&mut broker, "lane");
+        assert!(
+            broker.checkout_trash_catchup_needed(Some(host)),
+            "a lane is wanted"
+        );
+        let laps = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(crate::clock::epoch_ms()),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(laps.len(), 1, "{laps:?}");
+        assert_eq!(laps[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(!entry.exists());
     }
 
     /// Laps follow one another only after a lap that hit its cap, and never

@@ -1312,8 +1312,39 @@ impl CatchupLaneHolder {
     }
 }
 
+/// What a probe of a catch-up lane lock found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatchupLaneProbe {
+    /// Nobody holds the lock: no lane, whatever its holder line says (a
+    /// lane killed without running its drop leaves its line behind).
+    Free,
+    /// Someone holds the lock; its holder line, if it has one.
+    Held(Option<CatchupLaneHolder>),
+}
+
+/// Probe the lane lock at `path`: a non-blocking take that writes nothing
+/// and is released at once, then, only when the lock is held, its holder
+/// line. A missing directory reads as free; any other failure to open or
+/// lock reads as held by an unknown holder, so a probe never mistakes
+/// trouble for a free lane.
+pub(crate) fn probe_catchup_lane_lock(path: &Path) -> CatchupLaneProbe {
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path);
+    match opened.map(crate::file_lock::ExclusiveFileLock::try_acquire) {
+        Ok(Ok(Some(_free))) => CatchupLaneProbe::Free,
+        // No directory for it: nobody can hold it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CatchupLaneProbe::Free,
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => CatchupLaneProbe::Held(catchup_lane_holder(path)),
+    }
+}
+
 /// The holder line of the lane lock at `path`, read without taking the
-/// lock; `None` when it is empty, missing or unreadable.
+/// lock; `None` when it is empty, missing or unreadable. Meaningful only
+/// while the lock is held ([`probe_catchup_lane_lock`]).
 pub(crate) fn catchup_lane_holder(path: &Path) -> Option<CatchupLaneHolder> {
     let text = std::fs::read_to_string(path).ok()?;
     let pid = text.lines().find_map(|line| {
