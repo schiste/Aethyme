@@ -997,6 +997,7 @@ pub(crate) struct DrainPacer {
 
 impl DrainPacer {
     /// Always `pace`.
+    #[cfg(test)]
     pub(crate) fn fixed(pace: DeleterPace) -> Self {
         Self {
             need: None,
