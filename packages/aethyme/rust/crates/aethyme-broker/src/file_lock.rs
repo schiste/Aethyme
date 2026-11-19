@@ -668,6 +668,13 @@ pub(crate) fn repository_run_directory(main_root: &Path) -> io::Result<std::path
     repository_runtime_directory(main_root)
 }
 
+pub(crate) fn ensure_task_context_cache(main_root: &Path) -> io::Result<PathBuf> {
+    let root = repository_runtime_directory(main_root)?.join("start-context");
+    ensure_real_directory(&root)?;
+    ensure_real_directory(&root.join(".aethyme"))?;
+    Ok(root)
+}
+
 /// Which side of the per-session command/retirement fence to acquire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionOperationLockMode {
@@ -775,6 +782,15 @@ fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathB
 /// not beside the log, and is never unlinked, so every holder locks one inode.
 pub(crate) fn open_command_metrics_lock(main_root: &Path) -> io::Result<File> {
     let path = repository_runtime_lock_path(main_root, "command-metrics.lock")?;
+    let file = open_lock_file_nofollow(&path)?;
+    verify_named_lock_file(&path, &file)?;
+    Ok(file)
+}
+
+/// Open the stable rendezvous file for one gate-verdict cache shard. The
+/// repository owns a fixed number of files, independent of verdict retention.
+pub(crate) fn open_gate_verdict_lock(main_root: &Path, shard: u16) -> io::Result<File> {
+    let path = repository_runtime_lock_path(main_root, &format!("gate-verdict-{shard:03x}.lock"))?;
     let file = open_lock_file_nofollow(&path)?;
     verify_named_lock_file(&path, &file)?;
     Ok(file)

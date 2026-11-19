@@ -1797,11 +1797,27 @@ pub fn host_gc_inventory(
     Option<crate::GcEnvironmentCacheInventory>,
     Vec<crate::GcEnvironmentCacheCandidate>,
 ) {
-    let deadline = cache_gc_deadline(deadline);
-    let Some(root) = super::logs::environments_directory() else {
+    host_gc_inventory_in(
+        crate::host_state::default_host_state_dir().as_deref(),
+        repository,
+        deadline,
+    )
+}
+
+pub(crate) fn host_gc_inventory_in(
+    host_state: Option<&Path>,
+    repository: &str,
+    deadline: Option<Instant>,
+) -> (
+    Option<crate::GcEnvironmentCacheInventory>,
+    Vec<crate::GcEnvironmentCacheCandidate>,
+) {
+    let Some(host_state) = host_state else {
         return (None, Vec::new());
     };
-    match EnvironmentStore::open_default_cache_gc_read_only(deadline) {
+    let deadline = cache_gc_deadline(deadline);
+    let root = host_state.join(super::logs::ENVIRONMENTS_DIRECTORY);
+    match EnvironmentStore::open_cache_gc_read_only_in(host_state, deadline) {
         Ok(store) => gc_inventory(Some(&store), &root, repository, budget_bytes(), deadline),
         Err(error) => {
             let (inventory, _) = gc_inventory(None, &root, repository, budget_bytes(), deadline);
@@ -1834,19 +1850,38 @@ pub fn host_gc_evict(
     deadline: Option<Instant>,
     before_delete: impl FnOnce() -> Result<(), String>,
 ) -> Result<bool, String> {
+    let host_state = crate::host_state::default_host_state_dir();
+    let resource_db = crate::resources::default_host_resource_db_path().ok();
+    host_gc_evict_in(
+        host_state.as_deref(),
+        resource_db.as_deref(),
+        candidate,
+        deadline,
+        before_delete,
+    )
+}
+
+pub(crate) fn host_gc_evict_in(
+    host_state: Option<&Path>,
+    resource_db: Option<&Path>,
+    candidate: &crate::GcEnvironmentCacheCandidate,
+    deadline: Option<Instant>,
+    before_delete: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
     let deadline = cache_gc_deadline(deadline);
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err("environment cache eviction exceeded its bounded deadline".into());
     }
-    let root =
-        super::logs::environments_directory().ok_or("the host state directory is unavailable")?;
-    let store =
-        EnvironmentStore::open_default_cache_gc_read_only(deadline).map_err(|e| e.to_string())?;
+    let host_state = host_state.ok_or("the host state directory is unavailable")?;
+    let resource_db = resource_db.ok_or("the host resource database is unavailable")?;
+    let root = host_state.join(super::logs::ENVIRONMENTS_DIRECTORY);
+    let store = EnvironmentStore::open_cache_gc_read_only_in(host_state, deadline)
+        .map_err(|e| e.to_string())?;
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err("environment cache eviction exceeded its bounded deadline".into());
     }
     let coordinator =
-        crate::resources::HostResourceCoordinator::open_default().map_err(|e| e.to_string())?;
+        crate::resources::HostResourceCoordinator::open(resource_db).map_err(|e| e.to_string())?;
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err("environment cache eviction exceeded its bounded deadline".into());
     }

@@ -482,6 +482,85 @@ keys, lookup and reuse are unchanged.
   hit rate P` line under Gates) reports both over the same window as
   `gates.cached`.
 
+## Prepared session context and semantic patches
+
+The repository's existing `aethyme broker advanced watch pr tick` scheduler warms
+navigation for the locally observed remote default commit when committed
+graph authority is enabled. It reads exact Git objects, validates both the
+source and fragment digests, and atomically publishes a derived store under
+`.aethyme/run/start-context`. A known current commit skips materialization.
+The warmup does no remote fetch and runs no repository commands. It reuses a
+host graph artifact when available without waiting for another cache writer.
+The `start_context_warmup`, `start_context_warmup_inputs`, and
+`start_context_warmup_materialize` spans attribute the scheduler's work.
+
+`broker start --json` and adopt responses can carry `task_context` with
+`source_commit`, up to eight suggested `paths` and `symbols`, and
+`suggested_gates` when gate policy can be parsed. The source commit must
+match the recorded start or adoption revision. Up to four
+`source_anchors` point to symbols by path and line, each with up to two
+indexed callers. `observed_baseline` shows the last conclusive local gate
+result with the exact baseline tree and current gate definition when one is
+available. These historical observations do not verify the task candidate
+or claim that the current host environment matches the recorded run.
+Suggested gate names use the navigation paths. Missing context leaves the
+existing scope warning. `start_task_context` measures the lookup and query.
+
+A repository can commit declarative recipes in
+`.aethyme/semantic-patches.toml`:
+
+```toml
+[[recipe]]
+name = "new-api"
+kind = "rust_call"
+paths = ["src/**/*.rs"]
+from = "crate::legacy::request"
+to = "crate::api::request"
+```
+
+`aethyme broker start --task recipe:new-api --json` selects the named recipe
+from the fetched default branch. The Rust parser matches direct,
+crate-qualified calls in the declared scope. The broker writes a patch file
+under session scratch and evaluates the selected gates in a separate
+checkout using the existing gate trust decision. Gates see a synthetic
+candidate commit with the recorded base as its parent and as
+`AETHYME_GATE_BASE_COMMIT`. It reports
+`semantic_patch` (base commit, candidate commit and tree, patch path, changed files,
+replacement count, gate status and outcomes) or `semantic_patch_warning`
+when it could not make a candidate. Paths to evidence are present when gate
+logs were produced or retained for diagnosis. Status
+`selected_gates_passed` describes the preview tree and is independent of the
+ordinary submission gates. `no_gates_selected`, `selected_gate_failed`,
+`candidate_changed`, and `unavailable` carry the remaining outcomes. The
+preview store cannot supply cache evidence for a submission. Recipe phases
+are `semantic_patch_prepare`, `semantic_patch_candidate`, and
+`semantic_patch_verify`.
+
+From the session checkout at the reported base, inspect the patch with
+`git apply --check -- <patch_file>`. A user or agent can then apply it and
+review the working diff before committing the migration.
+
+## Concurrent gate verdict reuse
+
+Cache-eligible local gates with a complete execution profile check the existing
+repository verdict store. On a miss, a repository-local advisory lock gives one
+producer the right to execute. The producer holds the lock through durable
+verdict recording. A waiter re-observes its tree, then checks the same exact
+cache identity. It can use the recorded result, take over when no reusable
+verdict exists, or report resource contention if the shared wait reaches 60
+seconds or the native deadline. Cache bypass and incomplete profiles still
+execute separately. The lock names use 4,096 stable shards to bound runtime
+files. Collisions may wait but never share a verdict across different keys.
+
+The `gate_verdict_wait` phase measures contested lock time. The
+`gate_verdict_joined` phase count measures completed handoffs. A reused
+`GateRunOutcome` keeps the producer's run ID and duration. Its
+`wait_duration_ms` records contention on the receiving command when present
+and remains zero for an immediate cache hit. This is local to the shared
+broker state and uses the existing tree and execution profile trust contract.
+Submit runs additionally bind their immutable comparison base to the profile
+digest. A verdict for one comparison base cannot satisfy another.
+
 ## Git wrapper probe verdict cache (2026-11-15)
 
 Before its first Git command every `aethyme` process proves that the `git` it

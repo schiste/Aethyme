@@ -2650,8 +2650,8 @@ impl Broker {
                 drain_deadline.saturating_duration_since(deadline),
             );
         }
-        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
-        report.trash = self.retirement_trash_drain(host_dir.as_deref(), drain_deadline);
+        let host_dir = self.storage_context().host_state_dir.as_deref();
+        report.trash = self.retirement_trash_drain(host_dir, drain_deadline);
         self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
@@ -3005,8 +3005,11 @@ impl Broker {
         &self,
         deadline: Instant,
     ) -> crate::checkout_trash::TrashDrainReport {
-        let lock_path = crate::host_state::resolve_host_state_dir()
-            .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
+        let lock_path = self
+            .storage_context()
+            .host_state_dir
+            .as_deref()
+            .map(|dir| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
         self.drain_checkout_trash_with(
             lock_path.as_deref(),
             deadline,
@@ -3964,11 +3967,15 @@ mod tests {
     /// cleaned and the branch ref kept.
     #[test]
     fn a_clean_contained_checkout_is_retired_without_an_archive() {
-        let (_owner, _storage, mut broker) = fixture();
+        let (_owner, storage, mut broker) = fixture();
         let (session, worktree) = closed(&mut broker, "clean", |_| {});
 
         let report = run(&mut broker);
 
+        let fixture_lock = storage
+            .host_state_dir()
+            .join(crate::checkout_trash::DELETER_LOCK_FILE);
+        assert!(fixture_lock.is_file(), "{fixture_lock:?}");
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
