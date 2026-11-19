@@ -1607,6 +1607,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "remote-branches" {
         return run_gc_remote_branches(parsed);
     }
+    if action == "trash" {
+        return run_gc_trash(parsed);
+    }
     if action == "storage" {
         if parsed.positional.get(1).map(String::as_str) != Some("maintenance-lock") {
             return Err(UsageError::Message(
@@ -1866,6 +1869,110 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     }
     Ok(())
 }
+
+/// Default and largest `gc trash drain --max-minutes`.
+const GC_TRASH_DRAIN_DEFAULT_MINUTES: u32 = 20;
+const GC_TRASH_DRAIN_MAX_MINUTES: u32 = 60;
+
+/// `gc trash drain`: run the trash catch-up lane now, in the foreground.
+fn run_gc_trash(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 2 || parsed.positional[1] != "drain" {
+        return Err(UsageError::Message(
+            "gc trash accepts `drain [--max-minutes <n>] [--json]`".into(),
+        ));
+    }
+    let minutes = parsed.max_minutes.unwrap_or(GC_TRASH_DRAIN_DEFAULT_MINUTES);
+    if minutes == 0 || minutes > GC_TRASH_DRAIN_MAX_MINUTES {
+        return Err(UsageError::Message(format!(
+            "--max-minutes must be between 1 and {GC_TRASH_DRAIN_MAX_MINUTES}"
+        )));
+    }
+    let broker = open_broker(false)?;
+    let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+    let outcome = gc_trash_drain(
+        &broker,
+        host_dir.as_deref(),
+        std::time::Duration::from_secs(u64::from(minutes) * 60),
+        crate::checkout_trash::sample_host_pressure,
+    )?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        out!(
+            "Checkout trash drain: {} entr(y/ies) removed ({} files, {} files/s over {} lap(s)); ended: {}.",
+            outcome["entries_removed"],
+            outcome["unlinks"],
+            outcome["files_per_second"],
+            outcome["laps"],
+            outcome["end_reason"].as_str().unwrap_or("unknown"),
+        );
+        out!(
+            "  remaining: {} entr(y/ies){}",
+            outcome["entries_remaining"],
+            outcome["oldest_remaining_age_hours"]
+                .as_u64()
+                .map(|hours| format!(", the oldest moved in {hours} hour(s) ago"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// The lane `gc trash drain` runs, and what it reports; a refusal when
+/// another catch-up lane is live on this host.
+fn gc_trash_drain(
+    broker: &Broker,
+    host_dir: Option<&std::path::Path>,
+    total: std::time::Duration,
+    sample: fn() -> crate::checkout_trash::HostPressure,
+) -> Result<serde_json::Value, UsageError> {
+    let Some(host_dir) = host_dir else {
+        return Err(UsageError::Message(
+            "gc trash drain needs the host state directory, which could not be resolved".into(),
+        ));
+    };
+    let laps = broker.run_checkout_trash_catchup_laps(
+        Some(host_dir),
+        crate::broker::TrashCatchupBounds {
+            total,
+            lap_max: crate::checkout_trash::TRASH_CATCHUP_MAX,
+            max_laps: crate::broker::TRASH_CATCHUP_MAX_LAPS,
+            until_empty: true,
+        },
+        sample,
+    );
+    if laps
+        .first()
+        .is_some_and(|lap| lap.end == crate::broker::TrashCatchupEnd::LaneBusy)
+    {
+        return Err(UsageError::Message(GC_TRASH_DRAIN_LANE_BUSY.into()));
+    }
+    let drain_secs: f64 = laps.iter().map(|lap| lap.drain_time.as_secs_f64()).sum();
+    let unlinks: usize = laps.iter().map(|lap| lap.unlinks).sum();
+    let rows = broker.checkout_trash_rows();
+    let remaining = crate::checkout_trash::TrashBacklog::of(&rows);
+    Ok(serde_json::json!({
+        "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
+        "laps": laps.len(),
+        "slices": laps.iter().map(|lap| u64::from(lap.slices)).sum::<u64>(),
+        "entries_removed": laps.iter().map(|lap| lap.entries_removed).sum::<usize>(),
+        "unlinks": unlinks,
+        "bytes": laps.iter().map(|lap| lap.bytes).sum::<u64>(),
+        "drain_ms": (drain_secs * 1_000.0).round() as u64,
+        "files_per_second": if drain_secs > 0.0 {
+            (unlinks as f64 / drain_secs).round() as u64
+        } else {
+            0
+        },
+        "entries_remaining": rows.values().map(std::collections::BTreeMap::len).sum::<usize>(),
+        "oldest_remaining_age_hours": remaining
+            .oldest_age_ms(crate::clock::epoch_ms())
+            .map(|age| age / 3_600_000),
+    }))
+}
+
+/// The refusal of `gc trash drain` while another lane is live.
+const GC_TRASH_DRAIN_LANE_BUSY: &str = "another checkout trash catch-up lane is running on this host (a background worker's, or another `gc trash drain`); it is the one deleter allowed, so this run removed nothing. Try again once it ends.";
 
 /// `gc remote-branches plan`: preview the remote session-branch cleanup.
 fn run_gc_remote_branches(parsed: Parsed) -> Result<(), UsageError> {
@@ -3034,6 +3141,52 @@ mod artifact_worker_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
         (owner, storage, broker)
+    }
+
+    /// `gc trash drain` refuses, removing nothing, while another catch-up
+    /// lane holds the host lock, and runs once it is free.
+    #[test]
+    fn gc_trash_drain_refuses_while_another_lane_is_live() {
+        let (owner, _storage, broker) = worker_environment_fixture();
+        let host = owner.path().join("host-state");
+        std::fs::create_dir_all(&host).unwrap();
+        let lane = crate::checkout_trash::try_deleter_lock(
+            &host.join(crate::broker::TRASH_CATCHUP_LOCK_FILE),
+        )
+        .unwrap()
+        .unwrap();
+        let no_pressure = crate::checkout_trash::HostPressure::default;
+        let refused = gc_trash_drain(
+            &broker,
+            Some(&host),
+            std::time::Duration::from_secs(60),
+            no_pressure,
+        );
+        match refused {
+            Err(UsageError::Message(message)) => {
+                assert_eq!(message, GC_TRASH_DRAIN_LANE_BUSY);
+            }
+            other => panic!("expected the lane-busy refusal, got {other:?}"),
+        }
+        drop(lane);
+        let ran = gc_trash_drain(
+            &broker,
+            Some(&host),
+            std::time::Duration::from_secs(60),
+            no_pressure,
+        )
+        .unwrap();
+        assert_eq!(ran["end_reason"], "caught_up", "{ran}");
+        assert_eq!(ran["entries_remaining"], 0, "{ran}");
+        assert!(
+            gc_trash_drain(
+                &broker,
+                None,
+                std::time::Duration::from_secs(60),
+                no_pressure
+            )
+            .is_err()
+        );
     }
 
     /// The worker entry point resolves the `[cleanup]` source before the

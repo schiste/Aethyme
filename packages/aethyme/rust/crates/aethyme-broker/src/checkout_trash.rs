@@ -1333,6 +1333,9 @@ pub(crate) struct TrashDrainReport {
     pub(crate) deleter_busy: bool,
     /// Deleter threads the run used (0 or 1: one).
     pub(crate) threads: u32,
+    /// A retirement run skipped its drain because a catch-up lane was live
+    /// on this host (it drains this trash anyway).
+    pub(crate) skipped_for_catchup_lane: bool,
 }
 
 impl TrashDrainReport {
@@ -1340,7 +1343,9 @@ impl TrashDrainReport {
     /// `pressure`, `deadline`, or `finished` (every deletable entry was
     /// attempted).
     pub(crate) fn end_reason(&self) -> &'static str {
-        if self.deleter_busy {
+        if self.skipped_for_catchup_lane {
+            "skipped_for_catchup_lane"
+        } else if self.deleter_busy {
             "deleter_busy"
         } else if self.process_use_unknown {
             "process_use_unknown"
