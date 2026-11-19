@@ -968,6 +968,14 @@ Usage:
       cleaned, no open PR uses it as head and none is stacked on it; open
       PRs based on it are retargeted first, and the delete is leased on the
       merged head. --limit bounds the candidates read (default 25, max 200).
+  aethyme broker gc trash drain [--max-minutes <n>] [--json]
+      Drain this repository's checkout trash now, in the foreground, with
+      the lane the background worker runs: the single host-wide deleter,
+      paced, re-reading host pressure every 2 s and stopping at once at
+      critical memory pressure, in 30-second slices of 3 deleter threads,
+      until no entry is left to delete or --max-minutes (default 20, at
+      most 60) pass. Refused while another catch-up lane runs on this host.
+      Prints the entries removed, files per second and what remains.
   aethyme broker gc service plan [--json]
       Read-only macOS per-repository service plan for fixed `gc sweep --json`
       ticks every 900 seconds. Binds the immutable managed router/engine pair.
@@ -1564,6 +1572,8 @@ struct Parsed {
     operation: Option<String>,
     before: Option<i64>,
     limit: Option<u32>,
+    /// `gc trash drain --max-minutes`.
+    max_minutes: Option<u32>,
     detail: bool,
     active: bool,
     status: Option<String>,
@@ -1755,6 +1765,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         operation: None,
         before: None,
         limit: None,
+        max_minutes: None,
         detail: false,
         active: false,
         status: None,
@@ -1909,6 +1920,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--before requires a value".into()))?;
                 parsed.before = Some(value.parse().map_err(|_| {
                     UsageError::Message("--before must be an integer operation id".into())
+                })?);
+            }
+            "--max-minutes" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--max-minutes requires a value".into()))?;
+                parsed.max_minutes = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--max-minutes must be a positive integer".into())
                 })?);
             }
             "--limit" => {

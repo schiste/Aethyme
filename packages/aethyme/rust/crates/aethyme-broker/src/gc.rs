@@ -267,6 +267,11 @@ const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
 /// pass before the continuation worker takes its scoped recovery path.
 pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
+/// Hidden `broker gc` action of the trash catch-up lane process.
+pub(crate) const TRASH_CATCHUP_ACTION: &str = "__trash-catchup";
+/// When the worker that started a trash catch-up lane process started
+/// (epoch ms), for its `catchup_start_delay_ms`.
+pub(crate) const TRASH_CATCHUP_WORKER_STARTED_ENV: &str = "AETHYME_TRASH_CATCHUP_WORKER_STARTED_MS";
 const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
 /// Positive partial deletion is progress, but must not let one detached worker
 /// run indefinitely while another process keeps replenishing the cache.
@@ -3987,6 +3992,17 @@ pub(crate) fn wait_for_host_deleter_slot(
 /// thing in the worker process, before any thread or child exists.
 pub(crate) fn lower_artifact_worker_priority() -> BackgroundPriority {
     background_priority::lower_current_process()
+}
+
+/// Set the checkout trash deleter process to unthrottled disk I/O (macOS;
+/// see `background_priority::raise_for_trash_deleter`).
+pub(crate) fn raise_trash_deleter_priority() -> background_priority::DeleterPriority {
+    background_priority::raise_for_trash_deleter()
+}
+
+/// This process's disk I/O policy, as a telemetry label.
+pub(crate) fn current_io_policy() -> &'static str {
+    background_priority::current_io_policy()
 }
 
 /// Install the unattended-deletion pacer for the detached worker's thread,
@@ -8873,6 +8889,23 @@ impl Broker {
         canonical_root: &Path,
         gate_scope: Option<&std::ffi::OsStr>,
     ) -> Result<Command, BrokerOpError> {
+        self.detached_worker_command(
+            router,
+            canonical_root,
+            gate_scope,
+            &["broker", "gc", "__continue-artifacts"],
+        )
+    }
+
+    /// A detached worker process (`args`, then the repository root) bound
+    /// to the same broker database as this one.
+    fn detached_worker_command(
+        &mut self,
+        router: &Path,
+        canonical_root: &Path,
+        gate_scope: Option<&std::ffi::OsStr>,
+        args: &[&str],
+    ) -> Result<Command, BrokerOpError> {
         let child_database = crate::gate_database::resolve(canonical_root, None, gate_scope)
             .map_err(|reason| BrokerOpError::InvalidStorageContext {
                 reason: reason.into(),
@@ -8885,7 +8918,7 @@ impl Broker {
         }
         let mut command = Command::new(router);
         command
-            .args(["broker", "gc", "__continue-artifacts"])
+            .args(args)
             .arg(canonical_root)
             .current_dir(canonical_root)
             .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
@@ -9129,12 +9162,19 @@ impl Broker {
         // For `broker status`: which `[cleanup]` source this run resolved.
         crate::cleanup_config::record_active(self.store_ref(), self.main_root());
         let worker_started = Instant::now();
+        // The trash catch-up lane starts with the worker, as a process of
+        // its own: the volume is usually idle early in a run, which is when
+        // deletion is fast, and the other lanes take minutes. A separate
+        // process because this worker's disk I/O is throttled (see
+        // `lower_artifact_worker_priority`) and a thread cannot lift itself
+        // out of a throttled process.
+        let lane_started = self.start_checkout_trash_catchup_lane(worker_started, "worker_start");
         let result = self.run_artifact_sweep_recovery_worker_lanes();
         release_worker_lock();
-        // Deletes only through the host-wide deleter lock and holds no
-        // repository lock, so it runs after the worker lock is released:
-        // the next worker run starts while it drains.
-        self.run_checkout_trash_catchup_worker_lane(worker_started);
+        if !lane_started {
+            // Entries the lanes moved into the trash during this run.
+            self.start_checkout_trash_catchup_lane(worker_started, "worker_end");
+        }
         self.run_preparation_cache_measurement_worker_lane();
         // Recorded on every exit, including a busy host deleter, so status
         // shows why a run removed nothing; after the measurement, so its
@@ -9143,52 +9183,87 @@ impl Broker {
         result
     }
 
-    /// The detached worker's continuing trash catch-up lane
-    /// ([`Self::run_checkout_trash_catchup`]), while the trash is behind.
-    /// Records `checkout_trash_catchup`, including the share of this worker
-    /// run's wall time spent draining.
-    fn run_checkout_trash_catchup_worker_lane(&mut self, worker_started: Instant) {
+    /// Whether this detached worker should start the trash catch-up lane:
+    /// the worker environment, a durable repository past the post-boot
+    /// hold, and `checkout_trash_catchup_needed` (a deletable entry, no lane
+    /// process of this repository alive; another repository's live lane is
+    /// waited for by ours).
+    fn checkout_trash_catchup_wanted(&self, host_dir: Option<&Path>) -> bool {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
             || crate::host_state::path_is_ephemeral(self.main_root())
             || artifact_worker_post_boot_hold_now().is_some()
-            || self.checkout_trash_rows().is_empty()
         {
-            return;
+            return false;
         }
+        self.checkout_trash_catchup_needed(host_dir)
+    }
+
+    /// Start the catch-up lane process (`broker gc __trash-catchup`),
+    /// detached like this worker, at unthrottled disk I/O (it raises its
+    /// own policy). `true` when it was started. `when` names the point of
+    /// the worker run, for telemetry.
+    fn start_checkout_trash_catchup_lane(
+        &mut self,
+        worker_started: Instant,
+        when: &'static str,
+    ) -> bool {
         let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
-        let report = self.run_checkout_trash_catchup(
-            host_dir.as_deref(),
-            crate::checkout_trash::TRASH_CATCHUP_MAX,
-            crate::checkout_trash::sample_host_pressure,
-        );
-        let drain_secs = report.drain_time.as_secs_f64();
-        let files_per_second = if drain_secs > 0.0 {
-            (report.unlinks as f64 / drain_secs).round() as u64
-        } else {
-            0
+        if !self.checkout_trash_catchup_wanted(host_dir.as_deref()) {
+            return false;
+        }
+        let Some((router, _engine)) = artifact_worker_binaries() else {
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_lane_runtime_unverified",
+                Duration::ZERO,
+            );
+            return false;
         };
-        let worker_wall = worker_started.elapsed().as_secs_f64();
-        let drain_share_pct = if worker_wall > 0.0 {
-            (crate::checkout_trash::drain_time_this_process().as_secs_f64() * 100.0 / worker_wall)
-                .round() as u64
-        } else {
-            0
+        let root = self.main_root().to_path_buf();
+        let Ok(canonical_root) = std::fs::canonicalize(&root) else {
+            return false;
         };
-        crate::phase_telemetry::attach(
-            "checkout_trash_catchup",
-            serde_json::json!({
-                "end_reason": report.end.as_str(),
-                "slices": report.slices,
-                "entries_removed": report.entries_removed,
-                "unlinks": report.unlinks,
-                "bytes": report.bytes,
-                "drain_ms": u64::try_from(report.drain_time.as_millis()).unwrap_or(u64::MAX),
-                "elapsed_ms": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
-                "files_per_second_observed": files_per_second,
-                "busy_retries": report.busy_retries,
-                "worker_drain_share_pct": drain_share_pct,
-            }),
+        let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
+        let Ok(mut command) = self.detached_worker_command(
+            &router,
+            &canonical_root,
+            gate_scope.as_deref(),
+            &["broker", "gc", TRASH_CATCHUP_ACTION],
+        ) else {
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_lane_storage_context",
+                Duration::ZERO,
+            );
+            return false;
+        };
+        let worker_started_ms = now_ms().saturating_sub(
+            i64::try_from(worker_started.elapsed().as_millis()).unwrap_or(i64::MAX),
         );
+        command.env(
+            TRASH_CATCHUP_WORKER_STARTED_ENV,
+            worker_started_ms.to_string(),
+        );
+        configure_artifact_worker_process_group(&mut command);
+        match crate::bounded_output::spawn_serialized(&mut command) {
+            Ok(_child) => {
+                crate::phase_telemetry::add("checkout_trash_catchup_lane_spawned", Duration::ZERO);
+                crate::phase_telemetry::attach(
+                    "checkout_trash_catchup_spawn",
+                    serde_json::json!({
+                        "when": when,
+                        "after_worker_start_ms": u64::try_from(worker_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    }),
+                );
+                true
+            }
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_lane_spawn_failed",
+                    Duration::ZERO,
+                );
+                false
+            }
+        }
     }
 
     /// The detached worker's measurement lane, under the host-wide
