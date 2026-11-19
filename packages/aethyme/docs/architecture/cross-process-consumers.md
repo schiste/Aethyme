@@ -404,6 +404,53 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Tree hash spans, and a stat-seeded hash for submit's verification slot (2026-11-19)
+
+The working-tree hash (the gate cache key and the writer-quiescence proof)
+builds a private index from `read-tree HEAD`, which has no stat data, so
+`add -u` re-reads every tracked file, and then walks untracked files. Its
+cost was inferred, not measured. It is now split into spans wherever it runs,
+and submit's gate run on its freshly materialized verification slot seeds the
+private index from the slot's own index instead. With the seeded index,
+unchanged files are matched by stat data, and changed or racily clean entries
+are re-read, the way `git status` decides.
+
+- **Seeded hash (submit verification slot only).** The private index is a
+  copy of the slot's index, with the copy's modification time set to the
+  original's so Git's racy-clean rule is unchanged. A copy taken while the
+  index was being rewritten is refused. Every seeded Git command runs with
+  `core.trustctime=true`, `core.checkStat=default`, `core.fsmonitor=false`
+  and `core.untrackedCache=false`. The seeded result is used only when all of
+  these hold, each checked rather than assumed:
+  - no entry is assume-unchanged or skip-worktree (`ls-files -v`);
+  - the copied index's `write-tree` equals `HEAD^{tree}`, so nothing is
+    staged and the entries are those of a fresh `read-tree HEAD`;
+  - `core.autocrlf` is unset or false;
+  - `check-attr` reports `text`, `eol`, `crlf`, `filter`, `ident` and
+    `working-tree-encoding` as unspecified or unset on every tracked path.
+
+  Any other case, and any error, takes the full hash. Session gate runs, the
+  shared-verdict recheck, native gates, semantic-patch preview and graph
+  integrity keep the full hash. `AETHYME_TREE_HASH_SEED=off` disables the
+  seeded hash.
+- **Spans (introduced).** Inside every hash: `tree_hash_index_build` (full
+  path only), `tree_hash_tracked_rehash`, `tree_hash_untracked_walk`,
+  `tree_hash_untracked_add` and `tree_hash_write_tree`. In the seeded path:
+  `tree_hash_seeded_total`, `tree_hash_seed_index`, `tree_hash_seed_checks`
+  and `tree_hash_seed_attributes`. Per call site: `gate_inputs_tree_hash`,
+  `gate_shared_wait_tree_hash`, `session_gate_tree_hash`,
+  `native_gate_tree_hash`, `semantic_patch_tree_hash` and
+  `graph_integrity_tree_hash`.
+- **Counters (introduced).** `tree_hash_seeded`, or one of
+  `tree_hash_seed_fallback_<reason>` with `<reason>` one of `switched_off`,
+  `unreadable`, `index_moving`, `entry_flags`, `index_not_head`,
+  `content_conversion` or `git_failed`.
+- **Attachment (introduced).** `tree_hash_files` on the command's metric line:
+  `hashes`, `tracked_entries` and `untracked_files`, totals over the command.
+  `tracked_entries` counts index entries. The full path re-reads all of them;
+  the seeded path re-reads only the ones whose stat data changed, which is not
+  counted.
+
 ## Submit's graph check reports the simulated tree when graphs are not authoritative (2026-11-19)
 
 Submit's `graph_and_gate_selection` phase took 3 to 8 minutes on the busiest

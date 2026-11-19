@@ -848,7 +848,7 @@ impl Broker {
     ) -> Result<Vec<String>, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let tree = checkout.working_tree_hash()?;
+        let tree = checkout.working_tree_hash_at("session_gate_tree_hash")?;
         Ok(crate::gates::cancel_obsolete_runs(
             &mut self.store,
             &self.main_root,

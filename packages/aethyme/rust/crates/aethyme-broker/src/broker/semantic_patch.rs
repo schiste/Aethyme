@@ -121,13 +121,17 @@ impl Broker {
             let checkout = repo
                 .isolated_checkout_at(&candidate.path().join("checkout"), base)
                 .map_err(message)?;
-            if checkout.working_tree_hash().map_err(message)?
+            if checkout
+                .working_tree_hash_at("semantic_patch_tree_hash")
+                .map_err(message)?
                 != repo.commit_tree_id(base).map_err(message)?
             {
                 return Err("disposable checkout differs from the recorded commit".into());
             }
             let (files, replacements) = apply_rust_calls(checkout.root(), files, &from, &to)?;
-            let tree = checkout.working_tree_hash().map_err(message)?;
+            let tree = checkout
+                .working_tree_hash_at("semantic_patch_tree_hash")
+                .map_err(message)?;
             let patch = checkout.isolated_working_patch(base).map_err(message)?;
             if patch.is_empty() || patch.len() > MAX_PATCH_BYTES {
                 return Err("patch is empty or exceeds the artifact limit".into());
@@ -185,7 +189,7 @@ impl Broker {
                         .head_commit()
                         .is_ok_and(|head| head == result.candidate_commit);
                     let tree_matches = checkout
-                        .working_tree_hash()
+                        .working_tree_hash_at("semantic_patch_tree_hash")
                         .is_ok_and(|tree| tree == result.candidate_tree);
                     if !head_matches || !tree_matches {
                         result.gate_status = "candidate_changed";
