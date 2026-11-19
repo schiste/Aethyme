@@ -4,8 +4,10 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -73,6 +75,73 @@ def round_results(index, arm, root, repo, env, git, binary):
         return list(pool.map(gate, gate_inputs))
 
 
+
+def verify_sample(trial, previous_trees, previous_runs):
+    trees = {row["tree"] for rows in trial.values() for row in rows}
+    if len(trees) != 1 or trees & previous_trees:
+        raise ValueError("expected a new tree shared by both verification arms")
+    if any(row["returncode"] for rows in trial.values() for row in rows):
+        raise RuntimeError("verification command failed")
+    verdicts = []
+    for row in trial["broker"]:
+        results = row["results"]
+        if len(results) != 1 or results[0]["tree_hash"] != row["tree"] or results[0]["status"] != "pass":
+            raise ValueError("expected one passing verdict for the measured tree")
+        verdict = results[0]
+        if not verdict.get("run_id") or verdict["run_id"] in previous_runs:
+            raise ValueError("expected a gate run produced in this sample")
+        verdicts.append(verdict)
+    fresh = {row["run_id"]: row for row in verdicts if not row["cached"]}
+    for row in verdicts:
+        producer = fresh.get(row["run_id"])
+        if producer is None or (row["cached"] and (
+            not row.get("cache_provenance") or row["cache_provenance"] != producer.get("cache_provenance")
+        )):
+            raise ValueError("reused verdict lacks a matching producer in this sample")
+    if len(fresh) != sum(not row["cached"] for row in verdicts):
+        raise ValueError("independent executions have the same run ID")
+    previous_trees.update(trees)
+    previous_runs.update(fresh)
+    return verdicts
+
+
+def summarize(report, verdicts):
+    summary = {}
+    for arm in ("baseline", "broker"):
+        pair_wall = sorted(max(row["wall_ms"] for row in trial[arm]) for trial in report["samples"])
+        summary[arm] = {
+            "pair_median_ms": statistics.median(pair_wall),
+            "pair_p90_ms": pair_wall[math.ceil(0.9 * len(pair_wall)) - 1],
+        }
+    cached = [row for row in verdicts if row["cached"]]
+    summary["broker"].update(
+        executions=len(verdicts) - len(cached),
+        executions_avoided=len(cached),
+        waited_for_shared_verdict=sum((row["wait_duration_ms"] or 0) > 0 for row in cached),
+        reused_execution_ms=sum(row["duration_ms"] for row in cached),
+    )
+    summary["baseline"]["executions"] = len(verdicts)
+    return summary
+
+
+def write_summary(path, report):
+    summary = report["summary"]
+    shared = summary["broker"]
+    with Path(path).open("a") as stream:
+        stream.write("\n### Paired Playground shared verification\n\n")
+        stream.write(f'`{report["binary_version"]}`, {len(report["samples"])} matched pairs. '
+                     "Each pair's wall time is the slower of its two requests.\n\n")
+        stream.write("| Workflow | Median pair | p90 pair | Gate executions |\n"
+                     "| --- | ---: | ---: | ---: |\n")
+        for arm, label in (("baseline", "Direct test command"), ("broker", "Aethyme broker")):
+            row = summary[arm]
+            stream.write(f'| {label} | {row["pair_median_ms"]:.1f} ms | '
+                         f'{row["pair_p90_ms"]:.1f} ms | {row["executions"]} |\n')
+        stream.write(f'\nShared results avoided {shared["executions_avoided"]} executions. '
+                     f'{shared["waited_for_shared_verdict"]} requests waited for the shared verdict. '
+                     f'The reused executions recorded {shared["reused_execution_ms"]} ms '
+                     "of child execution time. Raw operation timings are in the artifact.\n")
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("stage", "run"))
@@ -100,25 +169,25 @@ def main():
     output = root / "results.json"
     with binary.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    report = {"binary_sha256": digest, "binary_version": run(repo, env, binary, "--version").stdout.strip(),
+    report = {"schema_version": 1, "binary_sha256": digest, "binary_version": run(repo, env, binary, "--version").stdout.strip(),
               "samples": []}
     # Reserve this receipt before running any commands that could populate the cache.
     with output.open("x") as stream:
         json.dump(report, stream, indent=2)
+    previous_trees, previous_runs, verdicts = set(), set(), []
     for index in range(1, args.samples + 1):
         arms = ("baseline", "broker") if index % 2 else ("broker", "baseline")
         trial = {arm: round_results(index, arm, root, repo, env, git, binary) for arm in arms}
         report["samples"].append(trial)
         output.write_text(json.dumps(report, indent=2) + "\n")
-        trees = {row["tree"] for rows in trial.values() for row in rows}
-        if len(trees) != 1:
-            raise ValueError("verification arms did not operate on the same tree")
-        if any(row["returncode"] for rows in trial.values() for row in rows):
-            raise RuntimeError(f"verification command failed in sample {index}; inspect {output}")
-        for row in trial["broker"]:
-            results = row["results"]
-            if len(results) != 1 or results[0]["tree_hash"] != row["tree"] or results[0]["status"] != "pass":
-                raise ValueError("expected one passing verdict for the measured tree")
+        try:
+            verdicts.extend(verify_sample(trial, previous_trees, previous_runs))
+        except (RuntimeError, ValueError) as error:
+            raise RuntimeError(f"invalid sample {index}: {error}; inspect {output}") from error
+    report["summary"] = summarize(report, verdicts)
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    if github_summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        write_summary(github_summary, report)
     print(output)
     return 0
 
