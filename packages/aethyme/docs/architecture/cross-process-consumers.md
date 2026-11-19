@@ -2534,7 +2534,14 @@ foreground sweep, and `open_gc_worker_admission` measures admission for
 the detached worker. The zero-duration `open_gc_inline_cadence_skip` event
 marks an open that uses recent sweep progress to skip headroom sampling.
 Confirmed-journal-only opens omit the sweep, worker, and rotation probes.
-Subphases are nested in their enclosing durations.
+Subphases are nested in their enclosing durations. Since 2026-11-19 worker
+admission nests `worker_admission_cleanup_outbox` (queueing a due post-close
+checkout cleanup), `worker_admission_compact_backfill`,
+`worker_admission_due_checks` (the recorded reads that decide whether any
+lane is due; absent, like the backfill, when the checkout is ephemeral or
+the worker is suppressed) and
+`worker_admission_launch` (runtime checks, the worker lock and the spawn;
+only when a lane is due).
 
 Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
 lookup, the initial worktree snapshot, receipt and admission;
@@ -2544,6 +2551,38 @@ command metrics include these timings plus `broker_open`, without child
 arguments. Timings are wall-clock milliseconds and do not sum to the full
 duration: startup, rendering and final bookkeeping are outside these phases.
 Failures before a report is returned have no phase breakdown.
+
+Introduced 2026-11-19. Guarded exec also records `precheck`,
+`command_and_supervision` and `postcheck` as spans, so `broker commit` and
+preparation, which wrap guarded exec without naming phases, carry them on
+their metric lines; `broker exec` keeps the values it names itself. Nested
+spans split the two checks: `exec_precheck_session` (session row and checkout
+discovery), `exec_precheck_census` (the dirty and untracked path snapshot and
+path identities), `exec_precheck_receipt` (receipt and helper observation
+rows), `exec_precheck_artifact_use` (artifact-use admission);
+`exec_postcheck_receipt` (outcome rows), `exec_postcheck_census` (the second
+snapshot and identity comparison), `exec_postcheck_audit` (the ownership
+audit and its receipt row) and `exec_postcheck_overlap_changes` (overlap
+content attached to warned leases). `broker commit` adds `commit_preflight`
+(session verification, path census and ownership audit before dispatch) and
+`commit_post_audit` (history shape, committed-path census and ownership audit
+after the command); the Git command and its hooks are inside
+`command_and_supervision`.
+
+Introduced 2026-11-19. The session view of `broker status` (`--session`, or
+compact status from a session checkout) adds spans `status_session_lookup`
+(finding the session for the current checkout), `status_session_coordination`,
+`status_session_block`, `status_session_scratch_dir`,
+`status_session_lease_requests`, `status_session_peers`,
+`status_main_checkout` (sync state and its advice), `status_session_stack` and
+`status_session_render` (revisioned rendering and output).
+
+Introduced 2026-11-19. `finish` measures the checkout it is about to remove
+before it takes the repository lifecycle claim, recorded as
+`finish_size_walk_unlocked` (the walk inside it is still `size_walk`). The
+figure it reports as `cleanup.reclaimed_bytes` is that measurement, as before.
+An already-closed session that `finish` only judges for cleanup eligibility is
+no longer walked at all.
 
 CLI exec also commits an opaque receipt before command dispatch and adds its id
 to the final text/JSON report. `broker advanced exec-status --session <id>`
