@@ -1981,31 +1981,60 @@ fn gc_trash_drain(
 /// <root>`): it raises its own disk I/O out of the worker's throttled
 /// policy, then runs the lane's laps for this repository.
 fn run_trash_catchup_lane_process(parsed: Parsed) -> Result<(), UsageError> {
-    if !matches!(
-        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV).as_deref(),
-        Ok("1")
-    ) || parsed.positional.len() != 2
-    {
-        return Err(UsageError::Message(
-            "the trash catch-up lane process is started only by the background worker".into(),
-        ));
-    }
-    let priority = crate::gc::raise_trash_deleter_priority();
-    crate::phase_telemetry::attach(
-        "checkout_trash_catchup_priority",
-        serde_json::json!({
-            "io_policy": priority.io_policy,
-            "darwin_bg_cleared": priority.darwin_bg_cleared,
-            "cpu_niced": priority.cpu_niced,
-        }),
-    );
-    let root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+    // The same invocation checks as the worker entry, before anything opens.
+    validate_artifact_sweep_worker_invocation(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV)
+            .ok()
+            .as_deref(),
+        parsed.read_only_snapshot,
+        parsed.positional.len(),
+        artifact_worker_test_or_build_environment(),
+    )?;
+    let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
         UsageError::Message(format!(
             "cannot resolve the trash catch-up repository: {error}"
         ))
     })?;
+    let discovered = crate::GitRepo::discover(&requested_root)?;
+    let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
+    if repository_root != requested_root {
+        return Err(UsageError::Message(
+            "the trash catch-up repository does not match its main checkout".into(),
+        ));
+    }
+    if crate::host_state::path_is_ephemeral(&repository_root)
+        || !crate::gc::artifact_worker_runtime_is_aligned()
+    {
+        return Err(UsageError::Message(
+            "the trash catch-up runtime or repository is not eligible".into(),
+        ));
+    }
+    let priority = crate::gc::raise_trash_deleter_priority();
+    // What took effect, read back: a raise the platform ignored stays
+    // visible in the first reading.
+    let effective = crate::gc::current_io_policy();
+    if effective == "throttle" {
+        crate::phase_telemetry::add(
+            "checkout_trash_catchup_priority_not_raised",
+            std::time::Duration::ZERO,
+        );
+    }
+    if priority.io_policy == "important" && effective != "throttle" {
+        // Below the headroom the drain no longer has the OS throttle as a
+        // bound: it is held to the catch-up rate instead of running unpaced.
+        crate::checkout_trash::mark_priority_raised();
+    }
+    crate::phase_telemetry::attach(
+        "checkout_trash_catchup_priority",
+        serde_json::json!({
+            "io_policy": effective,
+            "requested": priority.io_policy,
+            "darwin_bg_cleared": priority.darwin_bg_cleared,
+            "cpu_niced": priority.cpu_niced,
+        }),
+    );
     // No unrelated startup GC maintenance: this process only drains.
-    let broker = Broker::open_for_cleanup_resolve(&root)?;
+    let broker = Broker::open_for_cleanup_resolve(&repository_root)?;
     let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
     let worker_started_ms = std::env::var(crate::gc::TRASH_CATCHUP_WORKER_STARTED_ENV)
         .ok()
@@ -2013,7 +2042,7 @@ fn run_trash_catchup_lane_process(parsed: Parsed) -> Result<(), UsageError> {
     broker.run_checkout_trash_catchup_process(
         host_dir.as_deref(),
         worker_started_ms,
-        priority.io_policy,
+        effective,
         crate::checkout_trash::sample_host_pressure,
     );
     Ok(())
@@ -3189,6 +3218,43 @@ mod artifact_worker_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
         (owner, storage, broker)
+    }
+
+    /// The lane process's body records `checkout_trash_catchup` (with the
+    /// I/O policy) into the command's recorder, which the command metric
+    /// row is built from; the hidden action is refused outside the worker.
+    #[test]
+    fn the_trash_catchup_lane_records_its_attachment_and_is_refused_in_tests() {
+        let (owner, _storage, broker) = worker_environment_fixture();
+        let host = owner.path().join("host-state");
+        std::fs::create_dir_all(&host).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.run_checkout_trash_catchup_process(
+                Some(&host),
+                Some(crate::clock::epoch_ms()),
+                "important",
+                crate::checkout_trash::HostPressure::default,
+            );
+        }
+        let attachments = recorder.attachments();
+        let lane = attachments
+            .get("checkout_trash_catchup")
+            .expect("the lane attaches its record");
+        assert_eq!(lane["io_policy"], "important", "{lane}");
+        assert_eq!(lane["end_reason"], "caught_up", "{lane}");
+        // The hidden action runs the worker entry's invocation checks: in a
+        // test (or build) environment it is refused before anything opens.
+        assert!(
+            validate_artifact_sweep_worker_invocation(
+                Some("1"),
+                false,
+                2,
+                artifact_worker_test_or_build_environment(),
+            )
+            .is_err()
+        );
     }
 
     /// `gc trash drain` refuses, removing nothing, while another catch-up

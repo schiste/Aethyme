@@ -3824,8 +3824,8 @@ pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 #[cfg(test)]
 pub(crate) use retire::TRASH_CATCHUP_LOCK_FILE;
 pub(crate) use retire::{
-    CatchupLaneState, TRASH_CATCHUP_MAX_LAPS, TrashCatchupBounds, TrashCatchupEnd,
-    restore_incomplete_reason, take_last_checkout_restore,
+    TRASH_CATCHUP_MAX_LAPS, TrashCatchupBounds, TrashCatchupEnd, restore_incomplete_reason,
+    take_last_checkout_restore,
 };
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]

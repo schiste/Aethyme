@@ -1010,6 +1010,10 @@ pub(crate) struct DrainPacer {
     ceiling: Option<u32>,
     /// Deleter threads sharing the rate: each paces itself at its share.
     share: u32,
+    /// The rate the unpaced mode (below the headroom) is held to: set in a
+    /// process that raised its own disk I/O priority, where the OS throttle
+    /// no longer bounds it.
+    unpaced_cap: Option<u32>,
     /// Stop the drain, resumably, as soon as a reading shows critical
     /// memory pressure (the continuing catch-up lane), instead of going on
     /// at the floor.
@@ -1028,6 +1032,7 @@ impl DrainPacer {
             pace,
             ceiling: None,
             share: 1,
+            unpaced_cap: None,
             yield_on_memory_critical: false,
             memory_critical: false,
         }
@@ -1042,9 +1047,20 @@ impl DrainPacer {
             pace: DeleterPace::for_need(need, host),
             ceiling: None,
             share: 1,
+            unpaced_cap: PRIORITY_RAISED
+                .load(Ordering::Relaxed)
+                .then_some(DELETER_CATCHUP_UNLINKS_PER_SECOND),
             yield_on_memory_critical: false,
             memory_critical: host.memory_critical,
         }
+    }
+
+    /// Hold the unpaced mode to `cap` unlinks a second (and the configured
+    /// ceiling); `None` leaves it unpaced.
+    #[cfg(test)]
+    pub(crate) fn with_unpaced_cap(mut self, cap: Option<u32>) -> Self {
+        self.unpaced_cap = cap;
+        self
     }
 
     /// Pace one of `threads` deleter threads: its share of the rate, so the
@@ -1090,6 +1106,7 @@ impl DrainPacer {
     pub(crate) fn unlinks_per_second(&self) -> Option<u32> {
         self.pace
             .unlinks_per_second()
+            .or(self.unpaced_cap)
             .map(|rate| self.ceiling.map_or(rate, |ceiling| rate.min(ceiling)))
             .map(|rate| (rate / self.share.max(1)).max(1))
     }
@@ -1404,6 +1421,17 @@ impl TrashDrainReport {
             "finished"
         }
     }
+}
+
+/// This process raised its own disk I/O priority (the worker's trash
+/// catch-up lane process): its below-headroom drains are held to the
+/// catch-up rate instead of running unpaced.
+static PRIORITY_RAISED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process raised its disk I/O priority out of the
+/// worker's throttle.
+pub(crate) fn mark_priority_raised() {
+    PRIORITY_RAISED.store(true, Ordering::Relaxed);
 }
 
 /// Wall time this process has spent in [`drain_trash_paced`], for the
@@ -2628,6 +2656,34 @@ mod tests {
         // Unpaced never sleeps.
         let mut unpaced = RateWindow::new(None, start);
         assert_eq!(unpaced.admit(start), None);
+    }
+
+    /// In a process that raised its disk I/O priority, the below-headroom
+    /// mode is held to the catch-up rate (and the configured ceiling)
+    /// instead of running unpaced; elsewhere it stays unpaced.
+    #[test]
+    fn a_raised_process_caps_the_unpaced_mode() {
+        set_scripted_pressure(HostPressure::default());
+        let raised = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND));
+        assert_eq!(raised.pace(), DeleterPace::Unpaced);
+        assert_eq!(
+            raised.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+        let ceiling = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND))
+            .with_ceiling(Some(500));
+        assert_eq!(ceiling.unlinks_per_second(), Some(500));
+        let worker =
+            DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure).with_unpaced_cap(None);
+        assert_eq!(worker.unlinks_per_second(), None);
+        let paced = DrainPacer::for_need(DrainNeed::Gentle, scripted_pressure)
+            .with_unpaced_cap(Some(DELETER_CATCHUP_UNLINKS_PER_SECOND));
+        assert_eq!(
+            paced.unlinks_per_second(),
+            Some(DELETER_STEADY_UNLINKS_PER_SECOND)
+        );
     }
 
     /// An explicitly configured rate holds every paced mode at or below it;

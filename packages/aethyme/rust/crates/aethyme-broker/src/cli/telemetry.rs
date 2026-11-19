@@ -119,6 +119,10 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "capture",
     "cleanup",
     "gc",
+    // `gc __trash-catchup` (the worker's trash catch-up lane process) and
+    // `gc trash drain`.
+    "__trash-catchup",
+    "trash",
     "storage",
     // `gc reclaim` resolves to `reclaim`. A plan attaches its phase timings
     // and counts, which is what records it; see `command_records_metric`.
@@ -523,10 +527,13 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         // The detached artifact worker writes one phase-timing line per run,
         // so its removal slices leave timing evidence.
-        Some("gc") => matches!(
-            args.get(1).map(String::as_str),
-            Some("apply" | "sweep" | "__continue-artifacts")
-        ),
+        // The trash catch-up lane process and the operator's `gc trash
+        // drain` record their lane (`checkout_trash_catchup`) and drains.
+        Some("gc") => match args.get(1).map(String::as_str) {
+            Some("apply" | "sweep" | "__continue-artifacts" | "__trash-catchup") => true,
+            Some("trash") => args.get(2).map(String::as_str) == Some("drain"),
+            _ => false,
+        },
         // A reclaim plan is an observation and writes no outcome event; it
         // records its timing line by attaching phase details once it has run,
         // so a refused selector still leaves no telemetry behind. An apply
@@ -625,7 +632,8 @@ fn command_records_outcome(args: &[String]) -> bool {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("gates"), Some("affected")) | (Some("gc"), Some("__continue-artifacts"))
+        (Some("gates"), Some("affected"))
+            | (Some("gc"), Some("__continue-artifacts" | "__trash-catchup"))
     ) && command_records_metric(args)
 }
 
@@ -797,6 +805,24 @@ mod tests {
         let worker = ["gc", "__continue-artifacts", "/repository"].map(str::to_string);
         assert!(command_records_metric(&worker));
         assert!(!command_records_outcome(&worker));
+    }
+
+    /// The trash catch-up lane process writes its own row (labelled, no
+    /// outcome event, like the worker), and so does `gc trash drain`.
+    #[test]
+    fn the_trash_catchup_lane_and_gc_trash_drain_write_metric_rows() {
+        let lane = ["gc", "__trash-catchup", "/repository"].map(str::to_string);
+        assert!(command_records_metric(&lane));
+        assert!(!command_records_outcome(&lane));
+        assert_eq!(
+            safe_command_surface(&lane).as_deref(),
+            Some("gc.__trash-catchup")
+        );
+        let drain = ["gc", "trash", "drain", "--json"].map(str::to_string);
+        assert!(command_records_metric(&drain));
+        assert_eq!(safe_command_surface(&drain).as_deref(), Some("gc.trash"));
+        let other = ["gc", "trash", "list"].map(str::to_string);
+        assert!(!command_records_metric(&other));
     }
 
     #[test]

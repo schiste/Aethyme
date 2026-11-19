@@ -9176,20 +9176,17 @@ impl Broker {
 
     /// Whether this detached worker should start the trash catch-up lane:
     /// the worker environment, a durable repository past the post-boot
-    /// hold, entries in the trash, and no lane of this repository live (a
-    /// live lane of another repository is waited for by ours).
+    /// hold, and `checkout_trash_catchup_needed` (a deletable entry, no lane
+    /// process of this repository alive; another repository's live lane is
+    /// waited for by ours).
     fn checkout_trash_catchup_wanted(&self, host_dir: Option<&Path>) -> bool {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
             || crate::host_state::path_is_ephemeral(self.main_root())
             || artifact_worker_post_boot_hold_now().is_some()
-            || self.checkout_trash_rows().is_empty()
         {
             return false;
         }
-        !host_dir.is_some_and(|dir| {
-            self.checkout_trash_catchup_lane_state(dir)
-                == crate::broker::CatchupLaneState::ThisRepository
-        })
+        self.checkout_trash_catchup_needed(host_dir)
     }
 
     /// Start the catch-up lane process (`broker gc __trash-catchup`),
