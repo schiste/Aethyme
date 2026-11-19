@@ -1977,13 +1977,23 @@ impl Broker {
         if let Some(progress) = progress {
             progress.subphase("checking graph and selecting gates");
         }
+        let selection_policy = crate::phase_telemetry::span("submit_selection_policy_load");
         let graph_policy =
             crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &base)?;
         let graph_policy_changed =
             crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), merge_commit)
                 .map_or(true, |merged| merged != graph_policy);
-        let graph_integrity =
-            crate::graph_integrity::verify_disposable_checkout(&sim_worktree, &graph_policy);
+        drop(selection_policy);
+        // The slot was just materialized from `merge_commit`, whose tree is
+        // the simulated tree, and nothing has written to it since.
+        let graph_integrity = {
+            let _span = crate::phase_telemetry::span("submit_graph_integrity");
+            crate::graph_integrity::verify_disposable_checkout_of_tree(
+                &sim_worktree,
+                &graph_policy,
+                &simulation.tree,
+            )
+        };
         if graph_integrity.enforced {
             self.store().append_event(
                 crate::events::GRAPH_INTEGRITY_CHECKED,
@@ -1998,6 +2008,7 @@ impl Broker {
         // verification — recorded explicitly so nobody mistakes it for a
         // passing check run. A *malformed* gates.toml at the base stays a
         // hard error (broken intent, not absent intent).
+        let gate_load = crate::phase_telemetry::span("submit_gate_definitions_load");
         let (gates, gate_configuration_present) = match self.load_and_sync_gates_at_commit(&base)? {
             Some(gates) => (gates, true),
             None => (Vec::new(), false),
@@ -2006,6 +2017,7 @@ impl Broker {
             != self
                 .repo_handle()
                 .config_toml_at_commit(merge_commit, "gates")?;
+        drop(gate_load);
         if gate_policy_changed || graph_policy_changed {
             self.store().append_event(
                 crate::events::MERGE_POLICY_DEFERRED,
