@@ -92,6 +92,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and require a telemetry hit in the smoke test. Measure a fresh-state
   control too.
 
+- For paired gate benchmarks, give every sample a fresh exact tree shared by
+  both arms. Keep PATH and the tool environment stable so unrelated discovery
+  caches behave normally. Count an avoided execution only when a reused verdict
+  points to a fresh producer in that pair with the same execution profile.
+  Record pair wall time and child work separately.
+
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and verify the actual `SessionStart` payload arrives in
   the worker. Preserve the installed plugin's trust records, including
