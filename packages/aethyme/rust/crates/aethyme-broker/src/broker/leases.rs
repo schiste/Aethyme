@@ -5649,6 +5649,7 @@ impl Broker {
                 reason: format!("{reason}; no command ran"),
             });
         }
+        let preflight = crate::phase_telemetry::span("commit_preflight");
         let preflight_deadline = std::time::Instant::now() + SESSION_COMMIT_STATUS_BUDGET;
         let preflight_git_deadline = crate::git::limit_git_until(preflight_deadline);
         let (_session, checkout, head_before) = self
@@ -5701,6 +5702,7 @@ impl Broker {
             });
         }
         drop(preflight_git_deadline);
+        drop(preflight);
 
         let mut command = Vec::with_capacity(commit_args.len() + 2);
         command.push("git".to_owned());
@@ -5719,6 +5721,7 @@ impl Broker {
         let mut committed_paths = None;
         let mut committed_ownership = None;
         let mut post_commit_audit_error = None;
+        let post_audit = crate::phase_telemetry::span("commit_post_audit");
         let post_commit_deadline = std::time::Instant::now() + SESSION_COMMIT_STATUS_BUDGET;
         let post_commit_git_deadline = crate::git::limit_git_until(post_commit_deadline);
         let post_context = self.session_commit_context(session_id, caller_cwd);
@@ -5794,6 +5797,7 @@ impl Broker {
             }
         }
         drop(post_commit_git_deadline);
+        drop(post_audit);
 
         let post_commit_audit_complete = post_commit_audit_error.is_none()
             && committed_paths.is_some()
@@ -6258,14 +6262,19 @@ impl Broker {
             return Err(BrokerOpError::MissingExecCommand);
         }
         let precheck_started = std::time::Instant::now();
-        let session = self.store.session(session_id)?;
         // Global implicit leases and overlap classification are diagnostic
         // snapshots maintained by explicit refresh/submit paths. Guarded
         // authorization below reads current explicit leases, applies current
         // holder policy, and checks the foreign-file snapshot directly. Avoid
         // rescanning every live checkout here; leave the refresh timestamp
         // unchanged so it continues to describe the diagnostic snapshot.
-        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let (session, checkout) = {
+            let _span = crate::phase_telemetry::span("exec_precheck_session");
+            let session = self.store.session(session_id)?;
+            let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+            (session, checkout)
+        };
+        let census = crate::phase_telemetry::span("exec_precheck_census");
         let (mut before_dirty, before_untracked) = checkout.dirty_and_untracked_paths()?;
         before_dirty.sort();
         before_dirty.dedup();
@@ -6273,7 +6282,9 @@ impl Broker {
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
+        drop(census);
 
+        let receipt = crate::phase_telemetry::span("exec_precheck_receipt");
         let receipt_id = if record_receipt {
             Some(self.store.begin_guarded_exec_receipt(session_id)?)
         } else {
@@ -6284,6 +6295,8 @@ impl Broker {
             .map(|id| self.store.helper_observation_target(session_id, id))
             .transpose()?
             .flatten();
+        drop(receipt);
+        let artifact_admission = crate::phase_telemetry::span("exec_precheck_artifact_use");
         let mut artifact_use = match crate::file_lock::artifact_use::begin_artifact_use(
             self.main_root(),
             checkout.root(),
@@ -6309,6 +6322,7 @@ impl Broker {
                 .into());
             }
         };
+        drop(artifact_admission);
         let mut pending_not_started_dispatch = false;
         let mut terminal_dispatch_recorded = false;
         let precheck_ms = precheck_started.elapsed().as_millis() as u64;
@@ -6398,6 +6412,7 @@ impl Broker {
             }
         };
 
+        let receipt_outcome = crate::phase_telemetry::span("exec_postcheck_receipt");
         if let Some(receipt_id) = receipt_id.as_deref() {
             if status.command_started {
                 let command_outcome = if status.timed_out {
@@ -6428,7 +6443,9 @@ impl Broker {
                 );
             }
         }
+        drop(receipt_outcome);
 
+        let census = crate::phase_telemetry::span("exec_postcheck_census");
         let (mut after_dirty, after_untracked) = checkout.dirty_and_untracked_paths()?;
         after_dirty.sort();
         after_dirty.dedup();
@@ -6459,6 +6476,8 @@ impl Broker {
         touched.extend(modified_preexisting_dirty_paths.iter().cloned());
         touched.sort();
         touched.dedup();
+        drop(census);
+        let ownership_audit = crate::phase_telemetry::span("exec_postcheck_audit");
         let audit = self.audit_paths(
             session_id,
             "GUARDED_EXEC_BEFORE",
@@ -6477,17 +6496,29 @@ impl Broker {
                 ),
             );
         }
+        drop(ownership_audit);
         let command_success = status.succeeded;
         let ok = command_success && audit.ok;
         let mut warned_leases = audit.warned_leases;
-        self.attach_overlap_changes(session_id, &touched, &mut warned_leases);
+        {
+            let _span = crate::phase_telemetry::span("exec_postcheck_overlap_changes");
+            self.attach_overlap_changes(session_id, &touched, &mut warned_leases);
+        }
+        let postcheck_ms = audit_started.elapsed().as_millis() as u64;
+        // Also as spans, so a command that wraps guarded exec without naming
+        // these phases itself (`broker commit`, preparation) records them.
+        // A command that does name them (`broker exec`) keeps its own values.
+        for (name, elapsed_ms) in [
+            ("precheck", precheck_ms),
+            ("command_and_supervision", execution_ms),
+            ("postcheck", postcheck_ms),
+        ] {
+            crate::phase_telemetry::add(name, std::time::Duration::from_millis(elapsed_ms));
+        }
         let phase_timings_ms = std::collections::BTreeMap::from([
             ("precheck".to_string(), precheck_ms),
             ("command_and_supervision".to_string(), execution_ms),
-            (
-                "postcheck".to_string(),
-                audit_started.elapsed().as_millis() as u64,
-            ),
+            ("postcheck".to_string(), postcheck_ms),
         ]);
         let report = GuardedExecReport {
             session_id,
@@ -8392,6 +8423,64 @@ mod generic_guarded_exec_tests {
             !report.execution_receipt_id.is_empty(),
             "the command's durable receipt remains available for investigation"
         );
+    }
+
+    /// `broker commit` names no phases itself, so before these spans its
+    /// metric line attributed under a tenth of its time: the Git command and
+    /// its hooks ran inside guarded exec, whose timings only `broker exec`
+    /// copied into its line.
+    #[test]
+    fn local_commit_records_where_its_time_goes() {
+        let (repository, _storage, mut broker) = fixture();
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        let session = broker
+            .start_worktree("session-local commit telemetry", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path)
+            .canonicalize()
+            .unwrap();
+        broker.claim_lease(session.id, "tracked.txt", None).unwrap();
+        std::fs::write(worktree.join("tracked.txt"), "leased edit\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .guarded_commit_for_cli(
+                    session.id,
+                    &worktree,
+                    &["-m".into(), "record the phases".into()],
+                    true,
+                    false,
+                    None,
+                )
+                .unwrap()
+        };
+
+        assert!(report.execution.command_success, "{report:?}");
+        let (_, counts) = recorder.totals();
+        for phase in [
+            "commit_preflight",
+            "precheck",
+            "exec_precheck_session",
+            "exec_precheck_census",
+            "exec_precheck_receipt",
+            "exec_precheck_artifact_use",
+            "command_and_supervision",
+            "postcheck",
+            "exec_postcheck_receipt",
+            "exec_postcheck_census",
+            "exec_postcheck_audit",
+            "exec_postcheck_overlap_changes",
+            "commit_post_audit",
+        ] {
+            assert_eq!(counts.get(phase), Some(&1), "{phase}: {counts:?}");
+        }
     }
 
     #[cfg(unix)]

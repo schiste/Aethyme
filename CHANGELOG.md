@@ -4,6 +4,33 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.134] - 2026-11-19
+
+### Fixed
+
+- The checkout trash is now actually deleted while other work uses the disk. The background worker runs at the lowest disk priority, and on macOS that priority delays each of its disk operations whenever anything else used the same disk recently. On the busiest repository the deleter managed 25 files per second while a plain removal on the same volume in the same minute ran several hundred times faster, so the trash grew to over a thousand entries. The trash catch-up now runs as its own process, started by the worker as soon as a deletable entry exists, at normal disk priority and reduced CPU priority. It keeps every existing bound: the rate limit (8,000, 4,000 or 200 unlinks per second by host pressure), the configured ceiling, the 250 ms debt cap, the yield at critical memory pressure, and a 20-minute lap, with up to three laps back to back. Below the storage headroom it is held to 8,000 unlinks per second instead of running unpaced. What is deleted is unchanged (#1837).
+- The catch-up no longer waits for the worker's other lanes, which take 10 to 18 minutes on the busiest repository (#1837).
+- One catch-up process per repository; repositories take turns on the host-wide lane, a waiting repository gets it after the holder's current lap, and a retirement run skips its own trash drain only while its own repository's catch-up is live (#1837).
+- `finish` measures the checkout's size before taking the repository-wide lifecycle claim instead of while holding it. On the busiest repository that walk held the claim for about 37 s per finish (#1838).
+- In the trash deleter, ancestor identities are re-checked every 256 unlinks or every 50 ms, whichever comes first, so a directory moved out of the trash mid-removal loses at most the unlink already under way. Catch-up byte figures are measured once per slice (#1833).
+
+### Added
+
+- `aethyme broker gc trash drain [--max-minutes <n>] [--json]` runs the trash catch-up now for the current repository, with the same guards and pacing, and reports entries removed, files per second and what remains. It refuses while another catch-up is live (#1837).
+- Phase timings for `commit`, the checks before and after `exec`, worker admission on broker open, and the session `status` view. `commit` and `prepare` rows now carry the guarded command's `precheck`, `command_and_supervision` and `postcheck` (#1838).
+- Metric rows `gc.__trash-catchup` and `gc.trash`, with `io_policy` (the policy read back from the system), `catchup_start_delay_ms`, laps and end reason; counter `checkout_trash_catchup_priority_not_raised` when the priority raise did not take (#1837).
+
+### Upgrade notes
+
+- The `checkout_trash_catchup` attachment moves from the worker's `gc` row to the catch-up process's own `gc.__trash-catchup` row.
+- A repository that wants a quieter deleter sets `[cleanup] unattended_unlinks_per_second`; it applies in every mode of the catch-up process.
+
+### Known issues
+
+- Other bulk removals inside the worker still run at the lowest disk priority and can be starved the same way: the artifact cache sweep, checkout removal, compact-checkout removal and recovery-archive eviction.
+- The manual `gc trash drain` runs at the caller's priority and is unpaced below the storage headroom.
+- The checks before and after each `exec` are unchanged; the new timings show which step costs most.
+
 ## [0.8.133] - 2026-11-19
 
 ### Fixed

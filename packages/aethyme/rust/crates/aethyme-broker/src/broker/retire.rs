@@ -124,8 +124,64 @@ const TRASH_CATCHUP_GAP: std::time::Duration = std::time::Duration::from_secs(1)
 /// How long the catch-up lane keeps retrying a deleter lock held elsewhere
 /// before it ends.
 const TRASH_CATCHUP_BUSY_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a starting lane retries the lane lock, so a retirement run's
+/// momentary probe of it never turns a lane away.
+const TRASH_CATCHUP_LANE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Back-to-back laps one worker (or one `gc trash drain`) runs at most,
+/// each up to `checkout_trash::TRASH_CATCHUP_MAX`.
+pub(crate) const TRASH_CATCHUP_MAX_LAPS: usize = 3;
+/// How often a worker's lane retries a host lane held by another
+/// repository's lane.
+const TRASH_CATCHUP_LANE_RETRY: std::time::Duration = std::time::Duration::from_secs(45);
+/// File beside the lane lock in which a waiting lane names its repository.
+pub(crate) const TRASH_CATCHUP_WAITER_FILE: &str = "checkout-trash-catchup.waiting";
+/// A waiter note older than this is ignored (a waiter refreshes it at
+/// every retry).
+const TRASH_CATCHUP_WAITER_FRESH: std::time::Duration = std::time::Duration::from_secs(120);
 /// File name of the host-wide lock that keeps a second catch-up lane out.
 pub(crate) const TRASH_CATCHUP_LOCK_FILE: &str = "checkout-trash-catchup.lock";
+
+/// How long, and how many laps, catch-up runs back to back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrashCatchupBounds {
+    /// Wall time for all laps together.
+    pub(crate) total: std::time::Duration,
+    /// Wall time for one lap.
+    pub(crate) lap_max: std::time::Duration,
+    pub(crate) max_laps: usize,
+    /// Keep draining while any entry is deletable (the operator's command),
+    /// not only while the trash is behind.
+    pub(crate) until_empty: bool,
+    /// When the host lane is held by another repository's lane, try again
+    /// this often within `total` (the worker), instead of ending.
+    pub(crate) lane_retry: Option<std::time::Duration>,
+}
+
+impl TrashCatchupBounds {
+    /// The worker's lane process: up to [`TRASH_CATCHUP_MAX_LAPS`] laps of
+    /// `checkout_trash::TRASH_CATCHUP_MAX`, until no entry is deletable
+    /// (the worker starts it whenever the trash holds entries, so all of
+    /// its trash deletion runs unthrottled), waiting for another
+    /// repository's lane every [`TRASH_CATCHUP_LANE_RETRY`].
+    pub(crate) fn worker() -> Self {
+        let lap_max = crate::checkout_trash::TRASH_CATCHUP_MAX;
+        Self {
+            total: lap_max * TRASH_CATCHUP_MAX_LAPS as u32,
+            lap_max,
+            max_laps: TRASH_CATCHUP_MAX_LAPS,
+            until_empty: true,
+            lane_retry: Some(TRASH_CATCHUP_LANE_RETRY),
+        }
+    }
+}
+
+/// Whose catch-up lane holds the host lane lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchupLaneState {
+    Free,
+    ThisRepository,
+    OtherRepository,
+}
 
 /// Why a continuing catch-up lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +228,10 @@ pub(crate) struct TrashCatchupReport {
     pub(crate) elapsed: std::time::Duration,
     /// Slices that found the deleter lock held elsewhere.
     pub(crate) busy_retries: u32,
+    /// When the first slice started (`None`: none did).
+    pub(crate) first_slice_at: Option<Instant>,
+    /// The lap found the host lane held by another repository's lane.
+    pub(crate) lane_held_by_other_repository: bool,
 }
 
 impl TrashCatchupReport {
@@ -185,6 +245,8 @@ impl TrashCatchupReport {
             drain_time: std::time::Duration::ZERO,
             elapsed: std::time::Duration::ZERO,
             busy_retries: 0,
+            first_slice_at: None,
+            lane_held_by_other_repository: false,
         }
     }
 }
@@ -2588,7 +2650,8 @@ impl Broker {
                 drain_deadline.saturating_duration_since(deadline),
             );
         }
-        report.trash = self.drain_checkout_trash(drain_deadline);
+        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+        report.trash = self.retirement_trash_drain(host_dir.as_deref(), drain_deadline);
         self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
@@ -2648,12 +2711,13 @@ impl Broker {
             }),
         );
         let previous = self.checkout_retirement_progress();
-        let shrinking =
-            report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
+        let shrinking = report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
                 || report.strip.directories_stripped > 0
                 || report.idle_strip.strip.directories_stripped > 0
                 || report.scratch.retired > 0
                 || report.trash.entries_removed > 0
+                // A live catch-up lane drains the trash meanwhile.
+                || report.trash.skipped_for_catchup_lane
                 || (report.trash.entries_pending == 0 && kept == 0);
         let progress = CheckoutRetirementProgress {
             trash_pending: report.trash.entries_pending,
@@ -3037,26 +3101,7 @@ impl Broker {
         let applied = self.update_meta_json(
             CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
             |current: &mut crate::checkout_trash::TrashRows| {
-                for (dir, entries) in &before {
-                    for name in entries.keys() {
-                        match rows.get(dir).and_then(|after| after.get(name)) {
-                            Some(row) => {
-                                if let Some(stored) =
-                                    current.get_mut(dir).and_then(|stored| stored.get_mut(name))
-                                {
-                                    stored.failures = row.failures;
-                                    stored.pending = row.pending;
-                                }
-                            }
-                            None => {
-                                if let Some(stored) = current.get_mut(dir) {
-                                    stored.remove(name);
-                                }
-                            }
-                        }
-                    }
-                }
-                current.retain(|_, entries| !entries.is_empty());
+                crate::checkout_trash::apply_drain_rows(current, &before, &rows);
             },
         );
         crate::warn_unrecorded("record the checkout trash drain", applied);
@@ -3116,6 +3161,7 @@ impl Broker {
                 "process_use_unknown": report.process_use_unknown,
                 "end_reason": report.end_reason(),
                 "threads": threads,
+                "io_policy": crate::gc::current_io_policy(),
                 "entries_pending": report.entries_pending,
                 "oldest_pending_age_s": oldest_pending_age_s,
             }),
@@ -3126,7 +3172,7 @@ impl Broker {
     /// The backlog the deleter can work on: `rows` less the entries the last
     /// run passed over because a process still used them (they stay in the
     /// advice evidence, not in the pace or share decision).
-    fn checkout_trash_deletable_backlog(
+    pub(crate) fn checkout_trash_deletable_backlog(
         &self,
         rows: &crate::checkout_trash::TrashRows,
     ) -> crate::checkout_trash::TrashBacklog {
@@ -3149,23 +3195,53 @@ impl Broker {
     /// lock: the detached worker runs it after releasing its worker lock,
     /// so the next worker run (and its strip and retirement) starts as
     /// usual, and that run's drain takes the deleter lock between slices.
+    #[cfg(test)]
     pub(crate) fn run_checkout_trash_catchup(
         &self,
         host_dir: Option<&Path>,
         cap: std::time::Duration,
         sample: fn() -> crate::checkout_trash::HostPressure,
     ) -> TrashCatchupReport {
+        self.run_checkout_trash_catchup_lap(host_dir, cap, sample, false)
+    }
+
+    /// One catch-up lap, as described above; `until_empty` (the operator's
+    /// `gc trash drain`) keeps draining while any entry is deletable, not
+    /// only while the trash is behind.
+    pub(crate) fn run_checkout_trash_catchup_lap(
+        &self,
+        host_dir: Option<&Path>,
+        cap: std::time::Duration,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+        until_empty: bool,
+    ) -> TrashCatchupReport {
         let _span = crate::phase_telemetry::span("checkout_trash_catchup");
         let started = Instant::now();
         let end_at = started + cap;
         let mut report = TrashCatchupReport::new();
+        // A retirement run probes the lane lock to see whether a lane is
+        // live; a lane starting at that instant waits the probe out.
         let lane_lock = host_dir.and_then(|dir| {
-            crate::checkout_trash::try_deleter_lock(&dir.join(TRASH_CATCHUP_LOCK_FILE))
-                .ok()
-                .flatten()
+            let path = dir.join(TRASH_CATCHUP_LOCK_FILE);
+            let wait_until = Instant::now() + TRASH_CATCHUP_LANE_LOCK_WAIT;
+            loop {
+                match crate::checkout_trash::try_catchup_lane_lock(&path, self.main_root()) {
+                    Ok(Some(lock)) => break Some(lock),
+                    Ok(None) if Instant::now() < wait_until => {
+                        std::thread::sleep(DELETER_LOCK_POLL);
+                    }
+                    Ok(None) | Err(_) => break None,
+                }
+            }
         });
         let (Some(dir), Some(_lane_lock)) = (host_dir, lane_lock) else {
             report.end = TrashCatchupEnd::LaneBusy;
+            report.lane_held_by_other_repository = host_dir.is_some_and(|dir| {
+                crate::checkout_trash::catchup_lane_holder_repository(
+                    &dir.join(TRASH_CATCHUP_LOCK_FILE),
+                )
+                .is_some_and(|holder| !self.is_this_repository(&holder))
+            });
             report.elapsed = started.elapsed();
             crate::phase_telemetry::add(
                 "checkout_trash_catchup_end_lane_busy",
@@ -3173,6 +3249,7 @@ impl Broker {
             );
             return report;
         };
+        self.clear_own_catchup_lane_waiter(dir);
         let deleter_lock = dir.join(crate::checkout_trash::DELETER_LOCK_FILE);
         let mut busy_since: Option<Instant> = None;
         report.end = loop {
@@ -3181,16 +3258,20 @@ impl Broker {
                 break TrashCatchupEnd::Cap;
             }
             let rows = self.checkout_trash_rows();
-            if !self
-                .checkout_trash_deletable_backlog(&rows)
-                .behind(crate::clock::epoch_ms())
-            {
+            let deletable = self.checkout_trash_deletable_backlog(&rows);
+            let done = if until_empty {
+                deletable.entries == 0
+            } else {
+                !deletable.behind(crate::clock::epoch_ms())
+            };
+            if done {
                 break TrashCatchupEnd::CaughtUp;
             }
             if sample().memory_critical {
                 break TrashCatchupEnd::Pressure;
             }
             let slice_started = Instant::now();
+            report.first_slice_at.get_or_insert(slice_started);
             let drained = self.drain_checkout_trash_with(
                 Some(&deleter_lock),
                 (slice_started + TRASH_CATCHUP_SLICE).min(end_at),
@@ -3245,6 +3326,331 @@ impl Broker {
             std::time::Duration::ZERO,
         );
         report
+    }
+
+    /// Catch-up laps back to back: a lap that ends at its cap (`lap_max`)
+    /// is followed at once by the next, at most `max_laps` laps and `total`
+    /// wall time in all, so no gap opens until the next worker. Any other
+    /// end (caught up, pressure, no progress, busy) stops.
+    pub(crate) fn run_checkout_trash_catchup_laps(
+        &self,
+        host_dir: Option<&Path>,
+        bounds: TrashCatchupBounds,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+    ) -> Vec<TrashCatchupReport> {
+        let started = Instant::now();
+        let mut laps: Vec<TrashCatchupReport> = Vec::new();
+        loop {
+            let remaining = bounds.total.saturating_sub(started.elapsed());
+            let lap = self.run_checkout_trash_catchup_lap(
+                host_dir,
+                remaining.min(bounds.lap_max),
+                sample,
+                bounds.until_empty,
+            );
+            let time_left = !bounds.total.saturating_sub(started.elapsed()).is_zero();
+            let drained_laps = laps
+                .iter()
+                .filter(|lap| lap.end != TrashCatchupEnd::LaneBusy)
+                .count();
+            let mut wait = None;
+            let mut again = false;
+            if lap.end == TrashCatchupEnd::Cap && drained_laps + 1 < bounds.max_laps && time_left {
+                // Another repository waiting for the lane gets it now
+                // rather than after a further lap.
+                if host_dir.is_some_and(|dir| self.another_repository_waits_for_catchup_lane(dir)) {
+                    crate::phase_telemetry::add(
+                        "checkout_trash_catchup_yielded_to_waiter",
+                        std::time::Duration::ZERO,
+                    );
+                } else {
+                    again = true;
+                    crate::phase_telemetry::add(
+                        "checkout_trash_catchup_next_lap",
+                        std::time::Duration::ZERO,
+                    );
+                }
+            } else if lap.end == TrashCatchupEnd::LaneBusy
+                && lap.lane_held_by_other_repository
+                && time_left
+                && let (Some(retry), Some(dir)) = (bounds.lane_retry, host_dir)
+            {
+                // Another repository's lane: wait for a turn while this
+                // worker lives, and say so, so its holder hands over
+                // between laps.
+                self.note_catchup_lane_waiter(dir);
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_lane_retry",
+                    std::time::Duration::ZERO,
+                );
+                wait = Some(retry.min(bounds.total.saturating_sub(started.elapsed())));
+                again = true;
+            }
+            laps.push(lap);
+            if !again {
+                break;
+            }
+            if let Some(wait) = wait {
+                std::thread::sleep(wait);
+            }
+        }
+        laps
+    }
+
+    /// The body of the worker's catch-up lane process: its laps, then
+    /// `checkout_trash_catchup` on this process's metric row, with the
+    /// delay from `worker_started_ms` (the starting worker's start, epoch
+    /// ms) to the first slice and the disk I/O policy the process set.
+    pub(crate) fn run_checkout_trash_catchup_process(
+        &self,
+        host_dir: Option<&Path>,
+        worker_started_ms: Option<i64>,
+        io_policy: &'static str,
+        sample: fn() -> crate::checkout_trash::HostPressure,
+    ) -> Vec<TrashCatchupReport> {
+        let process_started = Instant::now();
+        // One lane process per repository, holding or waiting: a second one
+        // (another worker run while the first still waits for another
+        // repository's lane) ends at once.
+        let repository_lock = host_dir.map(|dir| {
+            crate::checkout_trash::try_deleter_lock(
+                &self.checkout_trash_repository_lane_lock_path(dir),
+            )
+        });
+        let _repository_lock = match repository_lock {
+            Some(Ok(Some(lock))) => Some(lock),
+            Some(Ok(None)) => {
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_repository_lane_present",
+                    std::time::Duration::ZERO,
+                );
+                return Vec::new();
+            }
+            Some(Err(_)) | None => None,
+        };
+        let laps =
+            self.run_checkout_trash_catchup_laps(host_dir, TrashCatchupBounds::worker(), sample);
+        let sum = |pick: fn(&TrashCatchupReport) -> u64| {
+            laps.iter().map(pick).fold(0_u64, u64::saturating_add)
+        };
+        let drain_time = laps
+            .iter()
+            .map(|lap| lap.drain_time)
+            .fold(std::time::Duration::ZERO, |total, time| {
+                total.saturating_add(time)
+            });
+        let unlinks = sum(|lap| lap.unlinks as u64);
+        let files_per_second = if drain_time.as_secs_f64() > 0.0 {
+            (unlinks as f64 / drain_time.as_secs_f64()).round() as u64
+        } else {
+            0
+        };
+        let wall = process_started.elapsed().as_secs_f64();
+        let drain_share_pct = if wall > 0.0 {
+            (crate::checkout_trash::drain_time_this_process().as_secs_f64() * 100.0 / wall).round()
+                as u64
+        } else {
+            0
+        };
+        let now = crate::clock::epoch_ms();
+        let start_delay_ms = laps
+            .iter()
+            .find_map(|lap| lap.first_slice_at)
+            .zip(worker_started_ms)
+            .map(|(first, started)| {
+                let first_ms = now
+                    .saturating_sub(i64::try_from(first.elapsed().as_millis()).unwrap_or(i64::MAX));
+                first_ms.saturating_sub(started).max(0)
+            });
+        if laps
+            .iter()
+            .filter(|lap| lap.end != TrashCatchupEnd::LaneBusy)
+            .count()
+            > 1
+        {
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_back_to_back",
+                std::time::Duration::ZERO,
+            );
+        }
+        crate::phase_telemetry::attach(
+            "checkout_trash_catchup",
+            serde_json::json!({
+                "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
+                "io_policy": io_policy,
+                "catchup_start_delay_ms": start_delay_ms,
+                "laps": laps.len(),
+                "slices": sum(|lap| u64::from(lap.slices)),
+                "entries_removed": sum(|lap| lap.entries_removed as u64),
+                "unlinks": unlinks,
+                "bytes": sum(|lap| lap.bytes),
+                "drain_ms": u64::try_from(drain_time.as_millis()).unwrap_or(u64::MAX),
+                "elapsed_ms": u64::try_from(process_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                "files_per_second_observed": files_per_second,
+                "busy_retries": sum(|lap| u64::from(lap.busy_retries)),
+                "drain_share_pct": drain_share_pct,
+            }),
+        );
+        laps
+    }
+
+    /// This repository's lane-process lock in `host_dir`: held for the whole
+    /// life of its catch-up lane process, holding the host lane or waiting
+    /// for it, so a worker never starts a second one.
+    fn checkout_trash_repository_lane_lock_path(&self, host_dir: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let root = std::fs::canonicalize(self.main_root())
+            .unwrap_or_else(|_| self.main_root().to_path_buf());
+        let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        let key = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        host_dir.join(format!("checkout-trash-catchup-{key}.lock"))
+    }
+
+    /// Whether a catch-up lane process of this repository is alive (holding
+    /// the host lane or waiting for it). The probe takes the lock for an
+    /// instant when it is free.
+    pub(crate) fn checkout_trash_lane_process_present(&self, host_dir: &Path) -> bool {
+        matches!(
+            crate::checkout_trash::try_deleter_lock(
+                &self.checkout_trash_repository_lane_lock_path(host_dir)
+            ),
+            Ok(None)
+        )
+    }
+
+    /// Whether the worker should start a catch-up lane process for this
+    /// repository (the environment gates aside): an entry the deleter can
+    /// delete (not only unconfirmed, failing or in-use ones), and no lane
+    /// process of this repository alive, holding or waiting.
+    pub(crate) fn checkout_trash_catchup_needed(&self, host_dir: Option<&Path>) -> bool {
+        let rows = self.checkout_trash_rows();
+        if rows.is_empty() || self.checkout_trash_deletable_backlog(&rows).entries == 0 {
+            return false;
+        }
+        !host_dir.is_some_and(|dir| {
+            self.checkout_trash_lane_process_present(dir)
+                || self.checkout_trash_catchup_lane_state(dir) == CatchupLaneState::ThisRepository
+        })
+    }
+
+    /// Whose catch-up lane, if any, is live on this host: its lock in
+    /// `host_dir` is held, and its holder line names the repository. The
+    /// probe takes the lock for an instant when it is free; a lane starting
+    /// then waits it out. A holder that names no repository counts as
+    /// another repository's.
+    pub(crate) fn checkout_trash_catchup_lane_state(&self, host_dir: &Path) -> CatchupLaneState {
+        let path = host_dir.join(TRASH_CATCHUP_LOCK_FILE);
+        match crate::checkout_trash::try_deleter_lock(&path) {
+            Ok(None) => {
+                if crate::checkout_trash::catchup_lane_holder_repository(&path)
+                    .is_some_and(|holder| self.is_this_repository(&holder))
+                {
+                    CatchupLaneState::ThisRepository
+                } else {
+                    CatchupLaneState::OtherRepository
+                }
+            }
+            Ok(Some(_)) | Err(_) => CatchupLaneState::Free,
+        }
+    }
+
+    fn is_this_repository(&self, path: &Path) -> bool {
+        let root = self.main_root();
+        path == root
+            || std::fs::canonicalize(path)
+                .ok()
+                .zip(std::fs::canonicalize(root).ok())
+                .is_some_and(|(path, root)| path == root)
+    }
+
+    /// Record that this repository's lane waits for the host lane
+    /// ([`TRASH_CATCHUP_WAITER_FILE`]); the holder hands over between laps.
+    fn note_catchup_lane_waiter(&self, host_dir: &Path) {
+        crate::warn_unrecorded(
+            "note a waiting checkout trash catch-up lane",
+            std::fs::write(
+                host_dir.join(TRASH_CATCHUP_WAITER_FILE),
+                format!("repository {}\n", self.main_root().display()),
+            ),
+        );
+    }
+
+    /// Whether a lane of another repository noted, within
+    /// [`TRASH_CATCHUP_WAITER_FRESH`], that it waits for the host lane.
+    fn another_repository_waits_for_catchup_lane(&self, host_dir: &Path) -> bool {
+        let path = host_dir.join(TRASH_CATCHUP_WAITER_FILE);
+        let fresh = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= TRASH_CATCHUP_WAITER_FRESH);
+        fresh
+            && std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("repository ").map(PathBuf::from))
+                })
+                .is_some_and(|waiter| !self.is_this_repository(&waiter))
+    }
+
+    /// Forget this repository's waiter note once its lane runs.
+    fn clear_own_catchup_lane_waiter(&self, host_dir: &Path) {
+        let path = host_dir.join(TRASH_CATCHUP_WAITER_FILE);
+        let own = std::fs::read_to_string(&path).ok().is_some_and(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("repository ").map(PathBuf::from))
+                .is_some_and(|waiter| self.is_this_repository(&waiter))
+        });
+        if own {
+            crate::warn_unrecorded(
+                "forget this repository's checkout trash catch-up waiter note",
+                std::fs::remove_file(path),
+            );
+        }
+    }
+
+    /// The retirement run's drain: skipped (and counted) while a catch-up
+    /// lane is live on this host, which drains this trash anyway and would
+    /// only make the run wait for the deleter lock; otherwise the ordinary
+    /// drain, waiting for that lock at most `DELETER_LOCK_WAIT`.
+    fn retirement_trash_drain(
+        &self,
+        host_dir: Option<&Path>,
+        deadline: Instant,
+    ) -> crate::checkout_trash::TrashDrainReport {
+        // Only this repository's own lane stands in for its drain: another
+        // repository's lane does not touch this trash, so the drain takes
+        // its turns on the deleter lock as before.
+        if host_dir.is_some_and(|dir| {
+            self.checkout_trash_catchup_lane_state(dir) == CatchupLaneState::ThisRepository
+        }) {
+            crate::phase_telemetry::add(
+                "checkout_trash_retirement_drain_skipped",
+                std::time::Duration::ZERO,
+            );
+            let rows = self.checkout_trash_rows();
+            return crate::checkout_trash::TrashDrainReport {
+                entries_pending: rows.values().map(std::collections::BTreeMap::len).sum(),
+                oldest_pending_created_ms: crate::checkout_trash::TrashBacklog::of(&rows)
+                    .oldest_created_ms,
+                skipped_for_catchup_lane: true,
+                ..crate::checkout_trash::TrashDrainReport::default()
+            };
+        }
+        let lock_path = host_dir.map(|dir| dir.join(crate::checkout_trash::DELETER_LOCK_FILE));
+        self.drain_checkout_trash_with(
+            lock_path.as_deref(),
+            deadline,
+            DrainOptions {
+                lock_wait: DELETER_LOCK_WAIT,
+                ..DrainOptions::default()
+            },
+        )
     }
 
     /// Whether the volume holding `trash` is below the artifact-sweep
@@ -3997,6 +4403,291 @@ mod tests {
         assert!(caught_up.entries_removed >= 1, "{caught_up:?}");
         assert!(!entry.exists());
         assert!(caught_up.elapsed < Duration::from_secs(60));
+    }
+
+    /// The lane process's body drains this repository's trash until no
+    /// entry is deletable (the worker starts it whenever the trash holds
+    /// entries), ends caught up, and reports a start delay measured from the
+    /// worker's start; with this repository's own lane already live it ends
+    /// at once, removing nothing.
+    #[test]
+    fn the_catchup_lane_process_drains_until_empty_from_the_workers_start() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "process");
+        let host = owner.path();
+        let own = crate::checkout_trash::try_catchup_lane_lock(
+            &host.join(super::TRASH_CATCHUP_LOCK_FILE),
+            broker.main_root(),
+        )
+        .unwrap()
+        .unwrap();
+        let busy = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(crate::clock::epoch_ms()),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(busy.len(), 1, "own lane live: no retry ({busy:?})");
+        assert_eq!(busy[0].end, super::TrashCatchupEnd::LaneBusy);
+        assert!(!busy[0].lane_held_by_other_repository);
+        assert!(entry.exists());
+        drop(own);
+
+        let worker_started_ms = crate::clock::epoch_ms() - 5_000;
+        let laps = broker.run_checkout_trash_catchup_process(
+            Some(host),
+            Some(worker_started_ms),
+            "important",
+            no_pressure,
+        );
+        assert_eq!(laps.len(), 1, "{laps:?}");
+        assert_eq!(laps[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(laps[0].first_slice_at.is_some());
+        assert!(!entry.exists());
+        assert!(super::TrashCatchupBounds::worker().until_empty);
+    }
+
+    /// The worker's spawn decision: a lane process is wanted for a
+    /// deletable entry, not for unconfirmed rows alone, and never while a
+    /// lane process of this repository is alive (one waiter per
+    /// repository); a second process for the repository ends at once.
+    #[test]
+    fn one_lane_process_per_repository_and_only_for_deletable_entries() {
+        let (owner, _storage, mut broker) = fixture();
+        let host = owner.path();
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "empty trash"
+        );
+
+        let (session, worktree) = closed(&mut broker, "pending only", |_| {});
+        let pool = worktree.parent().unwrap().to_path_buf();
+        let common = broker.main_git_common_dir().unwrap();
+        let repo = crate::git::GitRepo::discover(broker.main_root()).unwrap();
+        let mut pending = None;
+        let trashed = crate::checkout_trash::move_worktree_to_trash(
+            &repo,
+            &common,
+            &pool,
+            &worktree,
+            session.id,
+            &mut |_, _, row| {
+                pending = Some(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        broker
+            .record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, pending.unwrap())
+            .unwrap();
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "an unconfirmed row alone costs no process"
+        );
+
+        let entry = trashed_day_old_entry(&mut broker, "deletable");
+        assert!(broker.checkout_trash_catchup_needed(Some(host)));
+        let waiter = crate::checkout_trash::try_deleter_lock(
+            &broker.checkout_trash_repository_lane_lock_path(host),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(broker.checkout_trash_lane_process_present(host));
+        assert!(
+            !broker.checkout_trash_catchup_needed(Some(host)),
+            "a lane process of this repository is alive"
+        );
+        let second =
+            broker.run_checkout_trash_catchup_process(Some(host), None, "important", no_pressure);
+        assert!(second.is_empty(), "{second:?}");
+        assert!(entry.exists());
+        drop(waiter);
+        assert!(!broker.checkout_trash_lane_process_present(host));
+        assert!(broker.checkout_trash_catchup_needed(Some(host)));
+    }
+
+    /// Laps follow one another only after a lap that hit its cap, and never
+    /// more than the bound.
+    #[test]
+    fn back_to_back_catchup_laps_are_bounded() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "laps");
+        let capped = |max_laps| super::TrashCatchupBounds {
+            total: Duration::from_secs(60),
+            lap_max: Duration::ZERO,
+            max_laps,
+            until_empty: false,
+            lane_retry: None,
+        };
+        let laps =
+            broker.run_checkout_trash_catchup_laps(Some(owner.path()), capped(3), no_pressure);
+        assert_eq!(laps.len(), 3, "{laps:?}");
+        assert!(
+            laps.iter()
+                .all(|lap| lap.end == super::TrashCatchupEnd::Cap)
+        );
+        let one =
+            broker.run_checkout_trash_catchup_laps(Some(owner.path()), capped(1), no_pressure);
+        assert_eq!(one.len(), 1);
+        let no_time = broker.run_checkout_trash_catchup_laps(
+            Some(owner.path()),
+            super::TrashCatchupBounds {
+                total: Duration::ZERO,
+                ..capped(3)
+            },
+            no_pressure,
+        );
+        assert_eq!(no_time.len(), 1, "the total bounds the laps too");
+        assert!(entry.exists());
+        // A lap that is not capped (caught up) ends the run.
+        let drained = broker.run_checkout_trash_catchup_laps(
+            Some(owner.path()),
+            super::TrashCatchupBounds {
+                lap_max: Duration::from_secs(60),
+                ..capped(3)
+            },
+            no_pressure,
+        );
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert_eq!(drained[0].end, super::TrashCatchupEnd::CaughtUp);
+        assert!(!entry.exists());
+        assert_eq!(
+            super::TrashCatchupBounds::worker().max_laps,
+            super::TRASH_CATCHUP_MAX_LAPS
+        );
+    }
+
+    /// While this repository's catch-up lane is live, the retirement run
+    /// skips its own drain (counted, the trash left to the lane) instead of
+    /// waiting for the deleter lock. Another repository's live lane does not
+    /// serve this trash: the drain runs as before.
+    #[test]
+    fn the_retirement_drain_is_skipped_only_for_this_repositorys_lane() {
+        let (owner, _storage, mut broker) = fixture();
+        let other = trashed_day_old_entry(&mut broker, "other lane");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let foreign_root = owner.path().join("another-repository");
+
+        let foreign = crate::checkout_trash::try_catchup_lane_lock(&lane_path, &foreign_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::OtherRepository
+        );
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(
+            !other.exists(),
+            "drained although another repository's lane is live"
+        );
+        drop(foreign);
+
+        let entry = trashed_day_old_entry(&mut broker, "own lane");
+        let own = crate::checkout_trash::try_catchup_lane_lock(&lane_path, broker.main_root())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::ThisRepository
+        );
+        let started = Instant::now();
+        let skipped =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(skipped.skipped_for_catchup_lane, "{skipped:?}");
+        assert_eq!(skipped.end_reason(), "skipped_for_catchup_lane");
+        assert_eq!(skipped.entries_removed, 0);
+        assert!(skipped.entries_pending >= 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no wait for the deleter lock"
+        );
+        assert!(entry.exists());
+        drop(own);
+        assert_eq!(
+            broker.checkout_trash_catchup_lane_state(host),
+            super::CatchupLaneState::Free
+        );
+        let drained =
+            broker.retirement_trash_drain(Some(host), Instant::now() + Duration::from_secs(600));
+        assert!(!drained.skipped_for_catchup_lane, "{drained:?}");
+        assert!(!entry.exists());
+    }
+
+    /// A worker's lane that finds another repository's lane live notes that
+    /// it waits and retries within its time bound instead of giving up; a
+    /// holder that sees another repository waiting hands the lane over
+    /// between laps instead of chaining the next one.
+    #[test]
+    fn a_lane_waits_for_another_repositorys_lane_and_the_holder_hands_over() {
+        let (owner, _storage, mut broker) = fixture();
+        let entry = trashed_day_old_entry(&mut broker, "waiting");
+        let host = owner.path();
+        let lane_path = host.join(super::TRASH_CATCHUP_LOCK_FILE);
+        let waiter_path = host.join(super::TRASH_CATCHUP_WAITER_FILE);
+        let foreign_root = owner.path().join("another-repository");
+
+        let foreign = crate::checkout_trash::try_catchup_lane_lock(&lane_path, &foreign_root)
+            .unwrap()
+            .unwrap();
+        let waited = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_millis(2_500),
+                lap_max: Duration::from_secs(60),
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: Some(Duration::from_millis(200)),
+            },
+            no_pressure,
+        );
+        assert!(waited.len() >= 2, "retried: {waited:?}");
+        assert!(waited.iter().all(|lap| {
+            lap.end == super::TrashCatchupEnd::LaneBusy && lap.lane_held_by_other_repository
+        }));
+        let note = std::fs::read_to_string(&waiter_path).unwrap();
+        assert!(
+            note.contains(&broker.main_root().display().to_string()),
+            "{note}"
+        );
+        assert!(entry.exists());
+        drop(foreign);
+
+        // Its own lane clears its note; another repository's note makes a
+        // capped lap the last one.
+        let done = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_secs(60),
+                lap_max: Duration::ZERO,
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: None,
+            },
+            no_pressure,
+        );
+        assert_eq!(done.len(), 3, "{done:?}");
+        assert!(!waiter_path.exists(), "the lane cleared its own note");
+        std::fs::write(
+            &waiter_path,
+            format!("repository {}\n", foreign_root.display()),
+        )
+        .unwrap();
+        let handed_over = broker.run_checkout_trash_catchup_laps(
+            Some(host),
+            super::TrashCatchupBounds {
+                total: Duration::from_secs(60),
+                lap_max: Duration::ZERO,
+                max_laps: 3,
+                until_empty: false,
+                lane_retry: None,
+            },
+            no_pressure,
+        );
+        assert_eq!(handed_over.len(), 1, "{handed_over:?}");
+        assert_eq!(handed_over[0].end, super::TrashCatchupEnd::Cap);
     }
 
     /// A catch-up slice stops at once, resumably, at a reading of critical
