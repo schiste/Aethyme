@@ -4384,12 +4384,33 @@ impl Broker {
             .collect();
         let declared_count = rows.len();
 
-        let (derived, degraded) = match task {
+        let task_context = match task {
             Some(text) if !text.trim().is_empty() => {
-                derive_scopes_from_task(self.main_root(), text)
+                let session = self.store.session(session_id)?;
+                session
+                    .adopted_head
+                    .as_deref()
+                    .or(session.diff_base.as_deref())
+                    .ok_or_else(|| "session has no recorded checkout commit".to_string())
+                    .and_then(|commit| {
+                        derive_task_context(
+                            &self.store,
+                            self.main_root(),
+                            Path::new(&session.worktree_path),
+                            commit,
+                            text,
+                        )
+                    })
             }
-            _ => (Vec::new(), Some("session has no task text".to_string())),
+            _ => Err("session has no task text".to_string()),
         };
+        let (mut task_context, degraded) = match task_context {
+            Ok(context) => (Some(context), None),
+            Err(reason) => (None, Some(reason)),
+        };
+        let derived = task_context
+            .as_ref()
+            .map_or(&[][..], |context| context.symbols.as_slice());
         let already: std::collections::HashSet<String> =
             rows.iter().map(|(_, value, _, _)| value.clone()).collect();
         let derived_count = derived
@@ -4397,12 +4418,12 @@ impl Broker {
             .filter(|value| !already.contains(*value))
             .count();
         for value in derived {
-            if already.contains(&value) {
+            if already.contains(value) {
                 continue;
             }
             rows.push((
                 crate::ScopeKind::Symbol,
-                value,
+                value.clone(),
                 crate::ScopeOperation::Unknown,
                 crate::ScopeSource::Derived,
             ));
@@ -4411,10 +4432,14 @@ impl Broker {
         if !rows.is_empty() {
             self.store.record_session_scopes(session_id, &rows)?;
         }
+        if let Some(context) = &mut task_context {
+            context.bound_for_output();
+        }
         Ok(ScopeCaptureReport {
             declared: declared_count,
             derived: derived_count,
             degraded,
+            task_context,
         })
     }
 

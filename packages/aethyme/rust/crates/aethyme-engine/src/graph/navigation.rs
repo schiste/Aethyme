@@ -291,6 +291,15 @@ pub fn task_scope_view_redb(
     store: &ReadOnlyGraphStore,
     task: &TaskInput,
 ) -> Result<TaskScopeView, GraphStoreError> {
+    task_scope_with_anchors_redb(store, task).map(|(view, _)| view)
+}
+
+/// Return the same resolved anchors used by the scope query for consumers
+/// that also need precise source locations.
+pub fn task_scope_with_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+) -> Result<(TaskScopeView, Vec<Anchor>), GraphStoreError> {
     let anchors = resolve_anchors_redb(store, task, 5)?;
     let max_files = if task.kind.is_change_task() { 6 } else { 8 };
     let mut in_scope = build_in_scope_redb(store, &anchors, max_files)?;
@@ -301,7 +310,7 @@ pub fn task_scope_view_redb(
         cap_change_scope(&mut in_scope, max_files);
     }
 
-    Ok(TaskScopeView {
+    let view = TaskScopeView {
         task: task.raw.clone(),
         navigation_order: task_navigation_order_redb(store, task, &anchors)?,
         in_scope_files: in_scope.files.into_iter().map(|item| item.value).collect(),
@@ -317,7 +326,8 @@ pub fn task_scope_view_redb(
             .map(|item| item.value)
             .collect(),
         risks,
-    })
+    };
+    Ok((view, anchors))
 }
 
 pub fn task_next_view(map: &RepositoryMap, task: &TaskInput) -> GraphRelationView {

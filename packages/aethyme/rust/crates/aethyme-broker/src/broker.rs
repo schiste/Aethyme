@@ -3831,8 +3831,10 @@ mod scope_capture;
 mod status;
 mod status_helpers;
 
-pub use scope_capture::ScopeCaptureReport;
-use scope_capture::derive_scopes_from_task;
+use scope_capture::derive_task_context;
+mod context_warmup;
+pub(crate) mod semantic_patch;
+pub use scope_capture::{ScopeCaptureReport, TaskContext};
 pub(super) use status_helpers::*;
 
 #[cfg(test)]

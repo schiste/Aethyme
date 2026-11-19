@@ -5164,6 +5164,14 @@ impl GitRepo {
         Ok(records)
     }
 
+    pub(crate) fn graph_blob_bytes(&self, object: &str, limit: usize) -> Result<Vec<u8>, GitError> {
+        if !valid_git_object_id(object.as_bytes()) {
+            return Err(graph_snapshot_error("invalid exact blob object ID"));
+        }
+        self.run_git_output_limited(&["cat-file", "blob", object], limit)
+            .map(|output| output.stdout)
+    }
+
     fn config_blob_checked(&self, object: &str, path: &str) -> Result<String, GitError> {
         let args = ["cat-file", "blob", object];
         let output = self.run_git_output_limited(&args, 4 * 1024 * 1024)?;
@@ -12266,6 +12274,55 @@ impl GitRepo {
                 path,
             ],
         )
+    }
+
+    /// Patch from the exact commit to an isolated working copy.
+    pub(crate) fn isolated_working_patch(&self, commit: &str) -> Result<Vec<u8>, GitError> {
+        run_isolated_graph_git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                commit,
+                "--",
+            ],
+        )
+    }
+
+    /// Write a synthetic commit in a disposable repository and move its
+    /// detached HEAD and private index to that commit without rewriting files.
+    pub(crate) fn isolated_candidate_commit(
+        &self,
+        base: &str,
+        tree: &str,
+    ) -> Result<String, GitError> {
+        graph_snapshot_object_format(base)?;
+        graph_snapshot_object_format(tree)?;
+        let bytes = run_isolated_graph_git(
+            &self.root,
+            &[
+                "-c",
+                "user.name=Aethyme",
+                "-c",
+                "user.email=broker@aethyme.local",
+                "commit-tree",
+                tree,
+                "-p",
+                base,
+                "-m",
+                "Aethyme semantic patch preview",
+            ],
+        )?;
+        let commit = std::str::from_utf8(&bytes)
+            .map_err(|_| graph_snapshot_error("invalid candidate commit ID"))?
+            .trim();
+        graph_snapshot_object_format(commit)?;
+        run_isolated_graph_git(&self.root, &["reset", "--quiet", "--mixed", commit])?;
+        Ok(commit.to_owned())
     }
 
     /// Zero-context patch of `path` from `base` to the working tree, so

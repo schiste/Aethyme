@@ -243,6 +243,18 @@ impl ExecutionProfile {
         self.incomplete.join("; ")
     }
 
+    pub(crate) fn bind_comparison_base(mut self, base: Option<&str>) -> Self {
+        if let (Some(base), Some(digest)) = (base, &self.digest) {
+            let mut bound = Sha256::new();
+            bound.update(b"aethyme.gate-profile.comparison-base/v1\0");
+            bound.update(digest.as_bytes());
+            bound.update(b"\0");
+            bound.update(base.as_bytes());
+            self.digest = Some(format!("{:x}", bound.finalize()));
+        }
+        self
+    }
+
     pub(crate) fn digest(&self) -> Option<&str> {
         self.digest.as_deref()
     }
@@ -364,6 +376,32 @@ mod tests {
             environment,
             tools,
         }
+    }
+
+    #[test]
+    fn submit_profile_binds_the_comparison_commit() {
+        let original = ExecutionProfile::fixture_complete();
+        let a = original.clone().bind_comparison_base(Some("base-a"));
+        let b = original.clone().bind_comparison_base(Some("base-b"));
+        assert_ne!(a.digest(), b.digest());
+        assert_ne!(a.digest(), original.digest());
+        assert_eq!(
+            a.digest(),
+            original
+                .clone()
+                .bind_comparison_base(Some("base-a"))
+                .digest()
+        );
+        assert_eq!(
+            original.digest(),
+            original.clone().bind_comparison_base(None).digest()
+        );
+        assert_eq!(
+            ExecutionProfile::fixture_incomplete_quiescent()
+                .bind_comparison_base(Some("base-a"))
+                .digest(),
+            None
+        );
     }
 
     #[test]
