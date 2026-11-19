@@ -3016,8 +3016,14 @@ impl Broker {
         };
         let drain_started = Instant::now();
         let mut report = if threads > 1 {
+            let trash_dirs = rows.keys().cloned().collect::<Vec<_>>();
             crate::checkout_trash::drain_trash_parallel(
-                &mut rows, deadline, make_pacer, threads, None,
+                &mut rows,
+                deadline,
+                make_pacer,
+                threads,
+                None,
+                || crate::checkout_trash::trash_volumes_available(&trash_dirs),
             )
         } else {
             crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut make_pacer())

@@ -104,8 +104,9 @@ impl PinnedTreeRemoval {
     ///   on one never crosses a mount);
     /// - the ancestors' identities are re-checked when a directory is opened,
     ///   before every directory is removed, and every
-    ///   [`LISTED_TYPE_BINDING_CHECK_EVERY`] unlinks, instead of before every
-    ///   unlink.
+    ///   [`LISTED_TYPE_BINDING_CHECK_EVERY`] unlinks or
+    ///   [`LISTED_TYPE_BINDING_CHECK_INTERVAL`], whichever comes first,
+    ///   instead of before every unlink.
     ///
     /// Logical file bytes are not observed (no per-entry `stat`); the count
     /// of unlinks is returned.
@@ -389,6 +390,11 @@ where
 /// [`PinnedTreeRemoval::remove_trusting_listing_types_with_guard`]; every
 /// directory open and every directory removal re-checks them too.
 pub(crate) const LISTED_TYPE_BINDING_CHECK_EVERY: u32 = 256;
+/// The longest the listing-type mode goes without re-checking the
+/// ancestors, whatever the unlink count: on a slow volume 256 unlinks can
+/// take seconds, and a directory moved out meanwhile would lose them all.
+pub(crate) const LISTED_TYPE_BINDING_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported_platform() -> io::Error {
@@ -896,6 +902,8 @@ mod unix {
         // Unlinks since the ancestors' identities were last re-checked, in
         // the listing-type mode.
         let mut unchecked_unlinks = 0_u32;
+        // When the ancestors were last re-checked, in the listing-type mode.
+        let mut checked_at = Instant::now();
 
         loop {
             let next_entry = stack
@@ -926,6 +934,7 @@ mod unix {
                 before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 unchecked_unlinks = 0;
+                checked_at = Instant::now();
                 ensure_named_directory(binding.parent_fd, &binding.name, binding.identity)?;
                 match unlink_at(parent_fd, &binding.name, true) {
                     Ok(()) => {
@@ -972,9 +981,12 @@ mod unix {
                 }
                 before_mutation()?;
                 unchecked_unlinks = unchecked_unlinks.saturating_add(1);
-                if unchecked_unlinks >= super::LISTED_TYPE_BINDING_CHECK_EVERY {
+                if unchecked_unlinks >= super::LISTED_TYPE_BINDING_CHECK_EVERY
+                    || checked_at.elapsed() >= super::LISTED_TYPE_BINDING_CHECK_INTERVAL
+                {
                     ensure_bindings(pinned, &bindings)?;
                     unchecked_unlinks = 0;
+                    checked_at = Instant::now();
                 }
                 match unlink_at(directory_fd, &c_name, false) {
                     Ok(()) => {
@@ -1011,6 +1023,7 @@ mod unix {
                 before_directory_open()?;
                 ensure_bindings(pinned, &bindings)?;
                 unchecked_unlinks = 0;
+                checked_at = Instant::now();
                 // `O_NOFOLLOW | O_DIRECTORY`: a symlink or a non-directory
                 // there now is refused, never followed.
                 let child = open_directory_at(directory_fd, &c_name)?;
@@ -1763,6 +1776,123 @@ mod unix {
             let left = fs::read_dir(&moved).unwrap().count();
             assert!(left > files - every, "{left} of {files} left");
             assert!(root.exists());
+        }
+
+        /// On a slow volume the re-check comes from the clock, long before
+        /// 256 unlinks: once `LISTED_TYPE_BINDING_CHECK_INTERVAL` has passed
+        /// since a directory moved out, the next unlink re-checks and stops.
+        #[test]
+        fn a_directory_moved_out_stops_listing_type_removal_within_the_interval() {
+            let every = super::super::LISTED_TYPE_BINDING_CHECK_EVERY as usize;
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            let moved = temp.path().join("moved");
+            fs::create_dir_all(root.join("dir")).unwrap();
+            let files = 2 * every;
+            for index in 0..files {
+                fs::write(root.join(format!("dir/file-{index}")), b"x").unwrap();
+            }
+            let mut mutations = 0_usize;
+            let result = PublicPinnedTreeRemoval::open(&root)
+                .unwrap()
+                .remove_trusting_listing_types_with_guard(None, || {
+                    mutations += 1;
+                    if mutations == 1 {
+                        fs::rename(root.join("dir"), &moved)?;
+                    } else if mutations == 2 {
+                        // The volume is slow: the next unlink comes after the
+                        // interval.
+                        std::thread::sleep(
+                            super::super::LISTED_TYPE_BINDING_CHECK_INTERVAL
+                                + std::time::Duration::from_millis(20),
+                        );
+                    }
+                    Ok(())
+                });
+
+            let error = result.expect_err("the moved directory stops removal");
+            assert!(
+                error.entries_reclaimed <= 1,
+                "{} files went after the move",
+                error.entries_reclaimed
+            );
+            assert!(fs::read_dir(&moved).unwrap().count() >= files - 1);
+        }
+
+        /// A file replaced by a directory (holding a file and a symlink out
+        /// of the tree) between the listing and its unlink: the refused
+        /// unlink falls back to a stat, the new directory is removed through
+        /// its own pinned descriptor, and nothing outside is touched. A file
+        /// replaced by a symlink to an outside directory is removed as a
+        /// link.
+        #[test]
+        fn a_file_swapped_mid_removal_is_handled_without_following_anything() {
+            for swap_to_directory in [true, false] {
+                let temp = tempdir().unwrap();
+                let root = temp.path().join("root");
+                let outside = temp.path().join("outside");
+                fs::create_dir_all(&root).unwrap();
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("keep.txt"), b"outside data").unwrap();
+                fs::write(root.join("swapped"), b"file").unwrap();
+                let mut swapped = false;
+                let result = PublicPinnedTreeRemoval::open(&root)
+                    .unwrap()
+                    .remove_trusting_listing_types_with_guard(None, || {
+                        if !swapped {
+                            swapped = true;
+                            fs::remove_file(root.join("swapped"))?;
+                            if swap_to_directory {
+                                fs::create_dir(root.join("swapped"))?;
+                                fs::write(root.join("swapped/inner"), b"inner")?;
+                                symlink(&outside, root.join("swapped/link"))?;
+                            } else {
+                                symlink(&outside, root.join("swapped"))?;
+                            }
+                        }
+                        Ok(())
+                    });
+
+                let (outcome, _) = result.unwrap();
+                assert_eq!(outcome, TreeRemoval::Complete, "{swap_to_directory}");
+                assert!(!root.exists(), "{swap_to_directory}");
+                assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"outside data");
+                assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+            }
+        }
+
+        /// A listing that reports a directory for a regular file or a
+        /// symlink: opening it as a directory (`O_NOFOLLOW | O_DIRECTORY`)
+        /// fails, so removal fails safely and nothing it names is followed
+        /// or removed.
+        #[test]
+        fn a_listing_that_calls_a_file_a_directory_fails_safely() {
+            for link in [false, true] {
+                let temp = tempdir().unwrap();
+                let root = temp.path().join("root");
+                let outside = temp.path().join("outside");
+                fs::create_dir_all(&root).unwrap();
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("keep.txt"), b"outside data").unwrap();
+                let entry = root.join("entry");
+                if link {
+                    symlink(&outside, &entry).unwrap();
+                } else {
+                    fs::write(&entry, b"file").unwrap();
+                }
+                FORCE_LISTED_KIND.with(|cell| cell.set(Some(ListedKind::Directory)));
+                let result = PublicPinnedTreeRemoval::open(&root)
+                    .unwrap()
+                    .remove_trusting_listing_types_with_guard(None, || Ok(()));
+                FORCE_LISTED_KIND.with(|cell| cell.set(None));
+
+                assert!(result.is_err(), "{link}");
+                assert!(
+                    fs::symlink_metadata(&entry).is_ok(),
+                    "{link}: the entry is left"
+                );
+                assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"outside data");
+            }
         }
 
         #[test]
