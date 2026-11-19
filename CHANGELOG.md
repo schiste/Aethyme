@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.139] - 2026-11-19
+
+### Fixed
+
+- Checkout retirement reaches more of its backlog. On the busiest repository it judged 775 closed checkouts in a day and retired 140, with about 31 s per run for the closed lap. Expiring commit pins used its full 20 s on 173 of 174 runs; it now runs at most every 30 minutes. While 50 or more closed checkouts are on disk, the closed lap's minimum time is 45 s instead of 20 s, within the lane's deadline. What may be removed is unchanged (#1853).
+- An archive that fails because the archive destination refuses a directory creation (a worker that inherited a sandbox, a read-only archive root) is kept as `archive_environment_denied` and retried by the next run instead of being remembered for 1, 6 and 24 hours. Repeated denials wait 10 minutes, doubling to a 6-hour cap, and raise the status advice `cleanup.retire-archive-denied` after three in a row. A fault inside the checkout itself, such as an unreadable file, is still `archive_failed` with the existing wait. A checkout whose archive is denied is always kept (#1853).
+- For an enforced graph policy, `submit` no longer hashes the whole verification checkout to choose which commit to verify. It checks that the checkout's commit carries the merge candidate's tree and verifies that commit; on a mismatch the general path runs. The verifier's own temporary copy is hashed from its index, as introduced in 0.8.138. Verdicts are unchanged (#1856).
+
+### Added
+
+- Counters `graph_integrity_full_enforced`, `graph_integrity_full_environment_refused` and `graph_integrity_known_tree_mismatch`; spans `graph_integrity_isolate`, `graph_integrity_source_check`, `graph_integrity_index`, `graph_integrity_link` and `graph_integrity_compare` (#1856).
+- Counters `checkout_retirement_kept_archive_environment_denied`, `checkout_retirement_archive_denied_waiting`, `checkout_retirement_prune_pins_not_due` and `checkout_retirement_closed_lap_backlog_floor`; the `checkout_retirement` attachment gains `closed_backlog` and `closed_lap_floor_ms` (#1853).
+
+### Upgrade notes
+
+- The shortcut for a disabled graph check introduced in 0.8.137 applies only where the policy at the submission's base is disabled. A repository whose base declares committed fragments runs the full verification; `graph_integrity_full_enforced` counts it.
+- Commit pins are expired at most every 30 minutes, so a pin can outlive its expiry by that long.
+
+### Known issues
+
+- Retirement keeps a checkout that any process holds open, including a file browser listing its folders. On the busiest repository that was 315 keeps in a day.
+- An enforced graph check whose committed fragments are stale costs minutes per submission and reports `stale` each time; it is advice and blocks nothing.
+
 ## [0.8.138] - 2026-11-19
 
 ### Changed
