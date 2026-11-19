@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.140] - 2026-11-19
+
+### Fixed
+
+- Graph integrity verification no longer regenerates the whole graph for a tree that has none committed. A repository that declares `committed_fragments` but has nothing under `.aethyme/graph/` can only be reported `stale`, because regeneration always writes the manifest and attributes file. Verification rebuilt every fragment to say so: on the busiest repository about 26,500 fragments and 316 to 439 s on every submission, more than half of it. The verdict now comes from one tree lookup, on every lane that runs the check: submission, gate runs, session gate runs, pull-request advice and native gates. Precedence is unchanged: an environment refusal is `error`, a missing pin is `incompatible`, otherwise `stale`. The full verification still runs when anything under `.aethyme/graph/` is in the index or untracked, or when the graph directory is ignored (#1858).
+- The background context warm-up returns quietly for a commit with no committed graph instead of printing a deferred warning on every tick (#1858).
+
+### Added
+
+- Span `graph_integrity_absent_check`; counters `graph_integrity_absent_tree` and `start_context_warmup_no_graph` (#1858).
+
+### Upgrade notes
+
+- For a tree with no committed graph, `changed_paths` is the single entry `.aethyme/graph` instead of every regenerated path, and the reason reads "no committed graph fragments in tree; nothing to verify".
+- A failure that the full regeneration could have hit while indexing such a tree was reported as `error`; it is now `stale`, since those steps no longer run.
+- The advice names the two ways out: run `aethyme graph refresh plan --repo .` and commit `.aethyme/graph/`, or set `[graph] authority = "disabled"`.
+
 ## [0.8.139] - 2026-11-19
 
 ### Fixed
