@@ -106,6 +106,9 @@ const RETIRE_BUSY_RECHECK_MS: i64 = 60 * 1_000;
 pub(crate) const RETIRE_STALLED_RUNS: u32 = 3;
 /// Runs in a row in which the trash grew before `broker status` says so.
 pub(crate) const TRASH_GROWING_RUNS_ADVICE_AT: u32 = 3;
+/// The least time the recovery-archive bound gets in a retirement run, even
+/// when the phases before it used the lane (it runs before the drain).
+const RETIRE_ARCHIVE_BOUND_RESERVE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The share of a retirement run's window kept for the trash drain, as
 /// `(numerator, denominator)`: a third normally, half while the trash is
@@ -884,6 +887,11 @@ pub(crate) struct CheckoutRetirementProgress {
     /// the run before.
     #[serde(default)]
     pub trash_growing_runs: u32,
+    /// Names of the trash entries the last deleter run passed over because
+    /// a process still used them (at most 256). The next run leaves them out
+    /// of its backlog decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trash_in_use_entries: Vec<String>,
     /// The last run's inspection that failed or timed out (session and the
     /// failing Git step), retried on the next run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2384,7 +2392,8 @@ impl Broker {
         let _inventory = crate::git::WorktreeInventoryRunScope::enter();
         let started = Instant::now();
         let window = deadline.saturating_duration_since(started);
-        let trash_behind = crate::checkout_trash::TrashBacklog::of(&self.checkout_trash_rows())
+        let trash_behind = self
+            .checkout_trash_deletable_backlog(&self.checkout_trash_rows())
             .behind(crate::clock::epoch_ms());
         let sweep_deadline = retirement_sweep_deadline(started, window, trash_behind);
         let mut report = CheckoutRetirementReport::default();
@@ -2460,8 +2469,15 @@ impl Broker {
                 std::time::Duration::ZERO,
             );
         }
+        // The per-repository bound on archive bytes (both locations),
+        // recorded in the storage ledger by location. It runs before the
+        // drain, which may use the rest of the lane, with at least its own
+        // small reserve; it bounds itself further inside.
+        self.record_recovery_archive_bound(
+            deadline.max(Instant::now() + RETIRE_ARCHIVE_BOUND_RESERVE),
+        );
         let drain_deadline = trash_drain_deadline(deadline, Instant::now(), window, trash_behind);
-        if drain_deadline > deadline {
+        if drain_deadline > deadline && !self.checkout_trash_rows().is_empty() {
             crate::phase_telemetry::add(
                 "checkout_trash_drain_budget_extended",
                 drain_deadline.saturating_duration_since(deadline),
@@ -2500,9 +2516,6 @@ impl Broker {
                 super::retire_operation::sweep_stale_partials(&root);
             }
         }
-        // The per-repository bound on archive bytes (both locations),
-        // recorded in the storage ledger by location.
-        self.record_recovery_archive_bound(deadline);
         let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
         let retired_pins =
             match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
@@ -2555,6 +2568,7 @@ impl Broker {
             process_use_unavailable: report.process_use_unavailable
                 || report.trash.process_use_unknown,
             trash_entries_in_use: report.trash.entries_in_use,
+            trash_in_use_entries: report.trash.in_use_names.clone(),
             trash_oldest_entry_ms: report.trash.oldest_pending_created_ms,
             trash_growing_runs: next_trash_growing_runs(
                 previous.trash_growing_runs,
@@ -2848,7 +2862,7 @@ impl Broker {
         };
         let before = rows.clone();
         let now_ms = crate::clock::epoch_ms();
-        let backlog = crate::checkout_trash::TrashBacklog::of(&rows);
+        let backlog = self.checkout_trash_deletable_backlog(&rows);
         let need = crate::checkout_trash::DrainNeed::of(
             self.checkout_trash_below_headroom(&first),
             backlog.behind(now_ms),
@@ -2856,7 +2870,10 @@ impl Broker {
         let mut pacer = crate::checkout_trash::DrainPacer::for_need(
             need,
             crate::checkout_trash::sample_host_pressure,
-        );
+        )
+        .with_ceiling(crate::gc::unattended_pacing::explicit_unlink_limit(
+            self.main_root(),
+        ));
         let drain_started = Instant::now();
         let mut report = crate::checkout_trash::drain_trash_paced(&mut rows, deadline, &mut pacer);
         // Entries recorded by another process during the drain are kept:
@@ -2908,14 +2925,26 @@ impl Broker {
         let oldest_pending_age_s = report
             .oldest_pending_created_ms
             .map(|created| now_ms.saturating_sub(created).max(0) / 1_000);
+        let ceiling_applied = report.configured_ceiling.is_some_and(|ceiling| {
+            pace.unlinks_per_second()
+                .is_some_and(|uncapped| ceiling < uncapped)
+        });
+        if ceiling_applied {
+            crate::phase_telemetry::add(
+                "checkout_trash_configured_ceiling_applied",
+                std::time::Duration::ZERO,
+            );
+        }
         crate::phase_telemetry::attach(
             "checkout_trash_drain",
             serde_json::json!({
                 "backlog_entries": backlog.entries,
                 "backlog_oldest_age_s": backlog_oldest_age_s,
                 "need": need.as_str(),
-                "pace": pace.as_str(),
-                "unlinks_per_second": pace.unlinks_per_second(),
+                "initial_pace": pace.as_str(),
+                "initial_unlinks_per_second": report.initial_unlinks_per_second,
+                "configured_ceiling": report.configured_ceiling,
+                "ceiling_applied": ceiling_applied,
                 "final_pace": final_pace,
                 "pace_changes": report.pace_changes,
                 "entries_removed": report.entries_removed,
@@ -2935,6 +2964,21 @@ impl Broker {
             }),
         );
         report
+    }
+
+    /// The backlog the deleter can work on: `rows` less the entries the last
+    /// run passed over because a process still used them (they stay in the
+    /// advice evidence, not in the pace or share decision).
+    fn checkout_trash_deletable_backlog(
+        &self,
+        rows: &crate::checkout_trash::TrashRows,
+    ) -> crate::checkout_trash::TrashBacklog {
+        let in_use = self
+            .checkout_retirement_progress()
+            .trash_in_use_entries
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        crate::checkout_trash::TrashBacklog::deletable(rows, &in_use)
     }
 
     /// Whether the volume holding `trash` is below the artifact-sweep
@@ -3636,6 +3680,28 @@ mod tests {
         assert!(passed_over.failed.is_empty(), "{passed_over:?}");
         assert!(inside.exists(), "the entry in use is kept");
         assert!(!second.exists(), "the entry behind it went in the same run");
+        let held_name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(passed_over.in_use_names, vec![held_name.clone()]);
+        // Recorded as passed over, it no longer counts toward "behind",
+        // however old it is.
+        broker
+            .store_ref()
+            .meta_set(
+                CHECKOUT_RETIREMENT_PROGRESS_KEY,
+                &serde_json::to_string(&CheckoutRetirementProgress {
+                    trash_in_use_entries: passed_over.in_use_names.clone(),
+                    ..CheckoutRetirementProgress::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let rows = broker.checkout_trash_rows();
+        assert_eq!(broker.checkout_trash_deletable_backlog(&rows).entries, 0);
+        assert_eq!(
+            crate::checkout_trash::TrashBacklog::of(&rows).entries,
+            1,
+            "{held_name} still counts for the advice"
+        );
 
         crate::session_holder::set_process_use_snapshot_for_tests(Some(
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),

@@ -928,6 +928,14 @@ pub(crate) struct TrashBacklog {
 
 impl TrashBacklog {
     pub(crate) fn of(rows: &TrashRows) -> Self {
+        Self::deletable(rows, &std::collections::BTreeSet::new())
+    }
+
+    /// The backlog the deleter can work on: as [`Self::of`], also leaving
+    /// out the entries the last run passed over because a process still used
+    /// them (`in_use`, entry names). An entry held open for days must not
+    /// keep the trash behind with nothing deletable.
+    pub(crate) fn deletable(rows: &TrashRows, in_use: &std::collections::BTreeSet<String>) -> Self {
         let mut backlog = Self::default();
         for (name, _) in rows
             .values()
@@ -936,6 +944,7 @@ impl TrashBacklog {
                 !row.pending
                     && row.failures < TRASH_FAILURE_REPORT_AFTER
                     && is_broker_entry_name(name)
+                    && !in_use.contains(*name)
             })
         {
             backlog.entries += 1;
@@ -993,6 +1002,9 @@ pub(crate) struct DrainPacer {
     need: Option<DrainNeed>,
     sample: fn() -> HostPressure,
     pace: DeleterPace,
+    /// `[cleanup] unattended_unlinks_per_second` when the repository sets
+    /// it explicitly: the ceiling of every paced mode (never of unpaced).
+    ceiling: Option<u32>,
 }
 
 impl DrainPacer {
@@ -1003,6 +1015,7 @@ impl DrainPacer {
             need: None,
             sample: HostPressure::default,
             pace,
+            ceiling: None,
         }
     }
 
@@ -1012,7 +1025,15 @@ impl DrainPacer {
             need: Some(need),
             sample,
             pace: DeleterPace::for_need(need, sample()),
+            ceiling: None,
         }
+    }
+
+    /// Hold every paced mode at or below `ceiling` unlinks a second (a
+    /// configured rate; `None` leaves the paces as they are).
+    pub(crate) fn with_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.ceiling = ceiling.filter(|rate| *rate > 0);
+        self
     }
 
     pub(crate) fn pace(&self) -> DeleterPace {
@@ -1023,6 +1044,18 @@ impl DrainPacer {
         self.need
     }
 
+    pub(crate) fn ceiling(&self) -> Option<u32> {
+        self.ceiling
+    }
+
+    /// The rate the current pace allows, held to the configured ceiling;
+    /// `None` when unpaced.
+    pub(crate) fn unlinks_per_second(&self) -> Option<u32> {
+        self.pace
+            .unlinks_per_second()
+            .map(|rate| self.ceiling.map_or(rate, |ceiling| rate.min(ceiling)))
+    }
+
     fn resample(&mut self) -> DeleterPace {
         if let Some(need) = self.need {
             self.pace = DeleterPace::for_need(need, (self.sample)());
@@ -1031,13 +1064,57 @@ impl DrainPacer {
     }
 }
 
+/// The most a limiter may fall behind its rate (a stall of the volume, a
+/// slow directory) and catch up without sleeping: the rate is a ceiling
+/// over any interval longer than this, never an average that a stall
+/// banks for a later burst.
+const DELETER_MAX_RATE_DEBT: Duration = Duration::from_millis(250);
+/// The least a limiter sleeps once ahead, so pacing costs no syscall per
+/// unlink.
+const DELETER_MIN_SLEEP: Duration = Duration::from_millis(5);
+
+/// The rate window of one limiter, on an explicit clock.
+#[derive(Debug, Clone, Copy)]
+struct RateWindow {
+    per_second: Option<u32>,
+    started: Instant,
+    unlinks: u64,
+}
+
+impl RateWindow {
+    fn new(per_second: Option<u32>, now: Instant) -> Self {
+        Self {
+            per_second,
+            started: now,
+            unlinks: 0,
+        }
+    }
+
+    /// Count one unlink at `now` and return how long to sleep before it.
+    /// A window more than [`DELETER_MAX_RATE_DEBT`] behind its rate moves
+    /// its start forward, so what a stall left undone is never issued in
+    /// one burst.
+    fn admit(&mut self, now: Instant) -> Option<Duration> {
+        self.unlinks = self.unlinks.saturating_add(1);
+        let per_second = self.per_second.filter(|rate| *rate > 0)?;
+        let due = Duration::from_secs_f64(self.unlinks as f64 / f64::from(per_second));
+        let elapsed = now.saturating_duration_since(self.started);
+        if let Some(ahead) = due.checked_sub(elapsed) {
+            return (ahead >= DELETER_MIN_SLEEP).then_some(ahead);
+        }
+        let behind = elapsed - due;
+        if let Some(forgiven) = behind.checked_sub(DELETER_MAX_RATE_DEBT) {
+            self.started += forgiven;
+        }
+        None
+    }
+}
+
 /// Holds unlinks to a rate by sleeping only when ahead of it, re-reading
 /// the drain's pace every [`DELETER_PACE_RESAMPLE_EVERY`].
 struct UnlinkLimiter<'a> {
     pacer: &'a mut DrainPacer,
-    per_second: Option<u32>,
-    started: Instant,
-    unlinks: u64,
+    window: RateWindow,
     sampled: Instant,
     pace_changes: u64,
 }
@@ -1046,10 +1123,8 @@ impl<'a> UnlinkLimiter<'a> {
     fn new(pacer: &'a mut DrainPacer) -> Self {
         let now = Instant::now();
         Self {
-            per_second: pacer.pace().unlinks_per_second(),
+            window: RateWindow::new(pacer.unlinks_per_second(), now),
             pacer,
-            started: now,
-            unlinks: 0,
             sampled: now,
             pace_changes: 0,
         }
@@ -1058,31 +1133,20 @@ impl<'a> UnlinkLimiter<'a> {
     /// Start the rate window again (a new entry): time spent between
     /// entries never buys a burst.
     fn restart(&mut self) {
-        self.started = Instant::now();
-        self.unlinks = 0;
+        self.window = RateWindow::new(self.window.per_second, Instant::now());
     }
 
     fn before_unlink(&mut self) {
         if self.sampled.elapsed() >= DELETER_PACE_RESAMPLE_EVERY {
             self.sampled = Instant::now();
-            let per_second = self.pacer.resample().unlinks_per_second();
-            if per_second != self.per_second {
-                self.per_second = per_second;
+            self.pacer.resample();
+            let per_second = self.pacer.unlinks_per_second();
+            if per_second != self.window.per_second {
+                self.window = RateWindow::new(per_second, Instant::now());
                 self.pace_changes = self.pace_changes.saturating_add(1);
-                self.restart();
             }
         }
-        self.unlinks = self.unlinks.saturating_add(1);
-        let Some(per_second) = self.per_second.filter(|rate| *rate > 0) else {
-            return;
-        };
-        let due = Duration::from_secs_f64(self.unlinks as f64 / f64::from(per_second));
-        let elapsed = self.started.elapsed();
-        // Sleep in batches of at least 5 ms so pacing costs no syscall per
-        // unlink.
-        if let Some(ahead) = due.checked_sub(elapsed)
-            && ahead >= Duration::from_millis(5)
-        {
+        if let Some(ahead) = self.window.admit(Instant::now()) {
             std::thread::sleep(ahead);
         }
     }
@@ -1207,7 +1271,19 @@ pub(crate) struct TrashDrainReport {
     pub(crate) pace_changes: u64,
     /// When the oldest entry still recorded after the run was moved in.
     pub(crate) oldest_pending_created_ms: Option<i64>,
+    /// The rate the run started at, after the configured ceiling (`None`
+    /// when unpaced).
+    pub(crate) initial_unlinks_per_second: Option<u32>,
+    /// The configured ceiling the paced modes were held to, if any.
+    pub(crate) configured_ceiling: Option<u32>,
+    /// Names of the entries passed over because a process used them (at
+    /// most [`TRASH_IN_USE_NAMES_MAX`]).
+    pub(crate) in_use_names: Vec<String>,
 }
+
+/// In-use entry names one run reports and the next run leaves out of the
+/// backlog decision, at most.
+pub(crate) const TRASH_IN_USE_NAMES_MAX: usize = 256;
 
 /// The longest one deleter run's open-file observation may take.
 const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
@@ -1256,6 +1332,8 @@ pub(crate) fn drain_trash_paced(
     let mut report = TrashDrainReport {
         pace: Some(pace),
         need: pacer.need(),
+        initial_unlinks_per_second: pacer.unlinks_per_second(),
+        configured_ceiling: pacer.ceiling(),
         ..TrashDrainReport::default()
     };
     match pace {
@@ -1428,6 +1506,9 @@ pub(crate) fn drain_trash_paced(
                     .is_some()
                 {
                     report.entries_in_use += 1;
+                    if report.in_use_names.len() < TRASH_IN_USE_NAMES_MAX {
+                        report.in_use_names.push(name.clone());
+                    }
                     crate::phase_telemetry::add("checkout_trash_entry_in_use", Duration::ZERO);
                     continue;
                 }
@@ -2014,6 +2095,114 @@ mod tests {
         let mut fixed = DrainPacer::fixed(DeleterPace::Steady);
         assert_eq!(fixed.resample(), DeleterPace::Steady);
         assert_eq!(fixed.need(), None);
+    }
+
+    /// A stall inside one entry (the volume blocking unlinks for 10 s) is
+    /// not banked: once it ends the limiter lets through at most the bounded
+    /// debt before sleeping again, and about the rate over the next second,
+    /// instead of the ~80,000 unlinks the stall left undone in one burst.
+    #[test]
+    fn a_stall_never_buys_an_unpaced_burst() {
+        let rate = DELETER_CATCHUP_UNLINKS_PER_SECOND;
+        let per_interval =
+            |interval: Duration| (f64::from(rate) * interval.as_secs_f64()).ceil() as u64;
+        let start = Instant::now();
+        let mut now = start;
+        let mut window = RateWindow::new(Some(rate), now);
+        // A second at the rate (unlinks themselves take no time here).
+        while now < start + Duration::from_secs(1) {
+            if let Some(sleep) = window.admit(now) {
+                now += sleep;
+            }
+        }
+        // The volume stalls for 10 s.
+        now += Duration::from_secs(10);
+        let stall_end = now;
+        let mut burst = 0_u64;
+        loop {
+            match window.admit(now) {
+                None => burst += 1,
+                Some(sleep) => {
+                    now += sleep;
+                    break;
+                }
+            }
+            assert!(burst < 1_000_000, "the limiter never slept again");
+        }
+        assert!(
+            burst <= per_interval(DELETER_MAX_RATE_DEBT) + per_interval(DELETER_MIN_SLEEP) + 8,
+            "{burst} unlinks issued without a sleep after the stall"
+        );
+        let mut next_second = burst + 1;
+        while now < stall_end + Duration::from_secs(1) {
+            if let Some(sleep) = window.admit(now) {
+                now += sleep;
+            }
+            next_second += 1;
+        }
+        assert!(
+            next_second
+                <= per_interval(Duration::from_secs(1))
+                    + per_interval(DELETER_MAX_RATE_DEBT)
+                    + per_interval(DELETER_MIN_SLEEP)
+                    + 8,
+            "{next_second} unlinks in the second after the stall"
+        );
+        // Unpaced never sleeps.
+        let mut unpaced = RateWindow::new(None, start);
+        assert_eq!(unpaced.admit(start), None);
+    }
+
+    /// An explicitly configured rate holds every paced mode at or below it;
+    /// a higher one changes nothing, and below the headroom it stays
+    /// unpaced.
+    #[test]
+    fn a_configured_ceiling_holds_every_paced_mode() {
+        set_scripted_pressure(HostPressure::default());
+        let capped =
+            DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure).with_ceiling(Some(500));
+        assert_eq!(capped.pace(), DeleterPace::Catchup);
+        assert_eq!(capped.unlinks_per_second(), Some(500));
+        assert_eq!(capped.ceiling(), Some(500));
+        let gentle =
+            DrainPacer::for_need(DrainNeed::Gentle, scripted_pressure).with_ceiling(Some(500));
+        assert_eq!(gentle.unlinks_per_second(), Some(500));
+        let higher = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure)
+            .with_ceiling(Some(1_000_000));
+        assert_eq!(
+            higher.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+        let unpaced = DrainPacer::for_need(DrainNeed::DiskPressure, scripted_pressure)
+            .with_ceiling(Some(500));
+        assert_eq!(unpaced.unlinks_per_second(), None);
+        let none = DrainPacer::for_need(DrainNeed::Backlog, scripted_pressure).with_ceiling(None);
+        assert_eq!(
+            none.unlinks_per_second(),
+            Some(DELETER_CATCHUP_UNLINKS_PER_SECOND)
+        );
+    }
+
+    /// An entry the last run passed over as in use, however old, does not
+    /// keep the trash behind; the rest of the backlog still counts.
+    #[test]
+    fn an_entry_in_use_does_not_keep_the_trash_behind() {
+        let now = 1_800_000_000_000_i64;
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let held = format!("{:013}-1-1-0", now - 2 * TRASH_BACKLOG_AGE_MS);
+        let fresh = format!("{:013}-1-1-1", now - 60_000);
+        let mut rows = TrashRows::new();
+        for name in [&held, &fresh] {
+            rows.entry(dir.clone())
+                .or_default()
+                .insert(name.clone(), row_for_backlog(0, false));
+        }
+        assert!(TrashBacklog::of(&rows).behind(now), "counted, it is behind");
+        let in_use = std::collections::BTreeSet::from([held.clone()]);
+        let deletable = TrashBacklog::deletable(&rows, &in_use);
+        assert_eq!(deletable.entries, 1, "{deletable:?}");
+        assert_eq!(deletable.oldest_age_ms(now), Some(60_000));
+        assert!(!deletable.behind(now));
     }
 
     /// A drain catching up still deletes only recorded entries and never
