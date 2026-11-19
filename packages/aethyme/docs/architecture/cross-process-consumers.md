@@ -404,6 +404,38 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Submit's enforced graph verification skips the slot hash (2026-11-19)
+
+On the busiest repository, the policy at the submission base declares
+committed graph fragments authoritative. Its `graph.integrity_checked` events
+show `enforced: true`, mostly with status `stale`. So the known-tree shortcut
+for disabled policies never applied there, and `submit_graph_integrity` still
+took about 208 s of real verification.
+
+That path used to hash the verification slot only to decide which commit to
+verify: HEAD when the hash equals HEAD's tree, otherwise a synthetic commit of
+the dirty state. Submit now checks that HEAD's tree is the simulated tree it
+materialized the slot from, which is one object lookup, and verifies HEAD
+without re-reading the slot. On a mismatch the general path runs. The isolated
+copy in which fragments are regenerated is created and written only by the
+verification, so its two hashes (source check and regenerated tree) use the
+stat-seeded hash, which falls back to the full hash whenever it cannot prove
+equality. Verdicts are unchanged: tests compare the outcome with the general
+path's, field for field, for a passing and a stale graph.
+
+- **Counters (introduced).** Why the full path ran:
+  `graph_integrity_full_enforced` (the policy enforces fragments) or
+  `graph_integrity_full_environment_refused` (inherited Git routing variables;
+  the outcome is an immediate `error`). Both are counted alongside the
+  existing `graph_integrity_full_verification`.
+  `graph_integrity_known_tree_mismatch` counts a slot whose HEAD did not
+  carry the simulated tree, where the general path ran.
+- **Spans (introduced).** Inside `submit_graph_integrity`:
+  `graph_integrity_isolate` (inventory, storage check, isolated checkout and
+  source check), `graph_integrity_source_check`, `graph_integrity_index`,
+  `graph_integrity_link` and `graph_integrity_compare` (regenerated tree hash
+  and changed paths). `graph_integrity_tree_hash` keeps timing each hash.
+
 ## Tree hash spans, and a stat-seeded hash for submit's verification slot (2026-11-19)
 
 The working-tree hash (the gate cache key and the writer-quiescence proof)
