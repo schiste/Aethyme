@@ -65,6 +65,9 @@ pub(crate) const DELETER_CATCHUP_LOADED_UNLINKS_PER_SECOND: u32 = 4_000;
 pub(crate) const TRASH_BACKLOG_ENTRIES: usize = 16;
 /// Age of the oldest recorded entry at or above which the trash is behind.
 pub(crate) const TRASH_BACKLOG_AGE_MS: i64 = 24 * 3_600_000;
+/// The longest one continuing catch-up lane (the detached worker's, after
+/// its other lanes) drains the trash.
+pub(crate) const TRASH_CATCHUP_MAX: Duration = Duration::from_secs(20 * 60);
 /// How often a catching-up drain reads the host's pressure again.
 const DELETER_PACE_RESAMPLE_EVERY: Duration = Duration::from_secs(2);
 /// Unlinks between checks that an entry being deleted is still in the trash.
@@ -1005,6 +1008,12 @@ pub(crate) struct DrainPacer {
     /// `[cleanup] unattended_unlinks_per_second` when the repository sets
     /// it explicitly: the ceiling of every paced mode (never of unpaced).
     ceiling: Option<u32>,
+    /// Stop the drain, resumably, as soon as a reading shows critical
+    /// memory pressure (the continuing catch-up lane), instead of going on
+    /// at the floor.
+    yield_on_memory_critical: bool,
+    /// The last reading showed critical memory pressure.
+    memory_critical: bool,
 }
 
 impl DrainPacer {
@@ -1016,17 +1025,34 @@ impl DrainPacer {
             sample: HostPressure::default,
             pace,
             ceiling: None,
+            yield_on_memory_critical: false,
+            memory_critical: false,
         }
     }
 
     /// The pace for `need`, from `sample` now and again during the drain.
     pub(crate) fn for_need(need: DrainNeed, sample: fn() -> HostPressure) -> Self {
+        let host = sample();
         Self {
             need: Some(need),
             sample,
-            pace: DeleterPace::for_need(need, sample()),
+            pace: DeleterPace::for_need(need, host),
             ceiling: None,
+            yield_on_memory_critical: false,
+            memory_critical: host.memory_critical,
         }
+    }
+
+    /// Stop at the first reading of critical memory pressure instead of
+    /// slowing to the floor.
+    pub(crate) fn yielding_on_memory_critical(mut self) -> Self {
+        self.yield_on_memory_critical = true;
+        self
+    }
+
+    /// Whether the drain must stop now for memory pressure.
+    fn must_yield(&self) -> bool {
+        self.yield_on_memory_critical && self.memory_critical
     }
 
     /// Hold every paced mode at or below `ceiling` unlinks a second (a
@@ -1058,7 +1084,9 @@ impl DrainPacer {
 
     fn resample(&mut self) -> DeleterPace {
         if let Some(need) = self.need {
-            self.pace = DeleterPace::for_need(need, (self.sample)());
+            let host = (self.sample)();
+            self.memory_critical = host.memory_critical;
+            self.pace = DeleterPace::for_need(need, host);
         }
         self.pace
     }
@@ -1136,7 +1164,9 @@ impl<'a> UnlinkLimiter<'a> {
         self.window = RateWindow::new(self.window.per_second, Instant::now());
     }
 
-    fn before_unlink(&mut self) {
+    /// Pace one unlink; `false` when the drain must stop now for memory
+    /// pressure (only a yielding pacer asks that).
+    fn before_unlink(&mut self) -> bool {
         if self.sampled.elapsed() >= DELETER_PACE_RESAMPLE_EVERY {
             self.sampled = Instant::now();
             self.pacer.resample();
@@ -1146,9 +1176,13 @@ impl<'a> UnlinkLimiter<'a> {
                 self.pace_changes = self.pace_changes.saturating_add(1);
             }
         }
+        if self.pacer.must_yield() {
+            return false;
+        }
         if let Some(ahead) = self.window.admit(Instant::now()) {
             std::thread::sleep(ahead);
         }
+        true
     }
 }
 
@@ -1279,6 +1313,58 @@ pub(crate) struct TrashDrainReport {
     /// Names of the entries passed over because a process used them (at
     /// most [`TRASH_IN_USE_NAMES_MAX`]).
     pub(crate) in_use_names: Vec<String>,
+    /// The run stopped, resumably, at a reading of critical memory pressure
+    /// (only a yielding pacer stops for it).
+    pub(crate) yielded_to_pressure: bool,
+    /// The host-wide deleter lock was held elsewhere: the run deleted
+    /// nothing.
+    pub(crate) deleter_busy: bool,
+}
+
+impl TrashDrainReport {
+    /// Why the run ended: `deleter_busy`, `process_use_unknown`,
+    /// `pressure`, `deadline`, or `finished` (every deletable entry was
+    /// attempted).
+    pub(crate) fn end_reason(&self) -> &'static str {
+        if self.deleter_busy {
+            "deleter_busy"
+        } else if self.process_use_unknown {
+            "process_use_unknown"
+        } else if self.yielded_to_pressure {
+            "pressure"
+        } else if self.budget_stopped {
+            "deadline"
+        } else {
+            "finished"
+        }
+    }
+}
+
+/// Wall time this process has spent in [`drain_trash_paced`], for the
+/// drain's share of a worker run.
+static DRAIN_NANOS_THIS_PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall time this process has spent draining the trash.
+pub(crate) fn drain_time_this_process() -> Duration {
+    Duration::from_nanos(DRAIN_NANOS_THIS_PROCESS.load(Ordering::Relaxed))
+}
+
+/// Bytes available to this user on the volume holding `fd`, or `None`
+/// when they cannot be read. The deleter measures what an entry freed as
+/// the change across its removal: with no per-file `stat` it cannot sum
+/// file lengths, and the volume's own figure is what matters. Other writers
+/// on the volume make it approximate; it never goes below zero.
+fn volume_available_bytes(fd: RawFd) -> Option<u64> {
+    // SAFETY: `statvfs` is a plain C struct whose zeroed representation is
+    // valid; `fstatvfs` fills it before any field is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live descriptor and `stat` is writable for the call.
+    if unsafe { libc::fstatvfs(fd, &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    let (available, fragment) = (u64::from(stat.f_bavail), stat.f_frsize as u64);
+    Some(available.saturating_mul(fragment))
 }
 
 /// In-use entry names one run reports and the next run leaves out of the
@@ -1513,12 +1599,14 @@ pub(crate) fn drain_trash_paced(
                     continue;
                 }
                 let left_trash = std::cell::Cell::new(false);
+                let yielded = std::cell::Cell::new(false);
                 limiter.restart();
                 let mut since_check = 0_u32;
-                match pinned.remove_with_progress_and_observed_file_bytes_and_guard(
-                    None,
-                    Some(deadline),
-                    || {
+                let available_before = volume_available_bytes(trash_fd);
+                // Listing types, no per-file `stat`: the trash is private
+                // to the broker and nothing else writes into an entry.
+                let removed =
+                    pinned.remove_trusting_listing_types_with_guard(Some(deadline), || {
                         since_check += 1;
                         if since_check >= TRASH_LOCATION_CHECK_EVERY {
                             since_check = 0;
@@ -1527,10 +1615,16 @@ pub(crate) fn drain_trash_paced(
                                 return Err(std::io::Error::other("the entry left the trash"));
                             }
                         }
-                        limiter.before_unlink();
+                        if !limiter.before_unlink() {
+                            yielded.set(true);
+                            return Err(std::io::Error::other("critical memory pressure"));
+                        }
                         Ok(())
-                    },
-                ) {
+                    });
+                let bytes = available_before
+                    .zip(volume_available_bytes(trash_fd))
+                    .map_or(0, |(before, after)| after.saturating_sub(before));
+                match removed.map(|(outcome, unlinks)| (outcome, unlinks, bytes)) {
                     Ok((crate::gc::TreeRemoval::Complete, unlinks, bytes)) => {
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
@@ -1568,6 +1662,16 @@ pub(crate) fn drain_trash_paced(
                         );
                         break 'dirs;
                     }
+                    Err(error) if yielded.get() => {
+                        report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
+                        report.bytes = report.bytes.saturating_add(bytes);
+                        report.yielded_to_pressure = true;
+                        crate::phase_telemetry::add(
+                            "checkout_trash_yielded_to_pressure",
+                            Duration::ZERO,
+                        );
+                        break 'dirs;
+                    }
                     Err(error) if left_trash.get() => {
                         report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
                         report.unrecognized += 1;
@@ -1597,6 +1701,10 @@ pub(crate) fn drain_trash_paced(
         }
     });
     crate::phase_telemetry::add("checkout_trash_drain_time", started.elapsed());
+    DRAIN_NANOS_THIS_PROCESS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     if report.budget_stopped {
         crate::phase_telemetry::add("checkout_trash_budget_stops", Duration::ZERO);
     }
