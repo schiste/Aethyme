@@ -4957,8 +4957,10 @@ fn prepare_archive_root(path: &Path) -> Result<PathBuf, String> {
             match std::fs::symlink_metadata(parent) {
                 Ok(_) => require_real_directory(parent)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(parent)
-                        .map_err(|error| format!("cannot create archive parent: {error}"))?;
+                    std::fs::create_dir(parent).map_err(|error| {
+                        note_archive_destination_error(&error);
+                        format!("cannot create archive parent: {error}")
+                    })?;
                     require_real_directory(parent)?;
                 }
                 Err(error) => {
@@ -4969,6 +4971,7 @@ fn prepare_archive_root(path: &Path) -> Result<PathBuf, String> {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
+                    note_archive_destination_error(&error);
                     return Err(format!("cannot create archive root: {error}"));
                 }
             }
@@ -4981,14 +4984,37 @@ fn prepare_archive_root(path: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "archive root disappeared during setup".into())
 }
 
+thread_local! {
+    /// Set when creating a directory in the archive destination (its
+    /// parent, its root, or a staging directory) was refused with a
+    /// permission error: the destination, not the checkout, refused.
+    static ARCHIVE_DESTINATION_DENIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn note_archive_destination_error(error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        ARCHIVE_DESTINATION_DENIED.with(|denied| denied.set(true));
+    }
+}
+
+/// Whether, since the last call on this thread, creating a directory in an
+/// archive destination was refused with a permission error (`EPERM`,
+/// `EACCES`); clears it. A permission error reading the checkout's own
+/// files never sets it.
+pub(crate) fn take_archive_destination_denied() -> bool {
+    ARCHIVE_DESTINATION_DENIED.with(|denied| denied.replace(false))
+}
+
 fn create_exclusive_archive_directory(parent: &Path, name: &str) -> Result<PathBuf, String> {
     require_real_directory(parent)?;
     if !is_contained_relative(name) || name.contains('/') {
         return Err("archive staging directory name is invalid".into());
     }
     let path = parent.join(name);
-    std::fs::create_dir(&path)
-        .map_err(|error| format!("cannot exclusively create {}: {error}", path.display()))?;
+    std::fs::create_dir(&path).map_err(|error| {
+        note_archive_destination_error(&error);
+        format!("cannot exclusively create {}: {error}", path.display())
+    })?;
     require_real_directory(&path)?;
     Ok(path)
 }
@@ -8306,6 +8332,37 @@ mod tests {
 
         let described = describe_untracked(&file, "tool.sh").unwrap().unwrap();
         assert_eq!(described.mode, Some(0o751));
+    }
+
+    /// A permission error creating a directory in the archive destination
+    /// marks the destination as refusing; a permission error reading a file
+    /// elsewhere (a checkout's own unreadable file) does not.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_archive_destination_refusing_a_directory_marks_a_denial() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let unreadable = root.path().join("unreadable.txt");
+        std::fs::write(&unreadable, "secret\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        take_archive_destination_denied();
+
+        let read = std::fs::read(&unreadable);
+        let created = create_exclusive_archive_directory(&locked, "7.retirement-v6.partial");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if read.is_ok() {
+            // A privileged runner reads and writes regardless.
+            return;
+        }
+        assert!(created.is_err());
+        assert!(take_archive_destination_denied(), "the destination refused");
+        assert!(!take_archive_destination_denied(), "taking it clears it");
+        let _ = std::fs::read(&unreadable);
+        assert!(!take_archive_destination_denied());
     }
 
     #[cfg(unix)]
