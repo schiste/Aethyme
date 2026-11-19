@@ -1887,6 +1887,9 @@ fn run_gc_trash(parsed: Parsed) -> Result<(), UsageError> {
             "--max-minutes must be between 1 and {GC_TRASH_DRAIN_MAX_MINUTES}"
         )));
     }
+    // Throttled like the unattended lane: background CPU and I/O priority
+    // for the rest of this process, before the broker opens.
+    let _priority = crate::gc::lower_artifact_worker_priority();
     let broker = open_broker(false)?;
     let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
     let outcome = gc_trash_drain(
@@ -1938,6 +1941,8 @@ fn gc_trash_drain(
             lap_max: crate::checkout_trash::TRASH_CATCHUP_MAX,
             max_laps: crate::broker::TRASH_CATCHUP_MAX_LAPS,
             until_empty: true,
+            // The operator is told at once that another lane runs.
+            lane_retry: None,
         },
         sample,
     );

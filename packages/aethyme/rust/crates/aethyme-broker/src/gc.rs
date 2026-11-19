@@ -9236,7 +9236,13 @@ impl Broker {
         {
             return false;
         }
-        !host_dir.is_some_and(Self::checkout_trash_catchup_lane_live)
+        // Another repository's live lane does not serve this trash: start
+        // ours, which waits for its turn. Only our own live lane means one
+        // is already running for this trash.
+        !host_dir.is_some_and(|dir| {
+            self.checkout_trash_catchup_lane_state(dir)
+                == crate::broker::CatchupLaneState::ThisRepository
+        })
     }
 
     /// Start the catch-up lane on its own thread at the start of the

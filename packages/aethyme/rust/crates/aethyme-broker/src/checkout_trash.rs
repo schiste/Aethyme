@@ -1230,6 +1230,53 @@ pub(crate) fn try_deleter_lock(path: &Path) -> std::io::Result<Option<DeleterLoc
     Ok(Some(DeleterLock { _lock: lock }))
 }
 
+/// Take the host-wide catch-up lane lock at `path` if nobody holds it,
+/// naming this process and `repository` in its holder line, so another
+/// process can tell whose lane is live ([`catchup_lane_holder_repository`]).
+pub(crate) fn try_catchup_lane_lock(
+    path: &Path,
+    repository: &Path,
+) -> std::io::Result<Option<DeleterLock>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? else {
+        return Ok(None);
+    };
+    crate::warn_unrecorded(
+        "name the checkout trash catch-up lane",
+        lock.record_holder(&format!(
+            "pid {} since {}\n{CATCHUP_LANE_REPOSITORY_PREFIX}{}\n",
+            std::process::id(),
+            crate::clock::epoch_ms(),
+            repository.display()
+        )),
+    );
+    Ok(Some(DeleterLock { _lock: lock }))
+}
+
+/// Holder-line prefix naming the repository whose catch-up lane holds the
+/// lane lock.
+const CATCHUP_LANE_REPOSITORY_PREFIX: &str = "repository ";
+
+/// The repository named by the lane lock's holder line at `path`. Read only
+/// while the lock is held: a released lock keeps its last holder's line.
+pub(crate) fn catchup_lane_holder_repository(path: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(CATCHUP_LANE_REPOSITORY_PREFIX)
+                .map(PathBuf::from)
+        })
+}
+
 /// Clear the user-immutable and append-only flags that make an unlink fail
 /// with `EPERM` on macOS (Finder's "Locked"). Best effort, never follows a
 /// link, never leaves the entry; nothing to do elsewhere.
@@ -1392,6 +1439,38 @@ pub(crate) const TRASH_IN_USE_NAMES_MAX: usize = 256;
 
 /// The longest one deleter run's open-file observation may take.
 const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Apply what one drain did to the stored rows `current`: the drain read
+/// `before` and left `after`. An entry it removed or forgot is dropped; for
+/// an entry it kept, only the fields it changed (failures, pending) are
+/// written, so a confirmation or a new row another process stored during
+/// the drain survives.
+pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, after: &TrashRows) {
+    for (dir, entries) in before {
+        for (name, was) in entries {
+            match after.get(dir).and_then(|after| after.get(name)) {
+                Some(now) => {
+                    if let Some(stored) =
+                        current.get_mut(dir).and_then(|stored| stored.get_mut(name))
+                    {
+                        if now.failures != was.failures {
+                            stored.failures = now.failures;
+                        }
+                        if now.pending != was.pending {
+                            stored.pending = now.pending;
+                        }
+                    }
+                }
+                None => {
+                    if let Some(stored) = current.get_mut(dir) {
+                        stored.remove(name);
+                    }
+                }
+            }
+        }
+    }
+    current.retain(|_, entries| !entries.is_empty());
+}
 
 /// The order one trash directory's confirmed, broker-named entries are
 /// deleted in: fewest failures first (capped at
@@ -2308,6 +2387,51 @@ mod tests {
             stripped: true,
             scratch: false,
         }
+    }
+
+    /// A drain writes back only what it changed: a confirmation stored by
+    /// another process during the drain is not overwritten with the
+    /// drain's stale `pending`, a new row survives, a failure the drain
+    /// counted and a confirmation it made are applied, and an entry it
+    /// removed is dropped.
+    #[test]
+    fn a_drain_writes_back_only_the_fields_it_changed() {
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let name = |nonce: u32| format!("1790000000000-1-1-{nonce}");
+        let mut before = TrashRows::new();
+        for (nonce, pending) in [(1, true), (2, false), (3, true), (4, false)] {
+            before
+                .entry(dir.clone())
+                .or_default()
+                .insert(name(nonce), row_for_backlog(0, pending));
+        }
+        // The drain: 1 still pending (its creator lives), 2 failed once,
+        // 3 confirmed, 4 removed.
+        let mut after = before.clone();
+        let entries = after.get_mut(&dir).unwrap();
+        entries.get_mut(&name(2)).unwrap().failures = 1;
+        entries.get_mut(&name(3)).unwrap().pending = false;
+        entries.remove(&name(4));
+        // Meanwhile another process confirmed 1 and recorded 5.
+        let mut current = before.clone();
+        let stored = current.get_mut(&dir).unwrap();
+        stored.get_mut(&name(1)).unwrap().pending = false;
+        stored.insert(name(5), row_for_backlog(0, true));
+
+        apply_drain_rows(&mut current, &before, &after);
+
+        let stored = &current[&dir];
+        assert!(
+            !stored[&name(1)].pending,
+            "the confirmation made meanwhile survives"
+        );
+        assert_eq!(stored[&name(2)].failures, 1);
+        assert!(!stored[&name(3)].pending);
+        assert!(!stored.contains_key(&name(4)));
+        assert!(
+            stored[&name(5)].pending,
+            "a row recorded meanwhile survives"
+        );
     }
 
     /// The trash is behind once it holds [`TRASH_BACKLOG_ENTRIES`] entries
