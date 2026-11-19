@@ -189,7 +189,8 @@ blocked.
    dependency upgrades, additions or lockfile edits. Anything else still needs
    the owner. When the key is `false`, ask the owner before preparing.
    If preparation or a gate refuses an untrusted policy, run
-   `aethyme broker advanced trust status --json` from the affected session.
+   `aethyme broker advanced trust status --repo "<session-worktree>" --json`
+   from the primary checkout.
    The refusal can name the primary checkout while the session uses a
    different committed policy. Give the human the `next_action` for the
    checkout policy in the status output. Retry the operation once that
