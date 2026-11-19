@@ -2713,6 +2713,25 @@ figure it reports as `cleanup.reclaimed_bytes` is that measurement, as before.
 An already-closed session that `finish` only judges for cleanup eligibility is
 no longer walked at all.
 
+Introduced 2026-11-19 (second round). The session peer view nests
+`peer_view_own_leases`, `peer_view_lease_overlaps` (the indexed overlap
+lookups; their rows and order are unchanged), `peer_view_scopes` and
+`peer_view_pre_edit`. Session coordination nests
+`coordination_action_notice`, `coordination_collaboration_fence`,
+`coordination_stale_count` and `coordination_waiters`. `blockers` nests one
+span per source: `blockers_operations`, `blockers_host_operations`,
+`blockers_resource_leases` (with `blockers_resource_lease_owners`, mapping
+lease worktree fingerprints to sessions, and the zero-duration count
+`blockers_resource_lease_owner_canonicalized`, one per recorded checkout
+that still exists and is resolved), `blockers_gate_cache`,
+`blockers_pidfiles` and `blockers_action_required`. `finish` splits its time
+under the lifecycle claim into `finish_claim_cleanup_plan` (the eligibility
+plan), `finish_claim_recovery_proof` (the recovery proof, ownership re-proof
+and the durable cleanup intent) and `finish_claim_removal` (the removal
+itself). Every Git worktree removal adds `worktree_remove_environments`
+(destroying the checkout's environments) and `git_worktree_remove` (the
+`git worktree remove` child, whose time is also in `subprocess_git`).
+
 CLI exec also commits an opaque receipt before command dispatch and adds its id
 to the final text/JSON report. `broker advanced exec-status --session <id>`
 reads one receipt by `--receipt` or a bounded latest list (`--limit`, default

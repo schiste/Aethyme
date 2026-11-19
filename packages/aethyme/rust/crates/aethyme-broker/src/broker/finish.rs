@@ -311,8 +311,10 @@ impl Broker {
         // The plan reads the walk above as a recorded size. The size only
         // feeds the reported `reclaimed_bytes`; eligibility never reads it,
         // and the path cannot have changed: the session check above refuses.
-        let item =
-            self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut checkout_size)?;
+        let item = {
+            let _span = crate::phase_telemetry::span("finish_claim_cleanup_plan");
+            self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut checkout_size)?
+        };
         report.cleanup_safe = item.as_ref().is_none_or(|item| item.eligible());
         let recovery_retry =
             !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
@@ -362,6 +364,7 @@ impl Broker {
         // even when the removal that follows is clean and needs none.
         let mut finish_reproof: Option<&'static str> = None;
         if !recovery_retry {
+            let _span = crate::phase_telemetry::span("finish_claim_recovery_proof");
             let spawned_witness = if session.origin == SessionOrigin::Spawned {
                 self.store()
                     .spawned_worktree_instance_witness(session.id)
@@ -448,9 +451,12 @@ impl Broker {
         // Once closed, reclaiming the worktree runs to completion: killing a
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
-        match crate::git::without_git_deadline(|| {
+        let removal = crate::phase_telemetry::span("finish_claim_removal");
+        let removed = crate::git::without_git_deadline(|| {
             self.cleanup_without_archive_under_lifecycle_claim(&cleanup_session, false)
-        }) {
+        });
+        drop(removal);
+        match removed {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;

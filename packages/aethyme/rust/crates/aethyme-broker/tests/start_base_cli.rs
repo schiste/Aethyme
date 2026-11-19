@@ -423,6 +423,26 @@ fn a_session_status_metric_line_names_each_step_of_the_view() {
             "{phase}: {status}"
         );
     }
+    // Inside the peer view, coordination and blockers.
+    for phase in [
+        "peer_view_own_leases",
+        "peer_view_lease_overlaps",
+        "peer_view_scopes",
+        "peer_view_pre_edit",
+        "coordination_action_notice",
+        "coordination_collaboration_fence",
+        "coordination_stale_count",
+        "coordination_waiters",
+        "blockers_operations",
+        "blockers_host_operations",
+        "blockers_resource_leases",
+        "blockers_pidfiles",
+    ] {
+        assert!(
+            status["phase_counts"][phase].as_u64() >= Some(1),
+            "{phase}: {status}"
+        );
+    }
 }
 
 #[test]

@@ -464,7 +464,10 @@ pub(crate) fn session_peer_view(
     let leases = broker
         .store_ref()
         .session_peer_lease_overlaps(session_id, now_ms())?;
-    let scopes = broker.store_ref().session_peer_scopes(session_id)?;
+    let scopes = {
+        let _span = crate::phase_telemetry::span("peer_view_scopes");
+        broker.store_ref().session_peer_scopes(session_id)?
+    };
     // Both store queries return rows ordered by peer session ID. Read only
     // the earliest relevant assignment and keep the same priority on both
     // sides of an overlap, so two sessions cannot both decide to wait.
@@ -474,7 +477,10 @@ pub(crate) fn session_peer_view(
         .into_iter()
         .chain(scopes.first().map(|entry| entry.0))
         .min();
-    let decision = pre_edit_decision(broker, session_id, earliest)?;
+    let decision = {
+        let _span = crate::phase_telemetry::span("peer_view_pre_edit");
+        pre_edit_decision(broker, session_id, earliest)?
+    };
     let all = serde_json::json!({"leases": leases, "scopes": scopes, "pre_edit": decision});
     let hash = format!(
         "{:x}",
@@ -586,25 +592,32 @@ pub(crate) fn session_coordination(
         .into_iter()
         .filter(|blocker| blocker.scope != crate::BlockerScope::Session)
         .collect();
-    if let Some(session_id) = session_id
-        && let Ok(Some(notice)) = broker.session_action_required_blocker(session_id)
-    {
-        actions.insert(0, notice);
+    if let Some(session_id) = session_id {
+        let _span = crate::phase_telemetry::span("coordination_action_notice");
+        if let Ok(Some(notice)) = broker.session_action_required_blocker(session_id) {
+            actions.insert(0, notice);
+        }
     }
     let mut warnings_by_kind = std::collections::BTreeMap::new();
     for warning in &other {
         *warnings_by_kind.entry(warning.kind.as_str()).or_insert(0) += 1;
     }
-    if broker
-        .collaboration_fence_state(crate::broker::FenceTrigger::Open)
-        .is_some()
-    {
+    let fenced = {
+        let _span = crate::phase_telemetry::span("coordination_collaboration_fence");
+        broker
+            .collaboration_fence_state(crate::broker::FenceTrigger::Open)
+            .is_some()
+    };
+    if fenced {
         warnings_by_kind.insert("collaboration_fence", 1);
     }
-    let stale = broker
-        .store_ref()
-        .recorded_stale_session_count(session_id)
-        .ok();
+    let stale = {
+        let _span = crate::phase_telemetry::span("coordination_stale_count");
+        broker
+            .store_ref()
+            .recorded_stale_session_count(session_id)
+            .ok()
+    };
     let information = serde_json::json!({
         "count": warnings_by_kind.values().sum::<usize>(),
         "warnings_by_kind": warnings_by_kind,
@@ -613,6 +626,7 @@ pub(crate) fn session_coordination(
         "recovery_checks": "not_inspected",
     });
     let waiters = session_id.map_or_else(Vec::new, |id| {
+        let _span = crate::phase_telemetry::span("coordination_waiters");
         crate::waiters::current_session_waiters(broker.main_root(), now_ms(), id)
             .into_iter()
             .filter(|waiter| waiter.alive)
