@@ -404,6 +404,51 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## No committed graph: nothing to regenerate (2026-11-19)
+
+A repository can declare `[graph] authority = "committed_fragments"` without
+ever committing `.aethyme/graph/`. Every verification of such a tree then
+regenerated every fragment (316 to 439 s per submit on the busiest repository)
+to reach the only possible verdict, `stale`. Regeneration always writes
+`.aethyme/graph/.gitattributes` and `.aethyme/graph/manifest.json`, which the
+source tree lacks. The event also listed all regenerated paths (about 26,500).
+
+The verifier now checks for that case first, with one object lookup:
+`ls-tree <treeish> -- .aethyme/graph`. When the case holds, it returns at once
+without isolating, indexing, linking or hashing a regenerated copy. The case
+holds when all of these do:
+
+- the verified commit has no `.aethyme/graph`;
+- for a working state, the index and working tree also have no hashed path
+  under it (`ls-files -co --exclude-standard`), and an on-disk engine pin is
+  one Git would hash;
+- `.aethyme/graph/manifest.json` is not ignored.
+
+The status stays `stale`, because older readers drop unknown statuses. The
+reason is `no committed graph fragments in tree; nothing to verify`, and
+`changed_paths` holds only `.aethyme/graph`. Its readers (the `broker report`
+graph section, submit's printed "stale graph paths", the
+`graph.integrity_checked` payload) only display it. The advice now says the
+repository declares fragments but has none committed, and how to generate
+them or disable the policy.
+
+Precedence is unchanged:
+- an environment that refuses graph verification is `error`;
+- a missing or empty engine pin is `incompatible`, with the full path's
+  reason;
+- otherwise the outcome is `stale`.
+
+Any other case takes the full verification. The lanes covered are submit (the
+known-tree path), the general disposable path (brokered pull-request advice,
+native gates), `gates run` and session gate runs (the working-state path,
+before any slot is created). The default-branch context warmup also returns
+quietly, with no deferred warning each tick, when the commit has no committed
+graph.
+
+- **Span (introduced).** `graph_integrity_absent_check`.
+- **Counters (introduced).** `graph_integrity_absent_tree`, and
+  `start_context_warmup_no_graph` for the warmup.
+
 ## Submit's enforced graph verification skips the slot hash (2026-11-19)
 
 On the busiest repository, the policy at the submission base declares

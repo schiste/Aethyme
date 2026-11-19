@@ -4877,6 +4877,31 @@ impl GitRepo {
         (!name.is_empty() && name.starts_with("refs/")).then(|| name.to_string())
     }
 
+    /// Whether `treeish` has an entry at `path` (a file or a directory):
+    /// one `ls-tree` lookup, no checkout read.
+    pub(crate) fn tree_has_path(&self, treeish: &str, path: &str) -> Result<bool, GitError> {
+        let listed = run_git(&self.root, &["ls-tree", "--name-only", treeish, "--", path])?;
+        Ok(!listed.trim().is_empty())
+    }
+
+    /// Whether the index or the working tree holds any path under `path`
+    /// that Git would hash: tracked entries and untracked, non-ignored files.
+    pub(crate) fn index_or_untracked_under(&self, path: &str) -> Result<bool, GitError> {
+        let listed = run_git(
+            &self.root,
+            &[
+                "ls-files",
+                "-c",
+                "-o",
+                "--exclude-standard",
+                "-z",
+                "--",
+                path,
+            ],
+        )?;
+        Ok(!listed.trim_matches('\0').trim().is_empty())
+    }
+
     /// Whether Git ignores `path`, relative to the repository root.
     pub fn path_is_ignored(&self, path: &str) -> bool {
         run_git(&self.root, &["check-ignore", "--quiet", "--", path]).is_ok()
