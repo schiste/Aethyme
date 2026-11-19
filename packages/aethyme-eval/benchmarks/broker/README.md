@@ -3,8 +3,8 @@
 Does the Aethyme broker land concurrent agent work more safely or cheaply
 than plain worktrees plus pull requests? Four agents do twelve small tasks
 on a throwaway Python repository, with three deliberate overlaps, under
-three coordination arms. This directory holds the harness. It never launches
-agents itself: the coordinator launches them through Chau7.
+three coordination arms. The original three-arm harness uses Chau7 to launch
+agents. The paired comparisons below can launch isolated Codex workers directly.
 
 Cardinal rule 1 applies: every setup script refuses a destination inside
 any Git work tree, so the playground is always its own repository, never
@@ -293,8 +293,8 @@ attempts, actual repair turns, and tasks that failed final verification.
 
 ### Shared verification
 
-The live task fixture measures avoided repair turns and observed duplicate
-closures. Different task trees do not guarantee that any two gate requests
+The live task fixture counts repair turns and reported duplicate work avoided.
+Different task trees do not guarantee that any two gate requests
 can share a result. Use the separate exact-tree probe to measure replay of
 the same unit suite. It pairs two simultaneous checks in each arm on four
 isolated worktrees per sample. Both arms receive the same tree for each

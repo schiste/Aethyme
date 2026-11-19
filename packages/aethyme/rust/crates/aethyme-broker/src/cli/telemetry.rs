@@ -440,10 +440,6 @@ pub(super) fn record_command_metric(
     );
 }
 
-/// Fold the spans recorded anywhere during the command into its metric
-/// fields. A phase or count the command named itself wins over a span of the
-/// same name; `phase_counts` says how many times each span ran, beside any
-/// counts the command attached.
 /// Record the actual hook transport result without changing its exit or stdout.
 pub(crate) fn record_hook_metric(
     repo: Option<&str>,
@@ -468,6 +464,10 @@ pub(crate) fn record_hook_metric(
     );
 }
 
+/// Fold the spans recorded anywhere during the command into its metric
+/// fields. A phase or count the command named itself wins over a span of the
+/// same name; `phase_counts` says how many times each span ran, beside any
+/// counts the command attached.
 fn with_spans(
     mut fields: serde_json::Map<String, serde_json::Value>,
     spans: &crate::phase_telemetry::Recorder,

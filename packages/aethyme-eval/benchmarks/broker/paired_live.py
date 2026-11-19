@@ -2,6 +2,7 @@
 """Compare direct Git and Aethyme with live Codex workers on the broker Playground."""
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from paired import HERE, MEASURES, codex_attempt, load_tasks, prepare, rep_environment, run, validate
@@ -208,10 +210,31 @@ def integrate(args, repo, root, env, git, work, arm, first_attempt):
             "rework_required": repair_used or not completed, "human_interventions": 0}
 
 
+@contextmanager
+def playground(scratch, folder, arm):
+    temporary = tempfile.TemporaryDirectory(prefix=f"paired-{arm}-", dir=scratch)
+    try:
+        yield Path(temporary.name).resolve()
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError as error:
+            if error.errno != errno.ENOTEMPTY:
+                raise
+            # Detached broker maintenance can still write to the fixture
+            # briefly after all timed commands have returned.
+            time.sleep(0.25)
+            try:
+                temporary.cleanup()
+            except OSError as retry_error:
+                warning = {"fixture": temporary.name, "error": str(retry_error)}
+                dump(folder / "cleanup-warning.json", warning)
+                print(json.dumps(warning), file=sys.stderr, flush=True)
+
+
 def run_group(args, folder, tasks, overlap, arm):
     git = shutil.which("git")
-    with tempfile.TemporaryDirectory(prefix=f"paired-{arm}-", dir=args.scratch) as temp:
-        root = Path(temp).resolve()
+    with playground(args.scratch, folder, arm) as root:
         env = dict(rep_environment(root), AETHYME_UPDATE_CHECK="off", AETHYME_MEASURE_OUTPUT="1")
         if args.hook_home:
             env["CODEX_HOME"] = str(args.hook_home)

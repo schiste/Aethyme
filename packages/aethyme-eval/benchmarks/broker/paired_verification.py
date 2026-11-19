@@ -35,12 +35,16 @@ def stage(root, env, git, binary):
 
 def round_results(index, arm, root, repo, env, git, binary):
     gate_inputs = []
+    worktree_root = (root / "worktrees").resolve()
     for slot in range(2):
         if arm == "broker":
             info = json.loads(run(repo, dict(env, AETHYME_AGENT_PID="none"), binary, "broker",
                                   "start", "--task", f"Shared unit suite sample {index} slot {slot}",
                                   "--short-name", f"gate-{index}-{slot}", "--json").stdout)
-            checkout, session = pathlib.Path(info["worktree_path"]), info["id"]
+            checkout = Path(info["worktree_path"]).resolve()
+            if not checkout.is_relative_to(worktree_root):
+                raise RuntimeError("Broker worktree escaped experiment root")
+            session = info["id"]
         else:
             checkout = root / "worktrees" / f"git-{index}-{slot}"
             run(repo, env, git, "worktree", "add", "--detach", str(checkout), "origin/main")
@@ -52,10 +56,12 @@ def round_results(index, arm, root, repo, env, git, binary):
         tree = run(checkout, env, git, "rev-parse", "HEAD^{tree}").stdout.strip()
         gate_inputs.append((checkout, session, tree))
     barrier = threading.Barrier(2)
+
     def gate(spec):
         checkout, session, tree = spec
-        argv = (binary, "broker", "advanced", "gates", "run", "--session", str(session), "--json") if session else (
-            *GATE_ARGV,)
+        argv = GATE_ARGV
+        if session is not None:
+            argv = (binary, "broker", "advanced", "gates", "run", "--session", str(session), "--json")
         barrier.wait(timeout=10)
         start = time.monotonic_ns()
         result = run(checkout, env, *argv, check=False)
