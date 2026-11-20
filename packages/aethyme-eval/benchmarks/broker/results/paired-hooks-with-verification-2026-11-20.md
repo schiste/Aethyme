@@ -147,3 +147,44 @@ The median within-pair duration difference was +17.51 s.
 The broker used 13.2% fewer uncached input tokens at the median. The
 small token sample and different direction in the substantial-gate
 cohort show sensitivity to task mix and agent behavior.
+
+## Opt-in early verification
+
+[PR #1883](https://github.com/schiste/Aethyme/pull/1883) starts bounded
+background verification after publication. Passing results are eligible
+for reuse when ordinary submit independently proves the same candidate
+tree, gate definition, and execution profile. The worker has one
+repository slot, yields at busy admission checks, and interrupts its own
+gate when the local head or fetched base changes.
+
+The controlled run used the same development build
+(`68d2916c5498ffa6dbdb2e806a8381797d34eb7e`) in both arms. Each pair used
+fresh identical Playground fixtures. One arm published with ordinary
+`advance` and the other with `advance --preverify`. Scenarios paired a
+one-pass gate with leads of 0 or 3 seconds, and a 40-pass gate with leads
+of 1 or 7 seconds. Each scenario ran twice with the arm order reversed.
+
+| Gate | Pairs | Ordinary submit median / p90 | Early submit median / p90 | Median paired time saved in submit | Median paired time saved across publish and submit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| All | 8 | 9.38 / 24.98 s | 6.62 / 19.55 s | 2.67 s | 2.39 s |
+| One pass | 4 | 6.23 / 8.53 s | 4.71 / 6.47 s | 1.77 s | 0.74 s |
+| Forty passes | 4 | 17.37 / 24.98 s | 10.26 / 19.55 s | 4.01 s | 3.65 s |
+
+All eight ordinary and eight early submits passed, and every early submit
+reused the background worker's exact verdict. Zero workers had finished
+before submit started in this run. Submit joined the work in progress or
+read its result after normal setup. Seven of eight submits were faster.
+Median publication took 2.30 s ordinary and 2.67 s with the worker. The
+eight independently executed foreground gates consumed 46.4 s in total,
+and the eight early gates consumed 48.2 s. Early execution moved work off
+the critical path. On this busy host, the cheap gate's measured latency
+change was larger than the gate itself, so the estimates still include
+host and command scheduling variation.
+
+Two deliberate supersession cases interrupted a running gate while
+another worker was refused the occupied slot. The worker exited 0.91 s
+after the local head changed and 1.74 s after the fetched base changed.
+The cancelled gates had already spent 1.28 s and 1.79 s on their commands
+and left no reusable verdict. An earlier build exposed a cache persistence
+assertion on cancellation. The repaired build passed both probes and the
+[hosted cancellation-and-reuse regression](https://github.com/schiste/Aethyme/actions/runs/44766634129).
