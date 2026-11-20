@@ -135,6 +135,8 @@ def worker(args, repo, root, env, git, task, arm, folder, peer_titles):
         publish = f"git push origin HEAD:refs/heads/{branch}"
     peer_context = f"Concurrent tasks: {', '.join(peer_titles)}. " if peer_titles else ""
     coordination = f"Inspect coordination state using {inspect}."
+    if arm == "baseline":
+        coordination += " Use direct Git for coordination and lifecycle commands."
     if args.hook_home and arm == "broker":
         coordination = (
             "Use the Aethyme startup context and hook updates for coordination. "
@@ -346,7 +348,8 @@ def run_group(args, folder, tasks, overlap, arm):
         env = dict(rep_environment(root), AETHYME_UPDATE_CHECK="off", AETHYME_MEASURE_OUTPUT="1")
         if args.hook_home:
             env["CODEX_HOME"] = str(args.hook_home)
-            env["PATH"] = str(Path(args.binary).parent) + os.pathsep + env["PATH"]
+            if arm == "broker":
+                env["PATH"] = str(Path(args.binary).parent) + os.pathsep + env["PATH"]
         repo = prepare(root, env, git)
         suite = (configure_verification(args, repo, env, git, arm)
                  if args.verification != "off" else None)
@@ -399,9 +402,12 @@ def run_group(args, folder, tasks, overlap, arm):
                 row["activity_signals"] = signals.get(row["session_id"], 0)
         for row, work in zip(rows, workers, strict=True):
             dump(work["folder"] / "result.json", row)
+        metrics = repo / ".aethyme/logs/command-metrics.jsonl"
+        collect_command_metrics(metrics, folder, workers, args.preverify and arm == "broker")
+        if arm == "baseline" and metrics.is_file() and metrics.stat().st_size > 0:
+            raise RuntimeError("direct Git arm ran broker commands; see broker-metrics.jsonl")
+        for row in rows:
             print(json.dumps(row), flush=True)
-        collect_command_metrics(repo / ".aethyme/logs/command-metrics.jsonl", folder, workers,
-                                args.preverify and arm == "broker")
         if args.hook_home and arm == "broker" and any(row["activity_signals"] < 2 for row in rows):
             raise RuntimeError("missing broker activity evidence for live Codex hooks")
         return rows
