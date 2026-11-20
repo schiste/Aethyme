@@ -722,6 +722,17 @@ seconds or the native deadline. Cache bypass and incomplete profiles still
 execute separately. The lock names use 4,096 stable shards to bound runtime
 files. Collisions may wait but never share a verdict across different keys.
 
+The `gate_graph_integrity_disabled_skip` count records when a local gate
+invocation skips a graph verification hash because the repository has no
+committed graph authority. The gate still hashes its exact inputs.
+`gate_artifact_marker` times registration of durable checkout-use markers,
+`gate_cancel_obsolete_runs` times the pre-run reconciliation of older gate
+processes, and `gate_execution_profile` measures one capture of the environment
+and tool versions used by the cache. `gate_command_setup` measures a gate's
+pre-spawn setup. Tool probes and the gate subprocess through output collection
+contribute to child-command attribution. Nested phases describe overlapping
+intervals and must not be added together.
+
 The `gate_verdict_wait` phase measures contested lock time. The
 `gate_verdict_joined` phase count measures completed handoffs. A reused
 `GateRunOutcome` keeps the producer's run ID and duration. Its
@@ -3519,6 +3530,11 @@ Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
   - Expiring retired-commit pins runs at most every 30 minutes (meta key `checkout_retirement.pins_pruned_at_ms`; counter `checkout_retirement_prune_pins_not_due` when skipped) instead of using its whole 20 s budget on every run.
   - While the last strip pass counted 50 or more closed checkouts on disk, the closed lap's floor is 45 s instead of 20 s (still bounded by the lane's deadline); counter `checkout_retirement_closed_lap_backlog_floor` when it applies, and the `checkout_retirement` attachment adds `closed_backlog` and `closed_lap_floor_ms`.
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
+
+- Changed 2026-11-20 (retirement lap order). On 0.8.139 the closed lap judged 0 to 5 checkouts a run (27 in 15 runs, 2 retired): one checkout's operation-state Git call took 37 to 45 s (the whole lap) on a slow volume, and three `git status` timeouts of about 14.5 s each took another lap, while 0.8.138's 14 a run had been cheap Finder-held `process_using_checkout` keeps. Now:
+  - The run's open-file observation is asked before the operation-state Git call, so a held checkout is kept without any Git call (and is no longer marked operation-in-progress).
+  - An inspection that failed or timed out on its own (`inspection_failed`) is remembered with the keep back-off (1 h, 6 h, then 24 h, or at once when HEAD or the index changes) instead of being judged again by the next lap; it is never retried within a run. A Git call the lap's own deadline cut short is kept as `deadline`, not remembered. The counter `checkout_retirement_inspection_retried` is retired.
+  - The `checkout_retirement` attachment adds `closed_examined` (checkouts the closed lap judged), `closed_stop` (`deadline`, `lap_complete`, `process_use_unknown`, `archive_deferred`) and `failed_inspection_ms` (time in judgements that ended `inspection_failed`); counters `checkout_retirement_closed_lap_stop_<reason>`.
 
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 

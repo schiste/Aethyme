@@ -3344,6 +3344,7 @@ fn begin_gate_artifact_use(
     session_id: Option<i64>,
     deadline: Option<Instant>,
 ) -> Result<GateArtifactUseGuard, crate::broker::BrokerOpError> {
+    let _span = crate::phase_telemetry::span("gate_artifact_marker");
     // Unsupported targets keep their established gate behavior. The matching
     // reclaimer returns ProtocolUnavailable there, so no automatic deletion
     // authority is enabled on a target without this producer protocol.
@@ -3647,6 +3648,7 @@ where
         // cancellation row per stale pidfile; these writes reconcile existing
         // runs, not a new dispatch. If a row write fails, the error leaves that
         // pidfile for a later recovery pass.
+        let _span = crate::phase_telemetry::span("gate_cancel_obsolete_runs");
         cancel_obsolete_runs(store, main_root, session_id, &tree)?;
     }
 
@@ -3702,7 +3704,10 @@ where
             // `cache = false`, so a cached verdict depends only on the tree,
             // gate definition and execution profile, and a session's proof
             // stays reusable by a submission of the same tree.
-            let profile = capture_profile(checkout.root(), subprocess_path.as_deref());
+            let profile = {
+                let _span = crate::phase_telemetry::span("gate_execution_profile");
+                capture_profile(checkout.root(), subprocess_path.as_deref())
+            };
             if !profile.writers_quiescent() {
                 return Err(crate::BrokerError::Io {
                     path: checkout.root().to_path_buf(),
@@ -5418,6 +5423,7 @@ fn run_gate_command_inner(
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
+    let setup = crate::phase_telemetry::span("gate_command_setup");
     require_command_allowance(context.absolute_deadline)?;
 
     // Before anything is spawned. A build that runs out of space reports link
@@ -5601,6 +5607,8 @@ fn run_gate_command_inner(
         process.env("PATH", path);
     }
     artifact_use.dispatch_attempted();
+    drop(setup);
+    let child_execution = crate::phase_telemetry::subprocess_span(&process);
     let mut child = match spawn_gate_command(&mut process, context.absolute_deadline) {
         Ok(child) => child,
         Err(error) => {
@@ -5921,6 +5929,7 @@ fn run_gate_command_inner(
                 stderr_result,
             )
         });
+    drop(child_execution);
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }

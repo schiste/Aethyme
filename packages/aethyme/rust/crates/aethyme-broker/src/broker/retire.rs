@@ -778,6 +778,7 @@ fn remembered_keep(code: &str) -> bool {
     matches!(
         code,
         "plan_refused"
+            | "inspection_failed"
             | "archive_too_large"
             | "archive_failed"
             | "archive_cleanup_failed"
@@ -1084,6 +1085,15 @@ pub(crate) struct CheckoutRetirementReport {
     pub kept: std::collections::BTreeMap<String, usize>,
     /// Kept checkouts not judged again this run (remembered keep, same key).
     pub keep_memo_skips: usize,
+    /// Checkouts the closed lap judged this run.
+    pub closed_examined: usize,
+    /// Why the closed lap stopped: `deadline`, `lap_complete` (the cursor
+    /// wrapped), `process_use_unknown` or `archive_deferred` (both judged
+    /// again first by the next run).
+    pub closed_stop: &'static str,
+    /// Milliseconds the closed lap spent on judgements that ended
+    /// `inspection_failed`.
+    pub failed_inspection_ms: u64,
     /// Sessions whose checkout is in the trash, recorded as cleaned.
     pub reconciled_trashed: usize,
     pub lap_complete: bool,
@@ -2282,6 +2292,28 @@ impl Broker {
             Err(_) => return Ok(Kept("operations_unknown")),
         }
         drop(sessions_phase);
+        // Cheap checks before the Git calls: the run's one open-file
+        // observation is asked before the operation state, so a checkout a
+        // process holds is kept without a Git call that, on a slow volume,
+        // took the whole lap (37 to 45 s for one checkout on the busiest
+        // repository). One observation for the whole run. Could not look is not a
+        // verdict about this checkout: the caller stops the lap here and
+        // retries soon instead of keeping every later checkout as unknown.
+        let run_process_use = {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_process_use");
+            match run.process_use() {
+                Ok(snapshot) => snapshot,
+                Err(reason) => {
+                    run.keep_detail = Some(reason);
+                    return Ok(Kept("process_use_unknown"));
+                }
+            }
+        };
+        if crate::reclaim::open_file_snapshot_blocker_for_worktree(&run_process_use, &worktree)
+            .is_some()
+        {
+            return Ok(Kept("process_using_checkout"));
+        }
         // A merge, rebase, cherry-pick, revert or bisect in progress, or
         // unmerged index entries: that state lives in the registration and
         // is neither archived nor in Git. A young one keeps the checkout
@@ -2315,27 +2347,11 @@ impl Broker {
                     }
                     true
                 }
+                // The lap's deadline cut the Git call short: no verdict.
+                Err(_) if Instant::now() >= run.deadline => return Ok(Kept("deadline")),
                 Err(_) => return Ok(Kept("operation_state_unknown")),
             }
         };
-        // One observation for the whole run. Could not look is not a
-        // verdict about this checkout: the caller stops the lap here and
-        // retries soon instead of keeping every later checkout as unknown.
-        let run_process_use = {
-            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_process_use");
-            match run.process_use() {
-                Ok(snapshot) => snapshot,
-                Err(reason) => {
-                    run.keep_detail = Some(reason);
-                    return Ok(Kept("process_use_unknown"));
-                }
-            }
-        };
-        if crate::reclaim::open_file_snapshot_blocker_for_worktree(&run_process_use, &worktree)
-            .is_some()
-        {
-            return Ok(Kept("process_using_checkout"));
-        }
         let _run_process_use = RunProcessUseScope::enter(run_process_use);
         if abandoned_operation {
             if run
@@ -2370,15 +2386,18 @@ impl Broker {
                 Err(error) => {
                     let detail = error.to_string();
                     run.keep_detail = Some(detail.clone());
-                    // An inspection that failed or ran out of time is not a
-                    // verdict about the checkout: retried next run, never
-                    // remembered as a refusal for an hour. The detail names
-                    // the Git step that failed.
-                    if inspection_failed(&error) || Instant::now() >= run.deadline {
-                        crate::phase_telemetry::add(
-                            "checkout_retirement_inspection_retried",
-                            std::time::Duration::ZERO,
-                        );
+                    // The lap's own deadline cut the inspection short: no
+                    // verdict at all, judged again when the lap comes back.
+                    if Instant::now() >= run.deadline {
+                        return Ok(Kept("deadline"));
+                    }
+                    // An inspection that failed or timed out on its own (a
+                    // `git status` slower than its limit) is not a refusal
+                    // either, but it would cost the same again on the next
+                    // run: remembered with the keep back-off, so the lap
+                    // spends that time on other checkouts first. Never
+                    // retried within the run. The detail names the Git step.
+                    if inspection_failed(&error) {
                         run.last_inspection_failure =
                             Some(format!("session {session_id}: {}", bounded_detail(&detail)));
                         return Ok(Kept("inspection_failed"));
@@ -2877,6 +2896,9 @@ impl Broker {
             "checkout_retirement",
             serde_json::json!({
                 "examined": report.examined,
+                "closed_examined": report.closed_examined,
+                "closed_stop": report.closed_stop,
+                "failed_inspection_ms": report.failed_inspection_ms,
                 "retired_clean": report.retired_clean,
                 "retired_archived": report.retired_archived,
                 "retired_operation_archived": report.retired_operation_archived,
@@ -3000,6 +3022,7 @@ impl Broker {
             CHECKOUT_RETIREMENT_CURSOR_KEY
         };
         let mut complete = false;
+        let mut stop = "deadline";
         let superseded: std::collections::BTreeMap<i64, i64> =
             self.meta_json(CHECKOUT_RETIREMENT_SUPERSEDED_KEY);
         let mut newly_superseded = std::collections::BTreeMap::new();
@@ -3025,6 +3048,7 @@ impl Broker {
             if page.is_empty() {
                 cursor = 0;
                 complete = true;
+                stop = "lap_complete";
                 break;
             }
             for session in page {
@@ -3111,7 +3135,16 @@ impl Broker {
                     continue;
                 }
                 report.examined += 1;
+                if !cleaned {
+                    report.closed_examined += 1;
+                }
+                let judged = Instant::now();
                 let outcome = self.retire_closed_checkout(session.id, run)?;
+                if !cleaned && outcome == RetireOutcome::Kept("inspection_failed") {
+                    report.failed_inspection_ms = report.failed_inspection_ms.saturating_add(
+                        u64::try_from(judged.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    );
+                }
                 if cleaned && outcome.retired() {
                     report.retired_cleaned_leftovers += 1;
                     crate::phase_telemetry::add(
@@ -3142,6 +3175,7 @@ impl Broker {
                         *report.kept.entry(code.to_string()).or_default() += 1;
                         report.process_use_unavailable |= code == "process_use_unknown";
                         cursor = previous_cursor;
+                        stop = code;
                         break 'lap;
                     }
                     RetireOutcome::Kept(code) => {
@@ -3167,6 +3201,20 @@ impl Broker {
                         }
                     },
                 ),
+            );
+        }
+        if !cleaned {
+            report.closed_stop = stop;
+            crate::phase_telemetry::add(
+                match stop {
+                    "lap_complete" => "checkout_retirement_closed_lap_stop_lap_complete",
+                    "process_use_unknown" => {
+                        "checkout_retirement_closed_lap_stop_process_use_unknown"
+                    }
+                    "archive_deferred" => "checkout_retirement_closed_lap_stop_archive_deferred",
+                    _ => "checkout_retirement_closed_lap_stop_deadline",
+                },
+                std::time::Duration::ZERO,
             );
         }
         crate::warn_unrecorded(
@@ -4418,6 +4466,61 @@ mod tests {
             assert!(retired_away(&worktree));
             assert!(is_cleaned(&broker, session.id));
         }
+    }
+
+    /// The cheap checks come before the Git calls: a checkout a process
+    /// holds is kept as `process_using_checkout` even mid-rebase (the
+    /// operation-state Git call is never made for it), and the lap goes on
+    /// past it to retire the next checkout in the same run. The run
+    /// records how many the closed lap judged and why it stopped.
+    #[test]
+    fn a_held_checkout_is_kept_before_any_git_call_and_the_lap_moves_on() {
+        let (_owner, _storage, mut broker) = fixture();
+        let root = broker.main_root().to_path_buf();
+        let (held, held_worktree) = closed(&mut broker, "held mid rebase", |worktree| {
+            std::fs::write(worktree.join("base.txt"), "session side\n").unwrap();
+            git(worktree, &["commit", "-qam", "session side"]);
+            std::fs::write(root.join("base.txt"), "main side\n").unwrap();
+            git(&root, &["commit", "-qam", "main side"]);
+            assert!(
+                !git_status(worktree, &["rebase", "main"]),
+                "the rebase conflicts"
+            );
+        });
+        let (clean, clean_worktree) = closed(&mut broker, "clean after", |_| {});
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "Finder".into(),
+                descriptor: "7".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&held_worktree).unwrap(),
+            }]),
+        ));
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.kept.get("process_using_checkout"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.kept.get("operation_in_progress"),
+            None,
+            "{report:#?}"
+        );
+        assert!(
+            !broker.checkout_retirement_in_progress().contains(&held.id),
+            "the operation state was never asked"
+        );
+        assert!(held_worktree.exists());
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(retired_away(&clean_worktree));
+        assert!(is_cleaned(&broker, clean.id));
+        assert_eq!(report.closed_examined, 2, "{report:#?}");
+        assert_eq!(report.closed_stop, "lap_complete");
+        assert_eq!(report.failed_inspection_ms, 0);
     }
 
     /// A rebase stopped on conflicts keeps the checkout: its state lives in
@@ -6323,10 +6426,11 @@ mod tests {
         assert!(worktree.join("vendor/keep.js").exists());
     }
 
-    /// An inspection that failed or timed out is retried on the next run,
-    /// never remembered as a plan refusal.
+    /// An inspection that failed or timed out on its own is remembered with
+    /// the keep back-off (a slow `git status` would cost the same on the
+    /// next run), under its own code, never as a plan refusal.
     #[test]
-    fn an_inspection_failure_is_retried_not_remembered() {
+    fn an_inspection_failure_is_remembered_not_retried_next_run() {
         let timed_out = BrokerOpError::CleanupResolveRefused {
             id: 7,
             reason: "its worktree is inspection_failed (cleanup inspection failed: git -c core.fsmonitor=false -c core.untrackedCache=false status --porcelain=v1 did not finish within 3s and was killed), which resolve does not archive".into(),
@@ -6342,7 +6446,8 @@ mod tests {
             reason: "its worktree is checked (git status timed out after 3.0 s (limit 3.0 s, outer command deadline) in a/b)".into(),
         };
         assert!(inspection_failed(&enriched));
-        assert!(!remembered_keep("inspection_failed"));
+        assert!(remembered_keep("inspection_failed"));
+        assert!(!remembered_keep("deadline"));
         assert!(remembered_keep("plan_refused"));
         assert_eq!(
             kept_counter("inspection_failed"),
