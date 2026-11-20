@@ -272,18 +272,13 @@ impl crate::Broker {
 
         // The working tree last: these walk it.
         if let Some(checkout) = &checkout {
-            if !neutered(SafetyCheck::Staged)
-                && checkout
-                    .has_tracked_changes(true)
-                    .map_err(|_| UnsafeReason::NotExamined)?
-            {
+            let (staged, unstaged) = checkout
+                .tracked_change_kinds()
+                .map_err(|_| UnsafeReason::NotExamined)?;
+            if staged && !neutered(SafetyCheck::Staged) {
                 return Err(UnsafeReason::Staged);
             }
-            if !neutered(SafetyCheck::Unstaged)
-                && checkout
-                    .has_tracked_changes(false)
-                    .map_err(|_| UnsafeReason::NotExamined)?
-            {
+            if unstaged && !neutered(SafetyCheck::Unstaged) {
                 return Err(UnsafeReason::Unstaged);
             }
             if !neutered(SafetyCheck::Untracked)

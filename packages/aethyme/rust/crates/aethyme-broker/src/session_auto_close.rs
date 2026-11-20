@@ -3567,15 +3567,19 @@ mod lane_tests {
         quiet(&mut broker, &pushed, 80);
         quiet(&mut broker, &nothing, 80);
 
-        for kept in [&early, &soon, &due, &pushed] {
+        for kept in [&early, &soon, &due] {
             kept_not_due(&mut broker, kept);
         }
+        // Pushed and nothing else: nothing on it can be lost, so it closes
+        // at the abandonment window instead of waiting for its class window
+        // and a note (the early-close rule), leaving the branch alone.
+        closes_as(&mut broker, &pushed, "pushed_unmerged");
         assert_eq!(
             closing_soon_notes(&broker, &early),
             0,
             "days from its close"
         );
-        for noted in [&soon, &due, &pushed] {
+        for noted in [&soon, &due] {
             assert_eq!(closing_soon_notes(&broker, noted), 1, "{:?}", noted.task);
         }
         let notes = broker.store_ref().unread_automation_notes(soon.id).unwrap();
@@ -3589,11 +3593,8 @@ mod lane_tests {
         );
         closes_as(&mut broker, &nothing, "landed");
 
-        for noted in [&due, &pushed] {
-            age_closing_soon_notes(&mut broker, noted, 25);
-        }
+        age_closing_soon_notes(&mut broker, &due, 25);
         closes_as(&mut broker, &due, "unpushed");
-        closes_as(&mut broker, &pushed, "pushed_unmerged");
         assert!(
             broker
                 .repo_handle()
@@ -4156,10 +4157,14 @@ mod lane_tests {
         crate::test_storage::TestStorage,
         crate::Broker,
     ) {
+        let fixture = fixture("");
+        // The shipped class windows (a day and longer): only the early rule
+        // can close anything at one hour.
+        shipped_class_windows(&fixture.2);
         crate::session_holder::set_process_use_snapshot_for_tests(Some(
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
-        fixture("")
+        fixture
     }
 
     /// Close with a one-hour abandonment window, as

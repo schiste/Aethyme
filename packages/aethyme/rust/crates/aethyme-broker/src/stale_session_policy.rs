@@ -774,9 +774,6 @@ impl crate::Broker {
                 tips.push(tip);
             }
         }
-        // The diff base is no exemption: an adopted session's base is the
-        // HEAD it was adopted at, which can carry commits nobody pushed. A
-        // base the default branch contains is landed like any other tip.
         let contains = |ancestor: &str, descendant: &str| {
             ancestor == descendant
                 || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))
@@ -800,6 +797,26 @@ impl crate::Broker {
                     .as_ref()
                     .is_some_and(|(_, upstream_tip)| contains(tip, upstream_tip.as_str()))
         };
+        // A tip at the diff base holds no session work only when the base
+        // itself survives the session: contained in the default branch (as
+        // the remote has it, or as the primary checkout has it, for a
+        // repository with no remote). An adopted session's base that holds
+        // commits nobody pushed is classed like any other tip.
+        let base_survives = session.diff_base.as_deref().is_some_and(|base| {
+            upstream
+                .as_ref()
+                .is_some_and(|(_, upstream_tip)| contains(base, upstream_tip.as_str()))
+                || repo
+                    .resolve_ref("HEAD")
+                    .is_some_and(|primary| contains(base, primary.as_str()))
+        });
+        let tips = tips
+            .into_iter()
+            .filter(|tip| !(base_survives && session.diff_base.as_deref() == Some(tip.as_str())))
+            .collect::<Vec<_>>();
+        if tips.is_empty() {
+            return StaleWorkClass::Landed;
+        }
         let unlanded = tips
             .iter()
             .filter(|tip| !landed(tip.as_str()))
