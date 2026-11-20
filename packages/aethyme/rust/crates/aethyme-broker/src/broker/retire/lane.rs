@@ -11,7 +11,10 @@
 //!
 //! Bounds:
 //! - One lane process per repository (a lane lock in the host state
-//!   directory). The worker skips its own laps while that lock is held.
+//!   directory). The worker takes the same lock for the length of its own
+//!   closed and cleaned laps and skips them when it cannot, so the kernel
+//!   lock makes the two exclusive; a starting lane waits for the worker's
+//!   laps to let go.
 //! - One judgement at a time per volume, host-wide (a per-volume turn lock
 //!   held for each judgement), so a volume never runs two of the lane's Git
 //!   inspections at once.
@@ -55,9 +58,46 @@ pub(crate) struct RetirementLaneReport {
     pub elapsed_ms: u64,
 }
 
+/// How long a waiter's note beside a volume turn lock counts as fresh: a
+/// waiter rewrites it at every poll.
+const RETIRE_LANE_WAITER_FRESH_MS: i64 = 1_000;
+/// How long a lane process waits for its repository's lane lock while the
+/// worker's own laps hold it (they last a few minutes at most).
+#[cfg(not(test))]
+const RETIRE_LANE_LOCK_WAIT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const RETIRE_LANE_LOCK_WAIT: Duration = Duration::from_secs(2);
+/// How often a starting lane asks again for its repository's lane lock.
+const RETIRE_LANE_LOCK_POLL: Duration = Duration::from_secs(1);
+
+/// The note a waiter for the turn lock at `path` keeps beside it.
+fn waiter_note_path(path: &Path) -> PathBuf {
+    path.with_extension("waiting")
+}
+
+/// The process named by a fresh waiter note at `note`, if any.
+pub(super) fn fresh_waiter(note: &Path, now_ms: i64) -> Option<u32> {
+    let text = std::fs::read_to_string(note).ok()?;
+    let mut words = text.split_whitespace();
+    let pid = match (words.next(), words.next()) {
+        (Some("pid"), Some(pid)) => pid.parse().ok()?,
+        _ => return None,
+    };
+    let at_ms: i64 = match (words.next(), words.next()) {
+        (Some("at"), Some(at)) => at.parse().ok()?,
+        _ => return None,
+    };
+    (now_ms.saturating_sub(at_ms) < RETIRE_LANE_WAITER_FRESH_MS).then_some(pid)
+}
+
 /// Take the host-wide turn lock at `path`, asking every
 /// [`RETIRE_LANE_TURN_POLL`] until `deadline`. `None` when it stayed held
 /// (or could not be opened) until then.
+///
+/// Turns are shared fairly between repositories' lanes: a waiter keeps a
+/// note beside the lock, and a process about to take the turn while
+/// another process's note is fresh first lets one poll go by, so a lane
+/// that judges back to back cannot keep the turn from a waiting one.
 pub(super) fn take_volume_turn(
     path: &Path,
     deadline: Instant,
@@ -65,7 +105,25 @@ pub(super) fn take_volume_turn(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
+    let note = waiter_note_path(path);
+    let own_pid = std::process::id();
+    let forget_note = || {
+        if fresh_waiter(&note, crate::clock::epoch_ms()) == Some(own_pid) {
+            crate::warn_unrecorded(
+                "clear a volume turn waiter note",
+                std::fs::remove_file(&note),
+            );
+        }
+    };
+    let mut yielded = false;
     loop {
+        if !yielded
+            && fresh_waiter(&note, crate::clock::epoch_ms()).is_some_and(|waiter| waiter != own_pid)
+        {
+            yielded = true;
+            crate::phase_telemetry::add("checkout_retirement_volume_turn_yielded", Duration::ZERO);
+            std::thread::sleep(RETIRE_LANE_TURN_POLL * 2);
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -74,14 +132,47 @@ pub(super) fn take_volume_turn(
             .open(path)
             .ok()?;
         match crate::file_lock::ExclusiveFileLock::try_acquire(file) {
-            Ok(Some(lock)) => return Some(lock),
+            Ok(Some(lock)) => {
+                forget_note();
+                return Some(lock);
+            }
             Ok(None) => {}
-            Err(_) => return None,
+            Err(_) => {
+                forget_note();
+                return None;
+            }
         }
         if Instant::now() + RETIRE_LANE_TURN_POLL >= deadline {
+            forget_note();
             return None;
         }
+        crate::warn_unrecorded(
+            "note a volume turn waiter",
+            std::fs::write(
+                &note,
+                format!("pid {own_pid} at {}\n", crate::clock::epoch_ms()),
+            ),
+        );
         std::thread::sleep(RETIRE_LANE_TURN_POLL);
+    }
+}
+
+/// Take this repository's lane lock at `path`, waiting up to
+/// [`RETIRE_LANE_LOCK_WAIT`] while it is held (the worker's own laps take it
+/// for their length). `None` when it stayed held: another lane process.
+fn take_lane_lock(
+    path: &Path,
+    repository: &Path,
+) -> std::io::Result<Option<crate::checkout_trash::CatchupLaneLock>> {
+    let deadline = Instant::now() + RETIRE_LANE_LOCK_WAIT;
+    loop {
+        if let Some(lock) = crate::checkout_trash::try_catchup_lane_lock(path, repository)? {
+            return Ok(Some(lock));
+        }
+        if Instant::now() + RETIRE_LANE_LOCK_POLL >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(RETIRE_LANE_LOCK_POLL);
     }
 }
 
@@ -182,8 +273,10 @@ impl Broker {
         lane: &mut RetirementLaneReport,
     ) -> &'static str {
         let _span = crate::phase_telemetry::span("checkout_retirement_lane");
-        // One lane process per repository: a second one ends at once.
-        let _repository_lock = match crate::checkout_trash::try_catchup_lane_lock(
+        // One lane process per repository, exclusive with the worker's own
+        // laps: it waits while the worker's laps hold the lock, and a
+        // second lane process ends once the wait runs out.
+        let _repository_lock = match take_lane_lock(
             &self.checkout_retirement_lane_lock_path(host_dir),
             self.main_root(),
         ) {
