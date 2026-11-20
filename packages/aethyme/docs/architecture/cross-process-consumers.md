@@ -722,6 +722,17 @@ seconds or the native deadline. Cache bypass and incomplete profiles still
 execute separately. The lock names use 4,096 stable shards to bound runtime
 files. Collisions may wait but never share a verdict across different keys.
 
+The `gate_graph_integrity_disabled_skip` count records when a local gate
+invocation skips a graph verification hash because the repository has no
+committed graph authority. The gate still hashes its exact inputs.
+`gate_artifact_marker` times registration of durable checkout-use markers,
+`gate_cancel_obsolete_runs` times the pre-run reconciliation of older gate
+processes, and `gate_execution_profile` measures one capture of the environment
+and tool versions used by the cache. `gate_command_setup` measures a gate's
+pre-spawn setup. Tool probes and the gate subprocess through output collection
+contribute to child-command attribution. Nested phases describe overlapping
+intervals and must not be added together.
+
 The `gate_verdict_wait` phase measures contested lock time. The
 `gate_verdict_joined` phase count measures completed handoffs. A reused
 `GateRunOutcome` keeps the producer's run ID and duration. Its
