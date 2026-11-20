@@ -4944,17 +4944,6 @@ impl GitRepo {
         Ok((staged, unstaged))
     }
 
-    /// Whether the index has an entry status cannot see changes to: one
-    /// flagged assume-unchanged (`ls-files -v` lowercase tag) or
-    /// skip-worktree (`S`).
-    pub(crate) fn has_hidden_index_entries(&self) -> Result<bool, GitError> {
-        let listed = run_git_bytes(&self.root, &["--no-optional-locks", "ls-files", "-v", "-z"])?;
-        Ok(listed
-            .split(|byte| *byte == 0)
-            .filter_map(|record| record.first())
-            .any(|tag| tag.is_ascii_lowercase() || *tag == b'S'))
-    }
-
     /// The subject of every stash entry (`stash list --format=%gs`), such as
     /// `WIP on <branch>: ...` or `On <branch>: ...`.
     pub(crate) fn stash_subjects(&self) -> Result<Vec<String>, GitError> {
