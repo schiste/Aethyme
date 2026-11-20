@@ -1,5 +1,6 @@
 //! Host-facing execution of an Aexeo v1 check. Publication remains the host's responsibility.
 mod portable_compare;
+mod portable_run;
 mod supervisor;
 
 use aethyme_broker::content_gate::strict::{DecisionInputs, strict_precheck_v1};
@@ -176,6 +177,13 @@ fn execute(path: &Path) -> Result<(), String> {
     Ok(())
 }
 pub fn run(args: &[String]) -> u8 {
+    if args.first().is_some_and(|arg| arg == "run-v2") {
+        if std::env::var_os("AETHYME_GATE_WORKER_ID").is_some() {
+            eprintln!("experimental comparison is forbidden in broker gates");
+            return 2;
+        }
+        return portable_run::run(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "compare-v2") {
         if std::env::var_os("AETHYME_GATE_WORKER_ID").is_some() {
             eprintln!("offline comparison is forbidden in broker gates");
@@ -190,7 +198,7 @@ pub fn run(args: &[String]) -> u8 {
         return 2;
     }
     if args.len() != 2 || args[0] != "run" {
-        eprintln!("usage: aethyme content-gate <run|compare-v2> MANIFEST.json");
+        eprintln!("usage: aethyme content-gate <run|compare-v2|run-v2> MANIFEST.json");
         return 2;
     }
     match execute(Path::new(&args[1])) {
