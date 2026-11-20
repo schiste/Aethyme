@@ -268,6 +268,57 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
 }
 
 #[test]
+fn reuse_restores_an_archived_checkout_without_main_checkout_override() {
+    for tombstone in [false, true] {
+        let tmp = repo();
+        let (id, worktree) = dirty_closed_session(tmp.path());
+        let reviewed = plan(tmp.path(), &id);
+        let outcome = json(&apply(
+            tmp.path(),
+            &id,
+            reviewed["digest"].as_str().unwrap(),
+        ));
+        assert_eq!(outcome["worktree_removed"], true);
+        if tombstone {
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(
+                worktree.join("ARCHIVED-SESSION.txt"),
+                "aethyme: retired session checkout\n",
+            )
+            .unwrap();
+        }
+        let restored = run(
+            tmp.path(),
+            &[
+                "start",
+                "--reuse",
+                worktree.to_str().unwrap(),
+                "--task",
+                "resume",
+            ],
+        );
+        assert!(
+            restored.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&restored.stdout),
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("notes/todo.txt")).unwrap(),
+            b"todo\n"
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("README.md")).unwrap(),
+            b"fixture\nstaged\nunstaged\n"
+        );
+        assert_eq!(
+            git(&worktree, &["diff", "--cached", "--name-only"]),
+            "README.md"
+        );
+    }
+}
+
+#[test]
 fn target_absent_commits_are_carried_by_a_verified_bundle() {
     let tmp = repo();
     let mut broker = isolation::open(tmp.path());
