@@ -140,15 +140,23 @@ const RETIRE_ARCHIVE_BOUND_RESERVE: std::time::Duration = std::time::Duration::f
 /// disk) to find them at a third of the bound, with the laps not reached.
 const RETIRE_ARCHIVE_BOUND_INTERVAL_MS: i64 = 30 * 60 * 1_000;
 
-/// Whether the recovery-archive bound is due this run: never recorded, its
-/// last pass found the archives over the bound, its last pass is at least
-/// [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or the clock went back.
-fn archive_bound_due(last: Option<(i64, bool)>, now_ms: i64) -> bool {
-    last.is_none_or(|(observed_at_ms, over_bound)| {
-        over_bound
-            || now_ms < observed_at_ms
-            || now_ms - observed_at_ms >= RETIRE_ARCHIVE_BOUND_INTERVAL_MS
-    })
+/// Whether the recovery-archive bound is due this run: this run wrote a
+/// recovery archive, none is recorded, or the last pass found the archives
+/// over the bound, did not measure them all (`partial`: its total may
+/// undercount), is at least [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or
+/// the clock went back.
+fn archive_bound_due(
+    last: Option<super::archive_bound::LastArchiveBound>,
+    archived_this_run: bool,
+    now_ms: i64,
+) -> bool {
+    archived_this_run
+        || last.is_none_or(|last| {
+            last.over_bound
+                || last.partial
+                || now_ms < last.observed_at_ms
+                || now_ms - last.observed_at_ms >= RETIRE_ARCHIVE_BOUND_INTERVAL_MS
+        })
 }
 
 /// How long the open sessions' paths may take to resolve, from the start
@@ -2884,9 +2892,15 @@ impl Broker {
         // recorded in the storage ledger by location. It runs before the
         // drain, which may use the rest of the lane, with at least its own
         // small reserve; it bounds itself further inside. While the last
-        // pass found the archives within the bound it runs at most every
-        // `RETIRE_ARCHIVE_BOUND_INTERVAL_MS`.
-        if archive_bound_due(self.last_recovery_archive_bound(), crate::clock::epoch_ms()) {
+        // pass measured every archive and found them within the bound, and
+        // this run's laps (which ran above) wrote no archive, it runs at
+        // most every `RETIRE_ARCHIVE_BOUND_INTERVAL_MS`.
+        let archived_this_run = report.retired_archived + report.retired_operation_archived > 0;
+        if archive_bound_due(
+            self.last_recovery_archive_bound(),
+            archived_this_run,
+            crate::clock::epoch_ms(),
+        ) {
             let _span = crate::phase_telemetry::span("checkout_retirement_archive_bound");
             self.record_recovery_archive_bound(
                 deadline.max(Instant::now() + RETIRE_ARCHIVE_BOUND_RESERVE),
@@ -7038,14 +7052,70 @@ mod tests {
     #[test]
     fn the_archive_bound_is_due_every_thirty_minutes_unless_over() {
         let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
-        assert!(super::archive_bound_due(None, now));
-        assert!(!super::archive_bound_due(Some((now - 60_000, false)), now));
-        assert!(super::archive_bound_due(Some((now - 60_000, true)), now));
-        assert!(super::archive_bound_due(
-            Some((now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS, false)),
+        let within = |observed_at_ms| super::super::archive_bound::LastArchiveBound {
+            observed_at_ms,
+            over_bound: false,
+            partial: false,
+        };
+        assert!(super::archive_bound_due(None, false, now));
+        assert!(!super::archive_bound_due(
+            Some(within(now - 60_000)),
+            false,
             now
         ));
-        assert!(super::archive_bound_due(Some((now + 60_000, false)), now));
+        assert!(super::archive_bound_due(
+            Some(super::super::archive_bound::LastArchiveBound {
+                over_bound: true,
+                ..within(now - 60_000)
+            }),
+            false,
+            now
+        ));
+        assert!(super::archive_bound_due(
+            Some(within(now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS)),
+            false,
+            now
+        ));
+        assert!(super::archive_bound_due(
+            Some(within(now + 60_000)),
+            false,
+            now
+        ));
+    }
+
+    /// A last pass that did not measure every archive may undercount: the
+    /// next run measures again rather than trusting it for 30 minutes.
+    #[test]
+    fn a_partial_archive_bound_record_is_due_again() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let partial = super::super::archive_bound::LastArchiveBound {
+            observed_at_ms: now - 60_000,
+            over_bound: false,
+            partial: true,
+        };
+        assert!(super::archive_bound_due(Some(partial), false, now));
+        assert!(!super::archive_bound_due(
+            Some(super::super::archive_bound::LastArchiveBound {
+                partial: false,
+                ..partial
+            }),
+            false,
+            now
+        ));
+    }
+
+    /// A run whose laps wrote a recovery archive runs the bound, however
+    /// recent and complete the last record is.
+    #[test]
+    fn a_run_that_archived_runs_the_archive_bound() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let recent = super::super::archive_bound::LastArchiveBound {
+            observed_at_ms: now - 60_000,
+            over_bound: false,
+            partial: false,
+        };
+        assert!(super::archive_bound_due(Some(recent), true, now));
+        assert!(!super::archive_bound_due(Some(recent), false, now));
     }
 
     /// A run whose open paths cannot be resolved in time says the closed

@@ -690,16 +690,32 @@ impl Broker {
         );
     }
 
-    /// When this repository's last recorded bound pass started (epoch ms)
-    /// and whether it found the archives over the bound; `None` when none
-    /// is recorded.
-    pub(crate) fn last_recovery_archive_bound(&self) -> Option<(i64, bool)> {
+    /// This repository's last recorded bound pass; `None` when none is
+    /// recorded.
+    pub(crate) fn last_recovery_archive_bound(&self) -> Option<LastArchiveBound> {
         let (host_state, _) = crate::host_state::resolve_host_state_dir()?;
         let repository = self.main_root().to_string_lossy().into_owned();
         crate::storage_ledger::recovery_archive_usage(&host_state)
             .get(&repository)
-            .map(|usage| (usage.observed_at_ms, usage.over_bound))
+            .map(|usage| LastArchiveBound {
+                observed_at_ms: usage.observed_at_ms,
+                over_bound: usage.over_bound,
+                partial: usage.partial,
+            })
     }
+}
+
+/// What the last recorded bound pass found, for deciding whether the next
+/// one is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LastArchiveBound {
+    /// When the pass started (epoch ms).
+    pub(crate) observed_at_ms: i64,
+    /// The archives were over the bound.
+    pub(crate) over_bound: bool,
+    /// The pass did not measure every archive (a budget stop or a failed
+    /// listing), so its total may undercount.
+    pub(crate) partial: bool,
 }
 
 /// Whether an archive can never be shown landed, whatever Git holds: it
