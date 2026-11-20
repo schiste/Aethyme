@@ -3551,6 +3551,20 @@ Covered by `broker/retire.rs` tests.
   - The `checkout_retirement` attachment adds `inspections`: `started`, `succeeded`, `failed` (`inspection_failed`), `cut_by_deadline`, `refused`, `median_succeeded_ms`.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-20 (checkout retirement lane process). The busiest repository started 295 sessions and finished 124 in a day, while the worker's closed lap (about 80 s of a 180 s, throttled window, a few times an hour, about 13 s per plan) retired 18; about 300 closed checkouts wait. Now:
+  - New detached process `broker gc __retire-lane <root>` (`broker/retire/lane.rs`).
+    - Start: the worker starts it at the start of its run, with the trash catch-up lane, when its environment gates pass (worker environment, durable repository, past the post-boot hold) and the last strip pass counted closed checkouts on disk (`checkout_retirement_lane_needed`). Counters `checkout_retirement_lane_spawned`, `_spawn_failed`, `_runtime_unverified`, `_storage_context`.
+    - Invocation and priority: it runs the worker entry's invocation checks, then leaves the macOS background band, sets process-scope `IOPOL_STANDARD` (normal disk priority, below the trash deleter's `IOPOL_IMPORTANT`) and CPU niceness 10. Linux keeps the inherited class. Attachment `checkout_retirement_lane_priority`.
+    - Opening: it opens its broker without startup GC maintenance.
+  - Bounds.
+    - One lane process per repository (`checkout-retirement-lane-<key>.lock` in the host state directory, key = 16 hex digits of the SHA-256 of the canonical main root). A second one ends `lane_present`. Probes take the lock for an instant and write nothing.
+    - While that lock is held, the worker's own closed and cleaned laps do not run (counter `checkout_retirement_laps_left_to_lane_process`; `closed_stop` `not_reached_lane_process`). The strip passes still run.
+    - One judgement at a time per volume, host-wide: each judgement holds `checkout-retirement-volume-<device>.lock` for its whole length, waited for until the slice's deadline (counter `checkout_retirement_volume_turn_unavailable` when not had; that checkout is kept as `deadline`, not remembered). So one Git inspection at a time runs on a volume across every repository's lane process.
+    - Pacing: before each 5-minute slice it reads host pressure. It waits 5 s while the host is loaded or memory is at warning (`paced_slices`), and ends at critical memory pressure (`pressure`). Each process runs at most 60 minutes (`cap`); the next worker starts another while closed checkouts wait.
+  - Work. Each slice takes the open sessions' paths and the open-file observation once, then runs the closed lap, then (when that lap reached its end) the cleaned lap. These are the worker's laps (`retirement_lap`) with the same judgement, keeps, remembered-keep back-off and 60 s inspection allowance, and the cursors are shared with the worker. The process ends `backlog_done` once both laps reached their end in one slice: every checkout not remembered as kept was judged. Other endings are `process_use_unknown`, `open_paths_unresolved`, `no_pool` and `error`; counters `checkout_retirement_lane_end_<reason>`.
+  - Telemetry. Each process writes its own command-metric row (`gc.__retire-lane`, no outcome event) with spans `checkout_retirement_lane`, `checkout_retirement_lane_pressure` and `checkout_retirement_lane_paced`. The attachment `checkout_retirement_lane` has `examined`, `retired`, `kept` (by reason), `inspections_started`, `inspections_succeeded`, `inspections_failed`, `inspections_cut_by_deadline`, `median_inspection_ms`, `slices`, `paced_slices`, `end_reason` and `elapsed_ms`.
+Covered by `broker/retire.rs`, `gc/background_priority.rs` and `cli/telemetry.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
