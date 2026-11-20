@@ -1090,13 +1090,23 @@ impl Broker {
         Ok((checkout, gates, changed))
     }
 
-    pub(super) fn record_graph_integrity(
+    fn record_graph_integrity(
         &mut self,
         checkout: &GitRepo,
         session_id: Option<i64>,
-    ) -> Result<crate::GraphIntegrityOutcome, BrokerOpError> {
+    ) -> Result<(), BrokerOpError> {
         let policy = crate::GraphIntegrityPolicy::load(checkout.root())?;
-        let outcome = if policy.enforces_committed_fragments() {
+        let enforced = policy.enforces_committed_fragments();
+        if !enforced && crate::git::graph_verification_environment_refusal().is_none() {
+            // Disabled authority emits no graph advice. Gates still hash the
+            // live checkout for their own verification and cache identity.
+            crate::phase_telemetry::add(
+                "gate_graph_integrity_disabled_skip",
+                std::time::Duration::ZERO,
+            );
+            return Ok(());
+        }
+        let outcome = if enforced {
             let worktree_root_plan = self.worktree_root_plan()?;
             crate::graph_integrity::verify_checkout_without_mutation_with_worktree_root_plan(
                 &self.main_root,
@@ -1123,7 +1133,7 @@ impl Broker {
         if let Some(advice) = outcome.advice() {
             eprintln!("[graph-integrity] {advice}");
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Load gates.toml and sync the definition snapshot so recorded
@@ -1212,6 +1222,45 @@ impl Broker {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn disabled_graph_authority_does_not_hash_gate_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(root.path()).unwrap();
+    let checkout = GitRepo::discover(root.path()).unwrap();
+
+    let recorder = crate::phase_telemetry::Recorder::default();
+    let _record = crate::phase_telemetry::install(recorder.clone());
+    broker.record_graph_integrity(&checkout, None).unwrap();
+
+    let (_, counts) = recorder.totals();
+    assert_eq!(counts.get("gate_graph_integrity_disabled_skip"), Some(&1));
+    assert!(!counts.contains_key("graph_integrity_tree_hash"));
 }
 
 #[cfg(all(test, unix))]
