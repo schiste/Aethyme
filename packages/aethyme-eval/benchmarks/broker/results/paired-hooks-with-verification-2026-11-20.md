@@ -119,10 +119,11 @@ directly took 4.77 / 6.85 s. Arm order was balanced, but the shared 10-CPU
 host was busy and the measured suite runtime varied by arm. The elapsed
 difference cannot all be attributed to broker bookkeeping. The five
 stock hook commands consumed 66.8 s of summed command time across the
-12 assignments and one repair. Pre- and post-tool hooks account for
-34.2 s of that total, mostly Git child time. Their median recorded output
-was zero bytes. The intervention and rework counts do not show an offset
-for those costs in this cohort. A larger trial across multiple hosts and
+12 assignments and one repair. They recorded 4,566 Git subprocess
+spans. Pre- and post-tool hooks account for 34.2 s and 2,229 of those
+spans, with nine Git spans at the median for either boundary. Their
+median recorded output was zero bytes. The intervention and rework
+counts do not show an offset for those costs in this cohort. A larger trial across multiple hosts and
 real workloads would be needed to generalize the magnitude.
 
 ### Six-way cheap-gate control
