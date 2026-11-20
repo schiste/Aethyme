@@ -4749,6 +4749,7 @@ impl Broker {
         resume_after: Option<&Path>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let roots = self.inspected_recovery_archive_roots();
+        let entries_span = crate::phase_telemetry::span("recovery_archive_listing_entries");
         let host_root = self.recovery_archive_root()?;
         let mut unowned = Vec::new();
         // Host state first, then the pool side, each in name order.
@@ -4756,6 +4757,7 @@ impl Broker {
         if let Some(pool) = self.pool_recovery_archive_root(false) {
             paths.extend(archive_entries_under(&pool, &mut unowned));
         }
+        drop(entries_span);
         let start = resume_after.map_or(0, |cursor| listing_resume_index(&paths, cursor));
         paths.rotate_left(start);
         let mut owned = Vec::new();
@@ -4831,16 +4833,20 @@ fn archive_entries_under(
                 return Vec::new();
             }
         };
-        let path = entry.path();
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        // The entry's type from the listing itself (no `lstat` per entry
+        // where the file system reports types, as APFS does; the standard
+        // library falls back to `lstat` where it does not): 2,390 `lstat`
+        // calls were most of a 101 s and a 268 s listing on the busiest
+        // repository. Like `lstat`, the listed type never follows a link.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
             Err(error) => {
                 unowned.push((root, format!("cannot inspect archive entry: {error}")));
                 return Vec::new();
             }
         };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            paths.push(path);
+        if !file_type.is_file() || file_type.is_symlink() {
+            paths.push(entry.path());
         }
     }
     paths.sort();
