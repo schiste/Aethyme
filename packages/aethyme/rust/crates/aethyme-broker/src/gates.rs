@@ -6220,6 +6220,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn content_gate_with_surviving_child_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let mut store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let mut gate = parse_gates("[[gate]]\nname='editorial'\nkind='content-gate-v1'\nmanifest='x.json'\ntimeout_seconds=30\n").unwrap().remove(0);
+        // Substitute only the launcher: reproduce a validator descendant that
+        // closes its pipes but remains in the broker-supervised process group.
+        gate.command = "(/bin/sleep 2) </dev/null >/dev/null 2>&1 & exit 0".into();
+        let outcomes = run_all_in(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            std::slice::from_ref(&gate),
+            None,
+            CachePolicy::Bypass,
+            GateStorageLocations::default(),
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Error);
+        let log = std::fs::read_to_string(outcomes[0].log_path.as_ref().unwrap()).unwrap();
+        assert!(
+            log.contains("gate writer cleanup could not be confirmed"),
+            "{log}"
+        );
+    }
+
     #[test]
     fn incomplete_checkout_refuses_gate_before_execution_or_cache_lookup() {
         let root = tempfile::tempdir().unwrap();
