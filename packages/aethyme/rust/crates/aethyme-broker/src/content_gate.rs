@@ -2,6 +2,8 @@
 //!
 //! Success is not permission to publish: validate the complete JSON schemas and
 //! independently bind all other decision inputs at the publication boundary.
+pub mod candidate_revision_v2;
+pub mod portable_v2;
 pub mod strict;
 
 use std::collections::{BTreeMap, BTreeSet};
