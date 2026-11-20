@@ -134,6 +134,51 @@ pub(crate) const TRASH_GROWING_RUNS_ADVICE_AT: u32 = 3;
 /// The least time the recovery-archive bound gets in a retirement run, even
 /// when the phases before it used the lane (it runs before the drain).
 const RETIRE_ARCHIVE_BOUND_RESERVE: std::time::Duration = std::time::Duration::from_secs(20);
+/// The recovery-archive bound runs at most this often (ms) while its last
+/// pass found the archives within the bound: on the busiest repository it
+/// used 105 s and 339 s of two runs (listing 2,390 archives on a contended
+/// disk) to find them at a third of the bound, with the laps not reached.
+const RETIRE_ARCHIVE_BOUND_INTERVAL_MS: i64 = 30 * 60 * 1_000;
+
+/// Whether the recovery-archive bound is due this run: this run wrote a
+/// recovery archive, none is recorded, or the last pass found the archives
+/// over the bound, did not measure them all (`partial`: its total may
+/// undercount), is at least [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or
+/// the clock went back.
+fn archive_bound_due(
+    last: Option<super::archive_bound::LastArchiveBound>,
+    archived_this_run: bool,
+    now_ms: i64,
+) -> bool {
+    archived_this_run
+        || last.is_none_or(|last| {
+            last.over_bound
+                || last.partial
+                || now_ms < last.observed_at_ms
+                || now_ms - last.observed_at_ms >= RETIRE_ARCHIVE_BOUND_INTERVAL_MS
+        })
+}
+
+/// How long the open sessions' paths may take to resolve, from the start
+/// of a lane of `window`: all of it but the closed lap's floor, and never
+/// less than a third. A resolution that runs out keeps nothing, so a fixed
+/// third threw away 80 s and 63 s of resolution on the busiest repository
+/// (683 open checkouts, 60 s allowed) and left the closed lap unreached.
+fn open_paths_allowance(
+    window: std::time::Duration,
+    closed_floor: std::time::Duration,
+) -> std::time::Duration {
+    window.saturating_sub(closed_floor).max(window / 3)
+}
+
+/// Whether the closed lap runs before the strip passes: while at least
+/// [`RETIRE_LAP_BACKLOG_AT`] closed checkouts wait. Retiring a closed
+/// checkout removes its regenerable directories with it, and on the busiest
+/// repository 7 of 334 closed checkouts still had any to strip, while the
+/// strip passes used 38 s of the window before the lap.
+fn closed_lap_first(closed_folders: usize) -> bool {
+    closed_folders >= RETIRE_LAP_BACKLOG_AT
+}
 /// How long a retirement drain waits for the host-wide deleter lock: a
 /// little more than one catch-up slice ([`TRASH_CATCHUP_SLICE`]), which
 /// releases it between slices.
@@ -1089,8 +1134,14 @@ pub(crate) struct CheckoutRetirementReport {
     pub closed_examined: usize,
     /// Why the closed lap stopped: `deadline`, `lap_complete` (the cursor
     /// wrapped), `process_use_unknown` or `archive_deferred` (both judged
-    /// again first by the next run).
+    /// again first by the next run); `not_reached_open_paths` when the open
+    /// sessions' paths could not be resolved in time and the lap never ran.
     pub closed_stop: &'static str,
+    /// The closed lap ran before the strip passes (a large closed backlog).
+    pub closed_lap_first: bool,
+    /// Open sessions whose paths the run resolved, and how long it took.
+    pub open_sessions: usize,
+    pub open_paths_ms: u64,
     /// Milliseconds the closed lap spent on judgements that ended
     /// `inspection_failed`.
     pub failed_inspection_ms: u64,
@@ -2717,24 +2768,35 @@ impl Broker {
         let _inventory = crate::git::WorktreeInventoryRunScope::enter();
         let started = Instant::now();
         let window = deadline.saturating_duration_since(started);
+        let setup_span = crate::phase_telemetry::span("checkout_retirement_setup");
         let trash_behind = self
             .checkout_trash_deletable_backlog(&self.checkout_trash_rows())
             .behind(crate::clock::epoch_ms());
         let sweep_deadline = retirement_sweep_deadline(started, window, trash_behind);
         let mut report = CheckoutRetirementReport::default();
         // Closed checkouts still on disk, as the last strip pass counted
-        // them: a large backlog gets the closed lap a larger floor.
+        // them: a large backlog gets the closed lap a larger floor, and the
+        // lap before the strip passes.
         let closed_backlog = self
             .checkout_retirement_progress()
             .strip
             .backlog
             .closed_folders;
+        drop(setup_span);
+        let closed_floor = closed_lap_floor(closed_backlog);
+        report.closed_lap_first = closed_lap_first(closed_backlog);
         let mut last_inspection_failure = None;
-        // Resolving the open sessions' paths may use a third of the window,
-        // never the phases after it.
-        if let Some(mut run) = self.begin_checkout_retirement_run(started + window / 3)? {
+        // Resolving the open sessions' paths may use the window less the
+        // closed lap's floor (never less than a third of it).
+        let open_paths_started = Instant::now();
+        let begun = self
+            .begin_checkout_retirement_run(started + open_paths_allowance(window, closed_floor))?;
+        report.open_paths_ms =
+            u64::try_from(open_paths_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(mut run) = begun {
             run.archive_deadline = deadline;
             report.open_path_resolutions = 1;
+            report.open_sessions = run.open_paths.len();
             #[cfg(test)]
             AFTER_OPEN_PATHS.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -2750,25 +2812,30 @@ impl Broker {
                 let left = sweep_deadline.saturating_duration_since(Instant::now());
                 (Instant::now() + (left * part / of).max(floor)).min(deadline)
             };
-            // Strip regenerable directories out of closed checkouts first:
-            // O(1) renames, no walk, capped per run, so the judgement laps
-            // that follow see small trees.
-            let strip_deadline = share(2, 5, RETIRE_STRIP_MIN_SHARE);
-            run.deadline = strip_deadline;
-            report.strip = self.strip_closed_checkouts(
-                &mut run,
-                strip_deadline,
-                super::strip::STRIP_CHECKOUTS_PER_RUN,
-            );
-            // Then the idle open sessions' regenerable directories, with
-            // their own share.
-            let idle_deadline = share(1, 4, RETIRE_IDLE_STRIP_MIN_SHARE);
-            run.deadline = idle_deadline;
-            report.idle_strip = self.strip_idle_open_checkouts(
-                &mut run,
-                idle_deadline,
-                super::strip_idle::IDLE_STRIP_CHECKOUTS_PER_RUN,
-            );
+            // Strip regenerable directories out of closed checkouts: O(1)
+            // renames, no walk, capped per run, so the judgement laps that
+            // follow see small trees; then the idle open sessions' ones,
+            // each pass with its own share.
+            let strip_passes =
+                |this: &mut Self, run: &mut RetireRun, report: &mut CheckoutRetirementReport| {
+                    let strip_deadline = share(2, 5, RETIRE_STRIP_MIN_SHARE);
+                    run.deadline = strip_deadline;
+                    report.strip = this.strip_closed_checkouts(
+                        run,
+                        strip_deadline,
+                        super::strip::STRIP_CHECKOUTS_PER_RUN,
+                    );
+                    let idle_deadline = share(1, 4, RETIRE_IDLE_STRIP_MIN_SHARE);
+                    run.deadline = idle_deadline;
+                    report.idle_strip = this.strip_idle_open_checkouts(
+                        run,
+                        idle_deadline,
+                        super::strip_idle::IDLE_STRIP_CHECKOUTS_PER_RUN,
+                    );
+                };
+            if !report.closed_lap_first {
+                strip_passes(self, &mut run, &mut report);
+            }
             // Session scratch directories of closed (or replaced) sessions:
             // O(1) renames into the trash with a small fixed budget, before
             // the laps, so build output left there never waits behind them.
@@ -2783,18 +2850,30 @@ impl Broker {
             report.scratch = self.retire_session_scratch(&mut run, scratch_deadline);
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
-            // its own share so neither starves the other.
-            let closed_floor = closed_lap_floor(closed_backlog);
+            // its own share so neither starves the other. Before the strip
+            // passes, the closed lap has the rest of the sweep window (at
+            // least its floor); after them, half of what they left.
             if closed_floor > RETIRE_LAP_MIN_SHARE {
                 crate::phase_telemetry::add(
                     "checkout_retirement_closed_lap_backlog_floor",
                     std::time::Duration::ZERO,
                 );
             }
-            let closed_deadline = share(1, 2, closed_floor);
+            let closed_deadline = if report.closed_lap_first {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_closed_lap_first",
+                    std::time::Duration::ZERO,
+                );
+                share(1, 1, closed_floor)
+            } else {
+                share(1, 2, closed_floor)
+            };
             run.deadline = closed_deadline;
             report.lap_complete =
                 self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
+            if report.closed_lap_first {
+                strip_passes(self, &mut run, &mut report);
+            }
             if !report.process_use_unavailable {
                 let cleaned_deadline = share(1, 1, RETIRE_CLEANED_LAP_MIN_SHARE);
                 run.deadline = cleaned_deadline;
@@ -2807,14 +2886,31 @@ impl Broker {
                 "checkout_retirement_open_paths_unresolved",
                 std::time::Duration::ZERO,
             );
+            report.closed_stop = "not_reached_open_paths";
         }
         // The per-repository bound on archive bytes (both locations),
         // recorded in the storage ledger by location. It runs before the
         // drain, which may use the rest of the lane, with at least its own
-        // small reserve; it bounds itself further inside.
-        self.record_recovery_archive_bound(
-            deadline.max(Instant::now() + RETIRE_ARCHIVE_BOUND_RESERVE),
-        );
+        // small reserve; it bounds itself further inside. While the last
+        // pass measured every archive and found them within the bound, and
+        // this run's laps (which ran above) wrote no archive, it runs at
+        // most every `RETIRE_ARCHIVE_BOUND_INTERVAL_MS`.
+        let archived_this_run = report.retired_archived + report.retired_operation_archived > 0;
+        if archive_bound_due(
+            self.last_recovery_archive_bound(),
+            archived_this_run,
+            crate::clock::epoch_ms(),
+        ) {
+            let _span = crate::phase_telemetry::span("checkout_retirement_archive_bound");
+            self.record_recovery_archive_bound(
+                deadline.max(Instant::now() + RETIRE_ARCHIVE_BOUND_RESERVE),
+            );
+        } else {
+            crate::phase_telemetry::add(
+                "checkout_retirement_archive_bound_not_due",
+                std::time::Duration::ZERO,
+            );
+        }
         let drain_deadline = trash_drain_deadline(deadline, Instant::now(), window, trash_behind);
         if drain_deadline > deadline && !self.checkout_trash_rows().is_empty() {
             crate::phase_telemetry::add(
@@ -2898,6 +2994,9 @@ impl Broker {
                 "examined": report.examined,
                 "closed_examined": report.closed_examined,
                 "closed_stop": report.closed_stop,
+                "closed_lap_first": report.closed_lap_first,
+                "open_sessions": report.open_sessions,
+                "open_paths_ms": report.open_paths_ms,
                 "failed_inspection_ms": report.failed_inspection_ms,
                 "retired_clean": report.retired_clean,
                 "retired_archived": report.retired_archived,
@@ -6404,6 +6503,7 @@ mod tests {
 
         let report = run(&mut broker);
 
+        assert!(!report.closed_lap_first, "a small backlog strips first");
         assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
@@ -6925,6 +7025,152 @@ mod tests {
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
+    }
+
+    /// Open paths may use the window less the closed lap's floor (never less
+    /// than a third): 0.8.141 lost 80 s and 63 s resolutions to a fixed 60 s.
+    #[test]
+    fn open_paths_may_use_the_window_less_the_closed_lap_floor() {
+        let window = Duration::from_secs(180);
+        assert_eq!(
+            super::open_paths_allowance(window, Duration::from_secs(45)),
+            Duration::from_secs(135)
+        );
+        assert_eq!(
+            super::open_paths_allowance(window, Duration::from_secs(150)),
+            Duration::from_secs(60),
+            "never less than a third"
+        );
+        assert_eq!(
+            super::open_paths_allowance(Duration::from_secs(12), Duration::from_secs(45)),
+            Duration::from_secs(4)
+        );
+    }
+
+    /// The bound runs when never recorded, over the bound, 30 minutes on,
+    /// or after the clock went back; otherwise it waits.
+    #[test]
+    fn the_archive_bound_is_due_every_thirty_minutes_unless_over() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let within = |observed_at_ms| super::super::archive_bound::LastArchiveBound {
+            observed_at_ms,
+            over_bound: false,
+            partial: false,
+        };
+        assert!(super::archive_bound_due(None, false, now));
+        assert!(!super::archive_bound_due(
+            Some(within(now - 60_000)),
+            false,
+            now
+        ));
+        assert!(super::archive_bound_due(
+            Some(super::super::archive_bound::LastArchiveBound {
+                over_bound: true,
+                ..within(now - 60_000)
+            }),
+            false,
+            now
+        ));
+        assert!(super::archive_bound_due(
+            Some(within(now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS)),
+            false,
+            now
+        ));
+        assert!(super::archive_bound_due(
+            Some(within(now + 60_000)),
+            false,
+            now
+        ));
+    }
+
+    /// A last pass that did not measure every archive may undercount: the
+    /// next run measures again rather than trusting it for 30 minutes.
+    #[test]
+    fn a_partial_archive_bound_record_is_due_again() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let partial = super::super::archive_bound::LastArchiveBound {
+            observed_at_ms: now - 60_000,
+            over_bound: false,
+            partial: true,
+        };
+        assert!(super::archive_bound_due(Some(partial), false, now));
+        assert!(!super::archive_bound_due(
+            Some(super::super::archive_bound::LastArchiveBound {
+                partial: false,
+                ..partial
+            }),
+            false,
+            now
+        ));
+    }
+
+    /// A run whose laps wrote a recovery archive runs the bound, however
+    /// recent and complete the last record is.
+    #[test]
+    fn a_run_that_archived_runs_the_archive_bound() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let recent = super::super::archive_bound::LastArchiveBound {
+            observed_at_ms: now - 60_000,
+            over_bound: false,
+            partial: false,
+        };
+        assert!(super::archive_bound_due(Some(recent), true, now));
+        assert!(!super::archive_bound_due(Some(recent), false, now));
+    }
+
+    /// A run whose open paths cannot be resolved in time says the closed
+    /// lap was not reached, instead of leaving `closed_stop` empty.
+    #[test]
+    fn unresolved_open_paths_report_the_closed_lap_not_reached() {
+        let (_owner, _storage, mut broker) = fixture();
+        let _open = broker.start_worktree("open unresolved", None).unwrap();
+        let (_session, worktree) = closed(&mut broker, "not reached", |_| {});
+
+        let report = broker.run_checkout_retirement(Instant::now()).unwrap();
+
+        assert_eq!(report.closed_stop, "not_reached_open_paths", "{report:#?}");
+        assert_eq!(report.closed_examined, 0, "{report:#?}");
+        assert_eq!(report.open_path_resolutions, 0, "{report:#?}");
+        assert!(worktree.exists(), "nothing judged without the open paths");
+    }
+
+    /// With 50 or more closed checkouts waiting, the closed lap runs before
+    /// the strip passes; below that the strip passes go first.
+    #[test]
+    fn a_large_closed_backlog_runs_the_closed_lap_first() {
+        assert!(!super::closed_lap_first(49));
+        assert!(super::closed_lap_first(50));
+        let (_owner, _storage, mut broker) = fixture();
+        let mut progress = CheckoutRetirementProgress::default();
+        progress.strip.backlog.closed_folders = 60;
+        broker
+            .store_ref()
+            .meta_set(
+                CHECKOUT_RETIREMENT_PROGRESS_KEY,
+                &serde_json::to_string(&progress).unwrap(),
+            )
+            .unwrap();
+        let (session, worktree) = closed(&mut broker, "closed first", |_| {});
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            run(&mut broker)
+        };
+
+        assert!(report.closed_lap_first, "{report:#?}");
+        assert_eq!(report.closed_examined, 1, "{report:#?}");
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(retired_away(&worktree));
+        assert!(is_cleaned(&broker, session.id));
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("checkout_retirement_closed_lap_first")
+                .copied(),
+            Some(1)
+        );
     }
 
     /// The strip pass goes on from where the last one stopped: a checkout

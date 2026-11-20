@@ -2073,6 +2073,18 @@ fn unsafe_graph_git_environment_key(key: &std::ffi::OsStr) -> bool {
     )
 }
 
+/// Read-only discovery can honor alternate global or system configuration.
+/// Inherited routing and inline configuration can redirect the checkout.
+pub(crate) fn repository_routing_environment_overridden() -> bool {
+    std::env::vars_os().any(|(key, _)| {
+        unsafe_graph_git_environment_key(&key)
+            || matches!(
+                key.to_str(),
+                Some("GIT_CONFIG_COUNT" | "GIT_CONFIG_PARAMETERS")
+            )
+    })
+}
+
 fn unsafe_session_commit_git_environment_key(key: &std::ffi::OsStr) -> bool {
     let normalized = key.to_string_lossy().to_ascii_uppercase();
     unsafe_graph_git_environment_key(std::ffi::OsStr::new(&normalized))
@@ -4214,7 +4226,7 @@ impl GitRepo {
     /// directory that exists. `None` leaves the question to Git; that covers
     /// main checkouts, paths inside a checkout, a `GIT_DIR`-style environment
     /// and every registration that is damaged or half removed.
-    fn registered_worktree_common_dir(path: &Path) -> Option<PathBuf> {
+    pub(crate) fn registered_worktree_common_dir(path: &Path) -> Option<PathBuf> {
         const POINTER_LIMIT: u64 = 4096;
         fn pointer(file: &Path) -> Option<String> {
             let metadata = std::fs::symlink_metadata(file).ok()?;
@@ -7530,7 +7542,23 @@ impl GitRepo {
         message: &str,
         attribution: &crate::attribution::Attribution,
     ) -> Result<String, GitError> {
+        self.commit_tree_with_date(tree, parents, message, attribution, None)
+    }
+
+    pub(crate) fn commit_tree_with_date(
+        &self,
+        tree: &str,
+        parents: &[&str],
+        message: &str,
+        attribution: &crate::attribution::Attribution,
+        fixed_date: Option<&str>,
+    ) -> Result<String, GitError> {
         let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
+        if fixed_date.is_some() {
+            // Candidate construction must be repeatable and cannot prompt for
+            // a signing key. A publishing workflow applies its own policy.
+            args.push("--no-gpg-sign".into());
+        }
         for parent in parents {
             args.push("-p".into());
             args.push((*parent).into());
@@ -7538,18 +7566,23 @@ impl GitRepo {
         args.push("-m".into());
         args.push(message.into());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = git_command()
+        let mut command = git_command();
+        command
             .args(&arg_refs)
             .current_dir(&self.root)
             .env("GIT_AUTHOR_NAME", &attribution.author.name)
             .env("GIT_AUTHOR_EMAIL", &attribution.author.email)
             .env("GIT_COMMITTER_NAME", &attribution.committer.name)
-            .env("GIT_COMMITTER_EMAIL", &attribution.committer.email)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: "commit-tree".into(),
-                source,
-            })?;
+            .env("GIT_COMMITTER_EMAIL", &attribution.committer.email);
+        if let Some(date) = fixed_date {
+            command
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
+        let output = command.output().map_err(|source| GitError::Spawn {
+            args: "commit-tree".into(),
+            source,
+        })?;
         if !output.status.success() {
             return Err(GitError::Git {
                 args: "commit-tree".into(),

@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.142] - 2026-11-20
+
+### Fixed
+
+- The retirement run reaches the closed checkouts on every pass. Before it may retire anything the run resolves the paths of every open session, with a fixed limit of a third of its window. On the busiest repository that took 63 to 80 s against 60 s, and a run that went over discarded the work and retired nothing: two passes in three. The step may now use the window less the closed lap's floor, never less than a third (#1886).
+- With 50 or more closed checkouts waiting, the closed lap runs before the strip passes, with the rest of the sweep window. The strip passes follow with their floors. Below 50 the order is unchanged. Which checkouts may be retired is unchanged (#1886).
+- The recovery-archive bound no longer spends minutes per pass. It checked each archive-root entry and each earlier recorded size one at a time without looking at the deadline: 105 to 339 s per pass on the busiest repository, with nothing to evict. It now runs at most every 30 minutes while the last record was within the bound, and every time when that record was over the bound, partial, missing or unreadable, or when the current run archived anything. The listing takes entry types from the directory read, and sizes the pass already holds are not looked up again (#1886).
+
+### Added
+
+- `closed_stop` is `not_reached_open_paths` when the closed lap never starts. The `checkout_retirement` attachment adds `closed_lap_first`, `open_sessions` and `open_paths_ms` (#1886).
+- Spans `checkout_retirement_setup`, `checkout_retirement_archive_bound`, `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`; counters `checkout_retirement_closed_lap_first` and `checkout_retirement_archive_bound_not_due` (#1886).
+
+### Known issues
+
+- Each retirement plan still costs one `git status`, about 13 s per checkout on a slow volume, so a pass judges only a few closed checkouts.
+
 ## [0.8.141] - 2026-11-20
 
 ### Fixed

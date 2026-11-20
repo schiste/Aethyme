@@ -3536,6 +3536,14 @@ Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
   - An inspection that failed or timed out on its own (`inspection_failed`) is remembered with the keep back-off (1 h, 6 h, then 24 h, or at once when HEAD or the index changes) instead of being judged again by the next lap; it is never retried within a run. A Git call the lap's own deadline cut short is kept as `deadline`, not remembered. The counter `checkout_retirement_inspection_retried` is retired.
   - The `checkout_retirement` attachment adds `closed_examined` (checkouts the closed lap judged), `closed_stop` (`deadline`, `lap_complete`, `process_use_unknown`, `archive_deferred`) and `failed_inspection_ms` (time in judgements that ended `inspection_failed`); counters `checkout_retirement_closed_lap_stop_<reason>`.
 
+- Changed 2026-11-20 (retirement run reaches its closed lap). On 0.8.141 on the busiest repository (closed backlog 335, 683 open sessions), two of three runs never started the closed lap: resolving the open sessions' paths took 80 s and 63 s against a fixed third of the 180 s window (60 s), and a resolution that runs out keeps nothing. The recovery-archive bound then took 105 s and 339 s to list 2,390 archives with nothing listed (one `lstat` per archive root entry, then one per earlier recorded size), which was the 300 s no checkout-retirement span covered. Now:
+  - Resolving open paths may use the window less the closed lap's floor, never less than a third (135 s of 180 s at the 45 s backlog floor).
+  - While 50 or more closed checkouts wait, the closed lap runs right after the scratch pass, with the rest of the sweep window (at least its floor), and the strip and idle strip passes follow with their floors (counter `checkout_retirement_closed_lap_first`). Below 50 the order is unchanged.
+  - The recovery-archive bound runs at most every 30 minutes while its last recorded pass measured every archive and found them within the bound, and the run's laps (which run before it) wrote no recovery archive. It runs on every run whose last record is over the bound or `partial` (it may undercount), and on every run that archived a checkout or an abandoned operation (from the storage ledger's `observed_at_ms`, `over_bound` and `partial`; counter `checkout_retirement_archive_bound_not_due` when skipped; span `checkout_retirement_archive_bound` around it). The archive listing takes entry types from the directory listing instead of one `lstat` per entry, and carrying earlier sizes forward checks only sizes the pass does not already hold. New spans `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`, and `checkout_retirement_setup` (the trash backlog and progress reads before the open paths).
+  - The `checkout_retirement` attachment adds `closed_lap_first`, `open_sessions` and `open_paths_ms`, and `closed_stop` is `not_reached_open_paths` when the open paths could not be resolved in time (it was empty).
+  - Unchanged and why. The plan's `git status` already runs with `GIT_OPTIONAL_LOCKS=0`, `core.fsmonitor=false` and `core.untrackedCache=false`; `git worktree list` takes no index or lock and reads each of about 1,000 registrations, already once per run. No cheaper listing gives the same answer, so both are left as they are.
+Covered by `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
@@ -3823,6 +3831,11 @@ The worker logs `gate_preverify_admission`, `gate_preverify_replay`,
 `gate_preverify_checkout`, `gate_preverify_execution` and `gate_preverify`
 timings, and an `early_verification` metric attachment with `state`,
 `executed_gates`, `cached_gates`, `cancelled_gates` and `executed_gate_ms`.
+Submit counts owned linear commits already based on the exact replay tip
+as `submit_replay_exact_parent`. The replay uses their existing Git trees
+in a complete, unmodified history view. Divergent inputs and merge commits
+retain their ordinary replay and provenance checks.
+
 The parent records `gate_preverify_launch`. These describe gate work and
 scheduling. The worker never creates or updates a submission queue entry.
 
@@ -3977,3 +3990,36 @@ could not be re-read. Stack notes come from sender
 ### Offline content-gate v2 comparison telemetry
 
 The standalone `content-gate compare-v2` command emits `timings_ms` in its JSON result: `input_read_and_parse_ms`, `compare_ms`, and `total_ms`. Failed input parsing can omit phases not reached. These measurements contain no input paths or content. This standalone command is not a broker gate and does not use the broker command recorder.
+
+### Hook dispatch telemetry
+
+`hook_no_write_target` counts pre-tool events that have no recognized write
+target and therefore skip repository discovery and coordination reads.
+
+`hook_registered_snapshot` measures proof of the linked checkout registration,
+bound repository identity, current-schema read-only database and exact session.
+It can be recorded again for opt-in hook metric attribution.
+`hook_post_recorded_view` counts post-tool boundaries served from that snapshot
+while the session's own view is still fresh and no notes await delivery. Peer
+lease and scope changes remain visible at these boundaries. An ambiguous
+registration, due own-view check or unread note takes the full hook route.
+
+### Exact batch verification
+
+`broker submit batch <base> <session=head>... --session <coordinator> --json`
+adds an explicit verification-only submit form. Ordered, distinct full
+commit IDs identify the members and the locally fetched default. The
+JSON result has `state`, `base`, `members` (with `session_id` and `head`),
+`tree`, `candidate`, `conflicting_session`, `conflict_paths`,
+`graph_advice` and `gates`. Only `verified` exits successfully and applies
+to the candidate as a whole. `busy`, `superseded`, `conflict`, `deferred`,
+`failed`, `no_candidate_changes`, `no_gate_configuration` and
+`no_gates_triggered` are distinct non-success outcomes. Pre-admission,
+ownership and execution errors keep the ordinary broker error contract.
+Candidate objects are created locally with no ref or submission queue update.
+
+Command metrics include `submit_batch_admission`, `submit_batch_compose`,
+`submit_batch_checkout`, `submit_batch_verify`, and
+`submit_batch_revalidate`. The `batch_verification` attachment contains the
+outcome, member count, executed and cached gate counts, and executed gate
+milliseconds. It contains no path, branch, commit or task information.

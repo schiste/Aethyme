@@ -331,6 +331,46 @@ impl BrokerStore {
     pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
         let repository_root = canonical_main_root(repo_root)?;
         let path = crate::broker_db_path(&repository_root)?;
+        Self::open_current_read_only(path, |path| {
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, path)
+        })
+    }
+
+    /// For the hook's advisory path only. The caller supplies a conventional
+    /// main checkout and Git common directory proven by the linked checkout's
+    /// bidirectional registration. An unbound or different database falls
+    /// back to ordinary Git discovery.
+    pub(crate) fn open_hook_snapshot(main_root: &Path, common: &Path) -> Result<Self, BrokerError> {
+        let path = crate::broker_db_path(main_root)?;
+        let scope = super::repository_identity::RepositoryBindingScope::from_resolved(
+            main_root.to_path_buf(),
+            common.to_path_buf(),
+            &path,
+            false,
+        )?;
+        let store = Self::open_current_read_only(path, |_| Ok(scope.clone()))?;
+        let binding = store.repository_worktree_binding()?;
+        if binding.repository_root.as_deref() != Some(main_root)
+            || binding.git_common_dir.as_deref() != Some(common)
+            || binding.broker_db_path.as_deref() != Some(scope.broker_db_path.as_path())
+            || binding.repository_key.as_deref() != Some(scope.repository_key.as_str())
+            || scope.repository_uuid.is_none()
+            || binding.repository_uuid != scope.repository_uuid
+        {
+            return Err(BrokerError::InvalidRepositoryWorktreeBinding(
+                "hook snapshot does not match a bound repository".into(),
+            ));
+        }
+        Ok(store)
+    }
+
+    fn open_current_read_only(
+        path: PathBuf,
+        scope: impl FnOnce(
+            &Path,
+        )
+            -> Result<super::repository_identity::RepositoryBindingScope, BrokerError>,
+    ) -> Result<Self, BrokerError> {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -347,10 +387,7 @@ impl BrokerStore {
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn,
-            binding_scope: Some(super::repository_identity::RepositoryBindingScope::capture(
-                &repository_root,
-                &path,
-            )?),
+            binding_scope: Some(scope(&path)?),
             path,
             _snapshot_dir: None,
         })

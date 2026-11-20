@@ -1239,6 +1239,9 @@ blocked.
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
+   Supply the repository only to the coordinator before `--`; do not pass
+   a second `--repo` or `-R` in the inner `gh` arguments, which it rejects.
+
    The broker classifies known commands and fails closed on ambiguity. For an
    authorized PR merge, use the broker's exact supported form:
    `pr merge <number> --merge|--squash|--rebase [--match-head-commit <sha>]`.
