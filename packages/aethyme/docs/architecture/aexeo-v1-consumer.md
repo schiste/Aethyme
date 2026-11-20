@@ -24,7 +24,9 @@ established, the required gate must block. No CMS integration is implied.
 `content_gate::strict::strict_precheck_v1` additionally validates both JSON
 documents against the bundled, unchanged Aexeo v0.0.24 v1 schemas with format
 checks enabled, rejects duplicate keys and oversized documents, verifies check
-summary counts and compares independently supplied decision input snapshots.
+summary counts, rejects duplicate check IDs and dangling finding-to-check references,
+and compares independently supplied decision input snapshots. These are
+conservative runner requirements in addition to the open v1 JSON schema.
 The host provides policy, options, collection and external observations
 explicitly and names every additional input. The bundled schemas and unique-key
 parser derive from Aexeo; their MIT license is included alongside them.
