@@ -173,9 +173,9 @@ fn execute(path: &Path) -> Result<(), String> {
         }
     };
     // A surviving process group could still mutate the verdict. Never trust it.
-    // SAFETY: signal 0 only probes the validator's own process group and
-    // touches no Rust memory.
     if !broker_mode
+        // SAFETY: signal 0 only probes the validator's own process group and
+        // touches no Rust memory.
         && (unsafe { libc::kill(-(child.id() as i32), 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
     {
