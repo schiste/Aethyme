@@ -169,6 +169,19 @@ fn execute(path: &Path) -> Result<(), String> {
     {
         return Err("validator descendants may still be active".into());
     }
+    // Nonzero exits are always blocked; distinguish the v1 protocol's outcomes
+    // without claiming that an unvalidated verdict is authentic or complete.
+    match status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Err("validator exited with code 1 (failed verdict or execution error)".into());
+        }
+        Some(2) => {
+            return Err("validator exited with code 2 (not checked or invalid input)".into());
+        }
+        Some(code) => return Err(format!("validator exited with code {code}")),
+        None => return Err("validator terminated without an exit code".into()),
+    }
     let meta =
         fs::symlink_metadata(&verdict_path).map_err(|_| "validator did not produce verdict")?;
     if !meta.file_type().is_file() {

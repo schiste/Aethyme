@@ -54,7 +54,9 @@ def run_case(root, aexeo, aethyme, name, text, media_type, expected):
     path = case / "manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     command = [str(aethyme), "content-gate", "run", str(path)]
-    invoke(command, 0 if expected == 0 else 2)
+    checked = invoke(command, 0 if expected == 0 else 2)
+    if expected in (1, 2) and f"validator exited with code {expected}" not in checked.stderr:
+        raise RuntimeError(f"{name}: missing exit-code diagnostic: {checked.stderr}")
     if name == "pass":
         (case / "article.txt").write_text("Changed after snapshot.", encoding="utf-8")
         invoke(command, 2)
