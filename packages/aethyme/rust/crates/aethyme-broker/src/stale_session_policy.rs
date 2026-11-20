@@ -448,6 +448,69 @@ pub(crate) fn abandonment_last_judged_at(store: &crate::BrokerStore) -> Option<i
     meta_ms(store, LAST_JUDGED_META_KEY)
 }
 
+/// Checkouts whose session the early-close rule closed, and when
+/// (`{checkout path: at_ms}`).
+pub(crate) const EARLY_CLOSED_META_KEY: &str = "stale_sessions.early_closed";
+/// Checkouts reused (`start --reuse`) within [`EARLY_RESUME_WINDOW_MS`] of
+/// an early close, and when.
+pub(crate) const EARLY_RESUMED_META_KEY: &str = "stale_sessions.early_resumed";
+/// A resume this soon after an early close says the session was still
+/// wanted.
+pub(crate) const EARLY_RESUME_WINDOW_MS: i64 = 24 * HOUR_MS;
+
+/// Every remembered `{checkout path: at_ms}` under `key`; unreadable is
+/// empty.
+pub(crate) fn read_checkout_times(store: &crate::BrokerStore, key: &str) -> BTreeMap<String, i64> {
+    store
+        .meta_get(key)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<BTreeMap<String, i64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn remember_checkout_time(store: &mut crate::BrokerStore, key: &str, checkout: &str, at_ms: i64) {
+    update_without_waiting(store, key, |raw| {
+        let mut times = raw
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, i64>>(raw).ok())
+            .unwrap_or_default();
+        times.retain(|_, at| at_ms.saturating_sub(*at) < 7 * 24 * HOUR_MS);
+        times.insert(checkout.to_string(), at_ms);
+        while times.len() > CLASSES_MAX {
+            times.pop_first();
+        }
+        Some(serde_json::to_string(&times).unwrap_or_default())
+    });
+}
+
+/// Record an early close of the session at `checkout` (best effort).
+pub(crate) fn record_early_close(store: &mut crate::BrokerStore, checkout: &str, at_ms: i64) {
+    remember_checkout_time(store, EARLY_CLOSED_META_KEY, checkout, at_ms);
+}
+
+/// Record a reuse of `checkout` when its session was closed early within
+/// [`EARLY_RESUME_WINDOW_MS`], counting
+/// `session_abandonment_safe_closed_then_resumed`; true when it was.
+pub(crate) fn record_resume_after_early_close(
+    store: &mut crate::BrokerStore,
+    checkout: &str,
+    at_ms: i64,
+) -> bool {
+    let closed_at = read_checkout_times(store, EARLY_CLOSED_META_KEY)
+        .get(checkout)
+        .copied();
+    let soon =
+        closed_at.is_some_and(|closed| at_ms.saturating_sub(closed) < EARLY_RESUME_WINDOW_MS);
+    if soon {
+        crate::phase_telemetry::add(
+            "session_abandonment_safe_closed_then_resumed",
+            Duration::ZERO,
+        );
+        remember_checkout_time(store, EARLY_RESUMED_META_KEY, checkout, at_ms);
+    }
+    soon
+}
+
 /// Remember `record` for `session_id` (best effort, never waiting on another
 /// database writer), keeping the newest [`CLASSES_MAX`] sessions.
 pub(crate) fn remember_class(store: &mut crate::BrokerStore, session_id: i64, record: ClassRecord) {
@@ -774,13 +837,6 @@ impl crate::Broker {
                 tips.push(tip);
             }
         }
-        let tips = tips
-            .into_iter()
-            .filter(|tip| session.diff_base.as_deref() != Some(tip.as_str()))
-            .collect::<Vec<_>>();
-        if tips.is_empty() {
-            return StaleWorkClass::Landed;
-        }
         let contains = |ancestor: &str, descendant: &str| {
             ancestor == descendant
                 || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))
@@ -804,6 +860,26 @@ impl crate::Broker {
                     .as_ref()
                     .is_some_and(|(_, upstream_tip)| contains(tip, upstream_tip.as_str()))
         };
+        // A tip at the diff base holds no session work only when the base
+        // itself survives the session: contained in the default branch (as
+        // the remote has it, or as the primary checkout has it, for a
+        // repository with no remote). An adopted session's base that holds
+        // commits nobody pushed is classed like any other tip.
+        let base_survives = session.diff_base.as_deref().is_some_and(|base| {
+            upstream
+                .as_ref()
+                .is_some_and(|(_, upstream_tip)| contains(base, upstream_tip.as_str()))
+                || repo
+                    .resolve_ref("HEAD")
+                    .is_some_and(|primary| contains(base, primary.as_str()))
+        });
+        let tips = tips
+            .into_iter()
+            .filter(|tip| !(base_survives && session.diff_base.as_deref() == Some(tip.as_str())))
+            .collect::<Vec<_>>();
+        if tips.is_empty() {
+            return StaleWorkClass::Landed;
+        }
         let unlanded = tips
             .iter()
             .filter(|tip| !landed(tip.as_str()))

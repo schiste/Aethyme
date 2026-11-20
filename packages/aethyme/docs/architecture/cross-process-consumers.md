@@ -404,6 +404,76 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Early close when nothing can be lost (2026-11-20)
+
+The abandonment window (`session_abandoned_after_hours`, for example `1`) may
+now close an idle session before the window of its work class (`[cleanup]
+stale_*_close_after_hours`), but only when nothing on the session can be lost.
+The rule is evaluated afresh on every look, and again under both claims right
+before the close transaction. It runs cheapest first (`abandonment_safety.rs`)
+and requires all of these:
+
+- no merge, rebase, cherry-pick, revert or bisect in progress;
+- no stash made on the session branch;
+- every tip (HEAD and the branch) is contained in the default branch, in the
+  session branch as the remote holds it now (`ls-remote`, never the local
+  tracking ref, which outlives a remote deletion), or in a merged
+  pull-request head. The diff base gets no exemption;
+- no staged change, no unstaged change, and no untracked file that Git does
+  not ignore.
+
+Anything that cannot be read counts as unsafe. A session that fails the rule
+keeps today's path: a closing-soon note, then the archive-verified close at
+its class window. A session closing early tolerates no process in its
+checkout, its holder's included: the open-file check runs whatever the holder
+evidence says.
+
+A follow-up session that the landed lanes protect also closes at the
+abandonment window when it passes the rule. Without that, a one-hour window
+would be forced up to the landed window for those sessions. `start --reuse`
+resumes such a session at the same HEAD.
+
+An agent's `PreToolUse` hook now counts as activity. The hook writes the file
+`.git/aethyme/hook-activity-<session>.json` in the main checkout at most once
+a minute, and the close path reads its modification time, so an agent that
+only reads is not idle.
+
+The work-class classification no longer drops a tip equal to the diff base.
+An adopted session whose HEAD carries commits nobody pushed is now `unpushed`,
+not `landed`.
+
+- **Checked under the claims before closing.** If the rule fails on the
+  first look but holds under the claims, the session is kept for that look
+  (`session_abandonment_early_rule_first_held_under_claims`), because the
+  process checks ran without the early-close strictness. The next pass starts
+  from the rule holding and runs them in full.
+- **Hidden index entries.** An entry flagged assume-unchanged or skip-worktree
+  hides changes from status, so such a checkout counts as not examined.
+- **Diff base.** The exemption differs by place. The early rule exempts no tip
+  equal to the diff base. The work-class computation, which only picks the
+  class window, drops such a tip when the base is contained in the upstream
+  default branch or in the primary checkout's HEAD.
+- **Reading the rule without a waiting period.** Each early close is recorded
+  on its `session.abandoned` event as `early_close: {rule:
+  "nothing_on_the_session_can_be_lost", checks: [...]}`, listing the checks it
+  passed. The meta key `stale_sessions.early_closed` holds `{checkout path:
+  at_ms}`, keyed by checkout so that a retired checkout reused as a new
+  session still counts. A `start --reuse` of that checkout within 24 h counts
+  `session_abandonment_safe_closed_then_resumed` and is recorded in
+  `stale_sessions.early_resumed`. `broker status` attaches
+  `session_abandonment_early_close_24h: {closed, resumed_within_24h}` and
+  warns with `sessions.early-close-resumed` when any were resumed: the agent
+  still wanted the session.
+- **Counters (introduced).**
+  - `session_abandonment_safe_closed`: a session closed by the early rule.
+  - `session_abandonment_kept_unsafe_<reason>`, where `<reason>` is one of
+    `in_progress`, `stash`, `head_not_contained`, `branch_not_contained`,
+    `staged`, `unstaged`, `untracked`, `unreadable` or `not_examined`.
+  - `session_abandonment_follow_up_safe`.
+  - `abandonment_safety_safe` and `abandonment_safety_unsafe`.
+- **Spans (introduced).** `abandonment_safety_check`, and
+  `abandonment_safety_remote` for the `ls-remote`.
+
 ## Abandonment lane: no stop on a refused listing, its own time, and why sessions stay (2026-11-20)
 
 What may close is unchanged. This only changes how often the lane judges.

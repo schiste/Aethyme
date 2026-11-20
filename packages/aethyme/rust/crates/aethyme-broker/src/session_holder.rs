@@ -1226,6 +1226,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// When the last session kept for recent activity can first be due: its
     /// newest activity plus the window it was judged against.
     not_due_before_ms: std::cell::Cell<Option<i64>>,
+    /// The session being judged passed the early-close safety rule
+    /// (`abandonment_safety`) before its class window.
+    early_safe_close: std::cell::Cell<bool>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -1409,6 +1412,18 @@ impl RecordedHolderProcessTable {
     pub(crate) fn clear_keep_reason(&self) {
         self.keep_reason.set(None);
         self.not_due_before_ms.set(None);
+        self.early_safe_close.set(false);
+    }
+
+    /// Record whether the session being judged passed the early-close safety
+    /// rule in its latest look.
+    pub(crate) fn note_early_safe_close(&self, safe: bool) {
+        self.early_safe_close.set(safe);
+    }
+
+    /// Whether the session being judged passed the early-close safety rule.
+    pub(crate) fn early_safe_close(&self) -> bool {
+        self.early_safe_close.get()
     }
 
     /// Record that the session being judged cannot be due before `at_ms`

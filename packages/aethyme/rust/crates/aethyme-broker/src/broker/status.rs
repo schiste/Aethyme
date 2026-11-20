@@ -713,6 +713,45 @@ impl Broker {
                 commands: Vec::new(),
             });
         }
+        // The idle rule's own reading, in place of a waiting period: of the
+        // sessions it closed early in the last day, how many were resumed
+        // within a day (they were still wanted).
+        let recent = |key: &str| {
+            stale::read_checkout_times(self.store_ref(), key)
+                .into_iter()
+                .filter(|(_, at)| now_ms.saturating_sub(*at) < stale::EARLY_RESUME_WINDOW_MS)
+                .map(|(checkout, _)| checkout)
+                .collect::<Vec<_>>()
+        };
+        let early_closed = recent(stale::EARLY_CLOSED_META_KEY);
+        let early_resumed = recent(stale::EARLY_RESUMED_META_KEY);
+        crate::phase_telemetry::attach(
+            "session_abandonment_early_close_24h",
+            serde_json::json!({
+                "closed": early_closed.len(),
+                "resumed_within_24h": early_resumed.len(),
+            }),
+        );
+        if !early_resumed.is_empty() {
+            view.advice.push(StatusAdvice {
+                id: "sessions.early-close-resumed",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "a session the idle rule closed early (nothing on it could be lost) was resumed within a day: the agent still wanted it, so the abandonment window may be too short for this repository",
+                summary: format!(
+                    "{} of {} session(s) closed early in the last 24 h were resumed within 24 h of the close",
+                    early_resumed.len(),
+                    early_closed.len().max(early_resumed.len())
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: early_resumed
+                    .iter()
+                    .take(20)
+                    .map(|checkout| format!("resumed checkout: {checkout}"))
+                    .collect(),
+                commands: Vec::new(),
+            });
+        }
         let window_ms = self.abandonment_window_ms();
         let last_judged = stale::abandonment_last_judged_at(self.store_ref());
         let age_ms = last_judged.map(|at| now_ms.saturating_sub(at));
