@@ -292,17 +292,19 @@ impl Broker {
         repo: &GitRepo,
         report: &BatchVerification,
     ) -> Result<bool, BrokerOpError> {
-        if !repo
-            .upstream_default_checked()?
-            .is_some_and(|(_, base)| base == report.base)
-        {
+        let Some(default) = crate::session_push::tracked_default(repo) else {
+            return Ok(false);
+        };
+        if default.commit != report.base {
             return Ok(false);
         }
         for member in &report.members {
             let session = self.store_ref().session(member.session_id)?;
-            if session.status.is_closed()
-                || self.session_push_state(session.id)?.remote_oid.as_deref() != Some(&member.head)
-            {
+            if session.status.is_closed() {
+                return Ok(false);
+            }
+            let (head, published) = self.session_push_tips(&session, Some(&default))?;
+            if head != member.head || published.as_deref() != Some(&member.head) {
                 return Ok(false);
             }
             let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;

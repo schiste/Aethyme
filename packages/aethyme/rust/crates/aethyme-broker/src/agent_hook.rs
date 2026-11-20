@@ -868,6 +868,7 @@ pub(crate) fn registered_hook_session(
     {
         use std::os::unix::fs::MetadataExt;
         // Keep Git's safe-directory handling for checkouts owned by others.
+        // SAFETY: geteuid takes no arguments and reads this process's identity.
         let uid = unsafe { libc::geteuid() };
         if [cwd.as_path(), common.as_path(), main]
             .iter()
