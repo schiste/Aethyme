@@ -38,7 +38,7 @@ fn acknowledge_peer_views() {
     });
 }
 
-use crate::{Broker, Session};
+use crate::{Broker, BrokerStore, Session};
 
 /// Hook events this entry point understands, in turn order.
 ///
@@ -231,6 +231,19 @@ fn decide(
         return Some(on_post_tool_use(&cwd));
     }
 
+    // A pre-tool event without a known write target has no coordination
+    // decision to make. Classify it before opening any repository state.
+    let targets = if event == HookEvent::PreToolUse {
+        let targets = write_targets(event_json);
+        if targets.is_empty() {
+            crate::phase_telemetry::add("hook_no_write_target", std::time::Duration::ZERO);
+            return Some(HookOutcome::Silent);
+        }
+        targets
+    } else {
+        Vec::new()
+    };
+
     // The installation notice describes the machine, not the repository, so it
     // is computed before the broker is opened and survives an open that fails.
     // A broker that will not open is one of the things a mismatched router and
@@ -283,7 +296,7 @@ fn decide(
             )
         }
         HookEvent::UserPromptSubmit => on_user_prompt_submit(&mut broker, session.as_ref()),
-        HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), event_json),
+        HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), &targets),
         HookEvent::Stop => {
             if let Err(error) = touch(&mut broker, session.as_ref()) {
                 crate::warn_unrecorded::<(), _>("record stopped session activity", Err(error));
@@ -486,13 +499,18 @@ pub(crate) fn session_peer_view(
     broker: &Broker,
     session_id: i64,
 ) -> Result<serde_json::Value, crate::BrokerError> {
+    recorded_peer_view(broker.store_ref(), session_id)
+}
+
+fn recorded_peer_view(
+    store: &BrokerStore,
+    session_id: i64,
+) -> Result<serde_json::Value, crate::BrokerError> {
     use sha2::{Digest, Sha256};
-    let leases = broker
-        .store_ref()
-        .session_peer_lease_overlaps(session_id, now_ms())?;
+    let leases = store.session_peer_lease_overlaps(session_id, now_ms())?;
     let scopes = {
         let _span = crate::phase_telemetry::span("peer_view_scopes");
-        broker.store_ref().session_peer_scopes(session_id)?
+        store.session_peer_scopes(session_id)?
     };
     // Both store queries return rows ordered by peer session ID. Read only
     // the earliest relevant assignment and keep the same priority on both
@@ -505,7 +523,7 @@ pub(crate) fn session_peer_view(
         .min();
     let decision = {
         let _span = crate::phase_telemetry::span("peer_view_pre_edit");
-        pre_edit_decision(broker, session_id, earliest)?
+        pre_edit_decision(store, session_id, earliest)?
     };
     let all = serde_json::json!({"leases": leases, "scopes": scopes, "pre_edit": decision});
     let hash = format!(
@@ -524,11 +542,11 @@ pub(crate) fn session_peer_view(
 }
 
 fn pre_edit_decision(
-    broker: &Broker,
+    store: &BrokerStore,
     session_id: i64,
     earliest_peer: Option<i64>,
 ) -> Result<serde_json::Value, crate::BrokerError> {
-    let own = broker.store_ref().session(session_id)?;
+    let own = store.session(session_id)?;
     if own.status.is_closed() {
         return Ok(serde_json::json!({
             "action": "wait",
@@ -542,7 +560,7 @@ fn pre_edit_decision(
         }));
     };
 
-    let peer = broker.store_ref().session(peer_id)?;
+    let peer = store.session(peer_id)?;
     let same_task = own
         .task
         .as_deref()
@@ -688,11 +706,7 @@ fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<St
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     let now = now_ms();
-    if !force
-        && previous["checked_at_ms"]
-            .as_i64()
-            .is_some_and(|at| now >= at && now - at < 30_000)
-    {
+    if !force && recent_own_view(&previous, now) {
         return None;
     }
 
@@ -788,7 +802,16 @@ pub(crate) fn render_peer_information(view: &serde_json::Value) -> Option<String
 /// Emit recorded peer changes once at hook boundaries. The file lock prevents
 /// concurrent hooks from overwriting each other's observed revision.
 fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
-    let path = hook_state_path(broker.main_root(), "hook-peer-view", session.id)?;
+    recorded_peer_view_update(broker.store_ref(), broker.main_root(), session.id, force)
+}
+
+fn recorded_peer_view_update(
+    store: &BrokerStore,
+    main_root: &std::path::Path,
+    session_id: i64,
+    force: bool,
+) -> Option<String> {
+    let path = hook_state_path(main_root, "hook-peer-view", session_id)?;
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
     let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
@@ -796,7 +819,7 @@ fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<S
     let previous: Option<serde_json::Value> = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let current = session_peer_view(broker, session.id).ok()?;
+    let current = recorded_peer_view(store, session_id).ok()?;
     let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
         || current["scope_count"].as_u64().unwrap_or(0) > 0;
     if !force && previous.as_ref() == Some(&current) {
@@ -820,10 +843,71 @@ fn append_context(outcome: HookOutcome, addition: Option<String>) -> HookOutcome
     }
 }
 
+fn recent_own_view(view: &serde_json::Value, now: i64) -> bool {
+    view["checked_at_ms"]
+        .as_i64()
+        .is_some_and(|at| now >= at && now - at < 30_000)
+}
+
+/// Resolve the exact registered linked checkout without starting Git.
+/// Unsupported layouts and overrides stay on the full hook path.
+pub(crate) fn registered_hook_session(
+    cwd: &std::path::Path,
+) -> Option<(std::path::PathBuf, BrokerStore, Session)> {
+    let _span = crate::phase_telemetry::span("hook_registered_snapshot");
+    if crate::git::repository_routing_environment_overridden() {
+        return None;
+    }
+    let cwd = cwd.canonicalize().ok()?;
+    let common = crate::git::GitRepo::registered_worktree_common_dir(&cwd)?;
+    let main = common.parent()?;
+    if common.file_name()? != ".git" || main == cwd {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Keep Git's safe-directory handling for checkouts owned by others.
+        let uid = unsafe { libc::geteuid() };
+        if [cwd.as_path(), common.as_path(), main]
+            .iter()
+            .any(|path| std::fs::metadata(path).map_or(true, |metadata| metadata.uid() != uid))
+        {
+            return None;
+        }
+    }
+    let store = BrokerStore::open_hook_snapshot(main, &common).ok()?;
+    let session = store.session_for_worktree(cwd.to_str()?).ok()??;
+    Some((main.to_path_buf(), store, session))
+}
+
+fn observe_post_tool(
+    main: &std::path::Path,
+    store: &BrokerStore,
+    session: &Session,
+) -> Option<HookOutcome> {
+    let own = hook_state_path(main, "hook-own-view", session.id)?;
+    let previous = serde_json::from_slice(&std::fs::read(own).ok()?).ok()?;
+    if !recent_own_view(&previous, now_ms())
+        || !store.unread_session_notes(session.id).ok()?.is_empty()
+        || !store.unread_automation_notes(session.id).ok()?.is_empty()
+    {
+        return None;
+    }
+    let peers = recorded_peer_view_update(store, main, session.id, false);
+    Some(append_context(HookOutcome::Silent, peers))
+}
+
 /// Hand a note from another session to this agent at the first turn
 /// boundary after a tool call, instead of waiting for its next prompt or
 /// broker command. Silent, and read-only, when nothing is unread.
 fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
+    if let Some((main, store, session)) = registered_hook_session(cwd)
+        && let Some(outcome) = observe_post_tool(&main, &store, &session)
+    {
+        crate::phase_telemetry::add("hook_post_recorded_view", std::time::Duration::ZERO);
+        return outcome;
+    }
     let Some(mut snapshot) = Broker::open_snapshot(cwd).ok() else {
         return HookOutcome::Silent;
     };
@@ -951,15 +1035,11 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
 fn on_pre_tool_use(
     broker: &mut Broker,
     session: Option<&Session>,
-    event_json: &serde_json::Value,
+    targets: &[std::path::PathBuf],
 ) -> HookOutcome {
     let Some(session) = session else {
         return HookOutcome::Silent;
     };
-    let targets = write_targets(event_json);
-    if targets.is_empty() {
-        return HookOutcome::Silent;
-    }
     let mut relatives: Vec<String> = targets
         .iter()
         .filter_map(|target| repo_relative(target, &session.worktree_path, broker.main_root()))
@@ -1733,6 +1813,23 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_pre_tool_does_not_open_a_repository() {
+        let spans = crate::phase_telemetry::Recorder::default();
+        let _recording = crate::phase_telemetry::install(spans.clone());
+        assert_eq!(
+            decide(
+                HookEvent::PreToolUse,
+                Some("/checkout-that-does-not-exist"),
+                &serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "/file"}}),
+                None,
+            ),
+            Some(HookOutcome::Silent)
+        );
+        assert_eq!(spans.totals().1.get("hook_no_write_target"), Some(&1));
+        assert_eq!(spans.totals().1.len(), 1);
+    }
 
     #[test]
     fn release_request_delivers_once_and_resolved_request_stays_silent() {

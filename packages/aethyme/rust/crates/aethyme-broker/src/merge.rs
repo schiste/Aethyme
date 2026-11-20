@@ -21,6 +21,10 @@ use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
 use crate::types::{MergeQueueEntry, MergeStatus, VerificationCandidate};
 
+#[path = "merge_batch.rs"]
+mod batch;
+pub(crate) use batch::BatchRequest;
+
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
@@ -52,6 +56,20 @@ fn mint_verification_candidate(
         tree: tree.to_string(),
         commit,
     })
+}
+
+fn append_verification_contract(message: &mut String, pending_messages: &str) {
+    if let Some(decision) = crate::contract_check::parse_contract_decision(pending_messages) {
+        message.push_str("\n\nContract decision: ");
+        message.push_str(decision.label());
+        // The contract gate reads this commit, not the session's. Dropping
+        // the justification made a justified `none` unpassable here.
+        if let Some(reason) = crate::contract_check::parse_contract_justification(pending_messages)
+        {
+            message.push_str("\nContract justification: ");
+            message.push_str(&reason);
+        }
+    }
 }
 
 pub(crate) fn require_session_checkout_identity(
@@ -2129,18 +2147,7 @@ impl Broker {
             .map(|commit| self.repo_handle().commit_message(commit))
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
-        if let Some(decision) = crate::contract_check::parse_contract_decision(&pending_messages) {
-            verification_message.push_str("\n\nContract decision: ");
-            verification_message.push_str(decision.label());
-            // The contract gate reads this commit, not the session's. Dropping
-            // the justification made a justified `none` unpassable here.
-            if let Some(reason) =
-                crate::contract_check::parse_contract_justification(&pending_messages)
-            {
-                verification_message.push_str("\nContract justification: ");
-                verification_message.push_str(&reason);
-            }
-        }
+        append_verification_contract(&mut verification_message, &pending_messages);
         let candidate = mint_verification_candidate(
             self.repo_handle(),
             &base,
@@ -2455,10 +2462,27 @@ impl Broker {
             });
         }
         let mut current = plan.integration_head.clone();
+        let mut plain_history = None;
         for commit in &plan.commits {
             if commit.ownership != SubmissionCommitOwnership::SessionOwned
                 || commit.integration_state != SubmissionIntegrationState::Pending
             {
+                continue;
+            }
+            // When this owned linear commit is already on the exact replay
+            // tip, applying its delta produces its existing tree. The replay
+            // tip is private: only the final tree and the original provenance
+            // reach candidate minting.
+            if let [parent] = commit.parents.as_slice()
+                && *parent == current
+                && *plain_history
+                    .get_or_insert_with(|| repo.has_complete_unmodified_history().unwrap_or(false))
+            {
+                current.clone_from(&commit.commit);
+                crate::phase_telemetry::add(
+                    "submit_replay_exact_parent",
+                    std::time::Duration::ZERO,
+                );
                 continue;
             }
             // A sync merge can be replayed as its first-parent delta when

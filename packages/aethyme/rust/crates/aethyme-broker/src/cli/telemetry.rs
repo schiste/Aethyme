@@ -386,7 +386,7 @@ pub(super) fn record_command_metric(
     };
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
-    let mut details = with_spans(details.unwrap_or_default(), spans);
+    let details = with_spans(details.unwrap_or_default(), spans);
     let Ok(cwd) = repository.map_or_else(std::env::current_dir, Ok) else {
         return;
     };
@@ -405,8 +405,31 @@ pub(super) fn record_command_metric(
     if args.first().is_some_and(|command| command == "hook") && session_id.is_none() {
         return;
     }
+    append_command_metric(
+        &main_root,
+        &label,
+        duration_ms,
+        exit,
+        output_bytes,
+        session_id,
+        spans.attribution(started, ended),
+        details,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_command_metric(
+    main_root: &std::path::Path,
+    label: &str,
+    duration_ms: i64,
+    exit: u8,
+    output_bytes: u64,
+    session_id: Option<i64>,
+    attribution: serde_json::Value,
+    mut details: serde_json::Map<String, serde_json::Value>,
+) {
     details.insert("session_id".into(), serde_json::json!(session_id));
-    details.insert("attribution".into(), spans.attribution(started, ended));
+    details.insert("attribution".into(), attribution);
     details.insert(
         "outcome".into(),
         serde_json::json!(match exit {
@@ -430,11 +453,11 @@ pub(super) fn record_command_metric(
         .map(|json| json[1..json.len().saturating_sub(1)].to_string())
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
-    let line = metric_line(ts, &label, duration_ms, exit, output_bytes, &extra_fields);
+    let line = metric_line(ts, label, duration_ms, exit, output_bytes, &extra_fields);
     // Under the shared append lock, so a GC trim replacing this log can never
     // drop the row with the inode it replaces.
     crate::gc::metrics_trim::append_command_metric_line(
-        &main_root,
+        main_root,
         &dir.join("command-metrics.jsonl"),
         line.as_bytes(),
     );
@@ -449,6 +472,29 @@ pub(crate) fn record_hook_metric(
     delivery: &'static str,
     spans: &crate::phase_telemetry::Recorder,
 ) {
+    let cwd = repo.map_or_else(std::env::current_dir, |path| Ok(path.into()));
+    if matches!(
+        event,
+        crate::agent_hook::HookEvent::PreToolUse | crate::agent_hook::HookEvent::PostToolUse
+    ) && let Ok(cwd) = &cwd
+        && let Some((main, _, session)) = crate::agent_hook::registered_hook_session(cwd)
+    {
+        let ended = std::time::Instant::now();
+        append_command_metric(
+            &main,
+            &format!("hook {}", event.as_str()),
+            (ended - started).as_millis() as i64,
+            0,
+            output_bytes,
+            Some(session.id),
+            spans.attribution(started, ended),
+            with_spans(
+                serde_json::Map::from_iter([("hook_delivery".into(), delivery.into())]),
+                spans,
+            ),
+        );
+        return;
+    }
     let ended = std::time::Instant::now();
     if let Some(repo) = repo {
         set_metric_repository(std::path::Path::new(repo));
