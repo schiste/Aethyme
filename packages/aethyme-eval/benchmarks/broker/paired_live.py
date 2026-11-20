@@ -303,6 +303,43 @@ def playground(scratch, folder, arm):
                 print(json.dumps(warning), file=sys.stderr, flush=True)
 
 
+def collect_command_metrics(path, folder, workers, preverify):
+    if not preverify:
+        if path.is_file():
+            shutil.copyfile(path, folder / "broker-metrics.jsonl")
+        return
+
+    scheduled = 0
+    for work in workers:
+        for name in ("publish.json", "repair-publish.json"):
+            receipt_path = work["folder"] / name
+            if receipt_path.is_file():
+                receipt = json.loads(receipt_path.read_text())
+                if receipt["published"]:
+                    publication = json.loads(receipt["stdout"])
+                    scheduled += publication.get("preverification") == "scheduled"
+
+    # Detached workers can finish after the task timer stops. Retain their
+    # receipts before deleting the Playground, including cancelled work.
+    deadline = time.monotonic() + 50
+    while True:
+        contents = path.read_text() if path.is_file() else ""
+        lines = contents[:contents.rfind("\n") + 1].splitlines()
+        metrics = [json.loads(line) for line in lines]
+        early = [metric for metric in metrics if "early_verification" in metric]
+        if len(early) >= scheduled or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    (folder / "broker-metrics.jsonl").write_text("\n".join(lines) + "\n" if lines else "")
+    dump(folder / "early-verification.json", {
+        "scheduled": scheduled, "completed": len(early),
+        "missing_receipts": max(0, scheduled - len(early)),
+        "workers": [{"session_id": metric.get("session_id"),
+                     "wall_ms": metric["duration_ms"], **metric["early_verification"]}
+                    for metric in early],
+    })
+
+
 def run_group(args, folder, tasks, overlap, arm):
     git = shutil.which("git")
     with playground(args.scratch, folder, arm) as root:
@@ -363,9 +400,8 @@ def run_group(args, folder, tasks, overlap, arm):
         for row, work in zip(rows, workers, strict=True):
             dump(work["folder"] / "result.json", row)
             print(json.dumps(row), flush=True)
-        metrics = repo / ".aethyme/logs/command-metrics.jsonl"
-        if metrics.is_file():
-            shutil.copyfile(metrics, folder / "broker-metrics.jsonl")
+        collect_command_metrics(repo / ".aethyme/logs/command-metrics.jsonl", folder, workers,
+                                args.preverify and arm == "broker")
         if args.hook_home and arm == "broker" and any(row["activity_signals"] < 2 for row in rows):
             raise RuntimeError("missing broker activity evidence for live Codex hooks")
         return rows
