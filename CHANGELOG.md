@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.145] - 2026-11-21
+
+### Added
+
+- Abandoned sessions can close early when nothing can be lost. Before its class window, a session idle past `session_abandoned_after_hours` now closes only if a fresh check finds: no merge, rebase, cherry-pick, revert or bisect in progress; no stash on the branch; every tip of HEAD and the branch contained in the upstream default branch, in the remote branch as the remote reports it now, or in a merged pull-request head; no staged or unstaged change; no untracked file Git does not ignore; and no index entry flagged skip-worktree or assume-unchanged. Anything that cannot be read keeps the session. The check runs on the first look and again under both claims immediately before the close; a rule that first holds under the claims keeps the session for that pass. An early close also requires the open-file check with no holder exemption. Sessions that fail the rule keep the existing path: a closing-soon note, then the archive-verified close at the class window (#1900).
+- A reading agent counts as active: the PreToolUse hook records activity at most once a minute (#1900).
+- Each early close records the checks it passed on its `session.abandoned` event. `broker status` attaches `session_abandonment_early_close_24h {closed, resumed_within_24h}` and warns with `sessions.early-close-resumed` when a session closed early was reused within 24 hours (#1900).
+- `broker status` advice `sessions.abandonment-held` ("N held by <reason>"), `sessions.abandonment-lane-idle` and `retention.invalid`; attachment `abandonment_lane_last_judged_age_ms`; a per-session record of the last keep reason (#1898).
+
+### Fixed
+
+- The abandonment lane no longer stops for good when a pass is refused the process listing. On the busiest repository it had judged no session for about 16 hours. The lane now stops only when the pass could judge nothing else; sessions whose verdict needs the listing wait for a worker that can take it (#1898).
+- Landed proofs can no longer use a whole page's time: a third of each page is reserved for abandonment judgements (#1898).
+- A working-tree status that could not finish is recorded as not examined (`working_tree_not_examined`) and is no longer remembered as a dirty verdict (#1898).
+- A fractional or invalid `session_abandoned_after_hours` is reported in status instead of silently disabling the lane. Nothing closes while it is invalid (#1898).
+- An adopted session whose base carries unpushed commits is classed by those commits instead of as landed (#1900).
+- A retirement run whose open-file observation ran out of time retries it once with up to 30 s instead of ending the pass. On the busiest repository three of six passes ended that way under load, at 10.4 to 10.9 s against a 10 s limit. A refused listing is told apart from a timed-out one; the worker probes once before starting the retirement lane, and the lane probes once at its own start (#1902).
+- A retirement lap no longer starts an inspection it cannot give its full allowance; the checkout is kept as `inspection_deferred` with the cursor before it. The worker's closed-lap floor with a large backlog goes from 45 s to 75 s (#1902).
+
+### Upgrade notes
+
+- The early close applies wherever `session_abandoned_after_hours` is shorter than a session's class window. The value is whole hours in `.aethyme/broker.toml` under `[retention]`.
+- A session closed under an agent refuses the next command with the reason and the exact `start --reuse` command; reuse recreates the checkout from its branch.
+- The untracked check is strict: a stray file the repository does not ignore, such as a desktop metadata file, keeps a session until its class window.
+
 ## [0.8.144] - 2026-11-20
 
 ### Changed
