@@ -188,3 +188,52 @@ The cancelled gates had already spent 1.28 s and 1.79 s on their commands
 and left no reusable verdict. An earlier build exposed a cache persistence
 assertion on cancellation. The repaired build passed both probes and the
 [hosted cancellation-and-reuse regression](https://github.com/schiste/Aethyme/actions/runs/44766634129).
+
+### Development build in the live comparison
+
+The same development build ran the 12 assignments with trusted hooks
+and `--preverify`. All assignments and exact-tree checks passed in
+both arms. Each arm again repaired one textual conflict and recorded
+zero human interventions. This run compared the candidate with direct
+Git. The controlled on/off run above isolates the opt-in switch more
+closely.
+
+| Measure | Direct Git median / p90 | Early Aethyme median / p90 | Change |
+| --- | ---: | ---: | ---: |
+| Task duration | 53.23 / 68.46 s | 68.50 / 85.10 s | +28.7% / +24.3% |
+| Uncached input tokens | 8,187.5 / 17,574 | 10,255 / 18,277 | +25.3% / +4.0% |
+| Cached input tokens | 97,408 / 153,344 | 115,456 / 293,888 | +18.5% / +91.7% |
+| Output tokens | 1,348 / 1,674 | 1,132 / 1,840 | −16.0% / +9.9% |
+| Exact-tree verification wall time | 3.78 / 5.53 s | 6.07 / 6.97 s | +60.4% / +26.0% |
+
+The median paired task-duration difference was +10.86 s. The broker
+was slower in all 12 pairs. In the six-way group, task time was
+57.64 / 68.46 s direct and 68.50 / 85.10 s broker. The release and
+development runs took place at different times and produced different
+direct controls, so their difference cannot isolate the feature.
+
+Of ten scheduled workers, three yielded to the repository slot holder,
+one was superseded, one produced no verdict, and five passed a gate.
+All ten produced telemetry. Both textual tasks and one semantic task
+reused an early verdict, so 3 of 12 final submits skipped physical gate
+execution. These verdicts covered 11.30 s of gate work. The two remaining
+gate runs consumed 6.29 s without a final reuse. Both came from the
+six-way group, where the integration base advanced between publications.
+The broker executed 14 gates across both stages, versus 12 in direct Git.
+The workers that yielded or skipped ran no gate commands. Successful
+early execution moved three checks off the foreground path and increased
+total executions by two.
+
+| Broker command | Calls | Total (ms) | Wall median / p90 (ms) | Child median / p90 (ms) | Queue median / p90 (ms) | Residual median / p90 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| submit | 12 | 72,347 | 6,044.5 / 6,938 | 5,180 / 6,311 | 1 / 2,672 | 430 / 639 |
+| submit preverify | 10 | 35,058 | 3,549 / 6,208 | 3,239.5 / 5,792 | 0 / 3 | 359.5 / 413 |
+| finish | 12 | 20,212 | 1,621 / 2,173 | 1,270 / 1,801 | 0 / 1 | 298 / 506 |
+| start | 12 | 16,951 | 1,145.5 / 2,245 | 973.5 / 1,206 | 0 / 255 | 157 / 445 |
+| advance | 13 | 16,052 | 1,246 / 1,480 | 833 / 933 | 13 / 35 | 300 / 612 |
+| hook.PreToolUse | 98 | 10,745 | 81 / 183 | 75 / 140 | 0 / 0 | 7.5 / 53 |
+| hook.PostToolUse | 97 | 14,186 | 82 / 276 | 73 / 254 | 0 / 0 | 9 / 24 |
+
+The development build assigns gate subprocess time to the child bucket.
+The combined command log labels both operations `submit`. The table
+splits out the rows that carry early-verification telemetry.
