@@ -1636,3 +1636,30 @@ project = "proj-7k2m"
 > `advisory` and `off` never touch the floor.
 
 Details: `architecture/local-v3-l2-optin.md`.
+
+### Verify a ready group together
+
+An integration coordinator can verify two to sixteen independent sessions in
+one checkout. Supply the exact fetched default commit and the published
+branch heads in the intended order. The sessions must already be based on
+that default commit and each must own its exclusive pending history. A
+stacked, stale or ambiguous member can use ordinary single-session submit.
+
+```sh
+aethyme broker submit batch "$BASE" "21=$FIRST_HEAD" "34=$SECOND_HEAD" \
+  --session "$COORDINATOR" --json
+```
+
+The broker returns the verified candidate commit, tree, ordered members,
+and exact gate results. A textual conflict identifies the member and paths
+before running a gate. A moved base or member invalidates the group. If a
+gate fails, the receipt identifies the gate and its outcome. The coordinator
+can repair or regroup the members and capture a fresh set of exact heads.
+
+A verified batch applies to the whole candidate. Land that candidate as one
+group through your repository's authorized merge workflow, with the expected
+base and the required provider checks. The candidate has the base as first
+parent and the participating heads as subsequent parents. Individual pull
+requests and prefixes still require verification on their own candidate.
+A repeated batch can reuse cacheable gate verdicts for the same tree,
+definition and execution profile. Use `--no-cache` for fresh gate execution.
