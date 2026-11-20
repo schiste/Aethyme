@@ -774,13 +774,9 @@ impl crate::Broker {
                 tips.push(tip);
             }
         }
-        let tips = tips
-            .into_iter()
-            .filter(|tip| session.diff_base.as_deref() != Some(tip.as_str()))
-            .collect::<Vec<_>>();
-        if tips.is_empty() {
-            return StaleWorkClass::Landed;
-        }
+        // The diff base is no exemption: an adopted session's base is the
+        // HEAD it was adopted at, which can carry commits nobody pushed. A
+        // base the default branch contains is landed like any other tip.
         let contains = |ancestor: &str, descendant: &str| {
             ancestor == descendant
                 || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))

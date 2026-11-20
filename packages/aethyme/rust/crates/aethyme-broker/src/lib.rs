@@ -256,6 +256,7 @@ pub use representation::{
     SessionContent, content_at as representation_content_at, find_landing, landing_base,
     plan_digest as representation_plan_digest, session_content, work_landed,
 };
+mod abandonment_safety;
 mod pr_overlap;
 mod repository_contract;
 mod resources;

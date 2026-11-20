@@ -4914,6 +4914,63 @@ impl GitRepo {
         Ok(!listed.trim_matches('\0').trim().is_empty())
     }
 
+    /// Whether `git diff --quiet` (with `--cached` when `staged`) reports a
+    /// difference: staged changes against HEAD, or unstaged changes against
+    /// the index. Never refreshes the index (`--no-optional-locks`), whose
+    /// modification time is session activity. Exit 1 is "differs"; any
+    /// other failure is an error, never "clean".
+    pub(crate) fn has_tracked_changes(&self, staged: bool) -> Result<bool, GitError> {
+        let mut args = vec![
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--quiet",
+            "--ignore-submodules=none",
+        ];
+        if staged {
+            args.push("--cached");
+        }
+        let mut command = git_command();
+        command
+            .args(&args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    /// The subject of every stash entry (`stash list --format=%gs`), such as
+    /// `WIP on <branch>: ...` or `On <branch>: ...`.
+    pub(crate) fn stash_subjects(&self) -> Result<Vec<String>, GitError> {
+        Ok(run_git(&self.root, &["stash", "list", "--format=%gs"])?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Whether the working tree holds any untracked file Git does not ignore.
+    pub(crate) fn has_untracked_files(&self) -> Result<bool, GitError> {
+        let listed = run_git(
+            &self.root,
+            &[
+                "--no-optional-locks",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        Ok(!listed.trim_matches('\0').is_empty())
+    }
+
     /// Whether Git ignores `path`, relative to the repository root.
     pub fn path_is_ignored(&self, path: &str) -> bool {
         run_git(&self.root, &["check-ignore", "--quiet", "--", path]).is_ok()

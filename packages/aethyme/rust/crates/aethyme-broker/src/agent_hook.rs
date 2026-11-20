@@ -1041,6 +1041,7 @@ fn on_pre_tool_use(
     let Some(session) = session else {
         return HookOutcome::Silent;
     };
+    record_hook_activity(broker.main_root(), session.id);
     let mut relatives: Vec<String> = targets
         .iter()
         .filter_map(|target| repo_relative(target, &session.worktree_path, broker.main_root()))
@@ -1689,6 +1690,42 @@ fn hook_state_path(
             .join("aethyme")
             .join(format!("{stem}-{session_id}.json"))
     })
+}
+
+/// The file whose modification time says when the session's agent last
+/// called a tool (`PreToolUse`), for the abandonment window: an agent that
+/// only reads changes no file and runs no broker command.
+const HOOK_ACTIVITY_STEM: &str = "hook-activity";
+/// The signal is rewritten at most this often.
+const HOOK_ACTIVITY_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Record that `session_id`'s agent is calling tools now. Best effort: the
+/// hook is read-only on the broker, so this is a small file, and losing it
+/// only makes a reading agent look idler than it is.
+pub(crate) fn record_hook_activity(main_root: &std::path::Path, session_id: i64) {
+    let Some(path) = hook_state_path(main_root, HOOK_ACTIVITY_STEM, session_id) else {
+        return;
+    };
+    let fresh = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < HOOK_ACTIVITY_REFRESH);
+    if !fresh {
+        save_hook_state(Some(&path), &crate::clock::epoch_ms());
+    }
+}
+
+/// When `session_id`'s agent last called a tool, in milliseconds since the
+/// epoch; `0` when never recorded.
+pub(crate) fn hook_activity_ms(main_root: &std::path::Path, session_id: i64) -> i64 {
+    hook_state_path(main_root, HOOK_ACTIVITY_STEM, session_id)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 fn save_hook_state(path: Option<&std::path::Path>, value: &impl serde::Serialize) {
