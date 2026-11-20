@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.143] - 2026-11-20
+
+### Fixed
+
+- Retirement inspections no longer time out just short of finishing. The eligibility check's `git status` had a fixed 15 s limit, and the first, cold walk of a large checkout on a contended volume lands just past it. On the busiest repository 13 of 19 inspections in four passes timed out, and in two passes 79 to 81 s of an 81 to 84 s lap produced nothing. Inside the retirement laps each plan's cleanup listings may now take up to 60 s, still bounded by the lap's deadline. The commands and what they prove are unchanged, and outside the laps the limit stays 15 s (#1892).
+- A plan in the cleaned lap ran its Git calls under the closed lap's deadline, already past, so they were never started and could be remembered as failed inspections. The planning context now takes each lap's deadline before every plan (#1892).
+
+### Added
+
+- The `checkout_retirement` attachment adds `inspections` with `started`, `succeeded`, `failed`, `cut_by_deadline`, `refused` and `median_succeeded_ms` (#1892).
+
 ## [0.8.142] - 2026-11-20
 
 ### Fixed
