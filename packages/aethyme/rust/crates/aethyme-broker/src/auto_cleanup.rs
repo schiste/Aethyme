@@ -3871,6 +3871,21 @@ fn deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
+/// Bound the initial, read-only Git reference snapshot to the retirement lane.
+/// An incomplete snapshot never advances retirement after the deadline.
+fn retirement_refs_with_deadline<T>(
+    deadline: Option<Instant>,
+    read: impl FnOnce() -> T,
+) -> Option<T> {
+    let _git_deadline = deadline.map(crate::git::limit_git_until);
+    let effective = crate::git::active_git_deadline();
+    if deadline_expired(effective) {
+        return None;
+    }
+    let result = read();
+    (!deadline_expired(effective)).then_some(result)
+}
+
 /// Resolve every live path once, retaining the store's order so a candidate
 /// reports the same first matching session as the former per-pair check. An
 /// expired or partial index is never used to authorize cleanup.
@@ -7838,8 +7853,21 @@ impl Broker {
 
         let landed_window_ms =
             i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
-        let mut decline_memo = LandedDeclineMemo::load(self);
-        let upstream_tip = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+        let Some((mut decline_memo, upstream_tip)) =
+            retirement_refs_with_deadline(deadline, || {
+                let memo = LandedDeclineMemo::load(self);
+                let upstream = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+                (memo, upstream)
+            })
+        else {
+            summary.deferred += 1;
+            summary
+                .reasons
+                .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                    after_session_id: cursor.after_session_id,
+                });
+            return Ok(summary);
+        };
         // Sessions that already show landing evidence go first, ahead of
         // the oldest-first cursor whose head is full of sessions that will
         // never close. Same proof, same re-checks: only the order changes.
@@ -10373,6 +10401,48 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_reference_reads_honor_and_restore_git_deadlines() {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let entered = std::cell::Cell::new(false);
+        let result = super::retirement_refs_with_deadline(Some(deadline), || {
+            entered.set(true);
+            assert_eq!(crate::git::active_git_deadline(), Some(deadline));
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(2),
+            );
+            42
+        });
+        assert!(entered.get(), "the read must run before its deadline");
+        assert_eq!(result, None);
+        assert_eq!(crate::git::active_git_deadline(), None);
+
+        let already_expired = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            super::retirement_refs_with_deadline(Some(already_expired), || panic!(
+                "expired reads must not start"
+            )),
+            None::<()>
+        );
+
+        crate::git::with_git_deadline(Duration::from_secs(5), || {
+            let outer = crate::git::active_git_deadline();
+            assert_eq!(
+                super::retirement_refs_with_deadline(
+                    Some(Instant::now() + Duration::from_secs(10)),
+                    || {
+                        assert_eq!(crate::git::active_git_deadline(), outer);
+                        42
+                    }
+                ),
+                Some(42)
+            );
+            assert_eq!(crate::git::active_git_deadline(), outer);
+        });
+    }
+
     use super::{
         AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupGroupInspection, AutoCleanupPolicy,
         LiveOverlapEvidence, ResolvedWorktreePath, SESSION_RETIREMENT_CURSOR_VERSION,
