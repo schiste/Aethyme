@@ -199,7 +199,7 @@ mod tests {
             assert!(!run(&c, &v, exit, false, &bytes));
         }
         assert!(!run(&c, &v, Some(0), true, &bytes));
-        assert!(!precheck_v1(b"{}", b"", Some(0), false, &bytes).is_ok());
+        assert!(precheck_v1(b"{}", b"", Some(0), false, &bytes).is_err());
         for (pointer, value) in [
             ("/status", json!("not_checked")),
             ("/status", json!("fail")),
