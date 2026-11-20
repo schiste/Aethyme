@@ -18,6 +18,11 @@ exit: 0
       advance, push, sync, finish, close, git, gh and adopt --reuse refuse
       another live agent; --take-over moves the session to the caller and
       records a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker submit queued <coordinator-id> --session <id> [--no-cache] [--json]
+      Opt into whole-group verification with published sessions already waiting
+      for a verification slot and naming the same coordinator. Start ordinary
+      verification immediately when a slot is free. A group verdict applies
+      only to the combined candidate and authorizes no ref or provider writes.
   aethyme broker submit preverify <head> <base> --session <id> [--json]
       Warm reusable gates on the pinned candidate. A regular submit still verifies it.
   aethyme broker submit batch <base> <session=head>... --session <id> [--no-cache] [--json]

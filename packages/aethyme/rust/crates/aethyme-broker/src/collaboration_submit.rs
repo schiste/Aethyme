@@ -515,8 +515,9 @@ pub(crate) fn submit(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
+    coordinator: Option<i64>,
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
-    submit_with(broker, session, cache, None, &mut || {})
+    submit_with(broker, session, cache, coordinator, None, &mut || {})
 }
 
 /// [`submit`] with the store opener injected, and `between` run after the
@@ -526,11 +527,12 @@ fn submit_with(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
+    coordinator: Option<i64>,
     open: Option<&mut OpenStore<'_>>,
     between: &mut dyn FnMut(),
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
     let Some(capture) = SubmitCapture::prepare(broker, session) else {
-        let outcome = broker.submit_with_policy(session, cache)?;
+        let outcome = broker.submit_for_queue(session, cache, None, coordinator)?;
         return Ok(CaptureSubmit::Submitted {
             outcome: Box::new(outcome),
             capture: None,
@@ -538,7 +540,7 @@ fn submit_with(
     };
     if !capture.required {
         between();
-        let outcome = broker.submit_with_policy(session, cache)?;
+        let outcome = broker.submit_for_queue(session, cache, None, coordinator)?;
         let base = outcome
             .verified_against
             .as_ref()
@@ -585,7 +587,7 @@ fn submit_with(
         return Ok(CaptureSubmit::Refused(report));
     };
     between();
-    match broker.submit_expecting_head(session, cache, &head) {
+    match broker.submit_for_queue(session, cache, Some(&head), coordinator) {
         Ok(outcome) => Ok(CaptureSubmit::Submitted {
             outcome: Box::new(outcome),
             capture: Some(CaptureStep::Done(report)),
@@ -975,6 +977,7 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
+            None,
             Some(&mut open),
             between,
         )?;
@@ -1086,6 +1089,7 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
+            None,
             Some(&mut open),
             &mut || {},
         )
@@ -1112,6 +1116,7 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
+            None,
             Some(&mut open),
             &mut || {},
         )

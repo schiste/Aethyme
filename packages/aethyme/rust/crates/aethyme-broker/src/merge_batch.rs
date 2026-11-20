@@ -5,10 +5,14 @@ use super::*;
 
 const MAX_BATCH_MEMBERS: usize = 16;
 
-#[derive(serde::Serialize)]
-pub(crate) struct BatchMember {
-    session_id: i64,
-    head: String,
+#[path = "merge_batch_queue.rs"]
+mod queue;
+pub use queue::Receipt as QueuedBatchReceipt;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchMember {
+    pub session_id: i64,
+    pub head: String,
 }
 
 pub(crate) struct BatchRequest {
@@ -93,6 +97,16 @@ impl Broker {
         request: BatchRequest,
         cache: crate::gates::CachePolicy,
     ) -> Result<BatchVerification, BrokerOpError> {
+        self.verify_batch_in_slot(coordinator_id, request, cache, None)
+    }
+
+    fn verify_batch_in_slot(
+        &mut self,
+        coordinator_id: i64,
+        request: BatchRequest,
+        cache: crate::gates::CachePolicy,
+        held_slot: Option<&mut crate::verification::ExactTreeVerificationSlot>,
+    ) -> Result<BatchVerification, BrokerOpError> {
         let admission = crate::phase_telemetry::span("submit_batch_admission");
         let mut report = BatchVerification::new(request);
         let coordinator = self.store_ref().session(coordinator_id)?;
@@ -111,16 +125,23 @@ impl Broker {
         self.check_submission_root_before_planning()?;
         let main = self.main_root_path();
         let repo = GitRepo::discover(&main)?;
-        let root_plan = self.worktree_root_plan()?;
-        let Some(mut slot) =
-            crate::verification::ExactTreeVerificationSlot::try_acquire_with_worktree_root_plan(
-                &main,
-                "merge-batch",
-                &root_plan,
-            )?
-        else {
-            report.state = "busy";
-            return Ok(report);
+        let mut standalone_slot;
+        let slot = if let Some(slot) = held_slot {
+            slot
+        } else {
+            let root_plan = self.worktree_root_plan()?;
+            let Some(slot) =
+                crate::verification::ExactTreeVerificationSlot::try_acquire_with_worktree_root_plan(
+                    &main,
+                    "merge-batch",
+                    &root_plan,
+                )?
+            else {
+                report.state = "busy";
+                return Ok(report);
+            };
+            standalone_slot = slot;
+            &mut standalone_slot
         };
         let Some(history) =
             capture_submission_plan_history_view(&main, self.repo_handle(), self.store_ref())
@@ -130,7 +151,7 @@ impl Broker {
                 "the coordinated history view could not be proven",
             ));
         };
-        if !self.batch_is_current(&repo, &report)? {
+        if !self.batch_is_current(&repo, &report.base, &report.members)? {
             return Ok(report);
         }
         self.require_trusted_policy_at_commit(&report.base, Some(coordinator_id))?;
@@ -221,7 +242,7 @@ impl Broker {
 
         let checkout = crate::phase_telemetry::span("submit_batch_checkout");
         let candidate = slot.materialize(&repo, &tip)?;
-        if !self.batch_is_current(&repo, &report)?
+        if !self.batch_is_current(&repo, &report.base, &report.members)?
             || validate_submission_history_view(
                 &main,
                 self.repo_handle(),
@@ -261,7 +282,7 @@ impl Broker {
         drop(verify);
 
         let _finalize = crate::phase_telemetry::span("submit_batch_revalidate");
-        if !self.batch_is_current(&repo, &report)?
+        if !self.batch_is_current(&repo, &report.base, &report.members)?
             || validate_submission_history_view(
                 &main,
                 self.repo_handle(),
@@ -290,15 +311,16 @@ impl Broker {
     fn batch_is_current(
         &self,
         repo: &GitRepo,
-        report: &BatchVerification,
+        base: &str,
+        members: &[BatchMember],
     ) -> Result<bool, BrokerOpError> {
         let Some(default) = crate::session_push::tracked_default(repo) else {
             return Ok(false);
         };
-        if default.commit != report.base {
+        if default.commit != base {
             return Ok(false);
         }
-        for member in &report.members {
+        for member in members {
             let session = self.store_ref().session(member.session_id)?;
             if session.status.is_closed() {
                 return Ok(false);
@@ -319,6 +341,180 @@ impl Broker {
         }
         Ok(true)
     }
+}
+
+pub(super) enum QueuedAdmission {
+    Single(crate::verification::ExactTreeVerificationSlot),
+    Verified(QueuedBatchReceipt),
+}
+
+impl Broker {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn admit_queued_verification(
+        &mut self,
+        main: &Path,
+        root_plan: &crate::WorktreeRootPlan,
+        entry: &MergeQueueEntry,
+        base: &str,
+        paths: &[String],
+        coordinator: Option<i64>,
+        cache: crate::gates::CachePolicy,
+        progress: Option<&crate::submit_progress::SubmitProgress>,
+    ) -> Result<QueuedAdmission, BrokerOpError> {
+        let mut ticket = None;
+        let mut attempted = false;
+        let acquire = |on_wait: &mut dyn FnMut(std::time::Duration)| {
+            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
+                main,
+                "merge-sim",
+                MERGE_VERIFICATION_SLOTS,
+                root_plan,
+                crate::gates::heartbeat_interval(),
+                on_wait,
+            )
+        };
+        let mut report_wait = |waited| {
+            if let Some(progress) = progress {
+                progress.report_slot_wait(main, waited);
+            }
+        };
+        let mut slot = acquire(&mut |waited| {
+            report_wait(waited);
+            if let Some(coordinator) = coordinator
+                && !std::mem::replace(&mut attempted, true)
+            {
+                let _phase = crate::phase_telemetry::span("submit_queued_batch_register");
+                let member = BatchMember {
+                    session_id: entry.session_id,
+                    head: entry.head_commit.clone(),
+                };
+                // The probe is opt-in and happens only after all ordinary
+                // verification slots have been observed busy.
+                if GitRepo::discover(main).is_ok_and(|repo| {
+                    self.batch_is_current(&repo, base, std::slice::from_ref(&member))
+                        .unwrap_or(false)
+                }) {
+                    ticket = queue::Ticket::enqueue(
+                        main,
+                        coordinator,
+                        member,
+                        base,
+                        paths,
+                        matches!(cache, crate::gates::CachePolicy::Bypass),
+                    );
+                }
+            }
+        })?;
+        let Some(ticket) = ticket else {
+            return Ok(QueuedAdmission::Single(slot));
+        };
+        let ready_cutoff = crate::file_lock::host_monotonic_ns();
+        let coordinator = coordinator.expect("only opted-in submissions take a ticket");
+        let wait = crate::phase_telemetry::span("submit_queued_batch_claim");
+        let admission = ticket.admit(ready_cutoff);
+        drop(wait);
+        match admission {
+            Ok(queue::Admission::Leader(request)) if ticket.claim_is_live() => {
+                let members = request.members.len();
+                if let Some(progress) = progress {
+                    progress.phase(crate::submit_progress::PHASE_VERIFYING);
+                }
+                let verified =
+                    self.verify_batch_in_slot(coordinator, request, cache, Some(&mut slot));
+                if verified.is_err() {
+                    slot.cleanup();
+                }
+                let receipt = match verified {
+                    Ok(result) => {
+                        crate::phase_telemetry::attach(
+                            "batch_verification",
+                            result.metric_details(),
+                        );
+                        match (result.state, result.candidate, result.tree) {
+                            ("verified", Some(candidate), Some(tree)) => Some(QueuedBatchReceipt {
+                                coordinator,
+                                verifier: entry.session_id,
+                                base: result.base,
+                                members: result.members,
+                                candidate,
+                                tree,
+                                gates: serde_json::to_value(result.gates)
+                                    .expect("a gate outcome serializes to JSON"),
+                            }),
+                            _ => None,
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let _phase = crate::phase_telemetry::span("submit_queued_batch_handoff");
+                let receipt = receipt
+                    .filter(|receipt| self.queued_receipt_is_current(coordinator, entry, receipt));
+                let receipt = ticket.complete(receipt).ok().flatten();
+                record_queued_batch(
+                    "leader",
+                    if receipt.is_some() {
+                        "verified"
+                    } else {
+                        "fallback"
+                    },
+                    Some(members),
+                );
+                if let Some(receipt) = receipt {
+                    return Ok(QueuedAdmission::Verified(receipt));
+                }
+            }
+            Ok(queue::Admission::Follower) => {
+                drop(slot);
+                let phase = crate::phase_telemetry::span("submit_queued_batch_follow");
+                if let Some(receipt) = ticket.follow()
+                    && self.queued_receipt_is_current(coordinator, entry, &receipt)
+                {
+                    record_queued_batch("follower", "verified", Some(receipt.members.len()));
+                    return Ok(QueuedAdmission::Verified(receipt));
+                }
+                record_queued_batch("follower", "fallback", None);
+                drop(phase);
+                drop(ticket);
+                return acquire(&mut report_wait).map(QueuedAdmission::Single);
+            }
+            Ok(queue::Admission::Single) => record_queued_batch("single", "no_cohort", None),
+            _ => record_queued_batch("single", "fallback", None),
+        }
+        Ok(QueuedAdmission::Single(slot))
+    }
+
+    fn queued_receipt_is_current(
+        &self,
+        coordinator: i64,
+        entry: &MergeQueueEntry,
+        receipt: &QueuedBatchReceipt,
+    ) -> bool {
+        let Ok(repo) = GitRepo::discover(&self.main_root_path()) else {
+            return false;
+        };
+        receipt.coordinator == coordinator
+            && receipt.base == entry.base_commit
+            && receipt.members.iter().any(|member| {
+                member.session_id == entry.session_id && member.head == entry.head_commit
+            })
+            && repo
+                .commit_tree_id(&receipt.candidate)
+                .is_ok_and(|tree| tree == receipt.tree)
+            && self
+                .batch_is_current(&repo, &receipt.base, &receipt.members)
+                .unwrap_or(false)
+    }
+}
+
+fn record_queued_batch(role: &'static str, outcome: &'static str, members: Option<usize>) {
+    crate::phase_telemetry::attach(
+        "queued_batch",
+        serde_json::json!({
+            "role": role,
+            "outcome": outcome,
+            "members": members,
+        }),
+    );
 }
 
 fn batch_refusal(id: i64, reason: &str) -> BrokerOpError {

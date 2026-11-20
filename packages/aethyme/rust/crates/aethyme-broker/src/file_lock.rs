@@ -1083,7 +1083,7 @@ fn describe_lifecycle_queue(
 /// order and staleness survive the clock being set forward or back. It
 /// restarts at boot; tickets from before a reboot belong to dead processes.
 #[cfg(unix)]
-fn host_monotonic_ns() -> u128 {
+pub(crate) fn host_monotonic_ns() -> u128 {
     // SAFETY: timespec is plain integers (and, on some targets, padding), for
     // which all-zero bytes are a valid value.
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
@@ -1096,7 +1096,7 @@ fn host_monotonic_ns() -> u128 {
 }
 
 #[cfg(not(unix))]
-fn host_monotonic_ns() -> u128 {
+pub(crate) fn host_monotonic_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos())

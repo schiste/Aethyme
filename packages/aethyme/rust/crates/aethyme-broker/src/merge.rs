@@ -24,6 +24,7 @@ use crate::types::{MergeQueueEntry, MergeStatus, VerificationCandidate};
 #[path = "merge_batch.rs"]
 mod batch;
 pub(crate) use batch::BatchRequest;
+pub use batch::{BatchMember, QueuedBatchReceipt};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
@@ -503,6 +504,10 @@ pub struct SubmitOutcome {
     /// The commit this submission was simulated and gated against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_against: Option<VerificationBase>,
+    /// An exact group-only result from explicit queued submission. No
+    /// individual verdict or authorization is carried by this receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_batch: Option<QueuedBatchReceipt>,
 }
 
 /// What a submission is simulated and gated against.
@@ -1508,7 +1513,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         expected_head: &str,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, Some(expected_head))
+        self.submit_inner(session_id, cache_policy, Some(expected_head), None)
     }
 
     /// Submit with an explicit policy for merged-tree gate cache lookup.
@@ -1517,7 +1522,17 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, None)
+        self.submit_inner(session_id, cache_policy, None, None)
+    }
+
+    pub(crate) fn submit_for_queue(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        expected_head: Option<&str>,
+        coordinator: Option<i64>,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_inner(session_id, cache_policy, expected_head, coordinator)
     }
 
     fn submit_inner(
@@ -1525,6 +1540,7 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
         expected_head: Option<&str>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // Refuse legacy and incomplete bindings before submission planning.
         // A fresh database may proceed, but its root is not created until the
@@ -1644,6 +1660,7 @@ impl Broker {
             pre_refresh,
             Some(&progress),
             prepared_plan,
+            coordinator,
         )?;
         outcome.lease_warnings = ownership.warned_leases;
         self.attach_overlap_changes(
@@ -1803,6 +1820,7 @@ impl Broker {
             no_changes: true,
             lease_warnings: Vec::new(),
             verified_against: None,
+            queued_batch: None,
             promoted: false,
             promotion_suppressed: None,
         })
@@ -1819,6 +1837,7 @@ impl Broker {
             pre_refresh,
             None,
             None,
+            None,
         )
     }
 
@@ -1829,6 +1848,7 @@ impl Broker {
         pre_refresh: Option<String>,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: `pre_refresh` is where the integration branch stood BEFORE the
         // follows-main refresh, read by the caller before its first refresh.
@@ -1852,6 +1872,7 @@ impl Broker {
             SimulationBase { base, pre_refresh },
             progress,
             prepared_plan,
+            coordinator.filter(|_| verification.source == VERIFIED_AGAINST_UPSTREAM),
         )?;
         outcome.verified_against = Some(verification);
         Ok(outcome)
@@ -1961,6 +1982,7 @@ impl Broker {
         simulation_base: SimulationBase,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         let SimulationBase { base, pre_refresh } = simulation_base;
         let entry = self
@@ -2091,6 +2113,7 @@ impl Broker {
                 no_changes: false,
                 lease_warnings: Vec::new(),
                 verified_against: None,
+                queued_batch: None,
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -2177,19 +2200,51 @@ impl Broker {
         }
         let main_root = self.main_root_path();
         let worktree_root_plan = self.worktree_root_plan()?;
-        let mut verification_slot =
-            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
-                &main_root,
-                "merge-sim",
-                MERGE_VERIFICATION_SLOTS,
-                &worktree_root_plan,
-                crate::gates::heartbeat_interval(),
-                &mut |waited| {
-                    if let Some(progress) = progress {
-                        progress.report_slot_wait(&main_root, waited);
-                    }
-                },
-            )?;
+        let coordinator = coordinator.filter(|_| {
+            entry.status == MergeStatus::Submitted
+                && entry.details_json.is_none()
+                && entry.base_commit == base
+                && !main_checkout_session
+        });
+        let mut verification_slot = match self.admit_queued_verification(
+            &main_root,
+            &worktree_root_plan,
+            &entry,
+            &base,
+            &submission_plan.merged_tree_paths,
+            coordinator,
+            cache_policy,
+            progress,
+        )? {
+            batch::QueuedAdmission::Single(slot) => slot,
+            batch::QueuedAdmission::Verified(receipt) => {
+                let details = serde_json::json!({
+                    "reason": "a waiting group was verified as a whole",
+                    "queued_batch_candidate": receipt.candidate,
+                });
+                self.store().set_merge_status(
+                    entry.id,
+                    MergeStatus::Superseded,
+                    None,
+                    Some(&details.to_string()),
+                )?;
+                return Ok(SubmitOutcome {
+                    entry: self.queue_entry(entry.id)?,
+                    submission_plan,
+                    conflicts: Vec::new(),
+                    conflict_details: Vec::new(),
+                    gate_outcomes: Vec::new(),
+                    graph_integrity: None,
+                    gate_verification: SubmissionGateVerification::not_run(),
+                    no_changes: false,
+                    lease_warnings: Vec::new(),
+                    verified_against: None,
+                    queued_batch: Some(receipt),
+                    promoted: false,
+                    promotion_suppressed: None,
+                });
+            }
+        };
         if let Some(progress) = progress {
             progress.phase(crate::submit_progress::PHASE_VERIFYING);
         }
@@ -2407,6 +2462,7 @@ impl Broker {
             no_changes: false,
             lease_warnings: Vec::new(),
             verified_against: None,
+            queued_batch: None,
             promoted: false,
             promotion_suppressed,
         })

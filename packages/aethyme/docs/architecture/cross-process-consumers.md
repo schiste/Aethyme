@@ -4025,3 +4025,25 @@ Command metrics include `submit_batch_admission`, `submit_batch_compose`,
 `submit_batch_revalidate`. The `batch_verification` attachment contains the
 outcome, member count, executed and cached gate counts, and executed gate
 milliseconds. It contains no path, branch, commit or task information.
+
+### Opportunistic queued batch verification
+
+`broker submit queued <coordinator-id> --session <id> [--no-cache] --json`
+opts a single submission into sharing the exact group gate when the ordinary
+verification pool is already saturated. Only requests already waiting at slot
+admission may join. The coordinator must be a member and every member names
+that coordinator. Standalone submissions use the existing JSON shape.
+
+A successful group reply carries `queued_batch` (`coordinator`, `verifier`,
+`base`, `members`, `candidate`, `tree`, and `gates`), `landed: false`,
+`next_action`, and `collaboration_capture`. The individual queue entries
+record `superseded` with the combined candidate ID. This receipt does not
+satisfy single-session verification or any provider check. Gate and input
+details in command output are scoped to the opted-in group.
+
+Command metrics include `submit_queued_batch_register`,
+`submit_queued_batch_claim`, `submit_queued_batch_handoff`, and
+`submit_queued_batch_follow`. The `queued_batch` attachment counts admitted
+members when known and records `role` (`leader`, `follower`, or `single`) and
+`outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
+on the verifier's `batch_verification` attachment.
