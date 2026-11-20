@@ -728,6 +728,8 @@ blocked.
    broker and Git routing before setting fixture-owned state and worktree paths.
    Passing the fixture to `--repo` alone can still bind the command to the
    session in the caller's current checkout.
+   Stage fixtures that use noninteractive test trust under the OS temporary
+   directory. The broker checks the resolved directory before recording trust.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
