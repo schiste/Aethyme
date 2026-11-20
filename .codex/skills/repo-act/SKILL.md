@@ -116,6 +116,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   spans can omit repository discovery done while writing the metric itself.
   Keep the same telemetry setting in both arms, and exercise the due-refresh
   or unread-note fallback separately from steady-state silent boundaries.
+  Verify that both paths emit the same command label and that measured output
+  bytes match actual stdout, including silence.
 
 - For concurrent-agent comparisons, register both worktrees and their task
   scopes before launching either worker. Use the same ordered integration and
