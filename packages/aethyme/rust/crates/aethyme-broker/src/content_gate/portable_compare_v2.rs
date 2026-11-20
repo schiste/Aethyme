@@ -12,14 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Inputs independently acquired for a fresh offline evaluation. This draft
-/// only supports absent collection and external evidence. Their absence must
-/// be established independently rather than inferred from an old verdict.
+/// supports a host-provided collection and requires external evidence to be
+/// independently established absent, not inferred from an old verdict.
 pub struct Inputs<'a> {
     pub base: &'a Snapshot,
     pub after: &'a [Item],
     pub change: &'a [u8],
     pub resolved_policy: &'a [u8],
     pub host_options: &'a [u8],
+    pub collection: Option<&'a [u8]>,
     pub evaluator_identity: &'a [u8],
     pub expected_validator_name: &'a str,
     pub expected_validator_version: &'a str,
@@ -139,11 +140,99 @@ fn envelope(bytes: &[u8]) -> Result<Value, &'static str> {
     Ok(value)
 }
 
+// Match the host projection to the reconstructed inventory and changed
+// metadata. Text extraction remains a host assertion, not an observed fact.
+fn validate_collection(
+    bytes: &[u8],
+    candidate: &Snapshot,
+    change: &Value,
+) -> Result<(), &'static str> {
+    let collection = parse_unique(bytes)?;
+    closed(&collection, &["change_id", "items", "complete"])?;
+    if collection["change_id"] != change["change_id"] {
+        return Err("collection change differs");
+    }
+    let complete = collection["complete"]
+        .as_bool()
+        .ok_or("invalid collection completeness")?;
+    let items = collection["items"]
+        .as_array()
+        .ok_or("invalid collection items")?;
+    if items.len() > 100_000 {
+        return Err("collection exceeds item limit");
+    }
+    let candidate_ids: BTreeSet<_> = candidate
+        .items
+        .iter()
+        .map(|i| i.entity_id.as_str())
+        .collect();
+    let mut by_id = BTreeMap::new();
+    for item in items {
+        closed(
+            item,
+            &[
+                "id",
+                "text",
+                "source_text",
+                "headings",
+                "metadata",
+                "evidence_sources",
+            ],
+        )?;
+        let id = item["id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("invalid collection identity")?;
+        if !candidate_ids.contains(id) || by_id.insert(id, item).is_some() {
+            return Err("collection identities differ");
+        }
+        for key in ["text", "source_text"] {
+            if item
+                .get(key)
+                .is_some_and(|v| !v.is_null() && !v.is_string())
+            {
+                return Err("invalid collection text");
+            }
+        }
+        if item.get("headings").is_some_and(|v| {
+            !v.is_null()
+                && v.as_array()
+                    .is_none_or(|a| a.iter().any(|x| !x.is_string()))
+        }) {
+            return Err("invalid collection headings");
+        }
+        for key in ["metadata", "evidence_sources"] {
+            if item.get(key).is_some_and(|v| {
+                !v.is_null()
+                    && v.as_object()
+                        .is_none_or(|m| m.values().any(|x| !x.is_string()))
+            }) {
+                return Err("invalid collection metadata");
+            }
+        }
+    }
+    if complete && by_id.len() != candidate_ids.len() {
+        return Err("complete collection identities differ");
+    }
+    for entry in change["entries"].as_array().ok_or("invalid entries")? {
+        if entry["operation"] != "delete" {
+            let item = by_id
+                .get(entry["entity_id"].as_str().ok_or("invalid entity")?)
+                .ok_or("changed collection item unavailable")?;
+            let metadata = |v: &Value| v.get("metadata").filter(|v| !v.is_null()).cloned();
+            if metadata(item) != metadata(entry) {
+                return Err("collection changed metadata differs");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compare an earlier and a freshly produced envelope against independently
 /// reconstructed inputs. Passing is never permission to publish. In addition
 /// to caller obligations above, snapshots must be duplicate-safe parsed. This
-/// implementation intentionally rejects collection/evidence inputs by not
-/// accepting them at all; it cannot validate those evaluation modes.
+/// host must independently establish that any collection faithfully projects
+/// the candidate; external evidence is not supported.
 pub fn compare(
     previous: &[u8],
     fresh: &[u8],
@@ -166,12 +255,15 @@ pub fn compare(
     let fresh = envelope(fresh)?;
     let change = parse_change(input.change)?;
     let candidate = overlay(input.base, input.change, input.after)?;
+    if let Some(bytes) = input.collection {
+        validate_collection(bytes, &candidate, &change)?;
+    }
     let binding = candidate_binding(&CandidateArtifacts {
         change: input.change,
         resolved_policy: input.resolved_policy,
         host_options: input.host_options,
         evaluator: input.evaluator_identity,
-        collection: None,
+        collection: input.collection,
         external_evidence: None,
         base_revision_sha256: snapshot_digest(input.base)?,
         candidate_revision_sha256: snapshot_digest(&candidate)?,
@@ -205,7 +297,7 @@ pub fn compare(
         change: input.change.to_vec(),
         policy: input.resolved_policy.to_vec(),
         options: input.host_options.to_vec(),
-        collection: None,
+        collection: input.collection.map(<[u8]>::to_vec),
         external: None,
         additional: BTreeMap::new(),
     };
@@ -278,6 +370,7 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
             host_options: v["artifacts"]["host_options"].as_str().unwrap().as_bytes(),
+            collection: None,
             evaluator_identity: v["artifacts"]["evaluator"].as_str().unwrap().as_bytes(),
             expected_validator_name: "aexeo",
             expected_validator_version: "0.0.24",
@@ -330,6 +423,35 @@ mod tests {
         let mut changed = base.clone();
         changed.complete = false;
         assert!(!run(&old, &old, &inputs(&v, &changed, &after)));
+    }
+    #[test]
+    fn binds_collection_and_rejects_inconsistent_projection() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let collection =
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","text":"abc"}]}"#;
+        input.collection = Some(collection);
+        verdict["binding_sha256"] =
+            json!("13853ce80d789902d38c941f81f8b59b6be34b7ead0137c7b35b95009bef97ac");
+        assert!(run(&verdict, &verdict, &input));
+        for bad in [
+            br#"{"change_id":"other","complete":true,"items":[{"id":"article"}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[]}"#.as_slice(),
+            br#"{"change_id":"example","complete":false,"items":[]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"other"}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","metadata":{"x":"y"}}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","unknown":true}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"complete":true,"items":[{"id":"article"}]}"#.as_slice(),
+        ] {
+            input.collection = Some(bad); assert!(!run(&verdict, &verdict, &input));
+        }
+        // Equivalent projection with different exact bytes is still a different input.
+        input.collection = Some(
+            br#"{ "change_id":"example","complete":true,"items":[{"id":"article","text":"abc"}]}"#,
+        );
+        assert!(!run(&verdict, &verdict, &input));
+        input.collection = None;
+        assert!(!run(&verdict, &verdict, &input));
     }
     #[test]
     fn rejects_unknown_nested_fields_duplicates_and_inconsistent_results() {
