@@ -48,6 +48,7 @@ pub(crate) enum UnsafeReason {
 }
 
 impl UnsafeReason {
+    #[cfg(test)]
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
@@ -290,5 +291,31 @@ impl crate::Broker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnsafeReason;
+
+    /// Every reason has its own counter, named after its code.
+    #[test]
+    fn every_unsafe_reason_names_its_counter_after_its_code() {
+        for reason in [
+            UnsafeReason::InProgress,
+            UnsafeReason::Stash,
+            UnsafeReason::HeadNotContained,
+            UnsafeReason::BranchNotContained,
+            UnsafeReason::Staged,
+            UnsafeReason::Unstaged,
+            UnsafeReason::Untracked,
+            UnsafeReason::Unreadable,
+            UnsafeReason::NotExamined,
+        ] {
+            assert_eq!(
+                reason.telemetry_name(),
+                format!("session_abandonment_kept_unsafe_{}", reason.code())
+            );
+        }
     }
 }
