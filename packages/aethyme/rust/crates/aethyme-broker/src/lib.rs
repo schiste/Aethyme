@@ -79,6 +79,7 @@ pub use disk_headroom::{
 pub mod cli;
 mod cli_output;
 mod console;
+pub mod content_gate;
 pub mod contract_check;
 mod delivery;
 mod enrollment_publication;
