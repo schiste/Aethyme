@@ -58,6 +58,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   metadata through coordinated Git, repeat the same probes, and then verify the
   native operation succeeds. Configure incremental graph maintenance separately;
   faster raw Git alone does not prove successful cleanup or authorize deletion.
+- If `broker start --reuse` rejects a retired checkout as not inside a Git
+  repository before restoring its archive, inspect its tombstone and verify the
+  exact target is the recorded retired worktree and is not the main checkout.
+  On affected versions, `broker start --reuse <exact-path> --allow-main-checkout`
+  restores that verified target; do not use this option for an unverified path.
+  Check the restored branch and broker session, then follow preparation and sync
+  instructions. Preserve the recovery archive and report the CLI defect.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
