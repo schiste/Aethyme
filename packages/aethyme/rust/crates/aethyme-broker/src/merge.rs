@@ -1417,7 +1417,7 @@ impl Broker {
         let gate_results = {
             let _span = crate::phase_telemetry::span("gate_preverify_execution");
             std::thread::scope(|scope| {
-                let (finished, completion) = std::sync::mpsc::channel();
+                let (finished, completion) = std::sync::mpsc::channel::<()>();
                 let progress = &progress;
                 scope.spawn(move || {
                     while matches!(
