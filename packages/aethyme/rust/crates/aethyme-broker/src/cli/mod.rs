@@ -2699,9 +2699,9 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
-    // Everywhere else `--pr` takes a pull-request number; for `push` it is a
-    // switch. Translate it before parsing.
-    let rest: Vec<String> = if subcommand == "push" {
+    // Publication commands use `--pr` as a switch. Other commands use a
+    // pull-request number. Normalize the switch before shared parsing.
+    let rest: Vec<String> = if matches!(subcommand.as_str(), "push" | "advance") {
         let separator = args
             .iter()
             .position(|arg| arg == "--")

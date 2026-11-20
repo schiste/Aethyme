@@ -1245,6 +1245,14 @@ fn early_verification_warms_pinned_submit_without_queueing() {
     git(repo, &["push", "-qu", "origin", "main"]);
     let base = git_output(repo, &["rev-parse", "origin/main"]);
 
+    let publication = run(repo, &["advance", "--pr", "--preverify", "--json"]);
+    assert!(!publication.status.success());
+    let error = String::from_utf8_lossy(&publication.stderr);
+    assert!(
+        error.contains("advance requires a live session in this repository"),
+        "{error}"
+    );
+
     let root = bind_fixture_worktree_root(repo, tmp.owner_path());
     let worktree = root.join("early-cache");
     git(
