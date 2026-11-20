@@ -320,6 +320,7 @@ impl Broker {
             !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
         report.cleanup_safe |= recovery_retry;
         if !report.cleanup_safe {
+            self.record_finish_keep(report.session_id, "cleanup_plan_unsafe");
             report.status = FinishStatus::Closed;
             report.cleanup.requested = true;
             report.cleanup.recovery_action =
@@ -452,10 +453,18 @@ impl Broker {
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
         let removal = crate::phase_telemetry::span("finish_claim_removal");
+        // The checkout this claim just proved clean and delivered leaves the
+        // pool by one rename into the trash (`finish_retire_move`); the
+        // deleter removes it later, once no process uses it.
+        let finish_retirement = super::retire::FinishRetirementScope::enter(report.session_id);
         let removed = crate::git::without_git_deadline(|| {
             self.cleanup_without_archive_under_lifecycle_claim(&cleanup_session, false)
         });
+        drop(finish_retirement);
         drop(removal);
+        if removed.is_err() {
+            self.record_finish_keep(report.session_id, "removal_failed");
+        }
         match removed {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
@@ -1118,7 +1127,24 @@ impl Broker {
         if report.cleanup_safe && broker_owned && !options.keep_worktree && auto_cleanup_enabled {
             self.run_finish_cleanup(&mut report, &session)?;
             return Ok(report);
-        } else if report.cleanup_safe {
+        }
+        // Why the checkout stays in the pool, on the session, for the
+        // retirement lane (`finish_retire_kept_<reason>`).
+        self.record_finish_keep(
+            session_id,
+            if options.keep_worktree {
+                "keep_worktree"
+            } else if !report.cleanup_safe && !report.dirty_paths.is_empty() {
+                "dirty"
+            } else if !report.cleanup_safe {
+                "not_proven_safe"
+            } else if !broker_owned {
+                "not_broker_owned"
+            } else {
+                "policy_disabled"
+            },
+        );
+        if report.cleanup_safe {
             if broker_owned && !options.keep_worktree && !auto_cleanup_enabled {
                 report.cleanup.kept = true;
                 if auto_cleanup_policy.is_err() {

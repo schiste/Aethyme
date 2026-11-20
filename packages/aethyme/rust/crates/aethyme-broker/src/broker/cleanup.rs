@@ -132,7 +132,10 @@ impl CleanupStatusLimits {
         output_bytes: usize,
         path_fields: usize,
     ) -> Self {
-        let per_call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // 15 s, or the allowance of the retirement inspection running on
+        // this thread (`InspectionAllowanceScope`).
+        let per_call_deadline =
+            std::time::Instant::now() + crate::cleanup_resolve::cleanup_listing_allowance();
         Self {
             deadline: overall_deadline.map_or(per_call_deadline, |deadline| {
                 deadline.min(per_call_deadline)
@@ -4963,7 +4966,11 @@ impl Broker {
         worktree: &Path,
         force: bool,
     ) -> Result<(), BrokerOpError> {
-        let in_lane = super::retire::in_retirement_lane();
+        // The retirement lane keeps what the move refuses, and `finish`
+        // falls back to Git's removal itself (counted once there): neither
+        // gets a fallback here.
+        let no_fallback =
+            super::retire::in_retirement_lane() || super::retire::in_finish_retirement(session.id);
         let refuse = |reason: String| BrokerOpError::DirtyWorktree {
             id: session.id,
             reason,
@@ -4986,7 +4993,7 @@ impl Broker {
                     "checkout_trash_declined_unclean",
                     std::time::Duration::ZERO,
                 );
-                if in_lane {
+                if no_fallback {
                     return Err(refuse("the checkout changed since it was judged".into()));
                 }
                 self.repo.worktree_remove_registered(worktree, false)?;
@@ -4995,7 +5002,7 @@ impl Broker {
         }
         let Some(pool) = self.trash_pool_for(session, worktree) else {
             crate::phase_telemetry::add("checkout_trash_outside_pool", std::time::Duration::ZERO);
-            if in_lane {
+            if no_fallback {
                 return Err(refuse(
                     "the checkout is not inside a broker-owned pool".into(),
                 ));
@@ -5024,11 +5031,14 @@ impl Broker {
         match moved {
             Ok(trashed) => {
                 self.note_checkout_trashed(&trashed);
+                if super::retire::in_finish_retirement(session.id) {
+                    crate::phase_telemetry::add("finish_retire_trashed", std::time::Duration::ZERO);
+                }
                 Ok(())
             }
             Err(reason) => {
                 crate::phase_telemetry::add("checkout_trash_refused", std::time::Duration::ZERO);
-                if in_lane {
+                if no_fallback {
                     return Err(refuse(reason));
                 }
                 crate::phase_telemetry::add(
@@ -5549,6 +5559,29 @@ impl Broker {
                             .collect(),
                     );
                     self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                } else if super::retire::in_finish_retirement(session_id) {
+                    // `finish` just proved this checkout clean and delivered
+                    // under this claim: one rename into the trash instead of
+                    // `git worktree remove` deleting it here (a median 48 s
+                    // with every start and finish waiting on this claim).
+                    // Whatever the move refuses falls back to Git's removal,
+                    // exactly as before.
+                    let moved = {
+                        let _span = crate::phase_telemetry::span("finish_retire_move");
+                        self.remove_checkout_through_trash(session, &worktree_path, force)
+                    };
+                    if let Err(error) = moved {
+                        crate::phase_telemetry::add(
+                            "finish_retire_git_fallback",
+                            std::time::Duration::ZERO,
+                        );
+                        crate::warn_unrecorded::<(), _>(
+                            "move a finished checkout into the trash",
+                            Err(error),
+                        );
+                        self.repo
+                            .worktree_remove_registered(&worktree_path, force)?;
+                    }
                 } else {
                     self.repo
                         .worktree_remove_registered(&worktree_path, force)?;

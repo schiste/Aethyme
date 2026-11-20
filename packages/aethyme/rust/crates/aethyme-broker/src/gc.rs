@@ -269,6 +269,8 @@ const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
 /// Hidden `broker gc` action of the trash catch-up lane process.
 pub(crate) const TRASH_CATCHUP_ACTION: &str = "__trash-catchup";
+/// Hidden `broker gc` action of the checkout retirement lane process.
+pub(crate) const RETIRE_LANE_ACTION: &str = "__retire-lane";
 /// When the worker that started a trash catch-up lane process started
 /// (epoch ms), for its `catchup_start_delay_ms`.
 pub(crate) const TRASH_CATCHUP_WORKER_STARTED_ENV: &str = "AETHYME_TRASH_CATCHUP_WORKER_STARTED_MS";
@@ -3992,6 +3994,13 @@ pub(crate) fn wait_for_host_deleter_slot(
 /// thing in the worker process, before any thread or child exists.
 pub(crate) fn lower_artifact_worker_priority() -> BackgroundPriority {
     background_priority::lower_current_process()
+}
+
+/// Set the checkout retirement lane process to normal disk priority and
+/// reduced CPU priority (macOS; see
+/// `background_priority::raise_for_retirement_lane`).
+pub(crate) fn raise_retirement_lane_priority() -> background_priority::DeleterPriority {
+    background_priority::raise_for_retirement_lane()
 }
 
 /// Set the checkout trash deleter process to unthrottled disk I/O (macOS;
@@ -9202,6 +9211,10 @@ impl Broker {
         // `lower_artifact_worker_priority`) and a thread cannot lift itself
         // out of a throttled process.
         let lane_started = self.start_checkout_trash_catchup_lane(worker_started, "worker_start");
+        // Closed checkouts waiting: the retirement lane process judges them
+        // continuously at normal disk priority, instead of this worker's
+        // closed lap sharing its throttled 180 s window.
+        self.start_checkout_retirement_lane();
         let result = self.run_artifact_sweep_recovery_worker_lanes();
         release_worker_lock();
         if !lane_started {
@@ -9292,6 +9305,61 @@ impl Broker {
             Err(_) => {
                 crate::phase_telemetry::add(
                     "checkout_trash_catchup_lane_spawn_failed",
+                    Duration::ZERO,
+                );
+                false
+            }
+        }
+    }
+
+    /// Start the checkout retirement lane process (`broker gc
+    /// __retire-lane`), detached like this worker, when this worker may
+    /// (the same gates as the trash catch-up lane) and
+    /// `checkout_retirement_lane_needed` says closed checkouts wait with no
+    /// lane process of this repository alive. `true` when it was started.
+    fn start_checkout_retirement_lane(&mut self) -> bool {
+        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
+            || crate::host_state::path_is_ephemeral(self.main_root())
+            || artifact_worker_post_boot_hold_now().is_some()
+        {
+            return false;
+        }
+        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+        let Some(host_dir) = host_dir else {
+            return false;
+        };
+        if !self.checkout_retirement_lane_needed(&host_dir) {
+            return false;
+        }
+        let Some((router, _engine)) = artifact_worker_binaries() else {
+            crate::phase_telemetry::add(
+                "checkout_retirement_lane_runtime_unverified",
+                Duration::ZERO,
+            );
+            return false;
+        };
+        let Ok(canonical_root) = std::fs::canonicalize(self.main_root()) else {
+            return false;
+        };
+        let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
+        let Ok(mut command) = self.detached_worker_command(
+            &router,
+            &canonical_root,
+            gate_scope.as_deref(),
+            &["broker", "gc", RETIRE_LANE_ACTION],
+        ) else {
+            crate::phase_telemetry::add("checkout_retirement_lane_storage_context", Duration::ZERO);
+            return false;
+        };
+        configure_artifact_worker_process_group(&mut command);
+        match crate::bounded_output::spawn_serialized(&mut command) {
+            Ok(_child) => {
+                crate::phase_telemetry::add("checkout_retirement_lane_spawned", Duration::ZERO);
+                true
+            }
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_lane_spawn_failed",
                     Duration::ZERO,
                 );
                 false

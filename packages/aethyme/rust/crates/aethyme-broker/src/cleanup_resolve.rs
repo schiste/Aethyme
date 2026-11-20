@@ -129,6 +129,17 @@ pub(crate) struct CleanupResolveRetirementContext {
     deadline: Option<Instant>,
 }
 
+impl CleanupResolveRetirementContext {
+    /// The deadline the plans made with this context run under; the
+    /// retirement run moves it to each lap's own deadline, so a context
+    /// captured in one lap does not hold the next lap's plans to a deadline
+    /// already past.
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+        self.ancestry_memo.deadline = Some(deadline);
+    }
+}
+
 /// A memo scoped to one captured retirement-planning context. Its keys are
 /// exact commit IDs, so results cannot leak across plans or changing refs.
 /// Apply-time validation deliberately uses the uncached Git helper below.
@@ -1672,10 +1683,10 @@ impl Broker {
             (bytes, sha256_hex(&unstaged))
         };
 
-        let inventory_deadline = context.deadline.map_or_else(
-            || std::time::Instant::now() + std::time::Duration::from_secs(15),
-            |deadline| deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(15)),
-        );
+        let listing_deadline = std::time::Instant::now() + cleanup_listing_allowance();
+        let inventory_deadline = context
+            .deadline
+            .map_or(listing_deadline, |deadline| deadline.min(listing_deadline));
         let untracked_paths = checkout
             .untracked_paths_until_with_limits(
                 inventory_deadline,
@@ -4800,6 +4811,43 @@ fn listing_resume_index(paths: &[PathBuf], cursor: &Path) -> usize {
         .iter()
         .position(|path| path.as_path() > cursor)
         .unwrap_or(0)
+}
+
+/// How long one cleanup status listing may take when no inspection
+/// allowance is set on this thread.
+const CLEANUP_LISTING_DEFAULT_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(15);
+
+thread_local! {
+    /// The per-listing allowance of the inspection running on this thread
+    /// (see [`InspectionAllowanceScope`]), replacing the 15 s default.
+    static INSPECTION_ALLOWANCE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long one cleanup `git status` listing (the eligibility status and
+/// the archive inventory's untracked listing) may take on this thread: the
+/// allowance of an [`InspectionAllowanceScope`], else 15 s. Any enclosing
+/// Git deadline still applies.
+pub(crate) fn cleanup_listing_allowance() -> std::time::Duration {
+    INSPECTION_ALLOWANCE
+        .with(std::cell::Cell::get)
+        .unwrap_or(CLEANUP_LISTING_DEFAULT_ALLOWANCE)
+}
+
+/// Sets this thread's cleanup listing allowance until dropped (restoring
+/// the previous one).
+pub(crate) struct InspectionAllowanceScope(Option<std::time::Duration>);
+
+impl InspectionAllowanceScope {
+    pub(crate) fn enter(allowance: std::time::Duration) -> Self {
+        Self(INSPECTION_ALLOWANCE.with(|cell| cell.replace(Some(allowance))))
+    }
+}
+
+impl Drop for InspectionAllowanceScope {
+    fn drop(&mut self) {
+        INSPECTION_ALLOWANCE.with(|cell| cell.set(self.0));
+    }
 }
 
 /// The archive candidates directly under one configured archive root, in
