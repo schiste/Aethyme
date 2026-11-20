@@ -331,9 +331,19 @@ pub(super) fn run_preverify(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     let _span = crate::phase_telemetry::span("gate_preverify");
-    let mut broker = open_broker(false)?;
-    let result =
-        broker.preverify_published_head(id, &parsed.positional[1], &parsed.positional[2])?;
+    let result = open_broker(false).and_then(|mut broker| {
+        Ok(broker.preverify_published_head(id, &parsed.positional[1], &parsed.positional[2])?)
+    });
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            crate::phase_telemetry::attach(
+                "early_verification",
+                serde_json::json!({ "state": "error" }),
+            );
+            return Err(error);
+        }
+    };
     crate::phase_telemetry::attach("early_verification", result.metric_details());
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&result)?);
