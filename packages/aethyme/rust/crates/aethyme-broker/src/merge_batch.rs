@@ -105,7 +105,7 @@ impl Broker {
         coordinator_id: i64,
         request: BatchRequest,
         cache: crate::gates::CachePolicy,
-        held_slot: Option<&mut crate::verification::ExactTreeVerificationSlot>,
+        execution: Option<QueuedBatchExecution<'_>>,
     ) -> Result<BatchVerification, BrokerOpError> {
         let admission = crate::phase_telemetry::span("submit_batch_admission");
         let mut report = BatchVerification::new(request);
@@ -126,8 +126,8 @@ impl Broker {
         let main = self.main_root_path();
         let repo = GitRepo::discover(&main)?;
         let mut standalone_slot;
-        let slot = if let Some(slot) = held_slot {
-            slot
+        let (slot, verifier, progress) = if let Some(execution) = execution {
+            (execution.slot, execution.verifier, execution.progress)
         } else {
             let root_plan = self.worktree_root_plan()?;
             let Some(slot) =
@@ -141,7 +141,7 @@ impl Broker {
                 return Ok(report);
             };
             standalone_slot = slot;
-            &mut standalone_slot
+            (&mut standalone_slot, coordinator_id, None)
         };
         let Some(history) =
             capture_submission_plan_history_view(&main, self.repo_handle(), self.store_ref())
@@ -262,8 +262,11 @@ impl Broker {
             tree,
         );
         report.graph_advice = graph.advice();
-        if let Some(path) = self.session_scratch_dir(coordinator_id) {
-            crate::session_scratch::remember_for_commands(coordinator_id, &path);
+        if let Some(path) = self.session_scratch_dir(verifier) {
+            crate::session_scratch::remember_for_commands(verifier, &path);
+        }
+        if let Some(progress) = progress {
+            progress.subphase("executing gates");
         }
         let storage = self.storage_context().gate_storage_locations();
         report.gates = crate::gates::run_affected_for_submit_in(
@@ -273,9 +276,9 @@ impl Broker {
             gates.as_deref().unwrap_or_default(),
             &changed,
             &report.base,
-            Some(coordinator_id),
+            Some(verifier),
             cache,
-            None,
+            progress,
             storage,
         )?;
         slot.cleanup();
@@ -343,6 +346,12 @@ impl Broker {
     }
 }
 
+struct QueuedBatchExecution<'a> {
+    slot: &'a mut crate::verification::ExactTreeVerificationSlot,
+    verifier: i64,
+    progress: Option<&'a crate::submit_progress::SubmitProgress>,
+}
+
 pub(super) enum QueuedAdmission {
     Single(crate::verification::ExactTreeVerificationSlot),
     Verified(QueuedBatchReceipt),
@@ -361,66 +370,96 @@ impl Broker {
         cache: crate::gates::CachePolicy,
         progress: Option<&crate::submit_progress::SubmitProgress>,
     ) -> Result<QueuedAdmission, BrokerOpError> {
-        let mut ticket = None;
-        let mut attempted = false;
-        let acquire = |on_wait: &mut dyn FnMut(std::time::Duration)| {
+        let report_wait = |waited| {
+            if let Some(progress) = progress {
+                progress.report_slot_wait(main, waited);
+            }
+        };
+        let acquire_single = || {
+            let mut report = report_wait;
             crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
                 main,
                 "merge-sim",
                 MERGE_VERIFICATION_SLOTS,
                 root_plan,
                 crate::gates::heartbeat_interval(),
-                on_wait,
-            )
+                &mut report,
+            ).map(QueuedAdmission::Single)
         };
-        let mut report_wait = |waited| {
-            if let Some(progress) = progress {
-                progress.report_slot_wait(main, waited);
-            }
+        let Some(coordinator) = coordinator else {
+            return acquire_single();
         };
-        let mut slot = acquire(&mut |waited| {
-            report_wait(waited);
-            if let Some(coordinator) = coordinator
-                && !std::mem::replace(&mut attempted, true)
-            {
-                let _phase = crate::phase_telemetry::span("submit_queued_batch_register");
-                let member = BatchMember {
-                    session_id: entry.session_id,
-                    head: entry.head_commit.clone(),
-                };
-                // The probe is opt-in and happens only after all ordinary
-                // verification slots have been observed busy.
-                if GitRepo::discover(main).is_ok_and(|repo| {
-                    self.batch_is_current(&repo, base, std::slice::from_ref(&member))
-                        .unwrap_or(false)
-                }) {
-                    ticket = queue::Ticket::enqueue(
-                        main,
-                        coordinator,
-                        member,
-                        base,
-                        paths,
-                        matches!(cache, crate::gates::CachePolicy::Bypass),
-                    );
+        let mut ticket = None;
+        let mut attempted = false;
+        let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+            main,
+            "merge-sim",
+            MERGE_VERIFICATION_SLOTS,
+            root_plan,
+            crate::gates::heartbeat_interval(),
+            &mut |waited, report| {
+                if report {
+                    report_wait(waited);
                 }
-            }
-        })?;
-        let Some(ticket) = ticket else {
-            return Ok(QueuedAdmission::Single(slot));
-        };
+                if !std::mem::replace(&mut attempted, true) {
+                    let _phase = crate::phase_telemetry::span("submit_queued_batch_register");
+                    let member = BatchMember {
+                        session_id: entry.session_id,
+                        head: entry.head_commit.clone(),
+                    };
+                    // This probe runs only after every slot is observed busy.
+                    if GitRepo::discover(main).is_ok_and(|repo| {
+                        self.batch_is_current(&repo, base, std::slice::from_ref(&member))
+                            .unwrap_or(false)
+                    }) {
+                        ticket = queue::Ticket::enqueue(
+                            main,
+                            coordinator,
+                            member,
+                            base,
+                            paths,
+                            matches!(cache, crate::gates::CachePolicy::Bypass),
+                        );
+                    }
+                }
+                match ticket.as_ref().map(queue::Ticket::has_claim).transpose() {
+                    Ok(claimed) => claimed.unwrap_or(false),
+                    Err(_) => {
+                        drop(ticket.take());
+                        false
+                    }
+                }
+            },
+        )?;
         let ready_cutoff = crate::file_lock::host_monotonic_ns();
-        let coordinator = coordinator.expect("only opted-in submissions take a ticket");
-        let wait = crate::phase_telemetry::span("submit_queued_batch_claim");
-        let admission = ticket.admit(ready_cutoff);
-        drop(wait);
+        let Some(ticket) = ticket else {
+            return Ok(QueuedAdmission::Single(
+                slot.expect("no ticket can redirect"),
+            ));
+        };
+        let admission = if slot.is_some() {
+            let _phase = crate::phase_telemetry::span("submit_queued_batch_claim");
+            ticket.admit(ready_cutoff)
+        } else {
+            Ok(queue::Admission::Follower)
+        };
         match admission {
             Ok(queue::Admission::Leader(request)) if ticket.claim_is_live() => {
                 let members = request.members.len();
                 if let Some(progress) = progress {
                     progress.phase(crate::submit_progress::PHASE_VERIFYING);
                 }
-                let verified =
-                    self.verify_batch_in_slot(coordinator, request, cache, Some(&mut slot));
+                let slot = slot.as_mut().expect("a batch verifier holds the slot");
+                let verified = self.verify_batch_in_slot(
+                    coordinator,
+                    request,
+                    cache,
+                    Some(QueuedBatchExecution {
+                        slot,
+                        verifier: entry.session_id,
+                        progress,
+                    }),
+                );
                 if verified.is_err() {
                     slot.cleanup();
                 }
@@ -465,6 +504,9 @@ impl Broker {
             }
             Ok(queue::Admission::Follower) => {
                 drop(slot);
+                if let Some(progress) = progress {
+                    progress.phase("waiting for shared verification");
+                }
                 let phase = crate::phase_telemetry::span("submit_queued_batch_follow");
                 if let Some(receipt) = ticket.follow()
                     && self.queued_receipt_is_current(coordinator, entry, &receipt)
@@ -475,12 +517,17 @@ impl Broker {
                 record_queued_batch("follower", "fallback", None);
                 drop(phase);
                 drop(ticket);
-                return acquire(&mut report_wait).map(QueuedAdmission::Single);
+                if let Some(progress) = progress {
+                    progress.phase(crate::submit_progress::PHASE_WAITING_FOR_SLOT);
+                }
+                return acquire_single();
             }
             Ok(queue::Admission::Single) => record_queued_batch("single", "no_cohort", None),
             _ => record_queued_batch("single", "fallback", None),
         }
-        Ok(QueuedAdmission::Single(slot))
+        Ok(QueuedAdmission::Single(
+            slot.expect("a redirect follows the accepted verifier"),
+        ))
     }
 
     fn queued_receipt_is_current(

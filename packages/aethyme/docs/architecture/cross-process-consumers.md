@@ -4043,7 +4043,9 @@ details in command output are scoped to the opted-in group.
 
 Command metrics include `submit_queued_batch_register`,
 `submit_queued_batch_claim`, `submit_queued_batch_handoff`, and
-`submit_queued_batch_follow`. The `queued_batch` attachment counts admitted
+`submit_queued_batch_follow`. Waiters retain the last immutable snapshot and
+reload only when the state file changes, timed by
+`submit_queued_batch_read_snapshot`. The `queued_batch` attachment counts admitted
 members when known and records `role` (`leader`, `follower`, or `single`) and
 `outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
 on the verifier's `batch_verification` attachment.

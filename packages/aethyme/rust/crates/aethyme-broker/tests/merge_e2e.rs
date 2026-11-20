@@ -1503,6 +1503,10 @@ mod queued_submit {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_gate_delay(0)
+        }
+
+        fn with_gate_delay(gate_seconds: u8) -> Self {
             let repository = common::FixtureRepository::new();
             let root = repository.path();
             init_repo(root);
@@ -1511,7 +1515,7 @@ mod queued_submit {
             // Count real gate executions independently of the CLI result. A
             // pause is used only to cancel a leader while its gate is running.
             let command = format!(
-                "git rev-parse HEAD^{{tree}} >> '{marker}' && if test -f '{pause}'; then sleep 5; fi",
+                "git rev-parse HEAD^{{tree}} >> '{marker}' && if test -f '{pause}'; then sleep 5; fi && sleep {gate_seconds}",
                 marker = marker.display(),
                 pause = pause.display(),
             );
@@ -1741,7 +1745,7 @@ mod queued_submit {
 
     #[test]
     fn two_waiters_share_one_exact_gate_when_one_slot_opens() {
-        let baseline = Fixture::new();
+        let baseline = Fixture::with_gate_delay(2);
         let mut baseline_slots = baseline.hold_slots();
         let mut a = baseline.start(0, false);
         let mut b = baseline.start(1, false);
@@ -1772,7 +1776,7 @@ mod queued_submit {
         let baseline_elapsed = before.elapsed();
         assert_eq!(baseline.gates().len(), 2);
 
-        let fixture = Fixture::new();
+        let fixture = Fixture::with_gate_delay(2);
         let mut slots = fixture.hold_slots();
         let mut first = fixture.start(0, true);
         fixture.queued(&mut first, 1);

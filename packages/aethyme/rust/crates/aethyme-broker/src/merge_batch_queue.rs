@@ -2,8 +2,10 @@
 //! merge verification slot. The queue state is advisory until normal exact
 //! batch admission and gates succeed.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -61,7 +63,7 @@ pub struct Receipt {
     pub gates: serde_json::Value,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Claim {
     leader: Waiter,
     members: Vec<Waiter>,
@@ -69,7 +71,7 @@ struct Claim {
     result: Option<Completion>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum Completion {
     Verified(Receipt),
     Fallback,
@@ -86,6 +88,42 @@ pub(super) struct Ticket {
     directory: PathBuf,
     waiter: Waiter,
     marker: Option<tempfile::NamedTempFile>,
+    observed: RefCell<Option<QueueSnapshot>>,
+}
+
+// Persist atomically replaces the state file. Holding the previously read
+// inode open ensures its identity cannot be recycled between observations.
+struct QueueSnapshot {
+    _file: File,
+    generation: QueueGeneration,
+    claim: Option<Claim>,
+}
+
+#[derive(PartialEq, Eq)]
+struct QueueGeneration {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    modified: std::time::SystemTime,
+    bytes: u64,
+}
+
+impl QueueGeneration {
+    fn read(file: &File) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        Ok(Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            modified: metadata.modified()?,
+            bytes: metadata.len(),
+        })
+    }
 }
 
 pub(super) enum Admission {
@@ -137,6 +175,7 @@ impl Ticket {
                 bypass_cache,
             },
             marker: Some(marker),
+            observed: RefCell::default(),
         };
         let ready_at = ticket
             .edit(|state| {
@@ -242,9 +281,13 @@ impl Ticket {
         })
     }
 
+    pub(super) fn has_claim(&self) -> io::Result<bool> {
+        self.observe(|claim| claim.is_some())
+    }
+
     pub(super) fn claim_is_live(&self) -> bool {
-        self.read().is_ok_and(|state| {
-            state.claim_for(&self.waiter).is_some_and(|claim| {
+        self.observe(|claim| {
+            claim.is_some_and(|claim| {
                 claim.result.is_none()
                     && claim
                         .members
@@ -252,6 +295,7 @@ impl Ticket {
                         .all(|member| member.alive(&self.directory))
             })
         })
+        .unwrap_or(false)
     }
 
     /// Wait only for an accepted leader, with no slot held. Failures and
@@ -262,21 +306,26 @@ impl Ticket {
             if !self.waiter.alive(&self.directory) {
                 return None;
             }
-            let state = self.read().ok()?;
-            let claim = state.claim_for(&self.waiter)?;
-            let outcome = match &claim.result {
-                Some(Completion::Verified(receipt)) => Handoff::Verified(receipt.clone()),
-                Some(Completion::Fallback) => Handoff::Fallback,
-                None if claim.leader.alive(&self.directory)
-                    && claim
-                        .members
-                        .iter()
-                        .all(|member| member.alive(&self.directory)) =>
-                {
-                    Handoff::Pending
-                }
-                None => Handoff::Fallback,
-            };
+            let outcome = self
+                .observe(|claim| {
+                    let Some(claim) = claim else {
+                        return Handoff::Fallback;
+                    };
+                    match &claim.result {
+                        Some(Completion::Verified(receipt)) => Handoff::Verified(receipt.clone()),
+                        Some(Completion::Fallback) => Handoff::Fallback,
+                        None if claim.leader.alive(&self.directory)
+                            && claim
+                                .members
+                                .iter()
+                                .all(|member| member.alive(&self.directory)) =>
+                        {
+                            Handoff::Pending
+                        }
+                        None => Handoff::Fallback,
+                    }
+                })
+                .ok()?;
             match outcome {
                 Handoff::Verified(receipt) => return Some(receipt),
                 Handoff::Fallback => return None,
@@ -314,16 +363,39 @@ impl Ticket {
     }
 
     fn read(&self) -> io::Result<State> {
-        use std::io::Read;
-
         match queue_file(&self.directory.join("state.json"), false) {
-            Ok(file) if file.metadata()?.len() <= MAX_STATE_BYTES => {
-                Ok(serde_json::from_reader(file.take(MAX_STATE_BYTES + 1))?)
-            }
-            Ok(_) => Err(io::Error::other("submit batch queue state is too large")),
+            Ok(file) => read_state(&file, file.metadata()?.len()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State::default()),
             Err(error) => Err(error),
         }
+    }
+
+    fn observe<T>(&self, inspect: impl FnOnce(Option<&Claim>) -> T) -> io::Result<T> {
+        let mut observed = self.observed.borrow_mut();
+        let file = match queue_file(&self.directory.join("state.json"), false) {
+            Ok(file) => file,
+            Err(error) => {
+                *observed = None;
+                return Err(error);
+            }
+        };
+        let generation = QueueGeneration::read(&file)?;
+        if let Some(snapshot) = &*observed
+            && snapshot.generation == generation
+        {
+            return Ok(inspect(snapshot.claim.as_ref()));
+        }
+        *observed = None;
+        let _phase = crate::phase_telemetry::span("submit_queued_batch_read_snapshot");
+        let state = read_state(&file, generation.bytes)?;
+        let claim = state.claim_for(&self.waiter).cloned();
+        let result = inspect(claim.as_ref());
+        *observed = Some(QueueSnapshot {
+            _file: file,
+            generation,
+            claim,
+        });
+        Ok(result)
     }
 }
 
@@ -441,6 +513,13 @@ fn paths_are_disjoint(occupied: &BTreeSet<&str>, paths: &[String]) -> bool {
     })
 }
 
+fn read_state(file: &File, bytes: u64) -> io::Result<State> {
+    if bytes > MAX_STATE_BYTES {
+        return Err(io::Error::other("submit batch queue state is too large"));
+    }
+    Ok(serde_json::from_reader(file.take(MAX_STATE_BYTES + 1))?)
+}
+
 fn queue_file(path: &Path, create: bool) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(create).create(create);
@@ -458,4 +537,89 @@ fn queue_file(path: &Path, create: bool) -> io::Result<std::fs::File> {
         ));
     }
     Ok(file)
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn enqueue(root: &Path, session: i64, target: &str) -> Ticket {
+        Ticket::enqueue(
+            root,
+            1,
+            BatchMember {
+                session_id: session,
+                head: session.to_string(),
+            },
+            "base",
+            &[target.into()],
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unchanged_observations_keep_the_snapshot_and_new_generation_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let first = enqueue(root.path(), 1, "a");
+        assert!(!first.has_claim().unwrap());
+        let fd = first.observed.borrow().as_ref().unwrap()._file.as_raw_fd();
+        for _ in 0..10 {
+            assert!(!first.has_claim().unwrap());
+            assert_eq!(
+                first.observed.borrow().as_ref().unwrap()._file.as_raw_fd(),
+                fd
+            );
+        }
+        let second = enqueue(root.path(), 2, "b");
+        assert!(matches!(
+            first.admit(host_monotonic_ns()).unwrap(),
+            Admission::Leader(_)
+        ));
+        assert!(second.has_claim().unwrap());
+        assert!(first.has_claim().unwrap());
+        assert_ne!(
+            first.observed.borrow().as_ref().unwrap()._file.as_raw_fd(),
+            fd
+        );
+        std::fs::write(first.directory.join("state.json"), "invalid JSON").unwrap();
+        assert!(first.has_claim().is_err());
+        assert!(first.observed.borrow().is_none());
+    }
+
+    #[test]
+    fn an_arrival_after_the_cutoff_cannot_join_even_before_claim_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let first = enqueue(root.path(), 1, "a");
+        let cutoff = host_monotonic_ns();
+        let late = enqueue(root.path(), 2, "b");
+        assert!(late.waiter.ready_at > cutoff);
+        assert!(matches!(first.admit(cutoff).unwrap(), Admission::Single));
+        assert!(!late.has_claim().unwrap());
+    }
+
+    #[test]
+    fn a_solo_fallback_withdraws_even_when_scheduler_lock_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let first = enqueue(root.path(), 1, "a");
+        let second = enqueue(root.path(), 2, "b");
+        let lock = ExclusiveFileLock::try_acquire(
+            queue_file(&first.directory.join("lock"), true).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            second.admit(host_monotonic_ns()).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let marker = second.directory.join(&second.waiter.ticket);
+        drop(second);
+        assert!(!marker.exists());
+        drop(lock);
+        assert!(matches!(
+            first.admit(host_monotonic_ns()).unwrap(),
+            Admission::Single
+        ));
+    }
 }
