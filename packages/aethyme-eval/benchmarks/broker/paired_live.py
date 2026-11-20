@@ -30,6 +30,68 @@ def verify_suite(repo, env):
                check=False).returncode == 0
 
 
+def configure_verification(args, repo, env, git, arm):
+    # Keep the trusted gate definition identical in both arms. Repeat the
+    # real suite for the substantial lane so gate cost is visible.
+    suite = shlex.quote(sys.executable) + " -B -m unittest discover -s tests -t . -q"
+    if args.verification == "substantial":
+        suite = (f'i=0; while [ "$i" -lt 40 ]; do {suite} || exit $?; '
+                 'i=$((i+1)); done')
+    ignore = repo / ".gitignore"
+    ignore.write_text(ignore.read_text() + "!.aethyme/gates.toml\n")
+    (repo / ".aethyme/gates.toml").write_text(
+        f'[[gate]]\nname="playground-suite"\ncommand={json.dumps(suite)}\n'
+        'cache=true\ntimeout_seconds=30\n'
+    )
+    run(repo, env, git, "add", ".gitignore", ".aethyme/gates.toml")
+    run(repo, env, git, "commit", "-qm", "Declare paired verification")
+    run(repo, env, git, "push", "-q", "origin", "main")
+    if arm == "broker":
+        # This approval switch is only for the disposable fixture and its
+        # own host-state directory. Invoke it from the fixture checkout.
+        trusted = run(repo, dict(env, AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS="1",
+                                 AETHYME_AGENT_PID="none"),
+                      args.binary, "broker", "advanced", "trust", "--repo", str(repo), "--json")
+        if len(json.loads(trusted.stdout)["recorded"]) != 1:
+            raise RuntimeError("missing fixture gate trust receipt")
+    return suite
+
+
+def verify_integration(args, env, git, candidate, upstream, work, filename):
+    if args.verification == "off":
+        return True
+    expected = run(candidate, env, git, "write-tree").stdout.strip()
+    started = time.monotonic()
+    if work["session"] is not None:
+        # The normal submit independently derives the merge candidate from
+        # the published head. Prove it matches the direct Git integration.
+        result = run(work["checkout"], dict(env, AETHYME_AGENT_PID="none"),
+                     args.binary, "broker", "submit", "--session", str(work["session"]),
+                     "--json", check=False)
+        report = json.loads(result.stdout) if result.stdout.strip() else {}
+        entry = report.get("entry", {})
+        gates = report.get("gate_outcomes", [])
+        passed = (result.returncode == 0 and entry.get("merged_tree") == expected
+                  and entry.get("base_commit") == upstream and len(gates) == 1
+                  and gates[0]["status"] == "pass" and gates[0]["tree_hash"] == expected)
+        receipt = {"passed": passed, "tree": expected, "exit": result.returncode,
+                   "gate": gates[0] if len(gates) == 1 else None,
+                   "actual_tree": entry.get("merged_tree"), "actual_base": entry.get("base_commit")}
+        if not passed:
+            receipt.update(stdout=result.stdout, stderr=result.stderr)
+    else:
+        result = run(candidate, env, "sh", "-c", work["gate_command"], check=False)
+        receipt = {"passed": result.returncode == 0, "tree": expected,
+                   "exit": result.returncode, "gate": None}
+        if not receipt["passed"]:
+            receipt.update(stdout=result.stdout, stderr=result.stderr)
+    receipt["wall_ms"] = (time.monotonic() - started) * 1000
+    receipt["expected_base"] = upstream
+    work["verification"].append(receipt)
+    dump(work["folder"] / filename, receipt)
+    return receipt["passed"]
+
+
 def check_hidden(repo, env, folder, test_name):
     runner = folder / "hidden.py"
     shutil.copyfile(HERE / "hidden_checks" / test_name, runner)
@@ -73,6 +135,8 @@ def worker(args, repo, root, env, git, task, arm, folder, peer_titles):
         publish = f"git push origin HEAD:refs/heads/{branch}"
     peer_context = f"Concurrent tasks: {', '.join(peer_titles)}. " if peer_titles else ""
     coordination = f"Inspect coordination state using {inspect}."
+    if arm == "baseline":
+        coordination += " Use direct Git for coordination and lifecycle commands."
     if args.hook_home and arm == "broker":
         coordination = (
             "Use the Aethyme startup context and hook updates for coordination. "
@@ -134,9 +198,13 @@ def coordinator_publish(args, env, git, work, expected_head, reference, receipt_
             raise ValueError("candidate contains disallowed paths or unexplained changes")
         run(checkout, env, git, "commit", "-qm", work["task"]["title"])
         session = work["session"]
-        argv = ((args.binary, "broker", "advance", "--session", str(session), "--json") if session
-                else (git, "push", "origin", f"HEAD:refs/heads/{branch}"))
-        result = run(checkout, env, *argv, check=False)
+        if session is None:
+            argv = (git, "push", "origin", f"HEAD:refs/heads/{branch}")
+        else:
+            argv = (args.binary, "broker", "advance", "--session", str(session), "--json")
+            if args.preverify:
+                argv += ("--preverify",)
+        result = run(checkout, dict(env, AETHYME_AGENT_PID="none"), *argv, check=False)
         receipt.update(published=result.returncode == 0, exit=result.returncode,
                        stdout=result.stdout, stderr=result.stderr)
     except (RuntimeError, ValueError) as error:
@@ -147,8 +215,6 @@ def coordinator_publish(args, env, git, work, expected_head, reference, receipt_
 def integrate(args, repo, root, env, git, work, arm, first_attempt):
     task, folder, branch, checkout = (work[k] for k in ("task", "folder", "branch", "checkout"))
     attempts = [first_attempt]
-    if args.coordinator_publish and first_attempt["exit"] == 0:
-        coordinator_publish(args, env, git, work, work["base"], work["base"], "publish.json")
     initial = verify_branch(repo, env, git, work, work["base"])
     conflict = None
     completed = False
@@ -187,12 +253,18 @@ def integrate(args, repo, root, env, git, work, arm, first_attempt):
                 coordinator_publish(args, env, git, work, initial["head"], upstream, "repair-publish.json")
             repaired = verify_branch(repo, env, git, work, upstream)
             dump(folder / "repair-validation.json", repaired)
-            if repaired["valid"]:
+            if repaired["valid"] and verify_integration(
+                args, env, git, checkout, upstream, work, "repair-verification.json"
+            ):
                 run(repo, env, git, "fetch", "-q", "origin", branch)
                 completed = run(repo, env, git, "merge", "--ff-only", "FETCH_HEAD", check=False).returncode == 0
-        else:
+        elif verify_integration(args, env, git, repo, upstream, work, "verification.json"):
             run(repo, env, git, "commit", "-qm", f"Integrate {task['id']}")
             completed = True
+        else:
+            # Missing or mismatched verification evidence leaves origin/main
+            # untouched and restores the fixture for the next assignment.
+            run(repo, env, git, "merge", "--abort")
         if completed:
             run(repo, env, git, "push", "-q", "origin", "main")
             if arm == "broker":
@@ -207,7 +279,8 @@ def integrate(args, repo, root, env, git, work, arm, first_attempt):
             **{key: sum(values) if None not in values else None for key, values in usage.items()},
             "attempts": attempts, "merged": completed, "session_finished": finish, "conflict": conflict,
             "session_id": work["session"], "repair_used": repair_used,
-            "rework_required": repair_used or not completed, "human_interventions": 0}
+            "rework_required": repair_used or not completed, "human_interventions": 0,
+            "integration_verification": work["verification"]}
 
 
 @contextmanager
@@ -232,25 +305,74 @@ def playground(scratch, folder, arm):
                 print(json.dumps(warning), file=sys.stderr, flush=True)
 
 
+def collect_command_metrics(path, folder, workers, preverify):
+    if not preverify:
+        if path.is_file():
+            shutil.copyfile(path, folder / "broker-metrics.jsonl")
+        return
+
+    scheduled = 0
+    for work in workers:
+        for name in ("publish.json", "repair-publish.json"):
+            receipt_path = work["folder"] / name
+            if receipt_path.is_file():
+                receipt = json.loads(receipt_path.read_text())
+                if receipt["published"]:
+                    publication = json.loads(receipt["stdout"])
+                    scheduled += publication.get("preverification") == "scheduled"
+
+    # Detached workers can finish after the task timer stops. Retain their
+    # receipts before deleting the Playground, including cancelled work.
+    deadline = time.monotonic() + 50
+    while True:
+        contents = path.read_text() if path.is_file() else ""
+        lines = contents[:contents.rfind("\n") + 1].splitlines()
+        metrics = [json.loads(line) for line in lines]
+        early = [metric for metric in metrics if "early_verification" in metric]
+        if len(early) >= scheduled or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    (folder / "broker-metrics.jsonl").write_text("\n".join(lines) + "\n" if lines else "")
+    dump(folder / "early-verification.json", {
+        "scheduled": scheduled, "completed": len(early),
+        "missing_receipts": max(0, scheduled - len(early)),
+        "workers": [{"session_id": metric.get("session_id"),
+                     "wall_ms": metric["duration_ms"], **metric["early_verification"]}
+                    for metric in early],
+    })
+
+
 def run_group(args, folder, tasks, overlap, arm):
     git = shutil.which("git")
     with playground(args.scratch, folder, arm) as root:
         env = dict(rep_environment(root), AETHYME_UPDATE_CHECK="off", AETHYME_MEASURE_OUTPUT="1")
         if args.hook_home:
             env["CODEX_HOME"] = str(args.hook_home)
-            env["PATH"] = str(Path(args.binary).parent) + os.pathsep + env["PATH"]
+            if arm == "broker":
+                env["PATH"] = str(Path(args.binary).parent) + os.pathsep + env["PATH"]
         repo = prepare(root, env, git)
+        suite = (configure_verification(args, repo, env, git, arm)
+                 if args.verification != "off" else None)
         workers = []
         for task in tasks:
             task_folder = folder / task["id"]
             task_folder.mkdir()
             peers = [peer["title"] for peer in tasks if peer is not task]
-            workers.append(worker(args, repo, root, env, git, task, arm, task_folder, peers))
+            assignment = worker(args, repo, root, env, git, task, arm, task_folder, peers)
+            assignment.update(gate_command=suite, verification=[])
+            workers.append(assignment)
+
+        def author(work):
+            attempt = codex_attempt(args, work["folder"] / "attempt.jsonl", root,
+                                    work["checkout"], env, work["prompt"],
+                                    config=work["codex_config"])
+            if args.coordinator_publish and attempt["exit"] == 0:
+                coordinator_publish(args, env, git, work, work["base"], work["base"], "publish.json")
+            return attempt
+
         group_started = time.monotonic()
         with ThreadPoolExecutor(max_workers=len(workers)) as pool:
-            attempts = [pool.submit(codex_attempt, args, work["folder"] / "attempt.jsonl",
-                                    root, work["checkout"], env, work["prompt"],
-                                    config=work["codex_config"]) for work in workers]
+            attempts = [pool.submit(author, work) for work in workers]
             rows = [integrate(args, repo, root, env, git, work, arm, attempt.result())
                     for work, attempt in zip(workers, attempts, strict=True)]
         group_seconds = time.monotonic() - group_started
@@ -280,10 +402,12 @@ def run_group(args, folder, tasks, overlap, arm):
                 row["activity_signals"] = signals.get(row["session_id"], 0)
         for row, work in zip(rows, workers, strict=True):
             dump(work["folder"] / "result.json", row)
-            print(json.dumps(row), flush=True)
         metrics = repo / ".aethyme/logs/command-metrics.jsonl"
-        if metrics.is_file():
-            shutil.copyfile(metrics, folder / "broker-metrics.jsonl")
+        collect_command_metrics(metrics, folder, workers, args.preverify and arm == "broker")
+        if arm == "baseline" and metrics.is_file() and metrics.stat().st_size > 0:
+            raise RuntimeError("direct Git arm ran broker commands; see broker-metrics.jsonl")
+        for row in rows:
+            print(json.dumps(row), flush=True)
         if args.hook_home and arm == "broker" and any(row["activity_signals"] < 2 for row in rows):
             raise RuntimeError("missing broker activity evidence for live Codex hooks")
         return rows
@@ -308,7 +432,15 @@ def summary(rows):
         contrasts = {}
         for arm in ("baseline", "broker"):
             own = [r for r in selected if r["arm"] == arm]
+            verification = [check for row in own for check in row["integration_verification"]]
+            shared = [check["gate"] for check in verification if check["passed"]
+                      and check["gate"] and check["gate"]["cached"]]
             contrasts[arm] = {
+                "integration_checks": len(verification),
+                "integration_checks_passed": sum(check["passed"] for check in verification),
+                "gate_verdicts_reused": len(shared),
+                "gate_execution_ms_reused": sum(gate["duration_ms"] or 0 for gate in shared),
+                "verification_wall_ms": measure([check["wall_ms"] for check in verification]),
                 "trials": len(own), "completed": sum(r["completed"] for r in own),
                 "initially_valid": sum(r["initial"]["valid"] for r in own),
                 "conflicts": sum(bool(r["conflict"]) for r in own),
@@ -328,7 +460,7 @@ def main():
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--scratch", required=True, type=Path)
+    parser.add_argument("--scratch", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--seed", type=int, default=19)
     parser.add_argument("--timeout", type=int, default=240)
     parser.add_argument("--only", nargs="+")
@@ -338,7 +470,19 @@ def main():
                         help="let the coordinator stage owned edits and publish them in either arm")
     parser.add_argument("--concurrent", action="store_true",
                         help="run six independent groups covering all twelve assignments")
+    parser.add_argument("--wide", action="store_true",
+                        help="also run the six independent assignments in a single concurrent group")
+    parser.add_argument("--verification", choices=("off", "cheap", "substantial"), default="off",
+                        help="require the same exact-tree integration gate in both arms")
+    parser.add_argument("--preverify", action="store_true",
+                        help="start early verification after broker publication")
     args = parser.parse_args()
+    if args.preverify and (not args.coordinator_publish or args.verification == "off"):
+        parser.error("--preverify requires --coordinator-publish and an integration gate")
+    if args.verification != "off" and not args.scratch.resolve().is_relative_to(
+        Path(tempfile.gettempdir()).resolve()
+    ):
+        parser.error("verification fixtures must be staged under the OS temporary directory")
     manifest = load_tasks()
     tasks = {task["id"]: task for task in manifest["tasks"]}
     args.overlaps = {group["id"]: group for group in manifest["overlaps"]}
@@ -352,6 +496,8 @@ def main():
             "disjoint-search-loyalty": (["t07", "t10"], None),
             "disjoint-report-text": (["t11", "t12"], None),
         })
+    if args.wide:
+        plan["disjoint-six"] = (["t02", "t06", "t07", "t10", "t11", "t12"], None)
     names = args.only or list(plan)
     if not names or len(set(names)) != len(names) or set(names) - plan.keys():
         parser.error("choose unique group IDs from " + ", ".join(plan))
@@ -366,6 +512,7 @@ def main():
         "model": args.model, "effort": "low", "seed": args.seed, "update_check": "off",
         "trusted_aethyme_hooks_requested": bool(args.hook_home),
         "coordinator_publishes": args.coordinator_publish,
+        "verification": args.verification, "preverify": args.preverify,
         "plan": [{"group": name, "arms": arms, "tasks": plan[name][0]} for name, arms in zip(names, order)],
         "binary_sha256": digest,
         "binary_version": subprocess.check_output([args.binary, "--version"], text=True).strip(),
