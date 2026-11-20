@@ -7238,13 +7238,6 @@ mod tests {
         crate::checkout_trash::HostPressure::default()
     }
 
-    fn critical_memory() -> crate::checkout_trash::HostPressure {
-        crate::checkout_trash::HostPressure {
-            memory_critical: true,
-            ..crate::checkout_trash::HostPressure::default()
-        }
-    }
-
     /// The lane process judges the closed backlog with the same judgement
     /// as the worker's laps and ends once both laps reached their end,
     /// recording its inspections.
