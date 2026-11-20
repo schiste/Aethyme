@@ -144,11 +144,14 @@ impl ExecutionProfile {
         // the added wall time to one probe budget. A missing optional tool is
         // a stable part of the profile; a timeout, output overflow, or other
         // spawn failure makes this run ineligible for cache reuse.
+        let recorder = crate::phase_telemetry::active();
         let tool_results = std::thread::scope(|scope| {
             let handles = TOOL_PROBES
                 .iter()
                 .map(|probe| {
+                    let recorder = recorder.clone();
                     scope.spawn(move || {
+                        let _record = recorder.map(crate::phase_telemetry::install);
                         (
                             probe.name.to_string(),
                             probe_version(probe, gate_cwd, subprocess_path),
