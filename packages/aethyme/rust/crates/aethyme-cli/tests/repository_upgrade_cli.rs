@@ -283,7 +283,9 @@ fn upgrade_proposal_fetches_only_the_pinned_commit_without_changing_the_plan() {
             serde_json::json!("--no-tags"),
             serde_json::json!("--no-recurse-submodules"),
             serde_json::json!("--"),
-            serde_json::json!(repo),
+            // The implementation canonicalizes the local repository before
+            // fetching; on macOS /var can be a symlink to /private/var.
+            serde_json::json!(fs::canonicalize(&repo).unwrap()),
             serde_json::json!(head),
         ]
     );
