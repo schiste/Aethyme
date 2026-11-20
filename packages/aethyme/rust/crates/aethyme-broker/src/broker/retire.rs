@@ -881,6 +881,47 @@ pub(crate) struct RetireRun {
     /// `EACCES`: this worker inherited a sandboxed caller's sandbox, or a
     /// volume refused writes): no further archive is attempted this run.
     archive_environment_denied: bool,
+    /// The plan inspections this run started and how they ended.
+    inspections: InspectionStats,
+}
+
+/// How long one lap inspection's Git listing (the eligibility `git status`
+/// and the archive inventory's untracked listing) may take, instead of the
+/// 15 s an interactive cleanup gets, still bounded by the lap's deadline.
+/// On 0.8.142 on the busiest repository every timed-out inspection stopped
+/// at 15 s (13 of them in 4 passes, 79 to 81 s of an 81 to 84 s lap) while
+/// a successful plan took about 13 s: a cold first walk of a checkout of
+/// ~17,000 tracked files on a contended volume needs a little more than 15
+/// s, and the walks after it are warm.
+const RETIRE_INSPECTION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The plan inspections of one retirement run (both laps), recorded per
+/// pass in the `checkout_retirement` attachment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InspectionStats {
+    /// Plans started.
+    pub started: usize,
+    /// Plans that completed (whatever they then decided).
+    pub succeeded: usize,
+    /// Plans whose inspection failed or timed out on its own
+    /// (`inspection_failed`).
+    pub failed: usize,
+    /// Plans the lap's own deadline cut short (`deadline`).
+    pub cut_by_deadline: usize,
+    /// Plans that refused the checkout (`plan_refused`, or no context).
+    pub refused: usize,
+    /// Milliseconds of each plan that completed.
+    pub succeeded_ms: Vec<u64>,
+}
+
+impl InspectionStats {
+    /// The median duration of a plan that completed (ms), `None` without
+    /// one; of an even count, the lower middle.
+    pub(crate) fn median_succeeded_ms(&self) -> Option<u64> {
+        let mut sorted = self.succeeded_ms.clone();
+        sorted.sort_unstable();
+        sorted.get(sorted.len().saturating_sub(1) / 2).copied()
+    }
 }
 
 impl RetireRun {
@@ -1142,6 +1183,8 @@ pub(crate) struct CheckoutRetirementReport {
     /// Open sessions whose paths the run resolved, and how long it took.
     pub open_sessions: usize,
     pub open_paths_ms: u64,
+    /// The plan inspections of both laps and how they ended.
+    pub inspections: InspectionStats,
     /// Milliseconds the closed lap spent on judgements that ended
     /// `inspection_failed`.
     pub failed_inspection_ms: u64,
@@ -2036,6 +2079,7 @@ impl Broker {
             keep_detail: None,
             last_inspection_failure: None,
             archive_environment_denied: false,
+            inspections: InspectionStats::default(),
         }))
     }
 
@@ -2429,17 +2473,43 @@ impl Broker {
                     }
                 }
             }
-            let Some(context) = run.plan_context.as_ref() else {
+            let lap_deadline = run.deadline;
+            let Some(context) = run.plan_context.as_mut() else {
+                run.inspections.refused += 1;
                 return Ok(Kept("plan_context_unavailable"));
             };
-            match self.cleanup_resolve_retirement_plan_with_context(session_id, false, context) {
-                Ok(plan) => plan,
+            // The context may have been captured by an earlier lap: its
+            // plans run under this lap's deadline, never one already past.
+            context.set_deadline(lap_deadline);
+            // A lap inspection's listings may take up to the allowance
+            // (within the lap's deadline) instead of 15 s each: one cold
+            // walk that needs 20 s costs less than five 15 s timeouts that
+            // decide nothing. Inline retirement at close keeps 15 s.
+            let _allowance = (!run.inline).then(|| {
+                crate::cleanup_resolve::InspectionAllowanceScope::enter(RETIRE_INSPECTION_ALLOWANCE)
+            });
+            run.inspections.started += 1;
+            let inspection_started = Instant::now();
+            let planned = self.cleanup_resolve_retirement_plan_with_context(
+                session_id,
+                false,
+                run.plan_context.as_ref().expect("context set above"),
+            );
+            match planned {
+                Ok(plan) => {
+                    run.inspections.succeeded += 1;
+                    run.inspections.succeeded_ms.push(
+                        u64::try_from(inspection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    );
+                    plan
+                }
                 Err(error) => {
                     let detail = error.to_string();
                     run.keep_detail = Some(detail.clone());
                     // The lap's own deadline cut the inspection short: no
                     // verdict at all, judged again when the lap comes back.
                     if Instant::now() >= run.deadline {
+                        run.inspections.cut_by_deadline += 1;
                         return Ok(Kept("deadline"));
                     }
                     // An inspection that failed or timed out on its own (a
@@ -2449,10 +2519,12 @@ impl Broker {
                     // spends that time on other checkouts first. Never
                     // retried within the run. The detail names the Git step.
                     if inspection_failed(&error) {
+                        run.inspections.failed += 1;
                         run.last_inspection_failure =
                             Some(format!("session {session_id}: {}", bounded_detail(&detail)));
                         return Ok(Kept("inspection_failed"));
                     }
+                    run.inspections.refused += 1;
                     return Ok(Kept("plan_refused"));
                 }
             }
@@ -2881,6 +2953,7 @@ impl Broker {
                     self.retirement_lap(&mut run, &mut report, true, cleaned_deadline)?;
             }
             last_inspection_failure = run.last_inspection_failure.take();
+            report.inspections = std::mem::take(&mut run.inspections);
         } else {
             crate::phase_telemetry::add(
                 "checkout_retirement_open_paths_unresolved",
@@ -2997,6 +3070,14 @@ impl Broker {
                 "closed_lap_first": report.closed_lap_first,
                 "open_sessions": report.open_sessions,
                 "open_paths_ms": report.open_paths_ms,
+                "inspections": {
+                    "started": report.inspections.started,
+                    "succeeded": report.inspections.succeeded,
+                    "failed": report.inspections.failed,
+                    "cut_by_deadline": report.inspections.cut_by_deadline,
+                    "refused": report.inspections.refused,
+                    "median_succeeded_ms": report.inspections.median_succeeded_ms(),
+                },
                 "failed_inspection_ms": report.failed_inspection_ms,
                 "retired_clean": report.retired_clean,
                 "retired_archived": report.retired_archived,
@@ -4531,6 +4612,14 @@ mod tests {
         assert_eq!(report.retired_clean, 5, "{report:#?}");
         assert!(report.lap_complete);
         assert_eq!(report.open_path_resolutions, 1);
+        assert_eq!(report.inspections.started, 5, "{report:#?}");
+        assert_eq!(report.inspections.succeeded, 5, "{report:#?}");
+        assert_eq!(report.inspections.succeeded_ms.len(), 5);
+        assert!(report.inspections.median_succeeded_ms().is_some());
+        assert_eq!(
+            report.inspections.failed + report.inspections.cut_by_deadline,
+            0
+        );
         assert_eq!(
             recorder
                 .totals()
@@ -7025,6 +7114,71 @@ mod tests {
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
+    }
+
+    /// The median of the plans that completed: the lower middle of an even
+    /// count, none without one.
+    #[test]
+    fn inspection_stats_report_the_median_successful_plan() {
+        let mut stats = super::InspectionStats::default();
+        assert_eq!(stats.median_succeeded_ms(), None);
+        stats.succeeded_ms = vec![5];
+        assert_eq!(stats.median_succeeded_ms(), Some(5));
+        stats.succeeded_ms = vec![9, 1, 7, 3];
+        assert_eq!(stats.median_succeeded_ms(), Some(3));
+        stats.succeeded_ms = vec![9, 1, 7];
+        assert_eq!(stats.median_succeeded_ms(), Some(7));
+    }
+
+    /// A lap inspection's listings get the retirement allowance instead of
+    /// 15 s, only while its scope is held, and the previous one comes back.
+    #[test]
+    fn the_inspection_allowance_applies_only_inside_its_scope() {
+        assert_eq!(
+            crate::cleanup_resolve::cleanup_listing_allowance(),
+            Duration::from_secs(15)
+        );
+        {
+            let _scope = crate::cleanup_resolve::InspectionAllowanceScope::enter(
+                super::RETIRE_INSPECTION_ALLOWANCE,
+            );
+            assert_eq!(
+                crate::cleanup_resolve::cleanup_listing_allowance(),
+                Duration::from_secs(60)
+            );
+        }
+        assert_eq!(
+            crate::cleanup_resolve::cleanup_listing_allowance(),
+            Duration::from_secs(15)
+        );
+    }
+
+    /// A planning context captured under a deadline that has passed plans
+    /// again once moved to the current lap's deadline (the cleaned lap
+    /// reuses the closed lap's context).
+    #[test]
+    fn a_context_moved_to_a_later_deadline_plans_after_the_first_passed() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _worktree) = closed(&mut broker, "later lap", |_| {});
+        let mut context = broker
+            .cleanup_resolve_retirement_context_until(Some(
+                Instant::now() + Duration::from_secs(30),
+            ))
+            .unwrap();
+        context.set_deadline(Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            broker
+                .cleanup_resolve_retirement_plan_with_context(session.id, false, &context)
+                .is_err(),
+            "a deadline already past starts no Git call"
+        );
+
+        context.set_deadline(Instant::now() + Duration::from_secs(60));
+
+        broker
+            .cleanup_resolve_retirement_plan_with_context(session.id, false, &context)
+            .expect("plans under the later deadline");
     }
 
     /// Open paths may use the window less the closed lap's floor (never less
