@@ -362,6 +362,48 @@ fn contract_preflight(broker: &mut crate::Broker, session: i64) -> Result<(), Us
     }
 }
 
+pub(super) fn run_submit_batch(
+    parsed: Parsed,
+    request: crate::merge::BatchRequest,
+) -> Result<(), UsageError> {
+    let id = parsed.session.ok_or_else(|| {
+        UsageError::Message("submit batch requires a coordinator --session <id>".into())
+    })?;
+    if parsed.read_only_snapshot {
+        return Err(super::read_only_refusal(
+            &parsed,
+            "broker submit batch",
+            "run it from a live coordinator session",
+        ));
+    }
+    let result = open_broker(false)?.verify_batch(
+        id,
+        request,
+        if parsed.no_cache {
+            crate::CachePolicy::Bypass
+        } else {
+            crate::CachePolicy::Use
+        },
+    )?;
+    crate::phase_telemetry::attach("batch_verification", result.metric_details());
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        out!("Batch verification {}", result.state);
+        if result.state == "verified" {
+            out!("{}", serde_json::to_string_pretty(&result)?);
+        }
+    }
+    if result.state == "verified" {
+        Ok(())
+    } else {
+        Err(UsageError::Exit {
+            message: format!("batch verification {}", result.state),
+            code: crate::exit_status::REFUSED,
+        })
+    }
+}
+
 pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
