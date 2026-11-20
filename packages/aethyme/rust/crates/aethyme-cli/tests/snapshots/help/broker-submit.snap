@@ -20,6 +20,9 @@ exit: 0
       records a session.holder_bound event. Unidentified callers are not refused.
   aethyme broker submit preverify <head> <base> --session <id> [--json]
       Warm reusable gates on the pinned candidate. A regular submit still verifies it.
+  aethyme broker submit batch <base> <session=head>... --session <id> [--no-cache] [--json]
+      Verify one candidate from two to sixteen ready published sessions on the exact
+      fetched base. Reports the candidate and gates without updating any ref.
   aethyme broker submit prepare status --session <id> [--json]
       Inspect repository-declared dependency preparation for one worktree.
       This is read-only and reports the exact remediation when preparation is

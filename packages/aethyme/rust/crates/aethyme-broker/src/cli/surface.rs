@@ -294,7 +294,7 @@ pub fn resolve(args: &[String]) -> Resolution {
         }
         if first == "submit"
             && let Some(subcommand) = args.get(1).map(String::as_str)
-            && subcommand != "preverify"
+            && !matches!(subcommand, "preverify" | "batch")
             && !subcommand.starts_with('-')
         {
             return Resolution {
@@ -575,6 +575,10 @@ mod tests {
             (
                 "submit preverify head base --session 3",
                 "submit preverify head base --session 3",
+            ),
+            (
+                "submit batch base 3=head 4=head --session 3",
+                "submit batch base 3=head 4=head --session 3",
             ),
             ("finish close --session 3", "close --session 3"),
             ("finish cleanup 3 --force", "cleanup 3 --force"),

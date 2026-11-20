@@ -3831,6 +3831,11 @@ The worker logs `gate_preverify_admission`, `gate_preverify_replay`,
 `gate_preverify_checkout`, `gate_preverify_execution` and `gate_preverify`
 timings, and an `early_verification` metric attachment with `state`,
 `executed_gates`, `cached_gates`, `cancelled_gates` and `executed_gate_ms`.
+Submit counts owned linear commits already based on the exact replay tip
+as `submit_replay_exact_parent`. The replay uses their existing Git trees
+in a complete, unmodified history view. Divergent inputs and merge commits
+retain their ordinary replay and provenance checks.
+
 The parent records `gate_preverify_launch`. These describe gate work and
 scheduling. The worker never creates or updates a submission queue entry.
 
@@ -3980,3 +3985,36 @@ and the `remote_branch_cleanup` field of `gc sweep --json` use schema
 `planned`. `gc sweep --json` also adds `session_stack_failures` when a stacked session's parent
 could not be re-read. Stack notes come from sender
 `automation:session-stack`.
+
+### Hook dispatch telemetry
+
+`hook_no_write_target` counts pre-tool events that have no recognized write
+target and therefore skip repository discovery and coordination reads.
+
+`hook_registered_snapshot` measures proof of the linked checkout registration,
+bound repository identity, current-schema read-only database and exact session.
+It can be recorded again for opt-in hook metric attribution.
+`hook_post_recorded_view` counts post-tool boundaries served from that snapshot
+while the session's own view is still fresh and no notes await delivery. Peer
+lease and scope changes remain visible at these boundaries. An ambiguous
+registration, due own-view check or unread note takes the full hook route.
+
+### Exact batch verification
+
+`broker submit batch <base> <session=head>... --session <coordinator> --json`
+adds an explicit verification-only submit form. Ordered, distinct full
+commit IDs identify the members and the locally fetched default. The
+JSON result has `state`, `base`, `members` (with `session_id` and `head`),
+`tree`, `candidate`, `conflicting_session`, `conflict_paths`,
+`graph_advice` and `gates`. Only `verified` exits successfully and applies
+to the candidate as a whole. `busy`, `superseded`, `conflict`, `deferred`,
+`failed`, `no_candidate_changes`, `no_gate_configuration` and
+`no_gates_triggered` are distinct non-success outcomes. Pre-admission,
+ownership and execution errors keep the ordinary broker error contract.
+Candidate objects are created locally with no ref or submission queue update.
+
+Command metrics include `submit_batch_admission`, `submit_batch_compose`,
+`submit_batch_checkout`, `submit_batch_verify`, and
+`submit_batch_revalidate`. The `batch_verification` attachment contains the
+outcome, member count, executed and cached gate counts, and executed gate
+milliseconds. It contains no path, branch, commit or task information.
