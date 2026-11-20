@@ -1,0 +1,491 @@
+//! Experimental offline v2 comparison, not a publication authorization.
+//! The caller must independently acquire and protect every input, authenticate
+//! the fresh evaluator, establish inventory completeness and freshness, and
+//! synchronize the final check with publication.
+use super::candidate_overlay_v2::overlay;
+use super::candidate_revision_v2::{Item, Snapshot, snapshot_digest};
+use super::portable_v2::{CandidateArtifacts, candidate_binding};
+use super::strict::{DecisionInputs, parse_change, parse_unique, strict_precheck_v1};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+
+const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Inputs independently acquired for a fresh offline evaluation. This draft
+/// supports a host-provided collection and requires external evidence to be
+/// independently established absent, not inferred from an old verdict.
+pub struct Inputs<'a> {
+    pub base: &'a Snapshot,
+    pub after: &'a [Item],
+    pub change: &'a [u8],
+    pub resolved_policy: &'a [u8],
+    pub host_options: &'a [u8],
+    pub collection: Option<&'a [u8]>,
+    pub evaluator_identity: &'a [u8],
+    pub expected_validator_name: &'a str,
+    pub expected_validator_version: &'a str,
+    pub required_checks: &'a [&'a str],
+    pub fresh_exit_code: Option<i32>,
+    pub fresh_timed_out: bool,
+}
+
+/// Matching experimental evidence only; it confers no publication authority.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExperimentalMatch(());
+
+fn closed(v: &Value, allowed: &[&str]) -> Result<(), &'static str> {
+    if v.as_object()
+        .ok_or("expected object")?
+        .keys()
+        .any(|k| !allowed.contains(&k.as_str()))
+    {
+        return Err("unsupported verdict field");
+    }
+    Ok(())
+}
+fn valid_sha(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+fn closed_verdict(v: &Value) -> Result<(), &'static str> {
+    closed(
+        v,
+        &[
+            "schema",
+            "status",
+            "subject",
+            "validator",
+            "evaluated_at",
+            "reason",
+            "summary",
+            "checks",
+            "findings",
+            "findings_omitted",
+            "extensions",
+        ],
+    )?;
+    closed(&v["subject"], &["change_id", "base", "entries"])?;
+    closed(&v["subject"]["base"], &["kind", "revision"])?;
+    for entry in v["subject"]["entries"]
+        .as_array()
+        .ok_or("invalid subject")?
+    {
+        closed(entry, &["entity_id", "sha256"])?;
+    }
+    closed(
+        &v["validator"],
+        &["name", "version", "profile", "profile_sha256"],
+    )?;
+    closed(
+        &v["summary"],
+        &[
+            "checks",
+            "passed",
+            "failed",
+            "not_checked",
+            "blocking_failed",
+            "blocking_not_checked",
+        ],
+    )?;
+    for check in v["checks"].as_array().ok_or("invalid checks")? {
+        closed(check, &["id", "status", "blocking", "reason"])?;
+    }
+    for finding in v["findings"].as_array().ok_or("invalid findings")? {
+        closed(
+            finding,
+            &[
+                "rule_id",
+                "severity",
+                "message",
+                "entity_id",
+                "check_id",
+                "location",
+                "subject",
+                "suggestion",
+            ],
+        )?;
+        if let Some(location) = finding.get("location") {
+            closed(location, &["line", "column"])?;
+        }
+    }
+    if let Some(ext) = v.get("extensions") {
+        closed(ext, &["aexeo.offline-input-binding.v1"])?;
+        if ext.as_object().is_none_or(|m| m.len() != 1)
+            || !ext["aexeo.offline-input-binding.v1"]
+                .as_str()
+                .is_some_and(valid_sha)
+        {
+            return Err("unsupported verdict extension");
+        }
+    }
+    Ok(())
+}
+fn envelope(bytes: &[u8]) -> Result<Value, &'static str> {
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err("envelope exceeds size limit");
+    }
+    let value = parse_unique(bytes)?;
+    closed(
+        &value,
+        &["schema", "binding_profile", "binding_sha256", "verdict"],
+    )?;
+    if value["schema"] != "content-gate.bound-verdict/v2"
+        || value["binding_profile"] != "content-gate.candidate-binding/v1"
+        || !value["binding_sha256"].as_str().is_some_and(valid_sha)
+    {
+        return Err("unsupported envelope or binding");
+    }
+    closed_verdict(&value["verdict"])?;
+    Ok(value)
+}
+
+// Match the host projection to the reconstructed inventory and changed
+// metadata. Text extraction remains a host assertion, not an observed fact.
+fn validate_collection(
+    bytes: &[u8],
+    candidate: &Snapshot,
+    change: &Value,
+) -> Result<(), &'static str> {
+    let collection = parse_unique(bytes)?;
+    closed(&collection, &["change_id", "items", "complete"])?;
+    if collection["change_id"] != change["change_id"] {
+        return Err("collection change differs");
+    }
+    let complete = collection["complete"]
+        .as_bool()
+        .ok_or("invalid collection completeness")?;
+    let items = collection["items"]
+        .as_array()
+        .ok_or("invalid collection items")?;
+    if items.len() > 100_000 {
+        return Err("collection exceeds item limit");
+    }
+    let candidate_ids: BTreeSet<_> = candidate
+        .items
+        .iter()
+        .map(|i| i.entity_id.as_str())
+        .collect();
+    let mut by_id = BTreeMap::new();
+    for item in items {
+        closed(
+            item,
+            &[
+                "id",
+                "text",
+                "source_text",
+                "headings",
+                "metadata",
+                "evidence_sources",
+            ],
+        )?;
+        let id = item["id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("invalid collection identity")?;
+        if !candidate_ids.contains(id) || by_id.insert(id, item).is_some() {
+            return Err("collection identities differ");
+        }
+        for key in ["text", "source_text"] {
+            if item
+                .get(key)
+                .is_some_and(|v| !v.is_null() && !v.is_string())
+            {
+                return Err("invalid collection text");
+            }
+        }
+        if item.get("headings").is_some_and(|v| {
+            !v.is_null()
+                && v.as_array()
+                    .is_none_or(|a| a.iter().any(|x| !x.is_string()))
+        }) {
+            return Err("invalid collection headings");
+        }
+        for key in ["metadata", "evidence_sources"] {
+            if item.get(key).is_some_and(|v| {
+                !v.is_null()
+                    && v.as_object()
+                        .is_none_or(|m| m.values().any(|x| !x.is_string()))
+            }) {
+                return Err("invalid collection metadata");
+            }
+        }
+    }
+    if complete && by_id.len() != candidate_ids.len() {
+        return Err("complete collection identities differ");
+    }
+    for entry in change["entries"].as_array().ok_or("invalid entries")? {
+        if entry["operation"] != "delete" {
+            let item = by_id
+                .get(entry["entity_id"].as_str().ok_or("invalid entity")?)
+                .ok_or("changed collection item unavailable")?;
+            let metadata = |v: &Value| v.get("metadata").filter(|v| !v.is_null()).cloned();
+            if metadata(item) != metadata(entry) {
+                return Err("collection changed metadata differs");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare an earlier and a freshly produced envelope against independently
+/// reconstructed inputs. Passing is never permission to publish. In addition
+/// to caller obligations above, snapshots must be duplicate-safe parsed. This
+/// host must independently establish that any collection faithfully projects
+/// the candidate; external evidence is not supported.
+pub fn compare(
+    previous: &[u8],
+    fresh: &[u8],
+    input: &Inputs<'_>,
+) -> Result<ExperimentalMatch, &'static str> {
+    if input.evaluator_identity.is_empty()
+        || input.evaluator_identity.len() > 256
+        || std::str::from_utf8(input.evaluator_identity).is_err()
+        || input.expected_validator_name.is_empty()
+        || input.expected_validator_version.is_empty()
+    {
+        return Err("invalid trusted evaluator identity");
+    }
+    let required: BTreeSet<_> = input.required_checks.iter().copied().collect();
+    if required.is_empty() || required.len() != input.required_checks.len() || required.contains("")
+    {
+        return Err("nonempty distinct required checks needed");
+    }
+    let previous = envelope(previous)?;
+    let fresh = envelope(fresh)?;
+    let change = parse_change(input.change)?;
+    let candidate = overlay(input.base, input.change, input.after)?;
+    if let Some(bytes) = input.collection {
+        validate_collection(bytes, &candidate, &change)?;
+    }
+    let binding = candidate_binding(&CandidateArtifacts {
+        change: input.change,
+        resolved_policy: input.resolved_policy,
+        host_options: input.host_options,
+        evaluator: input.evaluator_identity,
+        collection: input.collection,
+        external_evidence: None,
+        base_revision_sha256: snapshot_digest(input.base)?,
+        candidate_revision_sha256: snapshot_digest(&candidate)?,
+    })?;
+    let binding_hex: String = binding.iter().map(|b| format!("{b:02x}")).collect();
+    let entries = change["entries"]
+        .as_array()
+        .ok_or("invalid change entries")?;
+    let by_id: BTreeMap<_, _> = candidate
+        .items
+        .iter()
+        .map(|item| (item.entity_id.as_str(), item))
+        .collect();
+    let mut current = BTreeMap::new();
+    let mut subject_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry["entity_id"].as_str().ok_or("invalid entity")?;
+        let item = by_id.get(id).copied();
+        let after = entry.get("after");
+        let content = match (after, item) {
+            (None, None) => None,
+            (Some(_), Some(item)) => Some(item.source.as_bytes().to_vec()),
+            _ => return Err("candidate subject differs"),
+        };
+        current.insert(id.to_owned(), content);
+        subject_entries.push(json!({"entity_id": id, "sha256": after.map(|s| &s["sha256"])}));
+    }
+    let subject =
+        json!({"change_id":change["change_id"], "base":change["base"], "entries":subject_entries});
+    let decision = DecisionInputs {
+        change: input.change.to_vec(),
+        policy: input.resolved_policy.to_vec(),
+        options: input.host_options.to_vec(),
+        collection: input.collection.map(<[u8]>::to_vec),
+        external: None,
+        additional: BTreeMap::new(),
+    };
+    for env in [&previous, &fresh] {
+        if env["binding_sha256"] != binding_hex {
+            return Err("candidate input binding differs");
+        }
+        let verdict = &env["verdict"];
+        if verdict["subject"] != subject
+            || verdict["validator"]["name"] != input.expected_validator_name
+            || verdict["validator"]["version"] != input.expected_validator_version
+        {
+            return Err("verdict subject or validator differs");
+        }
+        let encoded = serde_json::to_vec(verdict).map_err(|_| "invalid verdict")?;
+        strict_precheck_v1(
+            &decision,
+            &decision,
+            &encoded,
+            input.fresh_exit_code,
+            input.fresh_timed_out,
+            &current,
+        )?;
+        let checks: BTreeMap<_, _> = verdict["checks"]
+            .as_array()
+            .ok_or("invalid checks")?
+            .iter()
+            .filter_map(|c| c["id"].as_str().map(|id| (id, c)))
+            .collect();
+        for id in &required {
+            if !checks
+                .get(id)
+                .is_some_and(|c| c["status"] == "passed" && c["blocking"] == true)
+            {
+                return Err("required check absent or not passing");
+            }
+        }
+    }
+    let mut old = previous["verdict"].clone();
+    let mut new = fresh["verdict"].clone();
+    old.as_object_mut()
+        .ok_or("invalid verdict")?
+        .remove("evaluated_at");
+    new.as_object_mut()
+        .ok_or("invalid verdict")?
+        .remove("evaluated_at");
+    if old != new {
+        return Err("fresh verdict differs");
+    }
+    Ok(ExperimentalMatch(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (Value, Snapshot, Vec<Item>, Value) {
+        let v: Value = serde_json::from_str(include_str!("portable-verdict-vector.json")).unwrap();
+        let base = serde_json::from_value(v["base"].clone()).unwrap();
+        let after = serde_json::from_value(v["after"].clone()).unwrap();
+        let envelope = v["portable"].clone();
+        (v, base, after, envelope)
+    }
+    fn inputs<'a>(v: &'a Value, base: &'a Snapshot, after: &'a [Item]) -> Inputs<'a> {
+        Inputs {
+            base,
+            after,
+            change: v["artifacts"]["change"].as_str().unwrap().as_bytes(),
+            resolved_policy: v["artifacts"]["resolved_policy"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            host_options: v["artifacts"]["host_options"].as_str().unwrap().as_bytes(),
+            collection: None,
+            evaluator_identity: v["artifacts"]["evaluator"].as_str().unwrap().as_bytes(),
+            expected_validator_name: "aexeo",
+            expected_validator_version: "0.0.24",
+            required_checks: &["gate:7:article:words"],
+            fresh_exit_code: Some(0),
+            fresh_timed_out: false,
+        }
+    }
+    fn run(old: &Value, new: &Value, input: &Inputs<'_>) -> bool {
+        compare(
+            old.to_string().as_bytes(),
+            new.to_string().as_bytes(),
+            input,
+        )
+        .is_ok()
+    }
+    #[test]
+    fn matches_shared_vector_but_does_not_authorize_publication() {
+        let (v, base, after, old) = fixture();
+        let input = inputs(&v, &base, &after);
+        let mut fresh = old.clone();
+        fresh["verdict"]["evaluated_at"] = json!("2026-11-19T10:37:59Z");
+        assert!(run(&old, &fresh, &input));
+        fresh["verdict"]["validator"]["name"] = json!("other");
+        assert!(!run(&old, &fresh, &input));
+    }
+    #[test]
+    fn rejects_stale_evidence_missing_checks_and_process_failure() {
+        let (v, base, after, old) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        assert!(run(&old, &old, &input));
+        input.host_options = b"changed";
+        assert!(!run(&old, &old, &input));
+        input.host_options = v["artifacts"]["host_options"].as_str().unwrap().as_bytes();
+        input.evaluator_identity = b"";
+        assert!(!run(&old, &old, &input));
+        input.evaluator_identity = b"build";
+        input.required_checks = &[];
+        assert!(!run(&old, &old, &input));
+        input.required_checks = &["missing"];
+        assert!(!run(&old, &old, &input));
+        input.required_checks = &["gate:7:article:words", "gate:7:article:words"];
+        assert!(!run(&old, &old, &input));
+        input.required_checks = &["gate:7:article:words"];
+        input.fresh_exit_code = Some(1);
+        assert!(!run(&old, &old, &input));
+        input.fresh_exit_code = Some(0);
+        input.fresh_timed_out = true;
+        assert!(!run(&old, &old, &input));
+        let mut changed = base.clone();
+        changed.complete = false;
+        assert!(!run(&old, &old, &inputs(&v, &changed, &after)));
+    }
+    #[test]
+    fn binds_collection_and_rejects_inconsistent_projection() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let collection =
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","text":"abc"}]}"#;
+        input.collection = Some(collection);
+        verdict["binding_sha256"] =
+            json!("13853ce80d789902d38c941f81f8b59b6be34b7ead0137c7b35b95009bef97ac");
+        assert!(run(&verdict, &verdict, &input));
+        for bad in [
+            br#"{"change_id":"other","complete":true,"items":[{"id":"article"}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[]}"#.as_slice(),
+            br#"{"change_id":"example","complete":false,"items":[]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"other"}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","metadata":{"x":"y"}}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"items":[{"id":"article","unknown":true}]}"#.as_slice(),
+            br#"{"change_id":"example","complete":true,"complete":true,"items":[{"id":"article"}]}"#.as_slice(),
+        ] {
+            input.collection = Some(bad); assert!(!run(&verdict, &verdict, &input));
+        }
+        // Equivalent projection with different exact bytes is still a different input.
+        input.collection = Some(
+            br#"{ "change_id":"example","complete":true,"items":[{"id":"article","text":"abc"}]}"#,
+        );
+        assert!(!run(&verdict, &verdict, &input));
+        input.collection = None;
+        assert!(!run(&verdict, &verdict, &input));
+    }
+    #[test]
+    fn rejects_unknown_nested_fields_duplicates_and_inconsistent_results() {
+        let (v, base, after, old) = fixture();
+        let input = inputs(&v, &base, &after);
+        for pointer in [
+            "/verdict/subject",
+            "/verdict/validator",
+            "/verdict/summary",
+            "/verdict/checks/0",
+            "/verdict/subject/entries/0",
+        ] {
+            let mut bad = old.clone();
+            bad.pointer_mut(pointer).unwrap()["unknown"] = json!(true);
+            assert!(!run(&old, &bad, &input), "{pointer}");
+        }
+        let mut bad = old.clone();
+        bad["verdict"]["summary"]["passed"] = json!(0);
+        assert!(!run(&old, &bad, &input));
+        bad = old.clone();
+        bad["verdict"]["checks"][0]["blocking"] = json!(false);
+        assert!(!run(&old, &bad, &input));
+        bad = old.clone();
+        bad["verdict"]["extensions"]["unknown"] = json!("x");
+        assert!(!run(&old, &bad, &input));
+        bad = old.clone();
+        bad["verdict"]["findings"] =
+            json!([{ "rule_id":"r", "severity":"info", "message":"m", "check_id":"unknown" }]);
+        assert!(!run(&old, &bad, &input));
+        let duplicate = old.to_string().replacen(
+            "\"schema\":",
+            "\"schema\":\"content-gate.bound-verdict/v2\",\"schema\":",
+            1,
+        );
+        assert!(compare(duplicate.as_bytes(), old.to_string().as_bytes(), &input).is_err());
+    }
+}

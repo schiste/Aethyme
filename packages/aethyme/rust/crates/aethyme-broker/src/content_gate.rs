@@ -4,6 +4,7 @@
 //! independently bind all other decision inputs at the publication boundary.
 pub mod candidate_overlay_v2;
 pub mod candidate_revision_v2;
+pub mod portable_compare_v2;
 pub mod portable_v2;
 pub mod strict;
 
