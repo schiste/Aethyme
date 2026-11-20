@@ -18,6 +18,8 @@ exit: 0
       advance, push, sync, finish, close, git, gh and adopt --reuse refuse
       another live agent; --take-over moves the session to the caller and
       records a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker submit preverify <head> <base> --session <id> [--json]
+      Warm reusable gates on the pinned candidate. A regular submit still verifies it.
   aethyme broker submit prepare status --session <id> [--json]
       Inspect repository-declared dependency preparation for one worktree.
       This is read-only and reports the exact remediation when preparation is

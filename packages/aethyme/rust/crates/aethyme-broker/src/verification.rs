@@ -515,6 +515,17 @@ impl ExactTreeVerificationSlot {
         )
     }
 
+    pub(crate) fn try_acquire_with_worktree_root_plan(
+        main_root: &Path,
+        namespace: &str,
+        root_plan: &crate::WorktreeRootPlan,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        Self::try_acquire_at(
+            main_root,
+            plan_slot_placement_with_worktree_root_plan(main_root, namespace, root_plan),
+        )
+    }
+
     /// Acquire the exact placement that the caller capacity-checked before
     /// snapshot materialization. Replanning here could silently select a
     /// different volume after that preflight.

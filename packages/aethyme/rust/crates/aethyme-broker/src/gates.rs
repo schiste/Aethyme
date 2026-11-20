@@ -967,6 +967,12 @@ pub fn plan_pre_push(
 /// Sink for human-readable gate progress. Production uses stderr; tests can
 /// inject a collector without changing child stdout/stderr capture.
 pub trait GateProgressSink: Send + Sync {
+    /// An early verification observes the current candidate while it runs.
+    /// Normal gate invocations use the default and are never interrupted here.
+    fn early_verification_cancelled(&self) -> Option<bool> {
+        None
+    }
+
     fn report(&self, line: &str);
 }
 
@@ -2226,6 +2232,38 @@ pub(crate) fn run_affected_for_submit_in(
     )
 }
 
+/// Warm reusable verdicts for an exact checkout without recording a
+/// submission. Early work never replaces or cancels a foreground run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_early_verification(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    selections: Vec<Selection<'_>>,
+    session_id: i64,
+    comparison_base: &str,
+    deadline: Instant,
+    progress: &dyn GateProgressSink,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_selections(
+        store,
+        main_root,
+        checkout,
+        selections,
+        Some(session_id),
+        CachePolicy::Use,
+        GateRuntimeContext {
+            fresh_checkout: true,
+            progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: Some(deadline),
+            comparison_base: Some(comparison_base),
+            storage,
+        },
+    )
+}
+
 /// Test adapter using default storage locations and a finite allowance.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -2548,6 +2586,12 @@ impl GateOwnerLocks {
                 if let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? {
                     break lock;
                 }
+                if progress.early_verification_cancelled().is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "gate owner lock is occupied",
+                    ));
+                }
                 let waited = started.elapsed();
                 if waited >= next_report {
                     let held_by = describe_owner_lock_holder(&path);
@@ -2851,26 +2895,26 @@ fn acquire_gate_resources(
     let mut coordinator = crate::HostResourceCoordinator::open(&resource_db_path)
         .map_err(|error| error.to_string())?;
     let mut next_report = std::time::Instant::now();
+    let configured_wait = Duration::from_secs(gate.resource_wait_seconds);
+    let wait = if progress.early_verification_cancelled().is_some() {
+        Duration::ZERO
+    } else {
+        deadline.map_or(configured_wait, |d| {
+            d.saturating_duration_since(Instant::now())
+                .min(configured_wait)
+        })
+    };
     let grant = coordinator
-        .acquire_with_wait(
-            &request,
-            deadline
-                .map(|d| {
-                    d.saturating_duration_since(Instant::now())
-                        .min(Duration::from_secs(gate.resource_wait_seconds))
-                })
-                .unwrap_or(Duration::from_secs(gate.resource_wait_seconds)),
-            |message| {
-                let now = std::time::Instant::now();
-                if now >= next_report {
-                    progress.report(&format!(
-                        "gate {} waiting for host resources: {}",
-                        gate.name, message
-                    ));
-                    next_report = now + std::time::Duration::from_secs(5);
-                }
-            },
-        )
+        .acquire_with_wait(&request, wait, |message| {
+            let now = std::time::Instant::now();
+            if now >= next_report {
+                progress.report(&format!(
+                    "gate {} waiting for host resources: {}",
+                    gate.name, message
+                ));
+                next_report = now + Duration::from_secs(5);
+            }
+        })
         .map_err(|error| error.to_string())?;
     Ok(Some(GateResourceRuntime {
         grant,
@@ -3538,7 +3582,7 @@ fn claim_gate_verdict(
     let lock = crate::file_lock::ExclusiveFileLock::try_acquire(
         crate::file_lock::open_gate_verdict_lock(main_root, shard)?,
     )?;
-    if lock.is_some() {
+    if lock.is_some() || progress.early_verification_cancelled().is_some() {
         return Ok((lock, false));
     }
 
@@ -3613,6 +3657,7 @@ where
     CaptureProfile: FnMut(&Path, Option<&std::ffi::OsStr>) -> crate::gate_profile::ExecutionProfile,
 {
     let progress = runtime.progress;
+    let early_verification = progress.early_verification_cancelled().is_some();
     let admission_host = runtime.admission_host;
     let mut invocation_artifact_use = Some(begin_gate_artifact_use(
         store,
@@ -3642,7 +3687,9 @@ where
     // A timeout or output-cap failure may have stopped every owned writer.
     // Settle that proven case too; unresolved cleanup keeps its marker.
     let tree = hash.result?;
-    if let Some(session_id) = session_id {
+    if let Some(session_id) = session_id
+        && !early_verification
+    {
         // This stop/recovery pass precedes admission for a new gate so
         // obsolete process groups are stopped promptly. It records one
         // cancellation row per stale pidfile; these writes reconcile existing
@@ -3664,6 +3711,14 @@ where
     let mut subprocess_path_captured = false;
     let mut execution_profile = None;
     for selection in selections {
+        if progress.early_verification_cancelled() == Some(true)
+            || (early_verification
+                && runtime
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            break;
+        }
         if !subprocess_path_captured {
             subprocess_path = crate::git::sanitized_subprocess_path();
             subprocess_path_captured = true;
@@ -3738,6 +3793,12 @@ where
         let profile_digest = eligible
             .then(|| profile.and_then(crate::gate_profile::ExecutionProfile::digest))
             .flatten();
+        if early_verification && profile_digest.is_none() {
+            progress.report(
+                "Early verification skipped because this gate has no reusable execution profile",
+            );
+            break;
+        }
         let lookup = |store: &BrokerStore, digest| {
             store.cached_gate_result_for_execution_profile(
                 &gate.name,
@@ -3796,6 +3857,9 @@ where
                             source,
                         },
                     )?;
+                if early_verification && verdict_claim.is_none() {
+                    break;
+                }
                 if shared_wait {
                     let marker = artifact_use
                         .as_mut()
@@ -3990,6 +4054,9 @@ where
             threshold,
         } = crate::gate_admission::admit_gate_with(gate, progress, admission_host)
         {
+            if early_verification {
+                break;
+            }
             artifact_use
                 .finish_not_started()
                 .map_err(|source| crate::BrokerError::Io {
@@ -4034,6 +4101,15 @@ where
         );
         let owner_locks = match owner_locks {
             Ok(locks) => locks,
+            Err(source)
+                if early_verification
+                    && matches!(
+                        source.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                break;
+            }
             Err(source) if source.kind() == std::io::ErrorKind::TimedOut => {
                 artifact_use
                     .finish_not_started()
@@ -4326,7 +4402,7 @@ where
         // A deadline kill is the host's fault only the first time. A change
         // that hangs times out on every run of its tree, and deferring each one
         // would ask the agent to resubmit unchanged code forever.
-        if host_fault && timed_out && !has_capture_or_resource_error {
+        if !early_verification && host_fault && timed_out && !has_capture_or_resource_error {
             let earlier_timeouts = if gate.cache {
                 store.gate_timeouts_for_execution_profile(
                     &gate.name,
@@ -4351,11 +4427,18 @@ where
         }
         let (mut gate_status, mut failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
+        if progress.early_verification_cancelled() == Some(true)
+            || (early_verification && timed_out)
+        {
+            gate_status = GateStatus::Cancelled;
+            failure_class = None;
+            host_fault = false;
+        }
         // Admission checked the disk before the command started; a build can
         // still fill it while running, and what fails then is the host, not
         // the change. Read again, and only for a failure the broker has not
         // already attributed to the host (#288).
-        if gate_status != GateStatus::Pass && !host_fault {
+        if !matches!(gate_status, GateStatus::Pass | GateStatus::Cancelled) && !host_fault {
             let available_end =
                 crate::disk_headroom::available_headroom_for(checkout.root(), checkout.root());
             environment.free_disk_bytes_end =
@@ -4387,12 +4470,19 @@ where
                 .map(|load| format!(" at load 1m {load:.1}{}", cpu_suffix(&environment)))
                 .unwrap_or_default()
         ));
-        let cache_bypass_reason = should_bypass_timeout_text_test_failure_cache(
-            gate.cache,
-            gate_status,
-            failure_class,
-            &log_path,
-        )
+        // Only passing early runs enter the reusable cache. Record other
+        // outcomes without a cache identity so they cannot shadow an ordinary
+        // verdict or be mistaken for a foreground timeout on this profile.
+        let reusable_profile = cache_provenance
+            .as_ref()
+            .filter(|_| !early_verification || gate_status == GateStatus::Pass);
+        let cache_bypass_reason = (!early_verification
+            && should_bypass_timeout_text_test_failure_cache(
+                gate.cache,
+                gate_status,
+                failure_class,
+                &log_path,
+            ))
         .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
         let run_id = store.record_gate_result_with_execution_profile_and_cache_bypass(
             &NewGateResult {
@@ -4410,7 +4500,7 @@ where
                 session_id,
             },
             &environment,
-            cache_provenance.as_ref(),
+            reusable_profile,
             cache_bypass_reason,
         )?;
         drop(verdict_claim);
@@ -4440,7 +4530,9 @@ where
             break;
         }
     }
-    crate::base_incidents::settle_after_gate_runs(store, checkout, &outcomes);
+    if !early_verification {
+        crate::base_incidents::settle_after_gate_runs(store, checkout, &outcomes);
+    }
     Ok(outcomes)
 }
 
@@ -5178,7 +5270,8 @@ fn wait_gate_child_with_signaler(
             }
             Ok(None)
                 if drain_failed.load(std::sync::atomic::Ordering::Acquire)
-                    || resource_stop_requested.load(std::sync::atomic::Ordering::Acquire) =>
+                    || resource_stop_requested.load(std::sync::atomic::Ordering::Acquire)
+                    || context.progress.early_verification_cancelled() == Some(true) =>
             {
                 let renewal_failed =
                     resource_stop_requested.load(std::sync::atomic::Ordering::Acquire);
@@ -5190,7 +5283,7 @@ fn wait_gate_child_with_signaler(
                             b"aethyme: host resource lease renewal failed; stopping the gate while its leader is still owned\n",
                         );
                 }
-                // Both failure sources are handled only by this waiter. The
+                // Only this waiter handles interruption. The
                 // branch is reached after `try_wait()` returned `None`, so
                 // the leader is still unreaped and the process-group id has
                 // not been released for reuse.
@@ -5424,6 +5517,12 @@ fn run_gate_command_inner(
     use std::os::unix::process::CommandExt;
 
     let setup = crate::phase_telemetry::span("gate_command_setup");
+    if context.progress.early_verification_cancelled() == Some(true) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "early verification candidate was superseded",
+        ));
+    }
     require_command_allowance(context.absolute_deadline)?;
 
     // Before anything is spawned. A build that runs out of space reports link
@@ -5606,6 +5705,12 @@ fn run_gate_command_inner(
     if let Some(path) = context.subprocess_path {
         process.env("PATH", path);
     }
+    if context.progress.early_verification_cancelled() == Some(true) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "early verification candidate was superseded",
+        ));
+    }
     artifact_use.dispatch_attempted();
     drop(setup);
     let child_execution = crate::phase_telemetry::subprocess_span(&process);
@@ -5660,11 +5765,14 @@ fn run_gate_command_inner(
         return Err(std::io::Error::other(details));
     }
 
-    let pidfile = context.session_id.map(|sid| {
-        context
-            .run_dir
-            .join(format!("{sid}-{}.pid", context.gate_name))
-    });
+    let pidfile = context
+        .session_id
+        .filter(|_| context.progress.early_verification_cancelled().is_none())
+        .map(|sid| {
+            context
+                .run_dir
+                .join(format!("{sid}-{}.pid", context.gate_name))
+        });
     if let Some(pidfile) = &pidfile {
         let pid = child.id() as i32;
         let record = GatePidRecord {
@@ -6566,6 +6674,21 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
+        struct EarlyWorker;
+        impl GateProgressSink for EarlyWorker {
+            fn report(&self, line: &str) {
+                panic!("early verification must not wait: {line}");
+            }
+
+            fn early_verification_cancelled(&self) -> Option<bool> {
+                Some(false)
+            }
+        }
+        let (early_claim, early_waited) =
+            claim_gate_verdict(&checkout_root, shard, None, &EarlyWorker).unwrap();
+        assert!(early_claim.is_none());
+        assert!(!early_waited);
 
         struct OnWait<F>(std::sync::Mutex<Option<F>>);
         impl<F: FnOnce() + Send> GateProgressSink for OnWait<F> {
