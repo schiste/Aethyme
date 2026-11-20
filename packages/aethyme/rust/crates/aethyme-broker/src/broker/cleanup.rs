@@ -132,7 +132,10 @@ impl CleanupStatusLimits {
         output_bytes: usize,
         path_fields: usize,
     ) -> Self {
-        let per_call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // 15 s, or the allowance of the retirement inspection running on
+        // this thread (`InspectionAllowanceScope`).
+        let per_call_deadline =
+            std::time::Instant::now() + crate::cleanup_resolve::cleanup_listing_allowance();
         Self {
             deadline: overall_deadline.map_or(per_call_deadline, |deadline| {
                 deadline.min(per_call_deadline)
