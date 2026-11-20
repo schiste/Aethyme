@@ -4501,7 +4501,6 @@ mod lane_tests {
             .adopt_with(&tree, Some("follow-up"), crate::AdoptMode::Reuse, None)
             .unwrap()
             .session;
-        assert_eq!(reused.id, session.id);
         let reused_tree = PathBuf::from(&reused.worktree_path);
         assert_eq!(head_of(&reused_tree), head);
         let status = Command::new("git")
@@ -4521,11 +4520,11 @@ mod lane_tests {
             before.difference(&after).collect::<Vec<_>>()
         );
         assert!(
-            crate::stale_session_policy::read_session_times(
+            crate::stale_session_policy::read_checkout_times(
                 broker.store_ref(),
                 crate::stale_session_policy::EARLY_RESUMED_META_KEY
             )
-            .contains_key(&session.id),
+            .contains_key(&reused.worktree_path),
             "a resume within a day of an early close is recorded"
         );
         let view = broker.status(now_ms()).unwrap();

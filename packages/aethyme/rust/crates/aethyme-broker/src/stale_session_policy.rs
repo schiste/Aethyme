@@ -448,32 +448,34 @@ pub(crate) fn abandonment_last_judged_at(store: &crate::BrokerStore) -> Option<i
     meta_ms(store, LAST_JUDGED_META_KEY)
 }
 
-/// Sessions the early-close rule closed, and when (`{session: at_ms}`).
+/// Checkouts whose session the early-close rule closed, and when
+/// (`{checkout path: at_ms}`).
 pub(crate) const EARLY_CLOSED_META_KEY: &str = "stale_sessions.early_closed";
-/// Sessions resumed (`start --reuse`) within [`EARLY_RESUME_WINDOW_MS`] of
+/// Checkouts reused (`start --reuse`) within [`EARLY_RESUME_WINDOW_MS`] of
 /// an early close, and when.
 pub(crate) const EARLY_RESUMED_META_KEY: &str = "stale_sessions.early_resumed";
 /// A resume this soon after an early close says the session was still
 /// wanted.
 pub(crate) const EARLY_RESUME_WINDOW_MS: i64 = 24 * HOUR_MS;
 
-/// Every remembered `{session: at_ms}` under `key`; unreadable is empty.
-pub(crate) fn read_session_times(store: &crate::BrokerStore, key: &str) -> BTreeMap<i64, i64> {
+/// Every remembered `{checkout path: at_ms}` under `key`; unreadable is
+/// empty.
+pub(crate) fn read_checkout_times(store: &crate::BrokerStore, key: &str) -> BTreeMap<String, i64> {
     store
         .meta_get(key)
         .ok()
         .flatten()
-        .and_then(|raw| serde_json::from_str::<BTreeMap<i64, i64>>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<BTreeMap<String, i64>>(&raw).ok())
         .unwrap_or_default()
 }
 
-fn remember_session_time(store: &mut crate::BrokerStore, key: &str, session_id: i64, at_ms: i64) {
+fn remember_checkout_time(store: &mut crate::BrokerStore, key: &str, checkout: &str, at_ms: i64) {
     update_without_waiting(store, key, |raw| {
         let mut times = raw
-            .and_then(|raw| serde_json::from_str::<BTreeMap<i64, i64>>(raw).ok())
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, i64>>(raw).ok())
             .unwrap_or_default();
         times.retain(|_, at| at_ms.saturating_sub(*at) < 7 * 24 * HOUR_MS);
-        times.insert(session_id, at_ms);
+        times.insert(checkout.to_string(), at_ms);
         while times.len() > CLASSES_MAX {
             times.pop_first();
         }
@@ -481,21 +483,21 @@ fn remember_session_time(store: &mut crate::BrokerStore, key: &str, session_id: 
     });
 }
 
-/// Record an early close of `session_id` (best effort).
-pub(crate) fn record_early_close(store: &mut crate::BrokerStore, session_id: i64, at_ms: i64) {
-    remember_session_time(store, EARLY_CLOSED_META_KEY, session_id, at_ms);
+/// Record an early close of the session at `checkout` (best effort).
+pub(crate) fn record_early_close(store: &mut crate::BrokerStore, checkout: &str, at_ms: i64) {
+    remember_checkout_time(store, EARLY_CLOSED_META_KEY, checkout, at_ms);
 }
 
-/// Record a resume of `session_id` when it was closed early within
+/// Record a reuse of `checkout` when its session was closed early within
 /// [`EARLY_RESUME_WINDOW_MS`], counting
 /// `session_abandonment_safe_closed_then_resumed`; true when it was.
 pub(crate) fn record_resume_after_early_close(
     store: &mut crate::BrokerStore,
-    session_id: i64,
+    checkout: &str,
     at_ms: i64,
 ) -> bool {
-    let closed_at = read_session_times(store, EARLY_CLOSED_META_KEY)
-        .get(&session_id)
+    let closed_at = read_checkout_times(store, EARLY_CLOSED_META_KEY)
+        .get(checkout)
         .copied();
     let soon =
         closed_at.is_some_and(|closed| at_ms.saturating_sub(closed) < EARLY_RESUME_WINDOW_MS);
@@ -504,7 +506,7 @@ pub(crate) fn record_resume_after_early_close(
             "session_abandonment_safe_closed_then_resumed",
             Duration::ZERO,
         );
-        remember_session_time(store, EARLY_RESUMED_META_KEY, session_id, at_ms);
+        remember_checkout_time(store, EARLY_RESUMED_META_KEY, checkout, at_ms);
     }
     soon
 }

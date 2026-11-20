@@ -456,8 +456,9 @@ not `landed`.
 - **Reading the rule without a waiting period.** Each early close is recorded
   on its `session.abandoned` event as `early_close: {rule:
   "nothing_on_the_session_can_be_lost", checks: [...]}`, listing the checks it
-  passed. The meta key `stale_sessions.early_closed` holds `{session:
-  at_ms}`. A `start --reuse` within 24 h of an early close counts
+  passed. The meta key `stale_sessions.early_closed` holds `{checkout path:
+  at_ms}`, keyed by checkout so that a retired checkout reused as a new
+  session still counts. A `start --reuse` of that checkout within 24 h counts
   `session_abandonment_safe_closed_then_resumed` and is recorded in
   `stale_sessions.early_resumed`. `broker status` attaches
   `session_abandonment_early_close_24h: {closed, resumed_within_24h}` and

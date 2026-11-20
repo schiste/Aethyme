@@ -6176,6 +6176,36 @@ impl Broker {
         agent_identity: Option<&str>,
         context: SessionContext,
     ) -> Result<AdoptReport, BrokerOpError> {
+        let reuse = options.mode == AdoptMode::Reuse;
+        let report = self.adopt_with_options_and_context_inner(
+            worktree,
+            task,
+            options,
+            agent_identity,
+            context,
+        )?;
+        // Was this checkout closed early by the idle rule only hours ago?
+        // Then its session was still wanted: counted, and shown in `broker
+        // status`. Keyed by the checkout, so a retired checkout reused as a
+        // new session counts too.
+        if reuse {
+            crate::stale_session_policy::record_resume_after_early_close(
+                self.store(),
+                &report.session.worktree_path,
+                crate::clock::epoch_ms(),
+            );
+        }
+        Ok(report)
+    }
+
+    fn adopt_with_options_and_context_inner(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        options: AdoptOptions,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<AdoptReport, BrokerOpError> {
         // For an existing session, keep the established bounded default
         // refresh and comparison, but do it before task/liveness changes.
         let prefetched_default_branch = if options.mode == AdoptMode::Reuse {
@@ -6342,14 +6372,6 @@ impl Broker {
                     let (default_branch, default_branch_note) = self
                         .default_branch_after_reuse(&checkout, &session, prefetched, &freshness);
                     let lease_overlaps = self.planned_lease_overlaps(session.id, &planned_paths);
-                    // Was this session closed early by the idle rule only
-                    // hours ago? Then it was still wanted: counted, and shown
-                    // in `broker status`.
-                    crate::stale_session_policy::record_resume_after_early_close(
-                        self.store(),
-                        session.id,
-                        crate::clock::epoch_ms(),
-                    );
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,

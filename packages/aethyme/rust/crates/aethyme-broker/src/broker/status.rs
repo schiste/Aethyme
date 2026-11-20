@@ -717,10 +717,10 @@ impl Broker {
         // sessions it closed early in the last day, how many were resumed
         // within a day (they were still wanted).
         let recent = |key: &str| {
-            stale::read_session_times(self.store_ref(), key)
+            stale::read_checkout_times(self.store_ref(), key)
                 .into_iter()
                 .filter(|(_, at)| now_ms.saturating_sub(*at) < stale::EARLY_RESUME_WINDOW_MS)
-                .map(|(session_id, _)| session_id)
+                .map(|(checkout, _)| checkout)
                 .collect::<Vec<_>>()
         };
         let early_closed = recent(stale::EARLY_CLOSED_META_KEY);
@@ -742,17 +742,13 @@ impl Broker {
                     early_resumed.len(),
                     early_closed.len().max(early_resumed.len())
                 ),
-                session_id: early_resumed.first().copied(),
+                session_id: None,
                 queue_entry_id: None,
-                evidence: vec![format!(
-                    "resumed session(s): {}",
-                    early_resumed
-                        .iter()
-                        .take(20)
-                        .map(i64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )],
+                evidence: early_resumed
+                    .iter()
+                    .take(20)
+                    .map(|checkout| format!("resumed checkout: {checkout}"))
+                    .collect(),
                 commands: Vec::new(),
             });
         }

@@ -1646,11 +1646,13 @@ impl Broker {
                     "session_abandonment_safe_closed",
                     std::time::Duration::ZERO,
                 );
-                crate::stale_session_policy::record_early_close(
-                    self.store(),
-                    session_id,
-                    crate::clock::epoch_ms(),
-                );
+                if let Ok(closed) = self.store_ref().session(session_id) {
+                    crate::stale_session_policy::record_early_close(
+                        self.store(),
+                        &closed.worktree_path,
+                        crate::clock::epoch_ms(),
+                    );
+                }
             }
             process_table.clear_keep_reason();
             self.retire_inline_after_close(session_id, deadline);
