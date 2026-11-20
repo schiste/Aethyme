@@ -1442,7 +1442,7 @@ impl Broker {
                     progress,
                     storage,
                 );
-                let _ = finished.send(());
+                drop(finished);
                 gates
             })?
         };

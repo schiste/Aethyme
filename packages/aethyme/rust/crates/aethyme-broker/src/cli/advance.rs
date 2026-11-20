@@ -309,7 +309,7 @@ fn launch_preverify(checkout: &Path, session: i64, head: &str, base: &str) -> &'
         return "unavailable";
     };
     std::thread::spawn(move || {
-        let _ = worker.wait();
+        crate::warn_unrecorded("reap the early-verification worker", worker.wait());
     });
     "scheduled"
 }
