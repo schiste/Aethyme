@@ -4487,13 +4487,14 @@ mod lane_tests {
             "nothing_on_the_session_can_be_lost"
         );
 
-        broker.retire_inline_after_close(
-            session.id,
-            Some(std::time::Instant::now() + Duration::from_secs(600)),
-        );
+        // Retire the closed checkout as the retirement lane does, so reuse
+        // takes the CLI's restore path.
+        let report = broker
+            .run_checkout_retirement(std::time::Instant::now() + Duration::from_secs(600))
+            .unwrap();
         assert!(
             !tree.exists() || crate::broker::is_checkout_tombstone(&tree),
-            "the checkout is retired, so reuse takes the restore path"
+            "the checkout is retired, so reuse takes the restore path: {report:#?}"
         );
         assert!(broker.recreate_retired_checkout(&tree).unwrap());
         let reused = broker
