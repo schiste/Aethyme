@@ -1562,6 +1562,20 @@ mod queued_submit {
             let mut broker = common::open_fixture_repository_broker(&repository)
                 .unwrap()
                 .into_broker();
+
+            // The broker must bind its private verification root before the
+            // harness creates the physical slot locks there. A submit outside
+            // the gate's paths exercises the normal root-creation path without
+            // contributing to the measured gate invocations.
+            let bootstrap = agent_worktree(root, "bind-verification-root");
+            let bootstrap_session = broker
+                .adopt(&bootstrap, Some("bind verification root"))
+                .unwrap();
+            commit_edit(&bootstrap, "bootstrap.txt", "fixture initialization\n");
+            let initialized = broker.submit(bootstrap_session.id).unwrap();
+            assert_eq!(initialized.entry.status, MergeStatus::Verified);
+            assert!(initialized.gate_outcomes.is_empty());
+
             let [
                 (first, first_head, first_path),
                 (second, second_head, second_path),
