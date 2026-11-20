@@ -58,6 +58,11 @@ def run_case(root, aexeo, aethyme, name, text, media_type, expected):
     if expected in (1, 2) and f"validator exited with code {expected}" not in checked.stderr:
         raise RuntimeError(f"{name}: missing exit-code diagnostic: {checked.stderr}")
     if name == "pass":
+        manifest["required_checks"] = ["gate:7:article:missing"]
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        invoke(command, 2)
+        manifest["required_checks"] = ["gate:7:article:terms"]
+        path.write_text(json.dumps(manifest), encoding="utf-8")
         (case / "article.txt").write_text("Changed after snapshot.", encoding="utf-8")
         invoke(command, 2)
     print(f"{name}: Aexeo exit {expected}; Aethyme {'passed and rejected a changed candidate' if expected == 0 else 'blocked'}")
