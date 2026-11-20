@@ -43,6 +43,18 @@ impl Waiter {
             && crate::gates::process_start_time(self.pid) == Some(self.started)
     }
 
+    fn remove_stale_marker(&self, directory: &Path) {
+        if self.valid_ticket_name()
+            && let Err(error) = std::fs::remove_file(directory.join(&self.ticket))
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            crate::warn_unrecorded(
+                "remove stale submit batch waiter marker",
+                Err::<(), _>(error),
+            );
+        }
+    }
+
     fn valid_ticket_name(&self) -> bool {
         self.ticket.starts_with("live-")
             && self
@@ -437,11 +449,16 @@ impl Drop for Ticket {
     fn drop(&mut self) {
         // Withdraw independently of the metadata lock. A submit falling
         // back to individual work must stop being claimable immediately.
-        drop(self.marker.take());
+        if let Some(marker) = self.marker.take()
+            && let Err(error) = marker.close()
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            crate::warn_unrecorded("withdraw submit batch waiter marker", Err::<(), _>(error));
+        }
         if !self.registered.get() {
             return;
         }
-        let _ = self.edit(Duration::ZERO, false, |state| {
+        let withdrawal = self.edit(Duration::ZERO, false, |state| {
             state
                 .waiters
                 .retain(|other| other.ticket != self.waiter.ticket);
@@ -461,6 +478,12 @@ impl Drop for Ticket {
             }
             state.reap(&self.directory);
         });
+        // An active editor will reap the removed marker on its next edit.
+        if let Err(error) = withdrawal
+            && error.kind() != io::ErrorKind::WouldBlock
+        {
+            crate::warn_unrecorded("record withdrawn submit batch waiter", Err::<(), _>(error));
+        }
     }
 }
 
@@ -477,9 +500,7 @@ impl State {
             .iter()
             .chain(self.claims.iter().flat_map(|claim| &claim.members))
         {
-            if waiter.valid_ticket_name() {
-                let _ = std::fs::remove_file(directory.join(&waiter.ticket));
-            }
+            waiter.remove_stale_marker(directory);
         }
     }
 
@@ -488,9 +509,7 @@ impl State {
             if waiter.alive(directory) {
                 return true;
             }
-            if waiter.valid_ticket_name() {
-                let _ = std::fs::remove_file(directory.join(&waiter.ticket));
-            }
+            waiter.remove_stale_marker(directory);
             false
         };
         self.waiters.retain(retain_live);
