@@ -17,6 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+jsonschema = { version = "=0.61.2", default-features = false }
 bincode = "1"
 blake3 = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
