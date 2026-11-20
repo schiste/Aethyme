@@ -56,6 +56,22 @@ scratch directory defaults to the OS temporary directory for isolated trust
 setup. `--wide` enables the six-way group. `--preverify` optionally asks
 the tested broker to start early verification after publication.
 
+The substantial cohort used the following command with a fresh output
+directory, the binary identified by the run plan, and an isolated Codex home
+that had already approved the stock Aethyme hooks.
+
+```sh
+python packages/aethyme-eval/benchmarks/broker/paired_live.py \
+  --binary "$AETHYME_BINARY" --model gpt-6-sol --timeout 540 \
+  --output "$TRIAL_OUTPUT" --hook-home "$TRIAL_CODEX_HOME" \
+  --coordinator-publish --concurrent --wide --verification substantial \
+  --only disjoint-six textual semantic shared
+```
+
+The generated plan records the binary checksum, the Codex version,
+and the arm order for each group. The report uses the plan's default
+seed of 19.
+
 ## Published release with trusted hooks
 
 The 12 paired assignments ran on Aethyme v0.8.140
