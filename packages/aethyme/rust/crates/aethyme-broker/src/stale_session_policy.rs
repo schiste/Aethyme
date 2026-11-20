@@ -583,6 +583,7 @@ impl crate::Broker {
     /// Classify a stale session's work. Read-only Git, never a fetch: a
     /// remote-tracking ref older than the remote only makes the class more
     /// conservative.
+    #[cfg(test)]
     pub(crate) fn stale_work_class(&self, session: &crate::Session) -> StaleWorkClass {
         self.stale_work_class_with(session, TreeCheck::MayRemember)
     }
@@ -591,10 +592,12 @@ impl crate::Broker {
     /// whenever refs alone would class the session below unpushed: what a
     /// close decision uses. A remembered clean answer never closes a
     /// session; it only says one is not closable yet, or orders work.
+    #[cfg(test)]
     pub(crate) fn stale_work_class_fresh(&self, session: &crate::Session) -> StaleWorkClass {
         self.stale_work_class_with(session, TreeCheck::Fresh)
     }
 
+    #[cfg(test)]
     fn stale_work_class_with(&self, session: &crate::Session, tree: TreeCheck) -> StaleWorkClass {
         self.stale_work_class_examined(session, tree).0
     }

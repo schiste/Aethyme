@@ -632,7 +632,16 @@ impl Broker {
                 commands: Vec::new(),
             });
         }
-        self.push_abandonment_lane_advice(view, &open, now_ms);
+        // Sessions past the abandonment window read as abandoned to the
+        // agents view, yet they are still open in the store: those are the
+        // ones these advices are about.
+        let not_closed = view
+            .agents
+            .iter()
+            .filter(|agent| agent.session.cleanup_state == crate::SessionCleanupState::Open)
+            .map(|agent| agent.session.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.push_abandonment_lane_advice(view, &not_closed, now_ms);
     }
 
     /// Why open sessions past the abandonment window stay open (each one's
