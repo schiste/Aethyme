@@ -404,6 +404,48 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Abandonment lane: no stop on a refused listing, its own time, and why sessions stay (2026-11-20)
+
+What may close is unchanged. This only changes how often the lane judges.
+
+- **Refused process listing.** A detached worker started from a sandboxed
+  agent command inherits the sandbox and is refused the process listing. The
+  lane used to stop on such a pass. It now stops only when that pass judged
+  nothing else. Otherwise it goes on, and only the sessions whose verdict
+  needs the listing (`holder_process_table_denied`) wait for a worker that can
+  list processes. Counter: `session_retirement_continued_process_table_denied`.
+- **Own time for abandonment.** In each page of the oldest-first lap, a
+  landed proof may start only while more than a third of the page's time is
+  left, and must finish before that third begins. The third is kept for the
+  abandonment judgements of the sessions after it, which need no Git. The
+  cursor is not held for skipped landed proofs: they come in a later lap or in
+  the likely-landed queue. Counter:
+  `landed_proof_stopped_for_abandonment_reserve`.
+- **Not examined is not dirty.** A working-tree status that cannot be taken to
+  the end (its deadline cut it, or Git failed) is "not examined". The session
+  is kept for this pass as `working_tree_not_examined`, with no class record
+  and no closing-soon note, and the answer is not remembered as uncommitted
+  work. Counters: `stale_work_clean_not_examined` and
+  `session_abandonment_kept_working_tree_not_examined`.
+- **Why each session stays (meta, introduced).**
+  `stale_sessions.last_keep` maps each open session to its last abandonment
+  keep `{reason, at_ms}`; a close forgets it.
+  `stale_sessions.abandonment_last_judged_at` records the last time the lane
+  judged a session (closed, or kept for a reason other than a refused
+  listing).
+- **Status advice (introduced).**
+  - `sessions.abandonment-held` (info): "N session(s) past the abandonment
+    window are held: X by <reason>, ...".
+  - `sessions.abandonment-lane-idle` (warning): sessions are idle past the
+    window and the lane has judged none for over an hour.
+  - `retention.invalid` (warning): `.aethyme/broker.toml [retention]` cannot
+    be read, which disables every automatic close. A fractional
+    `session_abandoned_after_hours` such as `0.5` used to disable the lane
+    silently.
+- **Attachment (introduced).** `abandonment_lane_last_judged_age_ms` on the
+  `status` metric line, or `null` when nothing was ever judged. Span:
+  `status_abandonment_lane_advice`.
+
 ## No committed graph: nothing to regenerate (2026-11-19)
 
 A repository can declare `[graph] authority = "committed_fragments"` without

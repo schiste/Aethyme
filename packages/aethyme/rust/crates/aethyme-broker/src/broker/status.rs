@@ -632,6 +632,116 @@ impl Broker {
                 commands: Vec::new(),
             });
         }
+        self.push_abandonment_lane_advice(view, &open, now_ms);
+    }
+
+    /// Why open sessions past the abandonment window stay open (each one's
+    /// last keep reason), whether the lane has judged anything recently while
+    /// sessions are due, and a retention policy that cannot be read, which
+    /// disables the lane.
+    fn push_abandonment_lane_advice(
+        &self,
+        view: &mut StatusView,
+        open: &std::collections::BTreeSet<i64>,
+        now_ms: i64,
+    ) {
+        use crate::stale_session_policy as stale;
+        let _span = crate::phase_telemetry::span("status_abandonment_lane_advice");
+        if let Err(error) = crate::load_retention_policy(self.main_root()) {
+            view.advice.push(StatusAdvice {
+                id: "retention.invalid",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "a retention policy that cannot be read disables every automatic session close, including the abandonment window (`session_abandoned_after_hours` takes whole hours: `1`, never `0.5` or `\"1\"`)",
+                summary: format!(
+                    ".aethyme/broker.toml [retention] cannot be read, so abandoned sessions are never closed: {error}"
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![error.to_string()],
+                commands: Vec::new(),
+            });
+        }
+        let mut held = std::collections::BTreeMap::<String, Vec<i64>>::new();
+        for (session_id, keep) in stale::read_keep_records(self.store_ref()) {
+            if open.contains(&session_id) {
+                held.entry(keep.reason).or_default().push(session_id);
+            }
+        }
+        if !held.is_empty() {
+            let mut by_count = held.iter().collect::<Vec<_>>();
+            by_count
+                .sort_by(|left, right| right.1.len().cmp(&left.1.len()).then(left.0.cmp(right.0)));
+            let total: usize = held.values().map(Vec::len).sum();
+            view.advice.push(StatusAdvice {
+                id: "sessions.abandonment-held",
+                severity: StatusAdviceSeverity::Info,
+                reason: "each open session's last abandonment judgement kept it for this reason; the lane judges it again on its next pass",
+                summary: format!(
+                    "{total} session(s) past the abandonment window are held: {}",
+                    by_count
+                        .iter()
+                        .map(|(reason, sessions)| format!("{} by {reason}", sessions.len()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                session_id: by_count.first().and_then(|(_, sessions)| sessions.first().copied()),
+                queue_entry_id: None,
+                evidence: by_count
+                    .iter()
+                    .take(20)
+                    .map(|(reason, sessions)| {
+                        format!(
+                            "{reason}: session(s) {}",
+                            sessions
+                                .iter()
+                                .take(10)
+                                .map(i64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .collect(),
+                commands: Vec::new(),
+            });
+        }
+        let window_ms = self.abandonment_window_ms();
+        let last_judged = stale::abandonment_last_judged_at(self.store_ref());
+        let age_ms = last_judged.map(|at| now_ms.saturating_sub(at));
+        crate::phase_telemetry::attach(
+            "abandonment_lane_last_judged_age_ms",
+            age_ms.map_or(serde_json::Value::Null, serde_json::Value::from),
+        );
+        if window_ms <= 0 {
+            return;
+        }
+        let due = view
+            .agents
+            .iter()
+            .filter(|agent| open.contains(&agent.session.id))
+            .filter(|agent| now_ms.saturating_sub(agent.session.last_activity_at) > window_ms)
+            .count();
+        let stalled = age_ms.is_none_or(|age| age > stale::ABANDONMENT_LANE_IDLE_ADVICE_MS);
+        if due > 0 && stalled {
+            view.advice.push(StatusAdvice {
+                id: "sessions.abandonment-lane-idle",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "sessions are idle past the abandonment window but the lane has judged none for over an hour: it may be stopped (a refused process listing, a busy lock) or starved of time",
+                summary: format!(
+                    "{due} session(s) are past the abandonment window and the lane last judged one {}",
+                    age_ms.map_or_else(
+                        || "never".to_string(),
+                        |age| format!("{} min ago", age / 60_000)
+                    )
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![format!(
+                    "last judged at (ms since epoch): {}",
+                    last_judged.map_or_else(|| "never".to_string(), |at| at.to_string())
+                )],
+                commands: vec!["aethyme broker status --full --json".into()],
+            });
+        }
     }
 
     /// Warn when the last preparation could not verify a runtime probe: that
