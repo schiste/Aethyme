@@ -1,6 +1,6 @@
 //! Draft independent candidate overlay. This only establishes internal
 //! consistency of caller-provided inputs; it does not authorize publication.
-use super::candidate_revision_v2::{snapshot_digest, BaseKind, Item, Snapshot};
+use super::candidate_revision_v2::{BaseKind, Item, Snapshot, snapshot_digest};
 use super::strict::parse_change;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -215,7 +215,7 @@ pub fn overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     fn fixture() -> (Snapshot, Vec<Item>, Value) {
         let v: Value = serde_json::from_str(include_str!("portable-verdict-vector.json")).unwrap();
         (
