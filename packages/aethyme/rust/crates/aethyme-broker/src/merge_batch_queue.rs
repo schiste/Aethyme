@@ -2,7 +2,7 @@
 //! merge verification slot. The queue state is advisory until normal exact
 //! batch admission and gates succeed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -88,6 +88,7 @@ pub(super) struct Ticket {
     directory: PathBuf,
     waiter: Waiter,
     marker: Option<tempfile::NamedTempFile>,
+    registered: Cell<bool>,
     observed: RefCell<Option<QueueSnapshot>>,
 }
 
@@ -175,10 +176,11 @@ impl Ticket {
                 bypass_cache,
             },
             marker: Some(marker),
+            registered: Cell::new(false),
             observed: RefCell::default(),
         };
         let ready_at = ticket
-            .edit(|state| {
+            .edit(CLAIM_DEADLINE, |state| {
                 state.reap(&ticket.directory);
                 if state.waiters.len() >= MAX_WAITERS
                     || state.claims.len() >= MAX_WAITERS
@@ -207,13 +209,14 @@ impl Ticket {
             })
             .ok()??;
         ticket.waiter.ready_at = ready_at;
+        ticket.registered.set(true);
         Some(ticket)
     }
 
     /// Called after acquiring a real slot. Freeze the eligible requests that
     /// are already on disk, with no grace period for further arrivals.
     pub(super) fn admit(&self, ready_cutoff: u128) -> io::Result<Admission> {
-        self.edit(|state| {
+        let admission = self.edit(CLAIM_DEADLINE, |state| {
             state.reap(&self.directory);
             if state.claim_for(&self.waiter).is_some() {
                 return Admission::Follower;
@@ -253,11 +256,15 @@ impl Ticket {
                 result: None,
             });
             Admission::Leader(request)
-        })
+        })?;
+        if matches!(admission, Admission::Single) {
+            self.registered.set(false);
+        }
+        Ok(admission)
     }
 
     pub(super) fn complete(&self, receipt: Option<Receipt>) -> io::Result<Option<Receipt>> {
-        self.edit(|state| {
+        self.edit(CLAIM_DEADLINE, |state| {
             let claim = state
                 .claims
                 .iter_mut()
@@ -335,14 +342,14 @@ impl Ticket {
         }
     }
 
-    fn edit<T>(&self, edit: impl FnOnce(&mut State) -> T) -> io::Result<T> {
+    fn edit<T>(&self, lock_budget: Duration, edit: impl FnOnce(&mut State) -> T) -> io::Result<T> {
         let started = Instant::now();
         let lock_file = queue_file(&self.directory.join("lock"), true)?;
         let _lock = loop {
             if let Some(lock) = ExclusiveFileLock::try_acquire(lock_file.try_clone()?)? {
                 break lock;
             }
-            if started.elapsed() >= CLAIM_DEADLINE {
+            if started.elapsed() >= lock_budget {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "submit batch queue is busy",
@@ -404,7 +411,10 @@ impl Drop for Ticket {
         // Withdraw independently of the metadata lock. A submit falling
         // back to individual work must stop being claimable immediately.
         drop(self.marker.take());
-        let _ = self.edit(|state| {
+        if !self.registered.get() {
+            return;
+        }
+        let _ = self.edit(Duration::ZERO, |state| {
             state
                 .waiters
                 .retain(|other| other.ticket != self.waiter.ticket);
