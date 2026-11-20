@@ -44,7 +44,12 @@ pub(super) fn run(
         match child.try_wait() {
             Ok(Some(status)) if Instant::now() <= deadline => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Ok(Some(_)) => return Err("validator exceeded deadline".into()),
+            Ok(Some(_)) => {
+                if !broker_mode {
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                }
+                return Err("validator exceeded deadline".into());
+            }
             _ => {
                 if broker_mode {
                     let _ = child.kill();
@@ -63,6 +68,7 @@ pub(super) fn run(
         && (unsafe { libc::kill(-(child.id() as i32), 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
     {
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
         return Err("validator descendants may still be active".into());
     }
     // Nonzero exits never establish a trustworthy verdict.
@@ -72,5 +78,27 @@ pub(super) fn run(
         Some(2) => Err("validator exited with code 2 (not checked or invalid input)".into()),
         Some(code) => Err(format!("validator exited with code {code}")),
         None => Err("validator terminated without an exit code".into()),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kills_descendants_when_the_validator_exits_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let env = BTreeMap::from([("MARKER".to_owned(), marker.to_str().unwrap().to_owned())]);
+        let validator = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "(/bin/sleep 2; /bin/echo survived > \"$MARKER\") & exit 0".to_owned(),
+        ];
+        let result = run(&validator, &env, dir.path(), &dir.path().join("verdict"), 5, false, true);
+        assert_eq!(result.unwrap_err(), "validator descendants may still be active");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "validator descendant survived rejection");
     }
 }
