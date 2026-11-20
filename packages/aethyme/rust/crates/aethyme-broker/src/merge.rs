@@ -1056,6 +1056,47 @@ impl SubmissionReplay {
     }
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct EarlyVerification {
+    state: &'static str,
+    gates: Vec<GateRunOutcome>,
+}
+
+impl EarlyVerification {
+    pub(crate) fn state(&self) -> &'static str {
+        self.state
+    }
+
+    pub(crate) fn metric_details(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "executed_gates": self.gates.iter().filter(|gate| !gate.cached && gate.duration_ms.is_some_and(|ms| ms > 0)).count(),
+            "cached_gates": self.gates.iter().filter(|gate| gate.cached).count(),
+            "cancelled_gates": self.gates.iter().filter(|gate| gate.status == crate::GateStatus::Cancelled).count(),
+            "executed_gate_ms": self.gates.iter().filter(|gate| !gate.cached).filter_map(|gate| gate.duration_ms).sum::<i64>(),
+        })
+    }
+
+    fn skipped(state: &'static str) -> Self {
+        Self {
+            state,
+            gates: Vec::new(),
+        }
+    }
+}
+
+struct EarlyGateProgress(std::sync::atomic::AtomicBool);
+
+impl crate::gates::GateProgressSink for EarlyGateProgress {
+    fn report(&self, line: &str) {
+        eprintln!("{line}");
+    }
+
+    fn early_verification_cancelled(&self) -> Option<bool> {
+        Some(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
 impl Broker {
     #[cfg(test)]
     fn observe_submission_plan_test_phase(&self, phase: crate::broker::SubmissionPlanTestPhase) {
@@ -1250,6 +1291,182 @@ impl Broker {
             reference,
             commit,
             fallback_reason: None,
+        })
+    }
+
+    /// Run only reusable gates on the exact replay of a pinned published
+    /// head. A later submit still performs its usual ownership, base, tree,
+    /// policy and cache identity checks. This warms the existing verdict
+    /// store and does not create or update a submission queue entry.
+    pub(crate) fn preverify_published_head(
+        &mut self,
+        session_id: i64,
+        head: &str,
+        base: &str,
+    ) -> Result<EarlyVerification, BrokerOpError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let admission = crate::phase_telemetry::span("gate_preverify_admission");
+        if crate::git::graph_verification_environment_refusal().is_some() {
+            return Ok(EarlyVerification::skipped("git_routing_unknown"));
+        }
+        self.check_submission_root_before_planning()?;
+        let main_root = self.main_root_path();
+        let repo = GitRepo::discover(&main_root)?;
+        let session = self.store().session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        if checkout.root() == main_root || checkout.main_root()? != main_root {
+            return Ok(EarlyVerification::skipped("not_an_isolated_session"));
+        }
+        let current = || {
+            require_session_checkout_identity(&session, &checkout, Some(head)).is_ok()
+                && repo
+                    .upstream_default_checked()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, commit)| commit == base)
+        };
+        if !current() {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        let pushed = self.session_push_state(session_id)?;
+        if pushed.remote_oid.as_deref() != Some(head) {
+            return Ok(EarlyVerification::skipped("head_unpublished"));
+        }
+        let root_plan = self.worktree_root_plan()?;
+        let Some(mut slot) =
+            crate::verification::ExactTreeVerificationSlot::try_acquire_with_worktree_root_plan(
+                &main_root,
+                "merge-preverify",
+                &root_plan,
+            )?
+        else {
+            return Ok(EarlyVerification::skipped("busy"));
+        };
+        drop(admission);
+
+        let replay = crate::phase_telemetry::span("gate_preverify_replay");
+        let ownership = self.audit_submit_ownership(session_id)?;
+        if !ownership.ok {
+            return Ok(EarlyVerification::skipped("ownership_refused"));
+        }
+        self.require_trusted_policy_at_commit(base, Some(session_id))?;
+        let gates = self
+            .load_and_sync_gates_at_commit(base)?
+            .unwrap_or_default();
+        let gates: Vec<_> = gates
+            .into_iter()
+            .filter(|gate| gate.cache && !gate.content_gate_v1)
+            .collect();
+        if gates.is_empty() {
+            return Ok(EarlyVerification::skipped("no_reusable_gates"));
+        }
+        let Some(history_view) =
+            capture_submission_plan_history_view(&main_root, self.repo_handle(), self.store_ref())
+        else {
+            return Ok(EarlyVerification::skipped("history_unknown"));
+        };
+        let plan = self.build_submission_plan(&session, head, base)?;
+        let simulation = self.replay_submission_plan(&plan)?;
+        if !simulation.conflicts.is_empty() {
+            return Ok(EarlyVerification::skipped("candidate_conflict"));
+        }
+        if simulation.tree == repo.commit_tree_id(base)? {
+            return Ok(EarlyVerification::skipped("no_candidate_changes"));
+        }
+        if validate_submission_history_view(
+            &main_root,
+            self.repo_handle(),
+            self.store_ref(),
+            &history_view,
+        )
+        .is_err()
+            || !current()
+        {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(EarlyVerification::skipped("budget_exhausted"));
+        }
+        let candidate = mint_verification_candidate(
+            &repo,
+            base,
+            plan.pending_owned_commit_ids(),
+            &simulation.tree,
+            "chore(broker): prepare exact early verification candidate",
+            &crate::attribution::Attribution::broker_only(),
+            simulation.history_parent.as_deref(),
+        )?;
+        let changed = repo.gate_scope_changed_between(base, &candidate.commit)?;
+        let selections = crate::gates::select_gates(&gates, &changed);
+        let selected = selections.len();
+        if selected == 0 {
+            return Ok(EarlyVerification::skipped("no_gates_triggered"));
+        }
+        drop(replay);
+        let slot_checkout = {
+            let _span = crate::phase_telemetry::span("gate_preverify_checkout");
+            slot.materialize(&repo, &candidate.commit)?
+        };
+        if !current() {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        let storage = self.storage_context().gate_storage_locations();
+        if let Some(path) = self.session_scratch_dir(session_id) {
+            crate::session_scratch::remember_for_commands(session_id, &path);
+        }
+        let progress = EarlyGateProgress(std::sync::atomic::AtomicBool::new(false));
+        let gate_results = {
+            let _span = crate::phase_telemetry::span("gate_preverify_execution");
+            std::thread::scope(|scope| {
+                let (finished, completion) = std::sync::mpsc::channel::<()>();
+                let progress = &progress;
+                scope.spawn(move || {
+                    while matches!(
+                        completion.recv_timeout(Duration::from_millis(500)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        if !crate::git::with_git_deadline(Duration::from_secs(2), current) {
+                            progress.0.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                });
+                let gates = crate::gates::run_early_verification(
+                    self.store(),
+                    &main_root,
+                    &slot_checkout,
+                    selections,
+                    session_id,
+                    base,
+                    deadline,
+                    progress,
+                    storage,
+                );
+                drop(finished);
+                gates
+            })?
+        };
+        slot.cleanup();
+        let state = if progress.0.load(Ordering::Acquire) {
+            "superseded"
+        } else if gate_results.is_empty() {
+            "no_verdict"
+        } else if gate_results.len() != selected
+            || gate_results
+                .iter()
+                .any(|gate| gate.status != crate::GateStatus::Pass)
+        {
+            "incomplete"
+        } else {
+            "ready"
+        };
+        Ok(EarlyVerification {
+            state,
+            gates: gate_results,
         })
     }
 
