@@ -3544,6 +3544,13 @@ Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
   - Unchanged and why. The plan's `git status` already runs with `GIT_OPTIONAL_LOCKS=0`, `core.fsmonitor=false` and `core.untrackedCache=false`; `git worktree list` takes no index or lock and reads each of about 1,000 registrations, already once per run. No cheaper listing gives the same answer, so both are left as they are.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-20 (retirement inspections stop timing out at 15 s). On 0.8.142 on the busiest repository the closed lap was reached on every pass but judged 3 to 6 checkouts and retired 2 in 4 passes. 13 inspections ended `inspection_failed`, each at the eligibility `git -c core.fsmonitor=false -c core.untrackedCache=false status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none` (`GIT_OPTIONAL_LOCKS=0`, no `--ignored`, so ignored directories are not walked) stopping at its 15 s limit, 79 to 81 s of an 81 to 84 s lap. A successful plan took about 13 s, and the checkouts hold about 17,000 tracked files on a contended volume. Now:
+  - Inside the closed and cleaned laps, each plan's cleanup listings (that eligibility status and the archive inventory's untracked listing) may take up to 60 s (`RETIRE_INSPECTION_ALLOWANCE`) instead of 15 s, still bounded by the lap's deadline. Interactive cleanup and inline retirement at close keep 15 s. What the listings prove is unchanged.
+  - The planning context a run captures once now takes each lap's own deadline before every plan. Before, a plan of the cleaned lap ran its Git calls under the closed lap's deadline, already past, so they were not started and could be remembered as `inspection_failed`.
+  - The remembered-keep back-off for `inspection_failed` (1 h, 6 h, 24 h) was already applied: the 19 remembered keeps all had one attempt, and each pass judged fresh checkouts.
+  - The `checkout_retirement` attachment adds `inspections`: `started`, `succeeded`, `failed` (`inspection_failed`), `cut_by_deadline`, `refused`, `median_succeeded_ms`.
+Covered by `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
