@@ -49,7 +49,7 @@ def run_case(root, aexeo, aethyme, name, text, media_type, expected):
         "change": str(case / "change.json"), "policy": str(case / "preset.toml"),
         "options": str(case / "options.json"), "collection": None, "external": None,
         "additional": {}, "content": {"article": str(case / "article.txt")},
-        "validator": validator, "env": {"PATH": "/usr/bin:/bin"}, "timeout_seconds": 45,
+        "validator": validator, "required_checks": ["gate:7:article:terms"], "env": {"PATH": "/usr/bin:/bin"}, "timeout_seconds": 45,
     }
     path = case / "manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
