@@ -3551,6 +3551,17 @@ Covered by `broker/retire.rs` tests.
   - The `checkout_retirement` attachment adds `inspections`: `started`, `succeeded`, `failed` (`inspection_failed`), `cut_by_deadline`, `refused`, `median_succeeded_ms`.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-20 (finish retires through the trash). On the busiest repository's last 400 finishes:
+  - 181 (45 %) removed the checkout inline with `git worktree remove`: a median 48 s, p90 109 s, while holding the repository lifecycle claim, so every start and finish waited. Those finishes took a median 72 s, including a 13 s unlocked size walk.
+  - 153 (38 %) kept it because the caller passed `--keep-worktree`.
+  - 60 (15 %) kept it as not proven safe (dirty paths, or commits not on a delivery target).
+  - 6 failed the removal.
+
+  Now:
+  - When `finish` removes a checkout it proved clean and delivered under the claim, the removal moves it into the checkout trash in one rename (`remove_checkout_through_trash`: registration removed, reflog-only commits pinned, an operation in progress refuses) instead of `git worktree remove`. The deleter removes the entry later, and only once no process uses it. So `finish` takes no open-file observation, and a process in the checkout (usually the finishing caller's shell) does not refuse the move. Anything the move refuses falls back to `git worktree remove`, as before. New span `finish_retire_move`; counters `finish_retire_trashed`, `finish_retire_git_fallback`, `finish_retire_holder_check_deferred_to_deleter`.
+  - When `finish` leaves the checkout in the pool it records why on the session (meta key `checkout_retirement.finish_keeps`: session id to `reason`, `at_ms`; at most 16,384) and counts `finish_retire_kept_<reason>`. The reasons are `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`, `policy_disabled`, `cleanup_plan_unsafe` and `removal_failed`. The retirement lane still judges the checkout with the same rules. It counts `checkout_retirement_judged_after_finish_keep`, carries the finish reason into its remembered keep's detail (`finish kept it: <reason>`), and forgets the record once the checkout is retired.
+Covered by `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises

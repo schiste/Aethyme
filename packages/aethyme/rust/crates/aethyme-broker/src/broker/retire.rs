@@ -579,6 +579,95 @@ impl Drop for OperationStateArchivedScope {
     }
 }
 
+thread_local! {
+    /// The session whose checkout `finish` is removing on this thread, after
+    /// proving it clean and delivered under the lifecycle claim.
+    static FINISH_RETIREMENT: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether `finish` is removing `session_id`'s proven checkout on this
+/// thread: the removal moves it into the trash in one rename instead of
+/// `git worktree remove` deleting it under the lifecycle claim.
+pub(super) fn in_finish_retirement(session_id: i64) -> bool {
+    FINISH_RETIREMENT.with(std::cell::Cell::get) == Some(session_id)
+}
+
+/// Marks `finish`'s removal of `session_id`'s checkout until dropped.
+pub(super) struct FinishRetirementScope(Option<i64>);
+
+impl FinishRetirementScope {
+    pub(super) fn enter(session_id: i64) -> Self {
+        Self(FINISH_RETIREMENT.with(|cell| cell.replace(Some(session_id))))
+    }
+}
+
+impl Drop for FinishRetirementScope {
+    fn drop(&mut self) {
+        FINISH_RETIREMENT.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Meta key: why `finish` left a session's checkout in the pool (JSON:
+/// session id to [`FinishKeep`]), read by the retirement lane.
+pub(crate) const FINISH_KEEPS_KEY: &str = "checkout_retirement.finish_keeps";
+/// Recorded finish keeps at most; the lowest ids go first.
+const FINISH_KEEPS_MAX: usize = 16_384;
+
+/// Why `finish` did not retire a checkout, recorded on the session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FinishKeep {
+    /// `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`,
+    /// `policy_disabled`, `cleanup_plan_unsafe` or `removal_failed`.
+    pub reason: String,
+    pub at_ms: i64,
+}
+
+impl Broker {
+    /// Record why `finish` left `session_id`'s checkout in the pool, and
+    /// count it (`finish_retire_kept_<reason>`).
+    pub(super) fn record_finish_keep(&self, session_id: i64, reason: &'static str) {
+        crate::phase_telemetry::add(
+            match reason {
+                "keep_worktree" => "finish_retire_kept_keep_worktree",
+                "dirty" => "finish_retire_kept_dirty",
+                "not_proven_safe" => "finish_retire_kept_not_proven_safe",
+                "not_broker_owned" => "finish_retire_kept_not_broker_owned",
+                "policy_disabled" => "finish_retire_kept_policy_disabled",
+                "cleanup_plan_unsafe" => "finish_retire_kept_cleanup_plan_unsafe",
+                "removal_failed" => "finish_retire_kept_removal_failed",
+                _ => "finish_retire_kept_other",
+            },
+            std::time::Duration::ZERO,
+        );
+        let at_ms = crate::clock::epoch_ms();
+        crate::warn_unrecorded(
+            "record why finish kept a checkout",
+            self.update_meta_json(
+                FINISH_KEEPS_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, FinishKeep>| {
+                    stored.insert(
+                        session_id,
+                        FinishKeep {
+                            reason: reason.to_string(),
+                            at_ms,
+                        },
+                    );
+                    while stored.len() > FINISH_KEEPS_MAX {
+                        stored.pop_first();
+                    }
+                },
+            ),
+        );
+    }
+
+    /// Why `finish` left `session_id`'s checkout in the pool, if recorded.
+    pub(crate) fn finish_keep(&self, session_id: i64) -> Option<FinishKeep> {
+        self.meta_json::<std::collections::BTreeMap<i64, FinishKeep>>(FINISH_KEEPS_KEY)
+            .remove(&session_id)
+    }
+}
+
 /// `text` cut to [`RETIRE_KEEP_DETAIL_MAX`] bytes on a character boundary.
 fn bounded_detail(text: &str) -> String {
     let mut end = text.len().min(RETIRE_KEEP_DETAIL_MAX);
@@ -1703,6 +1792,21 @@ impl Broker {
             }
             Err(error) => return Err(refuse(format!("cannot read the operation state: {error}"))),
         }
+        // `finish` removing its own proven checkout: the finishing caller's
+        // shell is usually still in it, and `git worktree remove` deleted
+        // the files from under any such process. The move keeps them whole
+        // in the trash, and the deleter removes an entry only once no
+        // process uses it, so no open-file observation (1 to 14 s) is taken
+        // here and a holder does not refuse the move.
+        if in_finish_retirement(session.id) {
+            crate::phase_telemetry::add(
+                "finish_retire_holder_check_deferred_to_deleter",
+                std::time::Duration::ZERO,
+            );
+            return self
+                .pin_reflog_only_commits(session.id, worktree)
+                .map_err(|reason| refuse(format!("reflog commits could not be pinned: {reason}")));
+        }
         if let Some(snapshot) = RUN_PROCESS_USE.with(|cell| cell.borrow().clone()) {
             if let Some(reason) =
                 crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, worktree)
@@ -2095,10 +2199,26 @@ impl Broker {
         run.keep_detail = None;
         let outcome = self.retire_closed_checkout_inner(session_id, run)?;
         crate::phase_telemetry::add(outcome.counter(), std::time::Duration::ZERO);
+        // Why `finish` left this checkout, when it said: carried into the
+        // remembered keep's detail, so a keep is never judged blind of it.
+        let finish_keep = self.finish_keep(session_id);
+        if finish_keep.is_some() {
+            crate::phase_telemetry::add(
+                "checkout_retirement_judged_after_finish_keep",
+                std::time::Duration::ZERO,
+            );
+        }
         match outcome {
             RetireOutcome::Kept(code) if remembered_keep(code) => {
                 if let Ok(session) = self.store_ref().session(session_id) {
-                    self.remember_keep(&session, code, run.keep_detail.take());
+                    let detail = match (run.keep_detail.take(), finish_keep) {
+                        (detail, None) => detail,
+                        (Some(detail), Some(keep)) => {
+                            Some(format!("{detail} (finish kept it: {})", keep.reason))
+                        }
+                        (None, Some(keep)) => Some(format!("finish kept it: {}", keep.reason)),
+                    };
+                    self.remember_keep(&session, code, detail);
                 }
             }
             RetireOutcome::Kept(_) => {}
@@ -2107,6 +2227,17 @@ impl Broker {
             | RetireOutcome::RetiredOperationArchived { .. } => {
                 self.leave_checkout_tombstone(session_id, outcome);
                 self.forget_keep(session_id);
+                if finish_keep.is_some() {
+                    crate::warn_unrecorded(
+                        "forget why finish kept a retired checkout",
+                        self.update_meta_json(
+                            FINISH_KEEPS_KEY,
+                            |stored: &mut std::collections::BTreeMap<i64, FinishKeep>| {
+                                stored.remove(&session_id);
+                            },
+                        ),
+                    );
+                }
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session_id, false);
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_IN_PROGRESS_KEY, session_id, false);
             }
@@ -7179,6 +7310,72 @@ mod tests {
         broker
             .cleanup_resolve_retirement_plan_with_context(session.id, false, &context)
             .expect("plans under the later deadline");
+    }
+
+    /// `finish` moves the checkout it proved clean into the trash in one
+    /// rename (no `git worktree remove`), and the deleter removes it later.
+    #[test]
+    fn finish_moves_a_proven_checkout_into_the_trash() {
+        let (_owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("finish into trash", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.finish(session.id).unwrap()
+        };
+
+        assert!(report.cleanup.completed, "{report:#?}");
+        assert!(!worktree.exists(), "the checkout left the pool");
+        let counts = recorder.totals().1;
+        assert_eq!(
+            counts.get("finish_retire_trashed").copied(),
+            Some(1),
+            "{counts:#?}"
+        );
+        assert_eq!(
+            counts.get("finish_retire_git_fallback"),
+            None,
+            "{counts:#?}"
+        );
+        assert_eq!(broker.finish_keep(session.id), None);
+    }
+
+    /// A checkout `finish` keeps records why on the session, with its
+    /// counter.
+    #[test]
+    fn finish_records_why_it_kept_a_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("finish keeps", None).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .finish_with_options(
+                    session.id,
+                    crate::FinishOptions {
+                        keep_worktree: true,
+                    },
+                )
+                .unwrap()
+        };
+
+        assert!(report.closed, "{report:#?}");
+        assert!(PathBuf::from(&session.worktree_path).exists());
+        assert_eq!(
+            broker.finish_keep(session.id).map(|keep| keep.reason),
+            Some("keep_worktree".to_string())
+        );
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("finish_retire_kept_keep_worktree")
+                .copied(),
+            Some(1)
+        );
     }
 
     /// Open paths may use the window less the closed lap's floor (never less

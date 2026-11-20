@@ -5027,6 +5027,9 @@ impl Broker {
         match moved {
             Ok(trashed) => {
                 self.note_checkout_trashed(&trashed);
+                if super::retire::in_finish_retirement(session.id) {
+                    crate::phase_telemetry::add("finish_retire_trashed", std::time::Duration::ZERO);
+                }
                 Ok(())
             }
             Err(reason) => {
@@ -5038,6 +5041,12 @@ impl Broker {
                     "checkout_trash_fell_back_to_git",
                     std::time::Duration::ZERO,
                 );
+                if super::retire::in_finish_retirement(session.id) {
+                    crate::phase_telemetry::add(
+                        "finish_retire_git_fallback",
+                        std::time::Duration::ZERO,
+                    );
+                }
                 self.repo.worktree_remove_registered(worktree, force)?;
                 Ok(())
             }
@@ -5552,6 +5561,29 @@ impl Broker {
                             .collect(),
                     );
                     self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                } else if super::retire::in_finish_retirement(session_id) {
+                    // `finish` just proved this checkout clean and delivered
+                    // under this claim: one rename into the trash instead of
+                    // `git worktree remove` deleting it here (a median 48 s
+                    // with every start and finish waiting on this claim).
+                    // Whatever the move refuses falls back to Git's removal,
+                    // exactly as before.
+                    let moved = {
+                        let _span = crate::phase_telemetry::span("finish_retire_move");
+                        self.remove_checkout_through_trash(session, &worktree_path, force)
+                    };
+                    if let Err(error) = moved {
+                        crate::phase_telemetry::add(
+                            "finish_retire_git_fallback",
+                            std::time::Duration::ZERO,
+                        );
+                        crate::warn_unrecorded::<(), _>(
+                            "move a finished checkout into the trash",
+                            Err(error),
+                        );
+                        self.repo
+                            .worktree_remove_registered(&worktree_path, force)?;
+                    }
                 } else {
                     self.repo
                         .worktree_remove_registered(&worktree_path, force)?;
