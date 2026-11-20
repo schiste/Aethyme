@@ -472,17 +472,19 @@ pub(crate) fn record_hook_metric(
     delivery: &'static str,
     spans: &crate::phase_telemetry::Recorder,
 ) {
+    let args = ["hook".into(), event.as_str().into()];
     let cwd = repo.map_or_else(std::env::current_dir, |path| Ok(path.into()));
     if matches!(
         event,
         crate::agent_hook::HookEvent::PreToolUse | crate::agent_hook::HookEvent::PostToolUse
     ) && let Ok(cwd) = &cwd
         && let Some((main, _, session)) = crate::agent_hook::registered_hook_session(cwd)
+        && let Some(label) = safe_command_surface(&args)
     {
         let ended = std::time::Instant::now();
         append_command_metric(
             &main,
-            &format!("hook {}", event.as_str()),
+            &label,
             (ended - started).as_millis() as i64,
             0,
             output_bytes,
@@ -500,14 +502,7 @@ pub(crate) fn record_hook_metric(
         set_metric_repository(std::path::Path::new(repo));
     }
     set_command_metric_details(serde_json::json!({ "hook_delivery": delivery }));
-    record_command_metric(
-        &["hook".into(), event.as_str().into()],
-        0,
-        started,
-        ended,
-        output_bytes,
-        spans,
-    );
+    record_command_metric(&args, 0, started, ended, output_bytes, spans);
 }
 
 /// Fold the spans recorded anywhere during the command into its metric
