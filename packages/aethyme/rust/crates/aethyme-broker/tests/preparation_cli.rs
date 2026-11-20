@@ -1000,11 +1000,11 @@ max_concurrent = 2
     git(temp.path(), &["commit", "-qm", "fixture"]);
     let state = temp.path().join("host-state");
     // This test exercises shared-cache concurrency, so the independent host
-    // install pool must also allow two concurrent preparations on every runner.
+    // install pool needs two slots even when warning pressure halves its limit.
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         state.join("preparation.toml"),
-        "[installs]\nmax_concurrent = 2\n",
+        "[installs]\nmax_concurrent = 4\n",
     )
     .unwrap();
     let start = |task: &str| {
