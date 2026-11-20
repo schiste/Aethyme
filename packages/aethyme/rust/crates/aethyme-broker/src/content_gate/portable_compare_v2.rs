@@ -110,11 +110,19 @@ fn closed_verdict(v: &Value) -> Result<(), &'static str> {
         }
     }
     if let Some(ext) = v.get("extensions") {
-        closed(ext, &["aexeo.offline-input-binding.v1"])?;
-        if ext.as_object().is_none_or(|m| m.len() != 1)
-            || !ext["aexeo.offline-input-binding.v1"]
-                .as_str()
-                .is_some_and(valid_sha)
+        closed(
+            ext,
+            &[
+                "aexeo.offline-input-binding.v1",
+                "aexeo.html-content-scope.v1",
+            ],
+        )?;
+        if !ext["aexeo.offline-input-binding.v1"]
+            .as_str()
+            .is_some_and(valid_sha)
+            || ext
+                .get("aexeo.html-content-scope.v1")
+                .is_some_and(|scope| scope.as_str() != Some("main"))
         {
             return Err("unsupported verdict extension");
         }
@@ -452,6 +460,22 @@ mod tests {
         assert!(!run(&verdict, &verdict, &input));
         input.collection = None;
         assert!(!run(&verdict, &verdict, &input));
+    }
+    #[test]
+    fn permits_only_the_known_main_html_scope_extension() {
+        let (_, _, _, mut verdict) = fixture();
+        verdict["verdict"]["extensions"]["aexeo.html-content-scope.v1"] = json!("main");
+        assert!(closed_verdict(&verdict["verdict"]).is_ok());
+        for invalid in [json!("full"), json!(null), json!(true), json!(1)] {
+            verdict["verdict"]["extensions"]["aexeo.html-content-scope.v1"] = invalid;
+            assert!(closed_verdict(&verdict["verdict"]).is_err());
+        }
+        verdict["verdict"]["extensions"]["aexeo.html-content-scope.v1"] = json!("main");
+        verdict["verdict"]["extensions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aexeo.offline-input-binding.v1");
+        assert!(closed_verdict(&verdict["verdict"]).is_err());
     }
     #[test]
     fn rejects_unknown_nested_fields_duplicates_and_inconsistent_results() {
