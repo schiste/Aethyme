@@ -124,3 +124,25 @@ stock hook commands consumed 66.8 s of summed command time across the
 was zero bytes. The intervention and rework counts do not show an offset
 for those costs in this cohort. A larger trial across multiple hosts and
 real workloads would be needed to generalize the magnitude.
+
+### Six-way cheap-gate control
+
+A separate run on the same release and model repeated the six independent
+assignments concurrently. Both arms completed all six tasks and passed
+all six exact-tree checks. Each checked a different integration tree,
+with zero reuse, conflicts, repairs, or human interventions. Trusted
+hooks recorded 18 activity signals.
+
+| Measure | Direct Git median / p90 | Aethyme median / p90 |
+| --- | ---: | ---: |
+| Task duration | 44.83 / 45.82 s | 61.90 / 74.18 s |
+| Uncached input tokens | 8,441.5 / 9,875 | 7,330.5 / 8,947 |
+| Cached input tokens | 105,728 / 149,504 | 99,968 / 127,744 |
+| Output tokens | 1,176 / 1,511 | 1,130.5 / 1,378 |
+| Exact-tree verification wall time | 64 / 81 ms | 2,890 / 3,382 ms |
+
+Aethyme took 38.1% longer at the median and 61.9% longer at p90.
+The median within-pair duration difference was +17.51 s.
+The broker used 13.2% fewer uncached input tokens at the median. The
+small token sample and different direction in the substantial-gate
+cohort show sensitivity to task mix and agent behavior.
