@@ -201,10 +201,12 @@ impl Broker {
             .clone()
             .or_else(|| crate::host_state::resolve_host_state_dir().map(|(path, _)| path));
         let repository = self.main_root().to_string_lossy().into_owned();
+        let state_span = crate::phase_telemetry::span("recovery_archive_bound_state_read");
         let previous = host_state
             .as_deref()
             .map(|host| crate::storage_ledger::archive_bound_state(host, &repository))
             .unwrap_or_default();
+        drop(state_span);
         // Listing and classifying read only directory entries, manifests
         // and session records: no archive content is read or hashed here.
         // The one archive about to be removed is fully proven, under the
@@ -564,10 +566,14 @@ impl Broker {
         }
         drop(evict_span);
         // Keep what earlier passes learned about archives this pass did not
-        // reach, while they are still there.
+        // reach, while they are still there. A size this pass already holds
+        // (listed now, or counted from the earlier size) needs no `lstat`:
+        // keeping it changes nothing, and asking for each of 2,373 archives
+        // took about 70 s of one pass on the busiest repository.
+        let carry_span = crate::phase_telemetry::span("recovery_archive_bound_state_carry");
         for (path, known) in previous.sizes {
-            if std::fs::symlink_metadata(&path).is_ok() {
-                state.sizes.entry(path).or_insert(known);
+            if !state.sizes.contains_key(&path) && std::fs::symlink_metadata(&path).is_ok() {
+                state.sizes.insert(path, known);
             }
         }
         for (path, at) in previous.size_deferred_at_ms {
@@ -590,6 +596,7 @@ impl Broker {
                 crate::storage_ledger::record_archive_bound_state(host, &repository, &state),
             );
         }
+        drop(carry_span);
         stats.record();
         crate::phase_telemetry::attach(
             "recovery_archive_bound",
@@ -681,6 +688,17 @@ impl Broker {
             "record recovery archive usage in the storage ledger",
             crate::storage_ledger::record_recovery_archive_usage(&host_state, &repository, usage),
         );
+    }
+
+    /// When this repository's last recorded bound pass started (epoch ms)
+    /// and whether it found the archives over the bound; `None` when none
+    /// is recorded.
+    pub(crate) fn last_recovery_archive_bound(&self) -> Option<(i64, bool)> {
+        let (host_state, _) = crate::host_state::resolve_host_state_dir()?;
+        let repository = self.main_root().to_string_lossy().into_owned();
+        crate::storage_ledger::recovery_archive_usage(&host_state)
+            .get(&repository)
+            .map(|usage| (usage.observed_at_ms, usage.over_bound))
     }
 }
 
