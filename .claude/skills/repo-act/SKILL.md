@@ -111,6 +111,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `trusted_content_hash` where present, in an isolated Codex profile. Set
   `AETHYME_UPDATE_CHECK=off` in both arms.
 
+  When measuring Git-free hook boundaries, trace the complete hook process
+  with Git Trace2 and measure its caller-observed wall time. Internal dispatch
+  spans can omit repository discovery done while writing the metric itself.
+  Keep the same telemetry setting in both arms, and exercise the due-refresh
+  or unread-note fallback separately from steady-state silent boundaries.
+
 - For concurrent-agent comparisons, register both worktrees and their task
   scopes before launching either worker. Use the same ordered integration and
   repair rules in every arm, then verify both features on the final tree. A
