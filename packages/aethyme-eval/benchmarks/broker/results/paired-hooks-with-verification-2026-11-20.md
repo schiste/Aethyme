@@ -320,3 +320,31 @@ median of nine Git spans and zero output bytes. This is repeated work
 even when an agent receives no update. The measured next optimization
 target is unchanged tool boundaries, where skipping repeated Git
 discovery can remove work before testing for task-relevant changes.
+
+### Audited repeat of the shared-file group
+
+A separate repeat preserved the direct-first arm order and passed both
+exact-tree checks in both arms. The direct arm emitted zero broker
+command records. Both arms completed without repairs or human
+intervention. The direct tasks took 42.16 / 44.01 s and the broker
+tasks took 87.24 / 96.13 s. The two verification calls took
+3.81 / 4.44 s direct and 12.67 / 16.00 s broker. The latter includes
+gate subprocess time of 6.81 / 9.37 s on the shared host.
+
+Combining this audited group with the ten unaffected pairs gives the
+following sensitivity view. It spans one additional run on a busy host.
+The original assignments and the 10-pair comparison are preserved above.
+
+| Measure | Direct Git median / p90 | Aethyme median / p90 |
+| --- | ---: | ---: |
+| Task duration | 50.90 / 72.09 s | 62.50 / 96.13 s |
+| Uncached input tokens | 8,492.5 / 9,520 | 8,310 / 12,713 |
+| Cached input tokens | 107,328 / 117,632 | 109,248 / 257,408 |
+| Output tokens | 1,132 / 1,724 | 1,205 / 2,172 |
+| Exact-tree verification wall time | 3.58 / 4.62 s | 5.49 / 9.33 s |
+
+The median within-pair gap stayed +7.32 s. Overall median duration was
+22.8% higher and p90 was 33.3% higher. The six independent wins remain
+the same because their pairs did not change. The original and audited
+p90s show how sensitive the overall tail is to a two-pair group under
+host contention.
