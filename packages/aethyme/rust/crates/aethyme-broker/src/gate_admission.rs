@@ -236,7 +236,7 @@ pub(crate) fn admit(
             }
             return Admission::Admitted { waited };
         }
-        if waited >= bound {
+        if progress.early_verification_cancelled().is_some() || waited >= bound {
             progress.report(&format!(
                 "gate {gate_name} host load wait bound of {}s reached ({}); deferring without starting the gate",
                 bound.as_secs(),

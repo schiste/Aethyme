@@ -3808,7 +3808,10 @@ foreground diagnosis, pass the full object IDs to
 The worker checks session ownership and requires the base's trusted policy.
 It replays the pinned inputs in a separate exact-tree slot. There is one
 nonblocking worker slot per repository and a 45-second gate budget. A worker
-only runs gates that allow verdict reuse. It checks for a changed local head
+only runs gates that allow verdict reuse and have a complete execution
+profile. It yields to occupied verdict and owner locks, host resource
+queues, and configured load limits. It reports `no_verdict` when no gate
+produces a verdict. It checks for a changed local head
 or fetched base every 500 ms while gates run and interrupts its own gate
 processes when the candidate changes. Early failures do not qualify for
 cache reuse. Equivalent foreground requests can join its reusable gate work

@@ -1401,6 +1401,11 @@ impl Broker {
             simulation.history_parent.as_deref(),
         )?;
         let changed = repo.gate_scope_changed_between(base, &candidate.commit)?;
+        let selections = crate::gates::select_gates(&gates, &changed);
+        let selected = selections.len();
+        if selected == 0 {
+            return Ok(EarlyVerification::skipped("no_gates_triggered"));
+        }
         drop(replay);
         let slot_checkout = {
             let _span = crate::phase_telemetry::span("gate_preverify_checkout");
@@ -1434,8 +1439,7 @@ impl Broker {
                     self.store(),
                     &main_root,
                     &slot_checkout,
-                    &gates,
-                    &changed,
+                    selections,
                     session_id,
                     base,
                     deadline,
@@ -1450,10 +1454,11 @@ impl Broker {
         let state = if progress.0.load(Ordering::Acquire) {
             "superseded"
         } else if gate_results.is_empty() {
-            "no_gates_triggered"
-        } else if gate_results
-            .iter()
-            .any(|gate| gate.status != crate::GateStatus::Pass)
+            "no_verdict"
+        } else if gate_results.len() != selected
+            || gate_results
+                .iter()
+                .any(|gate| gate.status != crate::GateStatus::Pass)
         {
             "incomplete"
         } else {

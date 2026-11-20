@@ -1224,7 +1224,23 @@ fn early_verification_warms_pinned_submit_without_queueing() {
         "[promote]\nmode = \"verify-only\"\n",
     )
     .unwrap();
-    git(repo, &["add", ".aethyme/config.toml"]);
+    let started = origin.path().join("early-gate-started");
+    let gate_command = format!(
+        "if grep -qx 'cancellable candidate' tracked.txt; then touch '{}'; sleep 12; fi",
+        started.display(),
+    );
+    std::fs::write(
+        repo.join(".aethyme/gates.toml"),
+        format!(
+            "[[gate]]\nname = \"provenance\"\ncommand = {}\n",
+            serde_json::to_string(&gate_command).unwrap(),
+        ),
+    )
+    .unwrap();
+    git(
+        repo,
+        &["add", ".aethyme/config.toml", ".aethyme/gates.toml"],
+    );
     git(repo, &["commit", "-qm", "configure verify-only"]);
     git(repo, &["push", "-qu", "origin", "main"]);
     let base = git_output(repo, &["rev-parse", "origin/main"]);
@@ -1252,9 +1268,47 @@ fn early_verification_warms_pinned_submit_without_queueing() {
     ])))
     .unwrap();
     let id = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "cancellable candidate\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "cancellable candidate"]);
+    git(&worktree, &["push", "-qu", "origin", "HEAD"]);
+    let old_head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let args = [
+        "submit",
+        "preverify",
+        &old_head,
+        &base,
+        "--session",
+        &id,
+        "--json",
+    ];
+    let mut early_worker = common::broker_cli_for_fixture(CLI, &args, &worktree)
+        .current_dir(&worktree)
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", &root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !started.is_file()
+        && early_worker.try_wait().unwrap().is_none()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        started.is_file(),
+        "the early gate must start before superseding it"
+    );
     std::fs::write(worktree.join("tracked.txt"), "published candidate\n").unwrap();
     git(&worktree, &["add", "tracked.txt"]);
     git(&worktree, &["commit", "-qm", "candidate"]);
+    let cancelled: serde_json::Value =
+        serde_json::from_str(&stdout(early_worker.wait_with_output().unwrap())).unwrap();
+    assert_eq!(cancelled["state"], "superseded", "{cancelled}");
+    let stopped_gate = &cancelled["gates"][0];
+    assert_eq!(stopped_gate["status"], "cancelled", "{cancelled}");
+    assert_eq!(stopped_gate["cached"], false, "{cancelled}");
     git(&worktree, &["push", "-qu", "origin", "HEAD"]);
     let head = git_output(&worktree, &["rev-parse", "HEAD"]);
     let tree = git_output(&worktree, &["rev-parse", "HEAD^{tree}"]);
