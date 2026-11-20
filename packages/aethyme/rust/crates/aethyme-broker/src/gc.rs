@@ -11311,13 +11311,35 @@ impl Broker {
                     return Ok(());
                 }
             };
-            if crate::stale_session_policy::last_pass_process_table_denied() {
+            let process_table_denied =
+                crate::stale_session_policy::last_pass_process_table_denied();
+            // Sessions whose verdict did not need the process listing were
+            // judged anyway: a closed or landed session, or a keep for any
+            // other reason. Only the holder checks were deferred.
+            let judged_without_listing = report.sessions_retired > 0
+                || report.landed_sessions_examined > 0
+                || report.abandonment_sessions_closed > 0
+                || report
+                    .abandonment_sessions_kept
+                    .values()
+                    .any(|count| *count > 0);
+            if process_table_denied && judged_without_listing {
+                // Keep going: the next pass judges the sessions after these.
+                // Only the sessions kept as `holder_process_table_denied`
+                // wait for a worker that can list processes.
+                crate::phase_telemetry::add(
+                    "session_retirement_continued_process_table_denied",
+                    Duration::ZERO,
+                );
+            }
+            if process_table_denied && !judged_without_listing {
                 // This worker inherited a sandboxed caller's sandbox and
-                // cannot list processes: another pass would only defer every
-                // session again. Stop the lane with the request pending (the
-                // refusal is recorded for `broker status`), so the next
-                // worker, started by a command that can list processes or by
-                // the managed sweep, judges them.
+                // cannot list processes, and this pass judged nothing else:
+                // another pass would only defer every session again. Stop
+                // the lane with the request pending (the refusal is recorded
+                // for `broker status`), so the next worker, started by a
+                // command that can list processes or by the managed sweep,
+                // judges them.
                 crate::phase_telemetry::add(
                     "session_retirement_stopped_process_table_denied",
                     Duration::ZERO,

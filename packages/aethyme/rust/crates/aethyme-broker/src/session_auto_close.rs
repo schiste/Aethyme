@@ -3079,6 +3079,7 @@ mod lane_tests {
             Reason::StartReserved,
             Reason::LifecycleBusy,
             Reason::DeadlineReached,
+            Reason::WorkingTreeNotExamined,
             Reason::GateRunning,
             Reason::GatesUnknown,
             Reason::OperationUnresolved,
@@ -3133,6 +3134,7 @@ mod lane_tests {
                 | Reason::StartReserved
                 | Reason::LifecycleBusy
                 | Reason::DeadlineReached
+                | Reason::WorkingTreeNotExamined
                 | Reason::GateRunning
                 | Reason::GatesUnknown
                 | Reason::OperationUnresolved
@@ -3662,6 +3664,104 @@ mod lane_tests {
             broker.stale_work_class(&merged),
             crate::stale_session_policy::StaleWorkClass::Unpushed,
             "a merged pull request does not cover later commits"
+        );
+    }
+
+    /// A working-tree status that cannot be taken to the end (here a corrupt
+    /// index; in practice the lane's deadline) is "not examined": the class
+    /// is the protective one for this look only, and nothing is remembered,
+    /// so a later look is not answered "dirty" from it.
+    #[test]
+    fn a_status_that_cannot_finish_is_not_examined_and_never_remembered() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let nothing = broker.start_worktree("status cannot finish", None).unwrap();
+        quiet(&mut broker, &nothing, 80);
+        let worktree = PathBuf::from(&nothing.worktree_path);
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+            .current_dir(&worktree)
+            .output()
+            .unwrap();
+        let index = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        std::fs::write(&index, b"not an index").unwrap();
+        let (class, examined) = broker
+            .stale_work_class_examined(&nothing, crate::stale_session_policy::TreeCheck::Fresh);
+        assert_eq!(class, crate::stale_session_policy::StaleWorkClass::Unpushed);
+        assert!(!examined, "a status that failed was not an examination");
+        let remembered = broker
+            .store_ref()
+            .meta_get(crate::stale_session_policy::CLEAN_CACHE_META_KEY)
+            .unwrap()
+            .and_then(|raw| {
+                serde_json::from_str::<std::collections::BTreeMap<i64, serde_json::Value>>(&raw)
+                    .ok()
+            })
+            .unwrap_or_default();
+        assert!(
+            !remembered.contains_key(&nothing.id),
+            "a failed status must not be remembered as dirty: {remembered:?}"
+        );
+    }
+
+    /// Each open session's last keep reason is shown in `broker status`, as is
+    /// a lane that judged nothing for an hour while sessions are due, and a
+    /// retention policy that cannot be read.
+    #[test]
+    fn status_shows_why_abandoned_sessions_stay_open() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (held, _) = session(&mut broker, "held by a lease", false);
+        quiet(&mut broker, &held, 80);
+        crate::stale_session_policy::remember_keep(
+            broker.store(),
+            held.id,
+            Some(crate::stale_session_policy::KeepRecord {
+                reason: "lease_held".into(),
+                at_ms: now_ms(),
+            }),
+        );
+        let view = broker.status(now_ms()).unwrap();
+        let held_advice = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "sessions.abandonment-held")
+            .expect("held sessions are reported with their reason");
+        assert!(
+            held_advice.summary.contains("1 by lease_held"),
+            "{}",
+            held_advice.summary
+        );
+        // Nothing judged yet while the session is 80 h idle (window 72 h).
+        assert!(
+            view.advice
+                .iter()
+                .any(|advice| advice.id == "sessions.abandonment-lane-idle")
+        );
+        crate::stale_session_policy::record_abandonment_judged(broker.store(), now_ms());
+        let view = broker.status(now_ms()).unwrap();
+        assert!(
+            !view
+                .advice
+                .iter()
+                .any(|advice| advice.id == "sessions.abandonment-lane-idle")
+        );
+
+        // A fractional window cannot be read: loud, never silent.
+        std::fs::write(
+            broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 0.5\n",
+        )
+        .unwrap();
+        let view = broker.status(now_ms()).unwrap();
+        let invalid = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "retention.invalid")
+            .expect("an unreadable retention policy is reported");
+        assert!(
+            invalid.summary.contains("never closed"),
+            "{}",
+            invalid.summary
         );
     }
 

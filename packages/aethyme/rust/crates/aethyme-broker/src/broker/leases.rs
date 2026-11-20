@@ -449,6 +449,10 @@ pub(crate) enum AbandonmentKeepReason {
     LifecycleBusy,
     /// The pass deadline ran out during the running-work checks.
     DeadlineReached,
+    /// The working-tree status the work class depends on could not be taken
+    /// to the end (its deadline cut it, or Git failed): the session was not
+    /// examined this pass, and nothing about its work is recorded.
+    WorkingTreeNotExamined,
     /// A gate runs for the session.
     GateRunning,
     /// The gate inventory could not be read or verified.
@@ -541,6 +545,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "start_reserved",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::DeadlineReached => "deadline_reached",
+            Self::WorkingTreeNotExamined => "working_tree_not_examined",
             Self::GateRunning => "gate_running",
             Self::GatesUnknown => "gates_unknown",
             Self::OperationUnresolved => "operation_unresolved",
@@ -604,6 +609,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "session_abandonment_kept_start_reserved",
             Self::LifecycleBusy => "session_abandonment_kept_lifecycle_busy",
             Self::DeadlineReached => "session_abandonment_kept_deadline_reached",
+            Self::WorkingTreeNotExamined => "session_abandonment_kept_working_tree_not_examined",
             Self::GateRunning => "session_abandonment_kept_gate_running",
             Self::GatesUnknown => "session_abandonment_kept_gates_unknown",
             Self::OperationUnresolved => "session_abandonment_kept_operation_unresolved",
@@ -1776,11 +1782,23 @@ impl Broker {
         // The look under both claims decides the close: its working-tree
         // answer is taken now, never remembered (an unstaged edit or a new
         // untracked file does not change the index the memory is keyed by).
-        let class = if under_claims {
-            self.stale_work_class_fresh(session)
-        } else {
-            self.stale_work_class(session)
-        };
+        let (class, examined) = self.stale_work_class_examined(
+            session,
+            if under_claims {
+                stale::TreeCheck::Fresh
+            } else {
+                stale::TreeCheck::MayRemember
+            },
+        );
+        if !examined {
+            // Not examined is not uncommitted work: nothing is remembered,
+            // no closing-soon note is left, and the next pass asks again.
+            return Err(keep_with(
+                process_table,
+                AbandonmentKeepReason::WorkingTreeNotExamined,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
+        }
         let activity_ms = activity_ms.max(session.created_at);
         let not_due = |revisit_at_ms: Option<i64>| {
             if let Some(revisit_at_ms) = revisit_at_ms {

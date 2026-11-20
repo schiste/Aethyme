@@ -3867,6 +3867,11 @@ pub(crate) enum LiveOverlapEvidence {
     Unknown,
 }
 
+/// One page's time is split so landed proofs use at most all but
+/// `1 / ABANDONMENT_RESERVE_DIVISOR` of it; the rest is kept for the
+/// abandonment judgements of the sessions after them.
+const ABANDONMENT_RESERVE_DIVISOR: u32 = 3;
+
 fn deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
@@ -7953,6 +7958,16 @@ impl Broker {
         // landed proofs this pass, the cursor stays put, and the cheap
         // abandonment judgements go on.
         let mut cursor_pinned = false;
+        // The share of this page's time no landed proof may use: the
+        // abandonment judgements of the sessions after it need no Git and
+        // run in it. One landed proof took 13 s of a 30 s pass on the busiest
+        // repository and left the rest of the page unjudged.
+        let mut landed_reserve_reached = false;
+        // The lane's "last judged" stamp is written once per pass.
+        let mut judged_stamped = false;
+        let abandonment_reserve = deadline.map(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) / ABANDONMENT_RESERVE_DIVISOR
+        });
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -7987,11 +8002,31 @@ impl Broker {
             let landed_backed_off = landed_backoff
                 .get(&session.id)
                 .is_some_and(|(_, until)| *until > now);
+            // A landed proof starts only while more than the abandonment
+            // reserve is left, and must finish before the reserve begins.
+            let landed_deadline = match (deadline, abandonment_reserve) {
+                (Some(deadline), Some(reserve)) => {
+                    Some(deadline.checked_sub(reserve).unwrap_or(deadline))
+                }
+                (deadline, _) => deadline,
+            };
+            if !landed_reserve_reached && deadline_expired(landed_deadline) {
+                // No more landed proofs this pass. The cursor is not held for
+                // them: the sessions after this one are judged for
+                // abandonment, and their landed proofs come in a later lap
+                // (or the likely-landed queue).
+                crate::phase_telemetry::add(
+                    "landed_proof_stopped_for_abandonment_reserve",
+                    Duration::ZERO,
+                );
+                landed_reserve_reached = true;
+            }
             if landed_backed_off {
                 crate::phase_telemetry::add("landed_proof_budget_backed_off", Duration::ZERO);
             }
             let idle_enough_for_landed = landed_window_ms > 0
                 && !cursor_pinned
+                && !landed_reserve_reached
                 && !landed_backed_off
                 && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
@@ -8058,6 +8093,11 @@ impl Broker {
                 }
                 if closed {
                     summary.abandonment_closed += 1;
+                    crate::stale_session_policy::remember_keep(self.store(), session.id, None);
+                    if !judged_stamped {
+                        crate::stale_session_policy::record_abandonment_judged(self.store(), now);
+                        judged_stamped = true;
+                    }
                 } else {
                     // The close path counted `session_abandonment_kept_<reason>`
                     // already; the summary carries the same breakdown to
@@ -8065,6 +8105,20 @@ impl Broker {
                     let reason = holder_process_table
                         .keep_reason()
                         .unwrap_or(crate::broker::AbandonmentKeepReason::Unrecorded);
+                    crate::stale_session_policy::remember_keep(
+                        self.store(),
+                        session.id,
+                        Some(crate::stale_session_policy::KeepRecord {
+                            reason: reason.code().to_string(),
+                            at_ms: now,
+                        }),
+                    );
+                    if reason != crate::broker::AbandonmentKeepReason::HolderProcessTableDenied
+                        && !judged_stamped
+                    {
+                        crate::stale_session_policy::record_abandonment_judged(self.store(), now);
+                        judged_stamped = true;
+                    }
                     if reason == crate::broker::AbandonmentKeepReason::HolderProcessTableDenied {
                         // A pass refused the process listing (a worker started
                         // from a sandboxed caller) is no evidence about the
@@ -8121,7 +8175,7 @@ impl Broker {
                         landed_window_ms,
                         &mut holder_process_table,
                         allow_snapshot,
-                        deadline,
+                        landed_deadline,
                     )?
                 };
                 let elapsed = started.elapsed();
