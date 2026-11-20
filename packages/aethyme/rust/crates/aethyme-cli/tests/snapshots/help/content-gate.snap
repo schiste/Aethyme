@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+aethyme content-gate — evaluate an Aexeo v1 content change
+
+  aethyme content-gate run <manifest.json>
+    Run an uncached content check against a fresh verdict and current inputs.
+    The publication host must revalidate and synchronize the final decision.
+--- stderr

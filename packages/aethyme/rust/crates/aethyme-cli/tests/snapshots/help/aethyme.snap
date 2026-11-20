@@ -14,6 +14,10 @@ Hot path:
   verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
                               bounded source spans for Explore targets
 
+Content checks:
+  content-gate run <manifest.json>
+                              evaluate an uncached Aexeo content change
+
 Agent broker:
   broker start --task <text> --short-name <name>
                               create an isolated worktree + session

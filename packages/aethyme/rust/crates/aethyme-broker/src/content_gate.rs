@@ -2,6 +2,8 @@
 //!
 //! Success is not permission to publish: validate the complete JSON schemas and
 //! independently bind all other decision inputs at the publication boundary.
+pub mod strict;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;

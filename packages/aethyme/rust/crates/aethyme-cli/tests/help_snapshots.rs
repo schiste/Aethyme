@@ -18,6 +18,7 @@ use support::snapshots::assert_snapshots;
 use aethyme_broker::cli::{ADVANCED_VERBS, PUBLIC_VERBS, public_forms};
 
 const TOP_LEVEL: &[&str] = &[
+    "content-gate",
     "explore",
     "verify-targets",
     "explore-summary",
