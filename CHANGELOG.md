@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.141] - 2026-11-20
+
+### Fixed
+
+- The retirement lap no longer spends its time on checkouts it cannot retire. On the busiest repository a lap judged a median of 4 checkouts per run: about two thirds of its time went to `git status` plans that timed out at about 14.5 s each, and in some runs a single operation-state Git call took the whole 45 s. The run's open-file observation is now consulted before any Git call, so a checkout held open by a process is kept at no cost and the lap moves on (#1874).
+- A checkout whose `git status` failed or timed out on its own is remembered with the existing keep back-off (1 h, 6 h, then 24 h, or at once when HEAD or the index changes) instead of being inspected again on the next run. A Git call cut short by the lap's own deadline is kept as `deadline` and not remembered. Which checkouts may be retired is unchanged (#1874).
+
+### Added
+
+- Per-run fields on the `checkout_retirement` attachment: `closed_examined`, `closed_stop` (`deadline`, `lap_complete`, `process_use_unknown` or `archive_deferred`) and `failed_inspection_ms`; counters `checkout_retirement_closed_lap_stop_<reason>` (#1874).
+
+### Upgrade notes
+
+- The counter `checkout_retirement_inspection_retried` is removed. It only ever meant "inspected again on a later run".
+
+### Known issues
+
+- A checkout held open by another process, for example a file browser window showing the pool, still cannot be retired. On the busiest repository that is the largest remaining reason checkouts are kept.
+
 ## [0.8.140] - 2026-11-19
 
 ### Fixed
