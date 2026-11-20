@@ -515,12 +515,20 @@ pub(crate) fn submit(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
-    coordinator: Option<i64>,
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
-    submit_with(broker, session, cache, coordinator, None, &mut || {})
+    submit_with(broker, session, cache, None, None, &mut || {})
 }
 
-/// [`submit`] with the store opener injected, and `between` run after the
+pub(crate) fn submit_queued(
+    broker: &mut crate::Broker,
+    session: i64,
+    cache: crate::CachePolicy,
+    coordinator: i64,
+) -> Result<CaptureSubmit, crate::BrokerOpError> {
+    submit_with(broker, session, cache, Some(coordinator), None, &mut || {})
+}
+
+/// Submit with the store opener injected, and `between` run after the
 /// capture inputs are read and before the submit pins its head, so a test
 /// can move the session there.
 fn submit_with(

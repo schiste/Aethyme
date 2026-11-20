@@ -441,16 +441,17 @@ pub(super) fn run_submit(parsed: Parsed, coordinator: Option<i64>) -> Result<(),
     // Discard timings from any earlier submit in this process.
     drop(crate::submit_progress::take_phase_timings());
     let submit_started = std::time::Instant::now();
-    let submitted = crate::collaboration_submit::submit(
-        &mut broker,
-        session,
-        if parsed.no_cache {
-            crate::CachePolicy::Bypass
-        } else {
-            crate::CachePolicy::Use
-        },
-        coordinator,
-    );
+    let cache = if parsed.no_cache {
+        crate::CachePolicy::Bypass
+    } else {
+        crate::CachePolicy::Use
+    };
+    let submitted = match coordinator {
+        Some(coordinator) => {
+            crate::collaboration_submit::submit_queued(&mut broker, session, cache, coordinator)
+        }
+        None => crate::collaboration_submit::submit(&mut broker, session, cache),
+    };
     let mut phases = crate::submit_progress::take_phase_timings().unwrap_or_default();
     phases.insert("broker_open".into(), open_ms);
     phases.insert("contract_preflight".into(), preflight_ms);
