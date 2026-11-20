@@ -56,14 +56,19 @@ content-gate.json`. A generic broker command gate cannot run that entrypoint:
 the entrypoint requires the broker's native uncached marker when inside a gate.
 
 The manifest is a JSON object with required fields `change`, `policy`, `options`,
-`collection`, `external`, `additional`, `content`, `validator`, `env` and
+`collection`, `external`, `additional`, `content`, `validator`, `required_checks`, `env` and
 `timeout_seconds`. Paths are interpreted relative to the runner's current
 working directory. `collection` and `external` are paths or explicit `null`;
 `additional` maps names to paths for every other input; `content` maps each
 entity ID to its candidate filesystem path, including the path that must be
 absent for a deletion. `validator` is a nonempty argument vector starting with
 an absolute executable path. `env` is the complete environment passed to the
-validator (the runner adds the two protocol variables). The validator deadline
+validator (the runner adds the two protocol variables). `required_checks` is a
+nonempty array of distinct check IDs selected by the host. Each ID must appear
+in the verdict and every matching check must be blocking and passed. Hosts must
+update existing manifests to declare these IDs; omitting them fails closed. IDs
+are exact verdict check IDs, including Aexeo entity scoping; select them from
+the actual preset and candidate rather than copying an example. The validator deadline
 is between 1 and 3600 seconds and should be no longer than the gate deadline.
 
 The runner takes fresh input snapshots, hashes the validator executable, invokes
@@ -91,6 +96,7 @@ its actual inputs):
   "additional": {},
   "content": { "article-123": "candidate/article.md" },
   "validator": ["/usr/local/bin/aexeo-cli", "content-change", "--preset", "news", "--preset-source", "news=candidate/editorial.toml"],
+  "required_checks": ["gate:11:article-123:news.minimum_words"],
   "env": { "PATH": "/usr/bin:/bin" },
   "timeout_seconds": 45
 }
