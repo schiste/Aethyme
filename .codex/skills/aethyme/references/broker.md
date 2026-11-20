@@ -195,6 +195,11 @@ blocked.
    different committed policy. Give the human the `next_action` for the
    checkout policy in the status output. Retry the operation once that
    checkout reports trusted.
+   When staging a disposable Playground, run its broker commands, including
+   trust setup, with the Playground as their working directory. Clear inherited
+   broker and Git routing before setting fixture-owned state and worktree paths.
+   Passing the fixture to `--repo` alone can still bind the command to the
+   session in the caller's current checkout.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.

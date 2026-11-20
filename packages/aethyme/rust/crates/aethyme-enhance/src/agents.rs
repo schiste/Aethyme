@@ -723,6 +723,11 @@ blocked.
    pinned installs the repository declares), with lockfiles unchanged -- no
    dependency upgrades, additions or lockfile edits. Anything else still needs
    the owner. When the key is `false`, ask the owner before preparing.
+   When staging a disposable Playground, run its broker commands, including
+   trust setup, with the Playground as their working directory. Clear inherited
+   broker and Git routing before setting fixture-owned state and worktree paths.
+   Passing the fixture to `--repo` alone can still bind the command to the
+   session in the caller's current checkout.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
