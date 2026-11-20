@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.144] - 2026-11-20
+
+### Changed
+
+- `finish` retires the checkout with one rename. When `finish` has proven the checkout clean and delivered, it now moves it into the checkout trash under the lifecycle claim instead of removing it file by file with `git worktree remove`. On the busiest repository 45% of finishes removed the checkout, at a median 48 s under the repository-wide claim, so every other start and finish waited. The Git registration is removed and reflog-only commits are pinned first, the clean check is repeated immediately before the move, and anything the move refuses falls back to `git worktree remove` as before. The trash deleter removes the entry later, and only once no process uses it (#1895).
+- Closed checkouts are judged by a dedicated process. The worker starts `broker gc __retire-lane` when closed checkouts wait: one per repository, normal disk priority and reduced CPU priority, one Git inspection at a time per volume, in 5-minute slices paced by host pressure, ending when the backlog is done, at critical memory pressure or after 60 minutes. It calls the worker's own judgement with the same keeps, back-off and inspection allowance, and which checkouts may be retired is unchanged. The worker's own laps and the lane are exclusive through one kernel lock (#1897).
+
+### Added
+
+- When `finish` keeps a checkout it records why on the session: `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`, `policy_disabled`, `cleanup_plan_unsafe` or `removal_failed` (#1895).
+- Span `finish_retire_move`; counters `finish_retire_trashed`, `finish_retire_git_fallback`, `finish_retire_kept_<reason>`, `finish_retire_holder_check_deferred_to_deleter` and `checkout_retirement_judged_after_finish_keep` (#1895).
+- Metric row `gc.__retire-lane` with `examined`, `retired`, `kept` by reason, inspection counts, `median_inspection_ms`, `slices`, `paced_slices`, `end_reason` and `elapsed_ms`; stop reasons `not_reached_lane_process` and `volume_turn_unavailable`; counter `checkout_retirement_volume_turn_yielded` (#1897).
+
+### Upgrade notes
+
+- Right after `finish`, the finished checkout's bytes are still on disk in the pool's trash until the deleter removes them, so storage reports that root as not yet empty for a short time.
+- A process whose working directory is a finished checkout sees the directory renamed, not its files deleted.
+
 ## [0.8.143] - 2026-11-20
 
 ### Fixed
