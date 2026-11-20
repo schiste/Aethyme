@@ -1,6 +1,10 @@
 //! Version-pinned schema and decision-input checks for Aexeo v1.
 use super::{SubjectPrechecked, precheck_v1};
-use std::{collections::BTreeMap, fmt, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::OnceLock,
+};
 
 const CHANGE_SCHEMA: &str = include_str!("change.schema.json");
 const VERDICT_SCHEMA: &str = include_str!("verdict.schema.json");
@@ -66,6 +70,23 @@ pub fn strict_precheck_v1(
         return Err("verdict schema invalid");
     }
     let checks = result["checks"].as_array().ok_or("invalid checks")?;
+    // IDs identify individual check instances, including the host-required
+    // checks. Ambiguous or dangling references cannot support a safe precheck.
+    let mut check_ids = BTreeSet::new();
+    for check in checks {
+        let id = check["id"].as_str().ok_or("invalid check ID")?;
+        if !check_ids.insert(id) {
+            return Err("duplicate check ID");
+        }
+    }
+    for finding in result["findings"].as_array().ok_or("invalid findings")? {
+        if let Some(id) = finding.get("check_id") {
+            let id = id.as_str().ok_or("invalid finding check ID")?;
+            if !check_ids.contains(id) {
+                return Err("finding references unknown check");
+            }
+        }
+    }
     let count = |status: &str| {
         checks
             .iter()
@@ -226,6 +247,68 @@ mod tests {
         );
         assert!(strict_precheck_v1(&before, &before, &verdict, Some(0), true, &content).is_err());
         assert!(strict_precheck_v1(&before, &before, &verdict, Some(2), false, &content).is_err());
+    }
+    #[test]
+    fn rejects_ambiguous_check_and_finding_references() {
+        let (before, bytes, content) = fixture();
+        let mut verdict: Value = serde_json::from_slice(&bytes).unwrap();
+        let check = verdict["checks"][0].clone();
+        verdict["checks"].as_array_mut().unwrap().push(check);
+        verdict["summary"]["checks"] = json!(2);
+        verdict["summary"]["passed"] = json!(2);
+        assert_eq!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                verdict.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            ),
+            Err("duplicate check ID")
+        );
+        verdict["checks"].as_array_mut().unwrap().pop();
+        verdict["summary"]["checks"] = json!(1);
+        verdict["summary"]["passed"] = json!(1);
+        verdict["findings"] = json!([{ "rule_id": "r", "severity": "info", "message": "note", "check_id": "missing" }]);
+        assert_eq!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                verdict.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            ),
+            Err("finding references unknown check")
+        );
+        verdict["findings"][0]["check_id"] = json!("x");
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                verdict.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            )
+            .is_ok()
+        );
+        verdict["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("check_id");
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                verdict.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn checks_documents_and_every_declared_input() {
