@@ -115,3 +115,12 @@ evaluation: a file could change temporarily and be restored between reads. The
 host must supply immutable snapshots, or otherwise prevent concurrent mutation
 while the validator reads them, and retain the same protection through the
 publication-time check. The runner does not establish that guarantee itself.
+
+
+## Experimental offline v2 comparison
+
+`aethyme content-gate compare-v2 manifest.json` compares two draft v2 envelopes against independently acquired host inputs. It is forbidden inside broker gates and always reports `publication_authorized: false`. Exit 0 means evidence matched; exit 2 means it did not match or could not be checked. This is not a publication decision.
+
+The JSON manifest has path fields `previous`, `fresh`, `base`, `after`, `change`, `resolved_policy`, `host_options`, `evaluator_identity`, and `collection` (a path or explicit null); string fields `validator_name` and `validator_version`; an array of distinct `required_checks`; and `fresh_exit_code` (integer or explicit null) and `fresh_timed_out` (boolean). Paths are interpreted relative to the process working directory. `base` is the host snapshot JSON and `after` is an array of changed item projections. Inputs are size bounded and JSON duplicate keys are rejected.
+
+The command reads files supplied by the caller: it does not run or authenticate the evaluator, establish freshness, prove inventory completeness, or synchronize with publication. In particular the process status in the manifest is a caller assertion. The host must independently establish and protect all inputs, including collection provenance; external evidence is not supported. Files are read separately and may change during the operation.

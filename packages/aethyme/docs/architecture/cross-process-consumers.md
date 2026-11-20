@@ -3926,3 +3926,8 @@ and the `remote_branch_cleanup` field of `gc sweep --json` use schema
 `planned`. `gc sweep --json` also adds `session_stack_failures` when a stacked session's parent
 could not be re-read. Stack notes come from sender
 `automation:session-stack`.
+
+
+### Offline content-gate v2 comparison telemetry
+
+The standalone `content-gate compare-v2` command emits `timings_ms` in its JSON result: `input_read_and_parse_ms`, `compare_ms`, and `total_ms`. Failed input parsing can omit phases not reached. These measurements contain no input paths or content. This standalone command is not a broker gate and does not use the broker command recorder.
