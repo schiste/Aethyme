@@ -1246,11 +1246,18 @@ fn early_verification_warms_pinned_submit_without_queueing() {
     let base = git_output(repo, &["rev-parse", "origin/main"]);
 
     let publication = run(repo, &["advance", "--pr", "--preverify", "--json"]);
-    assert!(!publication.status.success());
-    let error = String::from_utf8_lossy(&publication.stderr);
-    assert!(
-        error.contains("advance requires a live session in this repository"),
-        "{error}"
+    let output = String::from_utf8_lossy(&publication.stdout);
+    assert_eq!(
+        publication.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::REFUSED)),
+        "stdout={output}\nstderr={}",
+        String::from_utf8_lossy(&publication.stderr),
+    );
+    let refusal: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(refusal["schema"], "aethyme.broker-error/v1");
+    assert_eq!(
+        refusal["error"]["message"],
+        "advance requires a live session in this repository",
     );
 
     let root = bind_fixture_worktree_root(repo, tmp.owner_path());
