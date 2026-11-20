@@ -1210,6 +1210,157 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
 }
 
 #[test]
+fn early_verification_warms_pinned_submit_without_queueing() {
+    let tmp = fixture();
+    let repo = tmp.path();
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "--bare", "-qb", "main"]);
+    git(
+        repo,
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"verify-only\"\n",
+    )
+    .unwrap();
+    let started = origin.path().join("early-gate-started");
+    let gate_command = format!(
+        "if grep -qx 'cancellable candidate' tracked.txt; then touch '{}'; sleep 12; fi",
+        started.display(),
+    );
+    std::fs::write(
+        repo.join(".aethyme/gates.toml"),
+        format!(
+            "[[gate]]\nname = \"provenance\"\ncommand = {}\n",
+            serde_json::to_string(&gate_command).unwrap(),
+        ),
+    )
+    .unwrap();
+    git(
+        repo,
+        &["add", ".aethyme/config.toml", ".aethyme/gates.toml"],
+    );
+    git(repo, &["commit", "-qm", "configure verify-only"]);
+    git(repo, &["push", "-qu", "origin", "main"]);
+    let base = git_output(repo, &["rev-parse", "origin/main"]);
+
+    let publication = run(repo, &["advance", "--pr", "--preverify", "--json"]);
+    let output = String::from_utf8_lossy(&publication.stdout);
+    assert_eq!(
+        publication.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::REFUSED)),
+        "stdout={output}\nstderr={}",
+        String::from_utf8_lossy(&publication.stderr),
+    );
+    let refusal: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(refusal["schema"], "aethyme.broker-error/v1");
+    assert_eq!(
+        refusal["error"]["message"],
+        "advance requires a live session in this repository",
+    );
+
+    let root = bind_fixture_worktree_root(repo, tmp.owner_path());
+    let worktree = root.join("early-cache");
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "agent/early-cache",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let run = |args: &[&str]| run_with_managed_worktree_root(&worktree, &root, args);
+    let adopted: serde_json::Value = serde_json::from_str(&stdout(run(&[
+        "start",
+        "--adopt",
+        "--task",
+        "verify pinned candidate early",
+        "--json",
+    ])))
+    .unwrap();
+    let id = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "cancellable candidate\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "cancellable candidate"]);
+    git(&worktree, &["push", "-qu", "origin", "HEAD"]);
+    let old_head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let args = [
+        "submit",
+        "preverify",
+        &old_head,
+        &base,
+        "--session",
+        &id,
+        "--json",
+    ];
+    let mut early_worker = common::broker_cli_for_fixture(CLI, &args, &worktree)
+        .current_dir(&worktree)
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", &root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !started.is_file()
+        && early_worker.try_wait().unwrap().is_none()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        started.is_file(),
+        "the early gate must start before superseding it"
+    );
+    std::fs::write(worktree.join("tracked.txt"), "published candidate\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "candidate"]);
+    let cancelled: serde_json::Value =
+        serde_json::from_str(&stdout(early_worker.wait_with_output().unwrap())).unwrap();
+    assert_eq!(cancelled["state"], "superseded", "{cancelled}");
+    let stopped_gate = &cancelled["gates"][0];
+    assert_eq!(stopped_gate["status"], "cancelled", "{cancelled}");
+    assert_eq!(stopped_gate["cached"], false, "{cancelled}");
+    git(&worktree, &["push", "-qu", "origin", "HEAD"]);
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let tree = git_output(&worktree, &["rev-parse", "HEAD^{tree}"]);
+
+    let early: serde_json::Value = serde_json::from_str(&stdout(run(&[
+        "submit",
+        "preverify",
+        &head,
+        &base,
+        "--session",
+        &id,
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(early["state"], "ready", "{early}");
+    assert_eq!(early["gates"][0]["tree_hash"], tree, "{early}");
+    assert_eq!(early["gates"][0]["cached"], false, "{early}");
+    assert!(
+        common::open_fixture_repository_broker(&tmp)
+            .unwrap()
+            .store()
+            .merge_queue()
+            .unwrap()
+            .is_empty()
+    );
+
+    let submitted: serde_json::Value =
+        serde_json::from_str(&stdout(run(&["submit", "--session", &id, "--json"]))).unwrap();
+    assert_eq!(submitted["entry"]["merged_tree"], tree, "{submitted}");
+    assert_eq!(submitted["gate_outcomes"][0]["cached"], true, "{submitted}");
+    assert_eq!(
+        submitted["gate_outcomes"][0]["run_id"],
+        early["gates"][0]["run_id"]
+    );
+}
+
+#[test]
 fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
     let tmp = fixture();
     let counter = tmp.path().join("submit-runs.txt");
