@@ -33,6 +33,15 @@ pub fn parse_unique(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         serde_json::from_slice(bytes).map_err(|_| "invalid or duplicate JSON")?;
     Ok(value)
 }
+/// Parse and validate a v1 change with the pinned schema.
+/// Callers needing a closed profile must also reject unsupported fields.
+pub fn parse_change(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
+    let change = parse_unique(bytes)?;
+    if !validator(CHANGE_SCHEMA, &CHANGE_VALIDATOR).is_valid(&change) {
+        return Err("change schema invalid");
+    }
+    Ok(change)
+}
 /// Exact, host-collected bytes of all other known decision inputs. An absent
 /// collection or external result is different from an empty one. The host is
 /// responsible for including any additional inputs and establishing their origin.
