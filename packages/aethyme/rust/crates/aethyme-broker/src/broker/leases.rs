@@ -1646,6 +1646,11 @@ impl Broker {
                     "session_abandonment_safe_closed",
                     std::time::Duration::ZERO,
                 );
+                crate::stale_session_policy::record_early_close(
+                    self.store(),
+                    session_id,
+                    crate::clock::epoch_ms(),
+                );
             }
             process_table.clear_keep_reason();
             self.retire_inline_after_close(session_id, deadline);
@@ -3979,6 +3984,24 @@ impl Broker {
         // new uncommitted work since the first look changes its window.
         let stale_class = if lane == SessionCloseLane::Abandonment {
             match self.stale_class_gate(&current, activity_at, observed_at, process_table, true) {
+                // The early-close rule first held here, under the claims,
+                // after the process checks ran on the first look's verdict
+                // (no rule held then): they may have exempted the holder's
+                // working directory or skipped the open-file observation. An
+                // early close needs those checks without the exemption, so
+                // this look keeps the session; the next pass starts from the
+                // rule holding and runs them in full.
+                Ok(_) if process_table.early_safe_close() && !early_safe => {
+                    crate::phase_telemetry::add(
+                        "session_abandonment_early_rule_first_held_under_claims",
+                        std::time::Duration::ZERO,
+                    );
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::WorkClassNotDue,
+                        AbandonedSessionCloseOutcome::NotDue,
+                    ));
+                }
                 Ok(class) => Some(class),
                 Err(kept) => return Ok(kept),
             }
@@ -4056,7 +4079,13 @@ impl Broker {
                         crate::session_auto_close::CLOSE_REASON_INACTIVE_NO_WORK,
                     )
                 } else if let Some(class) = stale_class {
-                    crate::session_auto_close::with_work_class(&payload, class.code())
+                    let payload =
+                        crate::session_auto_close::with_work_class(&payload, class.code());
+                    if process_table.early_safe_close() {
+                        crate::session_auto_close::with_early_close(&payload)
+                    } else {
+                        payload
+                    }
                 } else {
                     payload
                 }

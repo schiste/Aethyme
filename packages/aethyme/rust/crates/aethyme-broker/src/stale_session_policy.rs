@@ -448,6 +448,67 @@ pub(crate) fn abandonment_last_judged_at(store: &crate::BrokerStore) -> Option<i
     meta_ms(store, LAST_JUDGED_META_KEY)
 }
 
+/// Sessions the early-close rule closed, and when (`{session: at_ms}`).
+pub(crate) const EARLY_CLOSED_META_KEY: &str = "stale_sessions.early_closed";
+/// Sessions resumed (`start --reuse`) within [`EARLY_RESUME_WINDOW_MS`] of
+/// an early close, and when.
+pub(crate) const EARLY_RESUMED_META_KEY: &str = "stale_sessions.early_resumed";
+/// A resume this soon after an early close says the session was still
+/// wanted.
+pub(crate) const EARLY_RESUME_WINDOW_MS: i64 = 24 * HOUR_MS;
+
+/// Every remembered `{session: at_ms}` under `key`; unreadable is empty.
+pub(crate) fn read_session_times(store: &crate::BrokerStore, key: &str) -> BTreeMap<i64, i64> {
+    store
+        .meta_get(key)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<BTreeMap<i64, i64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn remember_session_time(store: &mut crate::BrokerStore, key: &str, session_id: i64, at_ms: i64) {
+    update_without_waiting(store, key, |raw| {
+        let mut times = raw
+            .and_then(|raw| serde_json::from_str::<BTreeMap<i64, i64>>(raw).ok())
+            .unwrap_or_default();
+        times.retain(|_, at| at_ms.saturating_sub(*at) < 7 * 24 * HOUR_MS);
+        times.insert(session_id, at_ms);
+        while times.len() > CLASSES_MAX {
+            times.pop_first();
+        }
+        Some(serde_json::to_string(&times).unwrap_or_default())
+    });
+}
+
+/// Record an early close of `session_id` (best effort).
+pub(crate) fn record_early_close(store: &mut crate::BrokerStore, session_id: i64, at_ms: i64) {
+    remember_session_time(store, EARLY_CLOSED_META_KEY, session_id, at_ms);
+}
+
+/// Record a resume of `session_id` when it was closed early within
+/// [`EARLY_RESUME_WINDOW_MS`], counting
+/// `session_abandonment_safe_closed_then_resumed`; true when it was.
+pub(crate) fn record_resume_after_early_close(
+    store: &mut crate::BrokerStore,
+    session_id: i64,
+    at_ms: i64,
+) -> bool {
+    let closed_at = read_session_times(store, EARLY_CLOSED_META_KEY)
+        .get(&session_id)
+        .copied();
+    let soon =
+        closed_at.is_some_and(|closed| at_ms.saturating_sub(closed) < EARLY_RESUME_WINDOW_MS);
+    if soon {
+        crate::phase_telemetry::add(
+            "session_abandonment_safe_closed_then_resumed",
+            Duration::ZERO,
+        );
+        remember_session_time(store, EARLY_RESUMED_META_KEY, session_id, at_ms);
+    }
+    soon
+}
+
 /// Remember `record` for `session_id` (best effort, never waiting on another
 /// database writer), keeping the newest [`CLASSES_MAX`] sessions.
 pub(crate) fn remember_class(store: &mut crate::BrokerStore, session_id: i64, record: ClassRecord) {

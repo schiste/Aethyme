@@ -442,6 +442,27 @@ The work-class classification no longer drops a tip equal to the diff base.
 An adopted session whose HEAD carries commits nobody pushed is now `unpushed`,
 not `landed`.
 
+- **Checked under the claims before closing.** If the rule fails on the
+  first look but holds under the claims, the session is kept for that look
+  (`session_abandonment_early_rule_first_held_under_claims`), because the
+  process checks ran without the early-close strictness. The next pass starts
+  from the rule holding and runs them in full.
+- **Hidden index entries.** An entry flagged assume-unchanged or skip-worktree
+  hides changes from status, so such a checkout counts as not examined.
+- **Diff base.** The exemption differs by place. The early rule exempts no tip
+  equal to the diff base. The work-class computation, which only picks the
+  class window, drops such a tip when the base is contained in the upstream
+  default branch or in the primary checkout's HEAD.
+- **Reading the rule without a waiting period.** Each early close is recorded
+  on its `session.abandoned` event as `early_close: {rule:
+  "nothing_on_the_session_can_be_lost", checks: [...]}`, listing the checks it
+  passed. The meta key `stale_sessions.early_closed` holds `{session:
+  at_ms}`. A `start --reuse` within 24 h of an early close counts
+  `session_abandonment_safe_closed_then_resumed` and is recorded in
+  `stale_sessions.early_resumed`. `broker status` attaches
+  `session_abandonment_early_close_24h: {closed, resumed_within_24h}` and
+  warns with `sessions.early-close-resumed` when any were resumed: the agent
+  still wanted the session.
 - **Counters (introduced).**
   - `session_abandonment_safe_closed`: a session closed by the early rule.
   - `session_abandonment_kept_unsafe_<reason>`, where `<reason>` is one of

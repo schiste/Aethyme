@@ -6342,6 +6342,14 @@ impl Broker {
                     let (default_branch, default_branch_note) = self
                         .default_branch_after_reuse(&checkout, &session, prefetched, &freshness);
                     let lease_overlaps = self.planned_lease_overlaps(session.id, &planned_paths);
+                    // Was this session closed early by the idle rule only
+                    // hours ago? Then it was still wanted: counted, and shown
+                    // in `broker status`.
+                    crate::stale_session_policy::record_resume_after_early_close(
+                        self.store(),
+                        session.id,
+                        crate::clock::epoch_ms(),
+                    );
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,

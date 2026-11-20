@@ -56,6 +56,36 @@ pub(crate) fn with_work_class(payload: &str, work_class: &str) -> String {
     value.to_string()
 }
 
+/// The checks of the early-close rule a close before the class window
+/// passed, in the order they ran, as recorded on its `session.abandoned`
+/// event (`early_close`).
+pub(crate) const EARLY_CLOSE_CHECKS: [&str; 7] = [
+    "no_operation_in_progress",
+    "no_stash_on_branch",
+    "head_and_branch_contained",
+    "no_staged_change",
+    "no_unstaged_change",
+    "no_hidden_index_entries",
+    "no_untracked_file",
+];
+
+/// Mark a close payload as an early close: before the work-class window,
+/// because nothing on the session could be lost.
+pub(crate) fn with_early_close(payload: &str) -> String {
+    let mut value: Value =
+        serde_json::from_str(payload).unwrap_or_else(|_| Value::Object(Default::default()));
+    if let Value::Object(fields) = &mut value {
+        fields.insert(
+            "early_close".into(),
+            json!({
+                "rule": "nothing_on_the_session_can_be_lost",
+                "checks": EARLY_CLOSE_CHECKS,
+            }),
+        );
+    }
+    value.to_string()
+}
+
 /// The pull requests recorded for one session, from
 /// `BrokerStore::session_pull_request_merges`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4243,12 +4273,36 @@ mod lane_tests {
         git(&tree, &["stash", "push", "-q"]);
         fixtures.push(("stash", stash, Some(UnsafeReason::Stash)));
 
+        // A real interactive rebase, stopped at a `break` before replaying
+        // anything: the checkout is clean and HEAD contained, only the
+        // in-progress rebase shows.
         let (rebase, tree) = start(broker, "rebase in progress");
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(["rebase", "-i", "HEAD"])
+            .current_dir(&tree)
+            .env("GIT_SEQUENCE_EDITOR", "sh -c 'echo break > \"$1\"' sh")
+            .output()
+            .unwrap();
         let git_dir = crate::git::checked_worktree_git_dir(&tree)
             .unwrap()
             .unwrap();
-        std::fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+        assert!(
+            git_dir.join("rebase-merge").is_dir(),
+            "the rebase must be stopped mid-way"
+        );
         fixtures.push(("rebase", rebase, Some(UnsafeReason::InProgress)));
+
+        // A change status cannot see: the file is flagged assume-unchanged.
+        let (hidden, tree) = start(broker, "assume-unchanged edit");
+        std::fs::write(tree.join("base.txt"), "hidden change\n").unwrap();
+        git(&tree, &["update-index", "--assume-unchanged", "base.txt"]);
+        fixtures.push(("assume_unchanged", hidden, Some(UnsafeReason::NotExamined)));
 
         // The branch holds an unpushed commit while HEAD sits detached on
         // the (contained) base: only the branch shows it.
@@ -4349,6 +4403,7 @@ mod lane_tests {
             (SafetyCheck::HeadContained, "detached_head"),
             (SafetyCheck::DiffBaseNotExempt, "adopted"),
             (SafetyCheck::RemoteAsked, "stale_tracking_ref"),
+            (SafetyCheck::IndexFlags, "assume_unchanged"),
         ];
         for (check, hazard) in expected {
             crate::abandonment_safety::neuter_for_test(Some(check));
@@ -4388,11 +4443,19 @@ mod lane_tests {
         }
     }
 
-    /// A safe session closed at one hour resumes exactly: `start --reuse`
-    /// finds the same HEAD, an empty diff, and every commit it could reach.
+    /// A safe session closed at one hour resumes exactly through the path
+    /// `start --reuse` takes: its retired checkout is recreated from the
+    /// branch (`recreate_retired_checkout`, as the CLI does), then the session
+    /// is reused, with the same HEAD, a clean status and every commit it
+    /// could reach. The close is recorded with its reason trail, and the
+    /// resume within a day is counted and advised.
     #[test]
     fn a_session_closed_at_one_hour_resumes_exactly() {
-        let (_owner, _storage, mut broker) = early_fixture();
+        let (_owner, _storage, mut broker) = fixture("closed_worktree_grace_hours = 0\n");
+        shipped_class_windows(&broker);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
         let session = broker
             .start_worktree("closed early, then reused", None)
             .unwrap();
@@ -4419,11 +4482,25 @@ mod lane_tests {
             "{reason:?}"
         );
         assert!(!is_open(&broker, session.id));
+        assert_eq!(
+            close_payload(&broker, session.id)["early_close"]["rule"],
+            "nothing_on_the_session_can_be_lost"
+        );
 
+        broker.retire_inline_after_close(
+            session.id,
+            Some(std::time::Instant::now() + Duration::from_secs(600)),
+        );
+        assert!(
+            !tree.exists() || crate::broker::is_checkout_tombstone(&tree),
+            "the checkout is retired, so reuse takes the restore path"
+        );
+        assert!(broker.recreate_retired_checkout(&tree).unwrap());
         let reused = broker
             .adopt_with(&tree, Some("follow-up"), crate::AdoptMode::Reuse, None)
             .unwrap()
             .session;
+        assert_eq!(reused.id, session.id);
         let reused_tree = PathBuf::from(&reused.worktree_path);
         assert_eq!(head_of(&reused_tree), head);
         let status = Command::new("git")
@@ -4442,6 +4519,51 @@ mod lane_tests {
             "commits became unreachable: {:?}",
             before.difference(&after).collect::<Vec<_>>()
         );
+        assert!(
+            crate::stale_session_policy::read_session_times(
+                broker.store_ref(),
+                crate::stale_session_policy::EARLY_RESUMED_META_KEY
+            )
+            .contains_key(&session.id),
+            "a resume within a day of an early close is recorded"
+        );
+        let view = broker.status(now_ms()).unwrap();
+        assert!(
+            view.advice
+                .iter()
+                .any(|advice| advice.id == "sessions.early-close-resumed")
+        );
+    }
+
+    /// The rule fails on the first look (a transient untracked file) and
+    /// holds only under the claims, after the process checks ran for a
+    /// class-window close: those checks skipped the open-file observation,
+    /// so the session is kept even though a process sits in its checkout.
+    #[test]
+    fn a_rule_that_first_holds_under_the_claims_keeps_the_session() {
+        let (_owner, _storage, mut broker) = early_fixture();
+        let session = broker
+            .start_worktree("pushed, a process inside", None)
+            .unwrap();
+        let tree = PathBuf::from(&session.worktree_path);
+        commit_in(&tree, "pushed.txt");
+        git(&tree, &["push", "-q", "origin", &session.branch]);
+        // Inside the pushed class's notice period: the first look passes.
+        quiet(&mut broker, &session, 50);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "agent".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&tree).unwrap(),
+            }]),
+        ));
+        crate::abandonment_safety::fail_next_looks_for_test(1);
+        let (outcome, _) = close_after_one_hour(&mut broker, &session);
+        crate::abandonment_safety::fail_next_looks_for_test(0);
+        assert_eq!(outcome, crate::broker::AbandonedSessionCloseOutcome::NotDue);
+        assert!(is_open(&broker, session.id));
     }
 
     /// An agent that only reads still calls tools: its PreToolUse signal is

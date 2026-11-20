@@ -15,7 +15,15 @@
 //!   local tracking ref, which survives a remote deletion), or in the head
 //!   of a merged pull request; the diff base gets no exemption;
 //! - no staged change, no unstaged change, no untracked file Git does not
-//!   ignore.
+//!   ignore, and no index entry flagged assume-unchanged or skip-worktree
+//!   (status cannot see changes to those; such a checkout is not examined).
+//!
+//! "No exemption for the diff base" is this rule's: a tip equal to the diff
+//! base must itself be contained like any other. The work-class computation
+//! (`stale_ref_class`, which only picks the class window) is different: it
+//! drops a tip equal to the diff base when that base is contained in the
+//! upstream default branch or in the primary checkout's HEAD, so a session
+//! without commits in a repository with no remote still reads `landed`.
 //!
 //! The checks run cheapest first and stop at the first that fails. Anything
 //! that cannot be read is "not examined", which never allows a close.
@@ -94,12 +102,26 @@ pub(crate) enum SafetyCheck {
     DiffBaseNotExempt,
     Staged,
     Unstaged,
+    /// Assume-unchanged and skip-worktree entries make the tree unexamined.
+    IndexFlags,
     Untracked,
 }
 
 #[cfg(test)]
 thread_local! {
     static NEUTERED: std::cell::Cell<Option<SafetyCheck>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_LOOKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The next `looks` rule evaluations on this thread fail as `Untracked`, as
+/// a transient file would make them (tests only).
+#[cfg(test)]
+pub(crate) fn fail_next_looks_for_test(looks: u32) {
+    FAIL_NEXT_LOOKS.with(|remaining| remaining.set(looks));
 }
 
 /// Skip `check` on this thread until `None` (tests only).
@@ -125,6 +147,8 @@ enum SafetyCheck {
     DiffBaseNotExempt,
     Staged,
     Unstaged,
+    /// Assume-unchanged and skip-worktree entries make the tree unexamined.
+    IndexFlags,
     Untracked,
 }
 
@@ -141,7 +165,19 @@ impl crate::Broker {
         session: &crate::Session,
     ) -> Result<(), UnsafeReason> {
         let _span = crate::phase_telemetry::span("abandonment_safety_check");
-        let verdict = self.abandonment_safety_verdict(session);
+        #[cfg(test)]
+        let forced_failure = FAIL_NEXT_LOOKS.with(|remaining| {
+            let left = remaining.get();
+            remaining.set(left.saturating_sub(1));
+            left > 0
+        });
+        #[cfg(not(test))]
+        let forced_failure = false;
+        let verdict = if forced_failure {
+            Err(UnsafeReason::Untracked)
+        } else {
+            self.abandonment_safety_verdict(session)
+        };
         crate::phase_telemetry::add(
             match verdict {
                 Ok(()) => "abandonment_safety_safe",
@@ -281,6 +317,13 @@ impl crate::Broker {
             }
             if unstaged && !neutered(SafetyCheck::Unstaged) {
                 return Err(UnsafeReason::Unstaged);
+            }
+            if !neutered(SafetyCheck::IndexFlags)
+                && checkout
+                    .has_hidden_index_entries()
+                    .map_err(|_| UnsafeReason::NotExamined)?
+            {
+                return Err(UnsafeReason::NotExamined);
             }
             if !neutered(SafetyCheck::Untracked)
                 && checkout
