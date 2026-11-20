@@ -1599,6 +1599,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == crate::gc::TRASH_CATCHUP_ACTION {
         return run_trash_catchup_lane_process(parsed);
     }
+    if action == crate::gc::RETIRE_LANE_ACTION {
+        return run_checkout_retirement_lane_process(parsed);
+    }
     // A managed sweep tick is a detached worker: its starved background lanes
     // may queue for the lifecycle lock (see `DetachedBackgroundWorker`).
     #[cfg(target_os = "macos")]
@@ -2043,6 +2046,62 @@ fn run_trash_catchup_lane_process(parsed: Parsed) -> Result<(), UsageError> {
         host_dir.as_deref(),
         worker_started_ms,
         effective,
+        crate::checkout_trash::sample_host_pressure,
+    );
+    Ok(())
+}
+
+/// The detached worker's checkout retirement lane process (`gc
+/// __retire-lane <root>`): normal disk priority, reduced CPU priority, then
+/// the lane's slices for this repository (see `broker/retire/lane.rs`).
+fn run_checkout_retirement_lane_process(parsed: Parsed) -> Result<(), UsageError> {
+    // The same invocation checks as the worker entry, before anything opens.
+    validate_artifact_sweep_worker_invocation(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV)
+            .ok()
+            .as_deref(),
+        parsed.read_only_snapshot,
+        parsed.positional.len(),
+        artifact_worker_test_or_build_environment(),
+    )?;
+    let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot resolve the checkout retirement repository: {error}"
+        ))
+    })?;
+    let discovered = crate::GitRepo::discover(&requested_root)?;
+    let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
+    if repository_root != requested_root {
+        return Err(UsageError::Message(
+            "the checkout retirement repository does not match its main checkout".into(),
+        ));
+    }
+    if crate::host_state::path_is_ephemeral(&repository_root)
+        || !crate::gc::artifact_worker_runtime_is_aligned()
+    {
+        return Err(UsageError::Message(
+            "the checkout retirement runtime or repository is not eligible".into(),
+        ));
+    }
+    let Some((host_dir, _)) = crate::host_state::resolve_host_state_dir() else {
+        return Err(UsageError::Message(
+            "the checkout retirement lane needs the host state directory".into(),
+        ));
+    };
+    let priority = crate::gc::raise_retirement_lane_priority();
+    crate::phase_telemetry::attach(
+        "checkout_retirement_lane_priority",
+        serde_json::json!({
+            "io_policy": crate::gc::current_io_policy(),
+            "requested": priority.io_policy,
+            "darwin_bg_cleared": priority.darwin_bg_cleared,
+            "cpu_niced": priority.cpu_niced,
+        }),
+    );
+    // No unrelated startup GC maintenance: this process only retires.
+    let mut broker = Broker::open_for_cleanup_resolve(&repository_root)?;
+    broker.run_checkout_retirement_lane_process(
+        &host_dir,
         crate::checkout_trash::sample_host_pressure,
     );
     Ok(())

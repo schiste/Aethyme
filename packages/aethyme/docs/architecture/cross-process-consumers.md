@@ -3663,6 +3663,33 @@ Covered by `broker/retire.rs` tests.
   - The `checkout_retirement` attachment adds `inspections`: `started`, `succeeded`, `failed` (`inspection_failed`), `cut_by_deadline`, `refused`, `median_succeeded_ms`.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-20 (finish retires through the trash). On the busiest repository's last 400 finishes:
+  - 181 (45 %) removed the checkout inline with `git worktree remove`: a median 48 s, p90 109 s, while holding the repository lifecycle claim, so every start and finish waited. Those finishes took a median 72 s, including a 13 s unlocked size walk.
+  - 153 (38 %) kept it because the caller passed `--keep-worktree`.
+  - 60 (15 %) kept it as not proven safe (dirty paths, or commits not on a delivery target).
+  - 6 failed the removal.
+
+  Now:
+  - When `finish` removes a checkout it proved clean and delivered under the claim, the removal moves it into the checkout trash in one rename (`remove_checkout_through_trash`: registration removed, reflog-only commits pinned, an operation in progress refuses) instead of `git worktree remove`. The deleter removes the entry later, and only once no process uses it. So `finish` takes no open-file observation, and a process in the checkout (usually the finishing caller's shell) does not refuse the move. Anything the move refuses falls back to `git worktree remove`, as before. New span `finish_retire_move`; counters `finish_retire_trashed`, `finish_retire_git_fallback`, `finish_retire_holder_check_deferred_to_deleter`.
+  - When `finish` leaves the checkout in the pool it records why on the session (meta key `checkout_retirement.finish_keeps`: session id to `reason`, `at_ms`; at most 16,384) and counts `finish_retire_kept_<reason>`. The reasons are `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`, `policy_disabled`, `cleanup_plan_unsafe` and `removal_failed`. The retirement lane still judges the checkout with the same rules. It counts `checkout_retirement_judged_after_finish_keep`, carries the finish reason into its remembered keep's detail (`finish kept it: <reason>`), and forgets the record once the checkout is retired.
+Covered by `broker/retire.rs` tests.
+
+- Changed 2026-11-20 (checkout retirement lane process). The busiest repository started 295 sessions and finished 124 in a day, while the worker's closed lap (about 80 s of a 180 s, throttled window, a few times an hour, about 13 s per plan) retired 18; about 300 closed checkouts wait. Now:
+  - New detached process `broker gc __retire-lane <root>` (`broker/retire/lane.rs`).
+    - Start: the worker starts it at the start of its run, with the trash catch-up lane, when its environment gates pass (worker environment, durable repository, past the post-boot hold) and the last strip pass counted closed checkouts on disk (`checkout_retirement_lane_needed`). Counters `checkout_retirement_lane_spawned`, `_spawn_failed`, `_runtime_unverified`, `_storage_context`.
+    - Invocation and priority: it runs the worker entry's invocation checks, then leaves the macOS background band, sets process-scope `IOPOL_STANDARD` (normal disk priority, below the trash deleter's `IOPOL_IMPORTANT`) and CPU niceness 10. Linux keeps the inherited class. Attachment `checkout_retirement_lane_priority`.
+    - Opening: it opens its broker without startup GC maintenance.
+  - Bounds.
+    - One lane process per repository (`checkout-retirement-lane-<key>.lock` in the host state directory, key = 16 hex digits of the SHA-256 of the canonical main root). A second one ends `lane_present`. Probes take the lock for an instant and write nothing.
+    - The worker takes the same lock for the length of its own closed and cleaned laps and skips both when it cannot (counter `checkout_retirement_laps_left_to_lane_process`; `closed_stop` `not_reached_lane_process`), so the kernel lock makes the worker's laps and the lane process exclusive and the lap cursors have one writer. The strip passes still run. A starting lane process waits up to 5 minutes for the lock while the worker's laps hold it, then ends `lane_present`.
+    - One judgement at a time per volume, host-wide: each judgement holds `checkout-retirement-volume-<device>.lock` for its whole length, waited for until the slice's deadline. So one Git inspection at a time runs on a volume across every repository's lane process.
+    - A judgement that never gets the turn is no verdict. It is kept as `volume_turn_unavailable` (counters `checkout_retirement_volume_turn_unavailable`, `checkout_retirement_kept_volume_turn_unavailable`, not remembered). The lap stops there and leaves its cursor before that checkout (`closed_stop` `volume_turn_unavailable`), instead of passing over it and every checkout after it.
+    - Turns are shared fairly between repositories' lanes. A waiter keeps a note beside the lock (`checkout-retirement-volume-<device>.waiting`: `pid <n> at <ms>`, rewritten every 250 ms poll), and a process about to take the turn while another process's note is under 1 s old first lets 500 ms go by (counter `checkout_retirement_volume_turn_yielded`).
+    - Pacing: before each 5-minute slice it reads host pressure. It waits 5 s while the host is loaded or memory is at warning (`paced_slices`), and ends at critical memory pressure (`pressure`). Each process runs at most 60 minutes (`cap`); the next worker starts another while closed checkouts wait.
+  - Work. Each slice takes the open sessions' paths and the open-file observation once, then runs the closed lap, then (when that lap reached its end) the cleaned lap. These are the worker's laps (`retirement_lap`) with the same judgement, keeps, remembered-keep back-off and 60 s inspection allowance, and the cursors are shared with the worker. The process ends `backlog_done` once both laps reached their end in one slice: every checkout not remembered as kept was judged. Other endings are `process_use_unknown`, `open_paths_unresolved`, `no_pool` and `error`; counters `checkout_retirement_lane_end_<reason>`.
+  - Telemetry. Each process writes its own command-metric row (`gc.__retire-lane`, no outcome event) with spans `checkout_retirement_lane`, `checkout_retirement_lane_pressure` and `checkout_retirement_lane_paced`. The attachment `checkout_retirement_lane` has `examined`, `retired`, `kept` (by reason), `inspections_started`, `inspections_succeeded`, `inspections_failed`, `inspections_cut_by_deadline`, `median_inspection_ms`, `slices`, `paced_slices`, `end_reason` and `elapsed_ms`.
+Covered by `broker/retire.rs`, `gc/background_priority.rs` and `cli/telemetry.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
@@ -4137,3 +4164,27 @@ Command metrics include `submit_batch_admission`, `submit_batch_compose`,
 `submit_batch_revalidate`. The `batch_verification` attachment contains the
 outcome, member count, executed and cached gate counts, and executed gate
 milliseconds. It contains no path, branch, commit or task information.
+
+### Opportunistic queued batch verification
+
+`broker submit queued <coordinator-id> --session <id> [--no-cache] --json`
+opts a single submission into sharing the exact group gate when the ordinary
+verification pool is already saturated. Only requests already waiting at slot
+admission may join. The coordinator must be a member and every member names
+that coordinator. Standalone submissions use the existing JSON shape.
+
+A successful group reply carries `queued_batch` (`coordinator`, `verifier`,
+`base`, `members`, `candidate`, `tree`, and `gates`), `landed: false`,
+`next_action`, and `collaboration_capture`. The individual queue entries
+record `superseded` with the combined candidate ID. This receipt does not
+satisfy single-session verification or any provider check. Gate and input
+details in command output are scoped to the opted-in group.
+
+Command metrics include `submit_queued_batch_register`,
+`submit_queued_batch_claim`, `submit_queued_batch_handoff`, and
+`submit_queued_batch_follow`. Waiters retain the last immutable snapshot and
+reload only when the state file changes, timed by
+`submit_queued_batch_read_snapshot`. The `queued_batch` attachment counts admitted
+members when known and records `role` (`leader`, `follower`, or `single`) and
+`outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
+on the verifier's `batch_verification` attachment.

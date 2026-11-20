@@ -1481,3 +1481,395 @@ fn test_output_that_looks_like_a_host_fault_is_still_a_rejection() {
     assert_eq!(outcome.entry.status, MergeStatus::Rejected);
     assert!(!outcome.gate_outcomes[0].is_host_fault());
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod queued_submit {
+    use super::*;
+    use std::fs::{self, File, OpenOptions};
+    use std::path::PathBuf;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    use serde_json::Value;
+
+    struct Fixture {
+        repository: common::FixtureRepository,
+        broker: Broker,
+        base: String,
+        sessions: [i64; 2],
+        heads: [String; 2],
+        worktrees: [PathBuf; 2],
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_gate_delay(0)
+        }
+
+        fn with_gate_delay(gate_seconds: u8) -> Self {
+            let repository = common::FixtureRepository::new();
+            let root = repository.path();
+            init_repo(root);
+            let marker = repository.owner_path().join("gate-starts");
+            let pause = repository.owner_path().join("pause-gate");
+            // Count real gate executions independently of the CLI result. A
+            // pause is used only to cancel a leader while its gate is running.
+            let command = format!(
+                "git rev-parse HEAD^{{tree}} >> '{marker}' && if test -f '{pause}'; then sleep 5; fi && sleep {gate_seconds}",
+                marker = marker.display(),
+                pause = pause.display(),
+            );
+            fs::write(
+                root.join(".aethyme/gates.toml"),
+                format!(
+                    "[[gate]]\nname = \"count\"\ncommand = {}\ntriggers = [\"src/**\"]\ncache = false\n",
+                    serde_json::to_string(&command).unwrap(),
+                ),
+            )
+            .unwrap();
+            fs::write(
+                root.join(".aethyme/config.toml"),
+                "[promote]\nmode = \"verify-only\"\n",
+            )
+            .unwrap();
+            sh(
+                root,
+                &["add", "--", ".aethyme/gates.toml", ".aethyme/config.toml"],
+            );
+            sh(root, &["commit", "-qm", "configure queue test gate"]);
+            let base = resolve(root, "HEAD");
+            // The disposable fixture uses exact locally published refs; this
+            // remote URL supplies identity only. The test performs no fetch.
+            sh(
+                root,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "git@github.com:example/queue-fixture.git",
+                ],
+            );
+            sh(root, &["update-ref", "refs/remotes/origin/main", &base]);
+            sh(
+                root,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            );
+
+            let mut broker = common::open_fixture_repository_broker(&repository)
+                .unwrap()
+                .into_broker();
+
+            // The broker must bind its private verification root before the
+            // harness creates the physical slot locks there. A submit outside
+            // the gate's paths exercises the normal root-creation path without
+            // contributing to the measured gate invocations.
+            let bootstrap = agent_worktree(root, "bind-verification-root");
+            let bootstrap_session = broker
+                .adopt(&bootstrap, Some("bind verification root"))
+                .unwrap();
+            commit_edit(&bootstrap, "bootstrap.txt", "fixture initialization\n");
+            let initialized = broker.submit(bootstrap_session.id).unwrap();
+            assert_eq!(initialized.entry.status, MergeStatus::Verified);
+            assert!(initialized.gate_outcomes.is_empty());
+
+            let [
+                (first, first_head, first_path),
+                (second, second_head, second_path),
+            ] = [("first", "src/a.py"), ("second", "src/b.py")].map(|(name, path)| {
+                let worktree = agent_worktree(root, name);
+                let session = broker.adopt(&worktree, Some(name)).unwrap();
+                commit_edit(&worktree, path, "changed = True\n");
+                let head = resolve(&worktree, "HEAD");
+                sh(
+                    root,
+                    &[
+                        "update-ref",
+                        &format!("refs/remotes/origin/{}", session.branch),
+                        &head,
+                    ],
+                );
+                (session.id, head, worktree)
+            });
+            Self {
+                repository,
+                broker,
+                base,
+                sessions: [first, second],
+                heads: [first_head, second_head],
+                worktrees: [first_path, second_path],
+            }
+        }
+
+        fn hold_slots(&self) -> Vec<File> {
+            let root = self
+                .broker
+                .worktree_root_plan()
+                .unwrap()
+                .preferred_root
+                .unwrap();
+            ["merge-sim", "merge-sim-1", "merge-sim-2", "merge-sim-3"]
+                .map(|namespace| {
+                    let directory = root.join(".aethyme/run").join(namespace);
+                    fs::create_dir_all(&directory).unwrap();
+                    let file = OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(directory.join("slot.lock"))
+                        .unwrap();
+                    file.lock().unwrap();
+                    file
+                })
+                .into()
+        }
+
+        fn start(&self, index: usize, queued: bool) -> RunningSubmit {
+            let session = self.sessions[index].to_string();
+            let coordinator = self.sessions[0].to_string();
+            let mut arguments = vec!["submit"];
+            if queued {
+                arguments.extend(["queued", &coordinator]);
+            }
+            arguments.extend(["--session", &session, "--json", "--no-cache"]);
+            let mut command = common::broker_cli(env!("CARGO_BIN_EXE_broker-cli-shim"), &arguments);
+            for (key, _) in std::env::vars_os() {
+                if key
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    command.env_remove(key);
+                }
+            }
+            self.broker
+                .configure_storage_context_for_child(&mut command)
+                .unwrap();
+            RunningSubmit(Some(
+                command
+                    .current_dir(&self.worktrees[index])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ))
+        }
+
+        fn state(&self) -> PathBuf {
+            self.repository
+                .path()
+                .join(".aethyme/run/submit-batch-waiters/state.json")
+        }
+
+        fn queued(&self, running: &mut RunningSubmit, count: usize) {
+            wait_for(|| {
+                running.assert_running();
+                fs::read(self.state())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|state| state["waiters"].as_array().unwrap().len() == count)
+            });
+        }
+
+        fn gates(&self) -> Vec<String> {
+            fs::read_to_string(self.repository.owner_path().join("gate-starts"))
+                .map(|output| output.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    struct RunningSubmit(Option<Child>);
+
+    impl RunningSubmit {
+        fn assert_running(&mut self) {
+            if self.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                let output = self.0.take().unwrap().wait_with_output().unwrap();
+                panic!(
+                    "submit exited before its slot opened: {:?}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        fn result(mut self) -> Value {
+            wait_for(|| self.0.as_mut().unwrap().try_wait().unwrap().is_some());
+            let output = self.0.take().unwrap().wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        }
+
+        fn cancel(mut self) {
+            let mut child = self.0.take().unwrap();
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+        }
+    }
+
+    impl Drop for RunningSubmit {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn wait_for(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "verification queue fixture timed out"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    fn assert_single(result: &Value) {
+        assert!(result["queued_batch"].is_null(), "{result}");
+        assert_eq!(result["entry"]["status"], "verified");
+        assert_eq!(result["gate_verification"]["status"], "passed");
+    }
+
+    #[test]
+    fn an_idle_pool_never_registers_a_ticket_and_one_waiter_needs_no_peer() {
+        let idle = Fixture::new();
+        assert_single(&idle.start(0, true).result());
+        assert!(!idle.state().exists());
+
+        let fixture = Fixture::new();
+        let mut slots = fixture.hold_slots();
+        let mut submit = fixture.start(0, true);
+        fixture.queued(&mut submit, 1);
+        drop(slots.pop());
+        assert_single(&submit.result());
+        assert_eq!(fixture.gates().len(), 1);
+    }
+
+    #[test]
+    fn two_waiters_share_one_exact_gate_when_one_slot_opens() {
+        let baseline = Fixture::with_gate_delay(2);
+        let mut baseline_slots = baseline.hold_slots();
+        let mut a = baseline.start(0, false);
+        let mut b = baseline.start(1, false);
+        wait_for(|| {
+            a.assert_running();
+            b.assert_running();
+            // Both commands reached actual slot acquisition. An ordinary
+            // submit has no batch state to observe.
+            baseline.sessions.iter().all(|id| {
+                let record = baseline
+                    .repository
+                    .path()
+                    .join(format!(".aethyme/run/submits/session-{id}.json"));
+                fs::read(record)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|record| {
+                        record["last_progress"].as_str().is_some_and(|progress| {
+                            progress.starts_with("submit waiting for a verification slot")
+                        })
+                    })
+            })
+        });
+        let before = Instant::now();
+        drop(baseline_slots.pop());
+        assert_single(&a.result());
+        assert_single(&b.result());
+        let baseline_elapsed = before.elapsed();
+        assert_eq!(baseline.gates().len(), 2);
+
+        let fixture = Fixture::with_gate_delay(2);
+        let mut slots = fixture.hold_slots();
+        let mut first = fixture.start(0, true);
+        fixture.queued(&mut first, 1);
+        let mut second = fixture.start(1, true);
+        fixture.queued(&mut second, 2);
+        let started = Instant::now();
+        drop(slots.pop());
+        let first = first.result();
+        let second = second.result();
+        eprintln!(
+            "one verification slot, two ready tasks: baseline {baseline_elapsed:?}, batch {:?}",
+            started.elapsed()
+        );
+        let batch = &first["queued_batch"];
+        assert_eq!(batch, &second["queued_batch"], "{first}\n{second}");
+        assert_eq!(batch["base"], fixture.base);
+        assert_eq!(batch["coordinator"], fixture.sessions[0]);
+        assert_eq!(
+            batch["members"],
+            serde_json::json!([
+                {"session_id": fixture.sessions[0], "head": fixture.heads[0]},
+                {"session_id": fixture.sessions[1], "head": fixture.heads[1]},
+            ])
+        );
+        assert_eq!(first["landed"], false);
+        assert!(first["entry"].is_null() && second["entry"].is_null());
+        assert_ne!(first["next_action"], second["next_action"]);
+        assert_eq!(fixture.gates(), vec![batch["tree"].as_str().unwrap()]);
+        let root = fixture.repository.path();
+        let candidate = batch["candidate"].as_str().unwrap();
+        assert_eq!(resolve(root, &format!("{candidate}^1")), fixture.base);
+        assert_eq!(resolve(root, &format!("{candidate}^2")), fixture.heads[0]);
+        assert_eq!(resolve(root, &format!("{candidate}^3")), fixture.heads[1]);
+        assert_eq!(resolve(root, "main"), fixture.base);
+        // An ordinary submit of a batch participant still runs its own gate.
+        assert_single(&fixture.start(0, false).result());
+        assert_eq!(fixture.gates().len(), 2);
+    }
+
+    #[test]
+    fn canceled_follower_is_excluded_before_the_slot_opens() {
+        let fixture = Fixture::new();
+        let mut slots = fixture.hold_slots();
+        let mut first = fixture.start(0, true);
+        fixture.queued(&mut first, 1);
+        let mut second = fixture.start(1, true);
+        fixture.queued(&mut second, 2);
+        second.cancel();
+        drop(slots.pop());
+        assert_single(&first.result());
+        assert_eq!(fixture.gates().len(), 1);
+    }
+
+    #[test]
+    fn canceled_leader_leaves_the_follower_to_verify_individually() {
+        let fixture = Fixture::new();
+        let mut slots = fixture.hold_slots();
+        let pause = fixture.repository.owner_path().join("pause-gate");
+        fs::write(&pause, "").unwrap();
+        let mut first = fixture.start(0, true);
+        fixture.queued(&mut first, 1);
+        let mut second = fixture.start(1, true);
+        fixture.queued(&mut second, 2);
+        drop(slots.pop());
+        wait_for(|| !fixture.gates().is_empty());
+        fs::remove_file(pause).unwrap();
+        let state: Value = serde_json::from_slice(&fs::read(fixture.state()).unwrap()).unwrap();
+        let leader = state["claims"][0]["leader"]["member"]["session_id"]
+            .as_i64()
+            .unwrap();
+        let survivor = if leader == fixture.sessions[0] {
+            first.cancel();
+            second
+        } else {
+            assert_eq!(leader, fixture.sessions[1]);
+            second.cancel();
+            first
+        };
+        assert_single(&survivor.result());
+        assert_eq!(fixture.gates().len(), 2);
+    }
+}

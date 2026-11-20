@@ -404,7 +404,7 @@ pub(super) fn run_submit_batch(
     }
 }
 
-pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
+pub(super) fn run_submit(parsed: Parsed, coordinator: Option<i64>) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
@@ -441,15 +441,17 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     // Discard timings from any earlier submit in this process.
     drop(crate::submit_progress::take_phase_timings());
     let submit_started = std::time::Instant::now();
-    let submitted = crate::collaboration_submit::submit(
-        &mut broker,
-        session,
-        if parsed.no_cache {
-            crate::CachePolicy::Bypass
-        } else {
-            crate::CachePolicy::Use
-        },
-    );
+    let cache = if parsed.no_cache {
+        crate::CachePolicy::Bypass
+    } else {
+        crate::CachePolicy::Use
+    };
+    let submitted = match coordinator {
+        Some(coordinator) => {
+            crate::collaboration_submit::submit_queued(&mut broker, session, cache, coordinator)
+        }
+        None => crate::collaboration_submit::submit(&mut broker, session, cache),
+    };
     let mut phases = crate::submit_progress::take_phase_timings().unwrap_or_default();
     phases.insert("broker_open".into(), open_ms);
     phases.insert("contract_preflight".into(), preflight_ms);
@@ -506,6 +508,42 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             });
         }
     };
+    if let Some(batch) = &outcome.queued_batch {
+        if parsed.json {
+            out!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "queued_batch": batch,
+                    "landed": false,
+                    "next_action": if session == batch.coordinator {
+                        "Use the authorized group merge workflow for this exact candidate"
+                    } else {
+                        "Wait for the named coordinator to handle the exact group candidate"
+                    },
+                    "collaboration_capture": capture.map(|capture| capture.finish(&broker)),
+                }))?
+            );
+        } else {
+            out!(
+                "Verified the queued group as one candidate {}.",
+                batch.candidate
+            );
+            out!(
+                "  verifier session {}, delivery coordinator session {}",
+                batch.verifier,
+                batch.coordinator
+            );
+            if session == batch.coordinator {
+                out!("  next: use the authorized group merge workflow for this exact candidate");
+            } else {
+                out!("  next: wait for the named coordinator to handle the exact group candidate");
+            }
+            if let Some(capture) = capture {
+                out!("{}", capture.finish(&broker).summary());
+            }
+        }
+        return Ok(());
+    }
     if parsed.json {
         match capture {
             None => out!("{}", serde_json::to_string_pretty(&outcome)?),

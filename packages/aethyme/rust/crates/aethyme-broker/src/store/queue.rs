@@ -994,6 +994,39 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Record group-only evidence without replacing a verdict another
+    /// individual submit may already have recorded for the same head.
+    pub(crate) fn record_queued_batch_supersession(
+        &mut self,
+        entry_id: i64,
+        session_id: i64,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE merge_queue
+             SET status = 'superseded', details_json = ?3, updated_at = ?4
+             WHERE id = ?1 AND session_id = ?2 AND status = 'simulating'",
+            params![entry_id, session_id, details_json, now],
+        )?;
+        if changed != 0 {
+            tx.execute(
+                "DELETE FROM verification_candidates WHERE queue_entry_id = ?1",
+                [entry_id],
+            )?;
+            insert_event(
+                &tx,
+                now,
+                "merge.superseded",
+                Some(session_id),
+                Some(details_json),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Mark one simulated queue entry superseded because normalized replay
     /// proved it content-empty, and advance its session's accepted
     /// contribution checkpoint in the same SQLite transaction.
