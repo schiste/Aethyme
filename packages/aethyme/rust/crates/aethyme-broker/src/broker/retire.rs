@@ -7446,10 +7446,13 @@ mod tests {
         let path = host.path().join("checkout-retirement-volume-1.lock");
         let _held = super::lane::take_volume_turn(&path, Instant::now() + Duration::from_secs(1))
             .expect("free turn");
+        // No stored cursor reads as the start of the lap, 0.
         let cursor_before = broker
             .store_ref()
             .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
-            .unwrap();
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut run = broker
             .begin_checkout_retirement_run(deadline)
@@ -7473,7 +7476,9 @@ mod tests {
             broker
                 .store_ref()
                 .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
-                .unwrap(),
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
             cursor_before,
             "the cursor stays before the checkout that was not judged"
         );

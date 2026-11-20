@@ -187,18 +187,17 @@ fn lock_key(root: &Path) -> String {
 }
 
 /// The volume `path` is on, as a lock name component (the device number;
-/// `0` where it cannot be read or the platform has none).
+/// `0` where it cannot be read).
+#[cfg(unix)]
 fn volume_key(path: &Path) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).map_or(0, |metadata| metadata.dev())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        0
-    }
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |metadata| metadata.dev())
+}
+
+/// No device number on this platform: one turn for every volume.
+#[cfg(not(unix))]
+fn volume_key(_path: &Path) -> u64 {
+    0
 }
 
 impl Broker {
