@@ -146,7 +146,11 @@ Aethyme took 38.1% longer at the median and 61.9% longer at p90.
 The median within-pair duration difference was +17.51 s.
 The broker used 13.2% fewer uncached input tokens at the median. The
 small token sample and different direction in the substantial-gate
-cohort show sensitivity to task mix and agent behavior.
+cohort show sensitivity to task mix and agent behavior. An audit found one
+failed broker start by the direct worker for t10. Excluding that pair,
+median task duration was 44.60 s direct and 59.87 s broker, and median
+uncached input was 8,298 versus 7,966 tokens. The remaining five tasks
+ran in the same six-worker group, so this is a sensitivity check.
 
 ## Opt-in early verification
 
@@ -218,7 +222,7 @@ All ten produced telemetry. Both textual tasks and one semantic task
 reused an early verdict, so 3 of 12 final submits skipped physical gate
 execution. These verdicts covered 11.30 s of gate work. The two remaining
 gate runs consumed 6.29 s without a final reuse. Both came from the
-six-way group, where the integration base advanced between publications.
+six-way group. The integration base advanced between landings in that group.
 The broker executed 14 gates across both stages, versus 12 in direct Git.
 The workers that yielded or skipped ran no gate commands. Successful
 early execution moved three checks off the foreground path and increased
@@ -237,3 +241,82 @@ total executions by two.
 The development build assigns gate subprocess time to the child bucket.
 The combined command log labels both operations `submit`. The table
 splits out the rows that carry early-verification telemetry.
+
+## Published v0.8.141 with trusted hooks
+
+The current-release comparison used the checksum-verified v0.8.141 binary
+(`2093b098d9cfc0a51ffadd2778ed4637a9c096b1`), the same Codex 0.170.0
+model settings, seed, and substantial gate as the previous release.
+Both arms completed all 12 assignments and passed all 12 exact-tree
+checks. Neither arm reused gate work or needed a human intervention.
+The coordinator detected and repaired one textual conflict in each arm.
+
+| Measure | Direct Git median / p90 | Aethyme median / p90 | Change |
+| --- | ---: | ---: | ---: |
+| Task duration | 50.90 / 72.09 s | 59.53 / 71.64 s | +17.0% / −0.6% |
+| Uncached input tokens | 8,436.5 / 12,997 | 8,310 / 12,603 | −1.5% / −3.0% |
+| Cached input tokens | 106,240 / 117,632 | 109,248 / 240,000 | +2.8% / +104.0% |
+| Output tokens | 1,170 / 1,724 | 1,205 / 1,693 | +3.0% / −1.8% |
+| Exact-tree verification wall time | 3.58 / 4.62 s | 5.28 / 6.28 s | +47.5% / +35.9% |
+
+The paired median duration difference was +7.32 s. All six wins came
+from the six independent assignments. The other six needed more time.
+The p90 advantage was about half a second and is sensitive to the small
+sample. Input token medians and paired differences answer different
+questions here. The paired median change was +657 uncached tokens.
+
+| Concurrent group | Pairs | Direct Git median / p90 | Aethyme median / p90 | Median paired difference |
+| --- | ---: | ---: | ---: | ---: |
+| Six independent changes | 6 | 61.41 / 72.09 s | 58.69 / 71.64 s | −2.47 s |
+| Textual overlap | 2 | 60.44 / 85.32 s | 84.03 / 104.22 s | +23.59 s |
+| Semantic overlap | 2 | 34.83 / 38.13 s | 50.81 / 54.97 s | +15.97 s |
+| Harmless shared-file changes | 2 | 40.52 / 42.86 s | 62.17 / 66.44 s | +21.65 s |
+
+The table shows the full assigned cohort. During the shared-file group
+one direct worker attempted a broker start, which failed before a session
+opened and used 421 ms of broker command time. Its model turn can also
+have changed. Excluding the whole affected group, task medians were
+56.30 s direct and 58.69 s broker, and the median paired difference was
+−0.74 s across the ten remaining pairs. This checks sensitivity to the
+protocol deviation as well as to dropping that task group. The harness
+now gives the direct arm explicit Git-only coordination instructions,
+keeps the measured broker binary off that arm's injected PATH, and
+rejects the group if it observes broker command telemetry.
+
+### Command and completed-task attribution
+
+All rows below are from the broker arm. They include any repeated
+calls within that arm. The gate command itself took 2.68 / 3.26 s;
+the older release's gate took 6.45 / 11.46 s. Host load, task behavior,
+and gate runtime varied across release runs. Those factors prevent
+assigning the aggregate release difference to a single code change.
+
+| Broker command | Calls | Total (ms) | Wall median / p90 (ms) | Child median / p90 (ms) | Queue median / p90 (ms) | Residual median / p90 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| submit | 12 | 63,886 | 5,261.5 / 6,243 | 4,955 / 5,763 | 1 / 4 | 364 / 470 |
+| finish | 12 | 16,130 | 1,164 / 1,755 | 986.5 / 1,526 | 0 / 0 | 177.5 / 229 |
+| advance | 13 | 12,600 | 969 / 1,066 | 723 / 804 | 13 / 19 | 210 / 265 |
+| start | 12 | 10,735 | 900 / 1,122 | 731.5 / 895 | 0.5 / 5 | 88 / 481 |
+| hook.PostToolUse | 99 | 9,547 | 67 / 123 | 63 / 100 | 0 / 0 | 4 / 10 |
+| hook.SessionStart | 13 | 9,273 | 678 / 977 | 513 / 793 | 0 / 0 | 169 / 213 |
+| hook.PreToolUse | 99 | 8,996 | 69 / 157 | 66 / 126 | 0 / 0 | 4 / 44 |
+| hook.Stop | 13 | 6,270 | 430 / 668 | 399 / 540 | 0 / 0 | 26 / 119 |
+| hook.UserPromptSubmit | 13 | 5,913 | 447 / 601 | 421 / 539 | 0 / 0 | 29 / 34 |
+| status | 4 | 1,582 | 403.5 / 539 | 201.5 / 312 | 0 / 0 | 186.5 / 258 |
+
+The broker's completed-task reports attributed 297 commands to 12
+tasks. Per task they recorded 11.46 / 15.52 s of summed command time,
+10.28 / 13.06 s of child work, 18 / 27 ms of queue time, and
+1.46 / 2.41 s of residual time. Recorded output was 14,670 / 22,362
+bytes per task. Bytes measure command output and use a separate source
+from the actual model token counts above. Broker telemetry recorded no
+retries, gate sharing, or duplicate work avoided. The textual repair
+counts came from the coordinator's Git check before submit, so broker
+conflict event counts remained zero.
+
+Pre- and post-tool hooks recorded 18.54 s of summed time and 2,288 Git
+subprocess spans over 198 boundaries. Each boundary type again had a
+median of nine Git spans and zero output bytes. This is repeated work
+even when an agent receives no update. The measured next optimization
+target is unchanged tool boundaries, where skipping repeated Git
+discovery can remove work before testing for task-relevant changes.
