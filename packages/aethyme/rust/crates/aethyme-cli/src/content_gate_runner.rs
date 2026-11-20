@@ -120,7 +120,8 @@ fn execute(path: &Path) -> Result<(), String> {
         return Err("invalid validator or timeout".into());
     }
     let required: std::collections::BTreeSet<_> = m.required_checks.iter().collect();
-    if required.is_empty() || required.len() != m.required_checks.len()
+    if required.is_empty()
+        || required.len() != m.required_checks.len()
         || required.iter().any(|id| id.trim().is_empty())
     {
         return Err("required_checks must contain distinct nonempty check IDs".into());
@@ -160,6 +161,8 @@ fn execute(path: &Path) -> Result<(), String> {
                 if broker_mode {
                     let _ = child.kill();
                 } else {
+                    // SAFETY: kill(2) takes plain integers and touches no Rust memory;
+                    // the negated pid targets the validator's own process group.
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
                     }
@@ -170,6 +173,8 @@ fn execute(path: &Path) -> Result<(), String> {
         }
     };
     // A surviving process group could still mutate the verdict. Never trust it.
+    // SAFETY: signal 0 only probes the validator's own process group and
+    // touches no Rust memory.
     if !broker_mode
         && (unsafe { libc::kill(-(child.id() as i32), 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
@@ -199,12 +204,19 @@ fn execute(path: &Path) -> Result<(), String> {
     let current = content(&m)?;
     strict_precheck_v1(&before, &after, &verdict, status.code(), false, &current)
         .map_err(str::to_owned)?;
-    let parsed = aethyme_broker::content_gate::strict::parse_unique(&verdict)
-        .map_err(str::to_owned)?;
+    let parsed =
+        aethyme_broker::content_gate::strict::parse_unique(&verdict).map_err(str::to_owned)?;
     let checks = parsed["checks"].as_array().ok_or("invalid checks")?;
     for id in required {
-        let matching: Vec<_> = checks.iter().filter(|c| c["id"].as_str() == Some(id)).collect();
-        if matching.is_empty() || matching.iter().any(|c| c["blocking"] != true || c["status"] != "passed") {
+        let matching: Vec<_> = checks
+            .iter()
+            .filter(|c| c["id"].as_str() == Some(id))
+            .collect();
+        if matching.is_empty()
+            || matching
+                .iter()
+                .any(|c| c["blocking"] != true || c["status"] != "passed")
+        {
             return Err(format!("required blocking check not passed: {id}"));
         }
     }
@@ -308,7 +320,8 @@ mod tests {
             assert!(execute(&p).is_err(), "{field}");
         }
         fs::write(&verdict_path, original).unwrap();
-        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         for value in [json!([]), json!(["x", "x"]), json!([" "])] {
             manifest["required_checks"] = value;
             fs::write(&p, manifest.to_string()).unwrap();
