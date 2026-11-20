@@ -3796,6 +3796,33 @@ Command metrics record `advance_broker_open`, `advance_state_validation`,
 and `advance_publish` when those phases run. Existing child spans still
 record the preparation and push work within those phases.
 
+### Early verification
+
+`broker advance --preverify` can start a worker after it confirms a clean
+published head and a fetched default base. The advance response's optional
+`preverification` field reports whether the worker was scheduled. For
+foreground diagnosis, pass the full object IDs to
+`broker submit preverify <head> <base> --session <id> --json`. It reports
+`state` and individual `gates` using the existing gate outcome shape.
+
+The worker checks session ownership and requires the base's trusted policy.
+It replays the pinned inputs in a separate exact-tree slot. There is one
+nonblocking worker slot per repository and a 45-second gate budget. A worker
+only runs gates that allow verdict reuse. It checks for a changed local head
+or fetched base every 500 ms while gates run and interrupts its own gate
+processes when the candidate changes. Early failures do not qualify for
+cache reuse. Equivalent foreground requests can join its reusable gate work
+using the exact tree, definition and execution profile lock. Ordinary submit
+still decides the full verdict against its own verified candidate, including
+any gates excluded from early verification.
+
+The worker logs `gate_preverify_admission`, `gate_preverify_replay`,
+`gate_preverify_checkout`, `gate_preverify_execution` and `gate_preverify`
+timings, and an `early_verification` metric attachment with `state`,
+`executed_gates`, `cached_gates`, `cancelled_gates` and `executed_gate_ms`.
+The parent records `gate_preverify_launch`. These describe gate work and
+scheduling. The worker never creates or updates a submission queue entry.
+
 ### Broker command attribution
 
 Command metric JSONL rows may carry a numeric `session_id`, a classified

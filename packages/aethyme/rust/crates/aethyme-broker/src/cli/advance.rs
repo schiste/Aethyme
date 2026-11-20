@@ -20,6 +20,8 @@ struct Advance {
     next_action: String,
     operation_id: Option<i64>,
     review_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preverification: Option<&'static str>,
     #[serde(skip)]
     code: u8,
 }
@@ -38,6 +40,7 @@ impl Advance {
             next_action: format!("aethyme broker status --session {session_id}"),
             operation_id: None,
             review_status: None,
+            preverification: None,
             code: exit::SUCCESS,
         }
     }
@@ -79,11 +82,12 @@ pub(super) fn run_advance(parsed: Parsed) -> Result<(), UsageError> {
         UsageError::Message("advance requires a registered worktree or --session <id>".into())
     })?;
     let mut report = Advance::new(id);
+    report.preverification = parsed.preverify.then_some("not_scheduled");
     let broker = {
         let _span = crate::phase_telemetry::span("advance_broker_open");
         open_broker(false)?
     };
-    if let Err(error) = advance(broker, parsed.open_pr, &mut report) {
+    if let Err(error) = advance(broker, parsed.open_pr, parsed.preverify, &mut report) {
         report.error(error);
     }
     if parsed.json {
@@ -92,6 +96,9 @@ pub(super) fn run_advance(parsed: Parsed) -> Result<(), UsageError> {
         out!("Session {id}: {} ({})", report.state, report.reason);
         if let Some(pr) = &report.pull_request {
             out!("Pull request: #{} {}", pr.number, pr.url);
+        }
+        if let Some(state) = report.preverification {
+            out!("Early verification: {state}");
         }
         out!("Next: {}", report.next_action);
     }
@@ -102,7 +109,12 @@ pub(super) fn run_advance(parsed: Parsed) -> Result<(), UsageError> {
     }
 }
 
-fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<(), BrokerOpError> {
+fn advance(
+    mut broker: Broker,
+    open_pr: bool,
+    preverify: bool,
+    report: &mut Advance,
+) -> Result<(), BrokerOpError> {
     let id = report.session_id;
     let session = broker.store_ref().session(id)?;
     let state_validation = crate::phase_telemetry::span("advance_state_validation");
@@ -236,6 +248,19 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
     let pushed = broker.push_session(id, open_pr)?;
     report.pushed_head = Some(pushed.pushed_oid.clone());
     report.pull_request = pushed.pr.clone();
+    if preverify
+        && pushed.uncommitted_files == 0
+        && let Some(base) = pushed.default_branch.as_ref().filter(|drift| {
+            drift.behind == 0 || drift.sync_impact == crate::main_drift::SyncImpact::Disjoint
+        })
+    {
+        report.preverification = Some(launch_preverify(
+            checkout.root(),
+            id,
+            &pushed.pushed_oid,
+            &base.commit,
+        ));
+    }
     let review = super::submit::review_on_push(broker.main_root(), &pushed);
     report.state = "published";
     report.reason = "the committed session head is published".into();
@@ -252,5 +277,68 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
         .as_ref()
         .and_then(|value| value["status"].as_str())
         .map(str::to_owned);
+    Ok(())
+}
+
+fn launch_preverify(checkout: &Path, session: i64, head: &str, base: &str) -> &'static str {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let _span = crate::phase_telemetry::span("gate_preverify_launch");
+    let Ok(program) = std::env::current_exe() else {
+        return "unavailable";
+    };
+    let worker = Command::new(program)
+        .args([
+            "broker",
+            "submit",
+            "preverify",
+            head,
+            base,
+            "--session",
+            &session.to_string(),
+            "--json",
+        ])
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    let Ok(mut worker) = worker else {
+        return "unavailable";
+    };
+    std::thread::spawn(move || {
+        let _ = worker.wait();
+    });
+    "scheduled"
+}
+
+pub(super) fn run_preverify(parsed: Parsed) -> Result<(), UsageError> {
+    let id = parsed
+        .session
+        .ok_or_else(|| UsageError::Message("submit preverify requires --session <id>".into()))?;
+    if parsed.read_only_snapshot {
+        return Err(super::read_only_refusal(
+            &parsed,
+            "broker submit preverify",
+            "run it from the live session worktree",
+        ));
+    }
+    if parsed.no_cache {
+        return Err(UsageError::Message(
+            "submit preverify uses the reusable gate cache".into(),
+        ));
+    }
+    let _span = crate::phase_telemetry::span("gate_preverify");
+    let mut broker = open_broker(false)?;
+    let result =
+        broker.preverify_published_head(id, &parsed.positional[1], &parsed.positional[2])?;
+    crate::phase_telemetry::attach("early_verification", result.metric_details());
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        out!("Early verification {}", result.state());
+    }
     Ok(())
 }
