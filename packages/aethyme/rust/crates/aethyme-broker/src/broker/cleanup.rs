@@ -4966,7 +4966,11 @@ impl Broker {
         worktree: &Path,
         force: bool,
     ) -> Result<(), BrokerOpError> {
-        let in_lane = super::retire::in_retirement_lane();
+        // The retirement lane keeps what the move refuses, and `finish`
+        // falls back to Git's removal itself (counted once there): neither
+        // gets a fallback here.
+        let no_fallback =
+            super::retire::in_retirement_lane() || super::retire::in_finish_retirement(session.id);
         let refuse = |reason: String| BrokerOpError::DirtyWorktree {
             id: session.id,
             reason,
@@ -4989,7 +4993,7 @@ impl Broker {
                     "checkout_trash_declined_unclean",
                     std::time::Duration::ZERO,
                 );
-                if in_lane {
+                if no_fallback {
                     return Err(refuse("the checkout changed since it was judged".into()));
                 }
                 self.repo.worktree_remove_registered(worktree, false)?;
@@ -4998,7 +5002,7 @@ impl Broker {
         }
         let Some(pool) = self.trash_pool_for(session, worktree) else {
             crate::phase_telemetry::add("checkout_trash_outside_pool", std::time::Duration::ZERO);
-            if in_lane {
+            if no_fallback {
                 return Err(refuse(
                     "the checkout is not inside a broker-owned pool".into(),
                 ));
@@ -5034,19 +5038,13 @@ impl Broker {
             }
             Err(reason) => {
                 crate::phase_telemetry::add("checkout_trash_refused", std::time::Duration::ZERO);
-                if in_lane {
+                if no_fallback {
                     return Err(refuse(reason));
                 }
                 crate::phase_telemetry::add(
                     "checkout_trash_fell_back_to_git",
                     std::time::Duration::ZERO,
                 );
-                if super::retire::in_finish_retirement(session.id) {
-                    crate::phase_telemetry::add(
-                        "finish_retire_git_fallback",
-                        std::time::Duration::ZERO,
-                    );
-                }
                 self.repo.worktree_remove_registered(worktree, force)?;
                 Ok(())
             }
