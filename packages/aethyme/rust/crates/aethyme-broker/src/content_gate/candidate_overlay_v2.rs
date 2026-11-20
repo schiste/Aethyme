@@ -123,14 +123,13 @@ pub fn overlay(
     {
         return Err("incomplete or mismatched base");
     }
-    if let Some(site) = change.get("site") {
-        if site.get("id").is_some_and(|id| id != &base.site_id)
+    if change.get("site").is_some_and(|site| {
+        site.get("id").is_some_and(|id| id != &base.site_id)
             || site
                 .get("base_url")
                 .is_some_and(|url| url.as_str() != base.site_base_url.as_deref())
-        {
-            return Err("site mismatch");
-        }
+    }) {
+        return Err("site mismatch");
     }
     inventory(&base.items)?;
     inventory(after)?;
