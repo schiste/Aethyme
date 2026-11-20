@@ -1420,7 +1420,18 @@ pub(crate) fn open_file_snapshot_under_with_budget(
     root: &Path,
     budget: Duration,
 ) -> OpenFileSnapshot {
-    let budget = budget.min(OPEN_FILE_SNAPSHOT_BUDGET);
+    open_file_snapshot_under_with_limit(root, budget, OPEN_FILE_SNAPSHOT_BUDGET)
+}
+
+/// [`open_file_snapshot_under_with_budget`] with `limit` in place of the
+/// 10 s cap, for a caller that retries an observation `lsof` could not
+/// finish in 10 s on a loaded host (the checkout retirement run).
+pub(crate) fn open_file_snapshot_under_with_limit(
+    root: &Path,
+    budget: Duration,
+    limit: Duration,
+) -> OpenFileSnapshot {
+    let budget = budget.min(limit);
     if budget.is_zero() {
         return incomplete_open_file_snapshot("maintenance deadline left no time for lsof");
     }
@@ -1436,7 +1447,7 @@ pub(crate) fn open_file_snapshot_under_with_budget(
             budget,
             OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES,
         ) {
-            Ok(output) => return snapshot_from_lsof_capture(output, root),
+            Ok(output) => return snapshot_from_lsof_capture(output, root, budget),
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return incomplete_open_file_snapshot(format!(
@@ -1451,6 +1462,7 @@ pub(crate) fn open_file_snapshot_under_with_budget(
 fn snapshot_from_lsof_capture(
     output: crate::bounded_output::LimitedOutput,
     root: &Path,
+    budget: Duration,
 ) -> OpenFileSnapshot {
     match output {
         crate::bounded_output::LimitedOutput::Completed(output) => parse_lsof_output(
@@ -1461,7 +1473,7 @@ fn snapshot_from_lsof_capture(
         ),
         crate::bounded_output::LimitedOutput::Deadline => incomplete_open_file_snapshot(format!(
             "lsof exceeded its {} second time limit",
-            OPEN_FILE_SNAPSHOT_BUDGET.as_secs()
+            budget.as_secs()
         )),
         crate::bounded_output::LimitedOutput::OutputLimit => {
             incomplete_open_file_snapshot(format!(
@@ -2892,7 +2904,7 @@ mod scan_tests {
             crate::bounded_output::LimitedOutput::OutputLimit,
         ] {
             assert!(matches!(
-                snapshot_from_lsof_capture(result, root),
+                snapshot_from_lsof_capture(result, root, OPEN_FILE_SNAPSHOT_BUDGET),
                 OpenFileSnapshot::Incomplete { observed, .. } if observed.is_empty()
             ));
         }

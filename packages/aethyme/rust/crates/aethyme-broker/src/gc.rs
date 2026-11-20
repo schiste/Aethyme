@@ -9331,6 +9331,15 @@ impl Broker {
         if !self.checkout_retirement_lane_needed(&host_dir) {
             return false;
         }
+        // A lane started from a worker that cannot list processes (a worker
+        // inherited from a sandboxed agent command) would inherit the same
+        // sandbox and judge nothing: probe once, and leave the lane to an
+        // unsandboxed worker (the managed GC sweep's, or one an operator's
+        // command starts). A probe that only ran out of time still starts
+        // it: the lane runs at normal disk priority and retries longer.
+        if self.checkout_retirement_listing_refused() {
+            return false;
+        }
         let Some((router, _engine)) = artifact_worker_binaries() else {
             crate::phase_telemetry::add(
                 "checkout_retirement_lane_runtime_unverified",

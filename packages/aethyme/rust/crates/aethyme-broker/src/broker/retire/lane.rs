@@ -35,6 +35,13 @@ const RETIRE_LANE_SLICE: Duration = Duration::from_secs(5 * 60);
 const RETIRE_LANE_MAX: Duration = Duration::from_secs(60 * 60);
 /// The gap between slices while the host is loaded or memory is at warning.
 const RETIRE_LANE_LOADED_GAP: Duration = Duration::from_secs(5);
+/// The budget of the one process-listing probe a worker (before starting
+/// the lane) and the lane (at its start) make.
+const RETIRE_LANE_LISTING_PROBE_BUDGET: Duration = Duration::from_secs(10);
+/// Meta key: when this repository's worker or lane was last refused the
+/// process listing (epoch ms): retirement waits for an unsandboxed runner.
+pub(crate) const CHECKOUT_RETIREMENT_LISTING_REFUSED_KEY: &str =
+    "checkout_retirement.listing_refused_at_ms";
 /// How often a judgement asks again for its volume's turn.
 const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
 
@@ -53,7 +60,8 @@ pub(crate) struct RetirementLaneReport {
     pub slices: usize,
     pub paced_slices: usize,
     /// `backlog_done`, `cap`, `pressure`, `process_use_unknown`,
-    /// `open_paths_unresolved`, `lane_present`, `no_pool` or `error`.
+    /// `process_listing_refused`, `open_paths_unresolved`, `lane_present`,
+    /// `no_pool` or `error`.
     pub end_reason: &'static str,
     pub elapsed_ms: u64,
 }
@@ -220,6 +228,34 @@ impl Broker {
         )
     }
 
+    /// Whether this process is refused the host-wide process listing the
+    /// retirement judgement needs (one bounded `lsof`, judged by how long it
+    /// took: an observation that ran out of time is not a refusal). Records
+    /// when, as meta `checkout_retirement.listing_refused_at_ms`, and counts
+    /// `checkout_retirement_lane_listing_refused`.
+    pub(crate) fn checkout_retirement_listing_refused(&self) -> bool {
+        let _span = crate::phase_telemetry::span("checkout_retirement_listing_probe");
+        let started = Instant::now();
+        let observed = crate::session_holder::retirement_run_process_use_snapshot(
+            RETIRE_LANE_LISTING_PROBE_BUDGET,
+        );
+        if matches!(observed, crate::reclaim::OpenFileSnapshot::Complete(_))
+            || process_use_failure(started.elapsed(), RETIRE_LANE_LISTING_PROBE_BUDGET)
+                == ProcessUseFailure::TimedOut
+        {
+            return false;
+        }
+        crate::phase_telemetry::add("checkout_retirement_lane_listing_refused", Duration::ZERO);
+        crate::warn_unrecorded(
+            "record that the process listing was refused",
+            self.store_ref().meta_set(
+                CHECKOUT_RETIREMENT_LISTING_REFUSED_KEY,
+                &crate::clock::epoch_ms().to_string(),
+            ),
+        );
+        true
+    }
+
     /// Whether the worker should start the retirement lane process: the
     /// last strip pass counted closed checkouts on disk, and no lane
     /// process of this repository is alive.
@@ -254,6 +290,7 @@ impl Broker {
                 "open_paths_unresolved" => "checkout_retirement_lane_end_open_paths_unresolved",
                 "lane_present" => "checkout_retirement_lane_end_lane_present",
                 "no_pool" => "checkout_retirement_lane_end_no_pool",
+                "process_listing_refused" => "checkout_retirement_lane_end_process_listing_refused",
                 _ => "checkout_retirement_lane_end_error",
             },
             Duration::ZERO,
@@ -287,6 +324,11 @@ impl Broker {
         else {
             return "no_pool";
         };
+        // A lane that cannot list processes judges nothing: it ends before
+        // spending a slice (a sandboxed worker should not have started it).
+        if self.checkout_retirement_listing_refused() {
+            return "process_listing_refused";
+        }
         let volume_turn = host_dir.join(format!(
             "checkout-retirement-volume-{}.lock",
             volume_key(&pool)

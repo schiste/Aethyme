@@ -98,7 +98,10 @@ const CHECKOUT_RETIREMENT_PINS_PRUNED_AT_KEY: &str = "checkout_retirement.pins_p
 /// Closed checkouts on disk at or above which the closed lap gets
 /// [`RETIRE_LAP_BACKLOG_MIN_SHARE`] instead of [`RETIRE_LAP_MIN_SHARE`].
 const RETIRE_LAP_BACKLOG_AT: usize = 50;
-const RETIRE_LAP_BACKLOG_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(45);
+/// Room for one inspection with its whole allowance and the steps around it
+/// (45 s before the 60 s allowance: 0.8.143's three cut inspections each had
+/// the whole lap and still ran out).
+const RETIRE_LAP_BACKLOG_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// Whether expiring retired-commit pins is due: never done, or done at least
 /// [`RETIRE_PIN_PRUNE_INTERVAL_MS`] ago (a clock that went back counts as
@@ -403,6 +406,33 @@ const RETIRE_KEEPS_MAX: usize = 4_096;
 /// The longest one process-use observation may take: the run's single one,
 /// or the fresh one a caller outside the lane takes before a rename.
 const RETIRE_PROCESS_USE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the one retry of a run's open-file observation may let `lsof`
+/// run, after the first ran out of its 10 s.
+const RETIRE_PROCESS_USE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why an open-file observation came back incomplete, judged from how long
+/// it took, not from its words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessUseFailure {
+    /// It used (nearly) its whole budget: `lsof` ran out of time.
+    TimedOut,
+    /// It ended well within its budget: the listing was refused or failed
+    /// outright (a sandboxed process, a missing `lsof`).
+    Refused,
+}
+
+/// [`ProcessUseFailure`] of an incomplete observation that took `elapsed`
+/// of `budget`: timed out from 90 % of the budget on.
+pub(crate) fn process_use_failure(
+    elapsed: std::time::Duration,
+    budget: std::time::Duration,
+) -> ProcessUseFailure {
+    if elapsed >= budget.mul_f64(0.9) {
+        ProcessUseFailure::TimedOut
+    } else {
+        ProcessUseFailure::Refused
+    }
+}
 /// An archive (written, read back, re-planned, then the checkout moved) is
 /// started only with at least this much of the lane's deadline left;
 /// otherwise the lap stops at that checkout and the next run starts with it.
@@ -849,6 +879,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
         "archive_deferred" => "checkout_retirement_kept_archive_deferred",
         "volume_turn_unavailable" => "checkout_retirement_kept_volume_turn_unavailable",
+        "inspection_deferred" => "checkout_retirement_kept_inspection_deferred",
         "operation_archive_failed" => "checkout_retirement_kept_operation_archive_failed",
         "holder_alive" => "checkout_retirement_kept_holder_alive",
         "holder_unknown" => "checkout_retirement_kept_holder_unknown",
@@ -988,6 +1019,11 @@ pub(crate) struct RetireRun {
 /// ~17,000 tracked files on a contended volume needs a little more than 15
 /// s, and the walks after it are warm.
 const RETIRE_INSPECTION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+/// The least lap time left for a lap to start an inspection: its allowance.
+#[cfg(not(test))]
+const RETIRE_INSPECTION_MIN_LEFT: std::time::Duration = RETIRE_INSPECTION_ALLOWANCE;
+#[cfg(test)]
+const RETIRE_INSPECTION_MIN_LEFT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The plan inspections of one retirement run (both laps), recorded per
 /// pass in the `checkout_retirement` attachment.
@@ -1071,8 +1107,58 @@ impl RetireRun {
                 .saturating_duration_since(Instant::now())
                 .min(RETIRE_PROCESS_USE_BUDGET);
             let started = Instant::now();
-            let observed = crate::session_holder::retirement_run_process_use_snapshot(budget);
-            crate::phase_telemetry::add("checkout_retirement_process_snapshot", started.elapsed());
+            let mut observed = crate::session_holder::retirement_run_process_use_snapshot(budget);
+            let elapsed = started.elapsed();
+            crate::phase_telemetry::add("checkout_retirement_process_snapshot", elapsed);
+            if matches!(
+                observed,
+                crate::reclaim::OpenFileSnapshot::Incomplete { .. }
+            ) {
+                match process_use_failure(elapsed, budget) {
+                    // `lsof` ran out of time (on the busiest repository, 10.4
+                    // to 10.9 s against 10 s under a load of 24 to 74, while
+                    // the same run's later observations took 1.7 to 4.7 s):
+                    // one retry with a longer limit, when the run has room,
+                    // instead of a lap that judges nothing.
+                    ProcessUseFailure::TimedOut => {
+                        let retry_budget = self
+                            .deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(RETIRE_PROCESS_USE_RETRY_LIMIT);
+                        if retry_budget > RETIRE_PROCESS_USE_BUDGET {
+                            crate::phase_telemetry::add(
+                                "checkout_retirement_process_snapshot_retried",
+                                std::time::Duration::ZERO,
+                            );
+                            let retry_started = Instant::now();
+                            observed =
+                                crate::session_holder::retirement_run_process_use_snapshot_with_limit(
+                                    retry_budget,
+                                    RETIRE_PROCESS_USE_RETRY_LIMIT,
+                                );
+                            crate::phase_telemetry::add(
+                                "checkout_retirement_process_snapshot_retry",
+                                retry_started.elapsed(),
+                            );
+                            if matches!(observed, crate::reclaim::OpenFileSnapshot::Complete(_)) {
+                                crate::phase_telemetry::add(
+                                    "checkout_retirement_process_snapshot_retry_recovered",
+                                    std::time::Duration::ZERO,
+                                );
+                            }
+                        }
+                    }
+                    // Refused at once (a sandboxed caller's worker): no retry
+                    // can see more; the run stops at the first checkout that
+                    // needs it, and the lane is left to an unsandboxed runner.
+                    ProcessUseFailure::Refused => {
+                        crate::phase_telemetry::add(
+                            "checkout_retirement_process_listing_refused",
+                            std::time::Duration::ZERO,
+                        );
+                    }
+                }
+            }
             self.process_use_taken_at = Some(Instant::now());
             self.process_use = Some(match observed {
                 crate::reclaim::OpenFileSnapshot::Incomplete { reason, .. } => {
@@ -1268,9 +1354,9 @@ pub(crate) struct CheckoutRetirementReport {
     /// Checkouts the closed lap judged this run.
     pub closed_examined: usize,
     /// Why the closed lap stopped: `deadline`, `lap_complete` (the cursor
-    /// wrapped), `process_use_unknown`, `archive_deferred` or
-    /// `volume_turn_unavailable` (all three judged again first by the next
-    /// run); `not_reached_open_paths` when the open
+    /// wrapped), `process_use_unknown`, `archive_deferred`,
+    /// `volume_turn_unavailable` or `inspection_deferred` (all judged again
+    /// first by the next run); `not_reached_open_paths` when the open
     /// sessions' paths could not be resolved in time and the lap never ran.
     pub closed_stop: &'static str,
     /// The closed lap ran before the strip passes (a large closed backlog).
@@ -2617,6 +2703,15 @@ impl Broker {
         }
         let plan = {
             let _phase = crate::phase_telemetry::span("checkout_retirement_phase_plan");
+            // An inspection the lap cannot give its whole allowance would
+            // be cut short and decide nothing: the lap stops before it, and
+            // the next lap (or slice) starts with this checkout.
+            if !run.inline
+                && run.deadline.saturating_duration_since(Instant::now())
+                    < RETIRE_INSPECTION_MIN_LEFT
+            {
+                return Ok(Kept("inspection_deferred"));
+            }
             if run.plan_context.is_none() {
                 match self.cleanup_resolve_retirement_context_until(Some(run.deadline)) {
                     Ok(context) => run.plan_context = Some(context),
@@ -3520,6 +3615,7 @@ impl Broker {
                     RetireOutcome::Kept(code)
                         if code == "process_use_unknown"
                             || code == "volume_turn_unavailable"
+                            || code == "inspection_deferred"
                             || (code == "archive_deferred" && report.examined > 1) =>
                     {
                         // Not a verdict about this checkout: the run
@@ -3573,6 +3669,9 @@ impl Broker {
                     "archive_deferred" => "checkout_retirement_closed_lap_stop_archive_deferred",
                     "volume_turn_unavailable" => {
                         "checkout_retirement_closed_lap_stop_volume_turn_unavailable"
+                    }
+                    "inspection_deferred" => {
+                        "checkout_retirement_closed_lap_stop_inspection_deferred"
                     }
                     _ => "checkout_retirement_closed_lap_stop_deadline",
                 },
@@ -7521,6 +7620,61 @@ mod tests {
         assert_eq!(super::lane::fresh_waiter(&note, 11_000), None);
         std::fs::write(&note, "garbage").unwrap();
         assert_eq!(super::lane::fresh_waiter(&note, 10_500), None);
+    }
+
+    /// An incomplete open-file observation that used its whole budget ran
+    /// out of time (retried longer); one that ended early was refused.
+    #[test]
+    fn an_incomplete_observation_is_judged_by_its_duration() {
+        let budget = Duration::from_secs(10);
+        assert_eq!(
+            super::process_use_failure(Duration::from_millis(10_400), budget),
+            super::ProcessUseFailure::TimedOut
+        );
+        assert_eq!(
+            super::process_use_failure(Duration::from_millis(9_000), budget),
+            super::ProcessUseFailure::TimedOut
+        );
+        assert_eq!(
+            super::process_use_failure(Duration::from_millis(300), budget),
+            super::ProcessUseFailure::Refused
+        );
+    }
+
+    /// A lap with less time left than an inspection's allowance does not
+    /// start one: it stops with its own reason and leaves the cursor
+    /// before that checkout, for the next lap to start with.
+    #[test]
+    fn a_lap_does_not_start_an_inspection_it_cannot_give_its_allowance() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree) = closed(&mut broker, "too little lap", |_| {});
+        let cursor = |broker: &crate::Broker| {
+            broker
+                .store_ref()
+                .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        let before = cursor(&broker);
+        let mut run = broker
+            .begin_checkout_retirement_run(Instant::now() + Duration::from_secs(30))
+            .unwrap()
+            .expect("open paths resolve");
+        // Less than the (test) minimum left when the plan would start.
+        let deadline = Instant::now() + Duration::from_millis(900);
+        run.deadline = deadline;
+        let mut report = CheckoutRetirementReport::default();
+
+        let complete = broker
+            .retirement_lap(&mut run, &mut report, false, deadline)
+            .unwrap();
+
+        assert!(!complete, "{report:#?}");
+        assert_eq!(report.closed_stop, "inspection_deferred", "{report:#?}");
+        assert_eq!(run.inspections.started, 0, "{report:#?}");
+        assert_eq!(cursor(&broker), before);
+        assert!(worktree.exists());
     }
 
     /// One judgement at a time per volume: a turn held elsewhere is waited

@@ -1125,6 +1125,15 @@ pub(crate) fn set_process_use_snapshot_for_tests(
 pub(crate) fn retirement_run_process_use_snapshot(
     budget: Duration,
 ) -> crate::reclaim::OpenFileSnapshot {
+    retirement_run_process_use_snapshot_with_limit(budget, budget)
+}
+
+/// [`retirement_run_process_use_snapshot`] allowing `lsof` up to `limit`
+/// (within `budget`), for the retry of an observation that ran out of time.
+pub(crate) fn retirement_run_process_use_snapshot_with_limit(
+    budget: Duration,
+    limit: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
     #[cfg(test)]
     if let Some(snapshot) = TEST_PROCESS_USE_QUEUE
         .with(|queue| queue.borrow_mut().pop_front())
@@ -1132,7 +1141,10 @@ pub(crate) fn retirement_run_process_use_snapshot(
     {
         return snapshot;
     }
-    crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget)
+    if limit <= Duration::from_secs(10) {
+        return crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget);
+    }
+    crate::reclaim::open_file_snapshot_under_with_limit(Path::new("/"), budget, limit)
 }
 
 /// One host-wide open-file observation for a checkout trash deleter run,
