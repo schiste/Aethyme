@@ -27,6 +27,7 @@ struct Manifest {
     additional: BTreeMap<String, PathBuf>,
     content: BTreeMap<String, PathBuf>,
     validator: Vec<String>,
+    required_checks: Vec<String>,
     env: BTreeMap<String, String>,
     timeout_seconds: u64,
 }
@@ -118,6 +119,12 @@ fn execute(path: &Path) -> Result<(), String> {
     {
         return Err("invalid validator or timeout".into());
     }
+    let required: std::collections::BTreeSet<_> = m.required_checks.iter().collect();
+    if required.is_empty() || required.len() != m.required_checks.len()
+        || required.iter().any(|id| id.trim().is_empty())
+    {
+        return Err("required_checks must contain distinct nonempty check IDs".into());
+    }
     let before = snapshot(path, &m)?;
     // The manifest must not have changed between parsing and capture.
     if before.additional.get("\0aethyme.runner.manifest") != Some(&manifest_bytes) {
@@ -192,6 +199,15 @@ fn execute(path: &Path) -> Result<(), String> {
     let current = content(&m)?;
     strict_precheck_v1(&before, &after, &verdict, status.code(), false, &current)
         .map_err(str::to_owned)?;
+    let parsed = aethyme_broker::content_gate::strict::parse_unique(&verdict)
+        .map_err(str::to_owned)?;
+    let checks = parsed["checks"].as_array().ok_or("invalid checks")?;
+    for id in required {
+        let matching: Vec<_> = checks.iter().filter(|c| c["id"].as_str() == Some(id)).collect();
+        if matching.is_empty() || matching.iter().any(|c| c["blocking"] != true || c["status"] != "passed") {
+            return Err(format!("required blocking check not passed: {id}"));
+        }
+    }
     Ok(())
 }
 pub fn run(args: &[String]) -> u8 {
@@ -239,7 +255,7 @@ mod tests {
             .replace("{verdict}", dir.join("verdict.json").to_str().unwrap())
             .replace("{policy}", dir.join("policy").to_str().unwrap())
             .replace("{article}", dir.join("article").to_str().unwrap());
-        let manifest = json!({"change":dir.join("change.json"),"policy":dir.join("policy"),"options":dir.join("options"),"collection":null,"external":null,"additional":{},"content":{"a":dir.join("article")},"validator":["/bin/sh","-c",command],"env":{"PATH":"/usr/bin:/bin"},"timeout_seconds":1});
+        let manifest = json!({"change":dir.join("change.json"),"policy":dir.join("policy"),"options":dir.join("options"),"collection":null,"external":null,"additional":{},"content":{"a":dir.join("article")},"validator":["/bin/sh","-c",command],"required_checks":["x"],"env":{"PATH":"/usr/bin:/bin"},"timeout_seconds":1});
         let path = dir.join("manifest.json");
         fs::write(&path, manifest.to_string()).unwrap();
         (root, path)
@@ -278,6 +294,29 @@ mod tests {
         assert!(execute(&p).is_err());
         fs::remove_file(d.path().join("article")).unwrap();
         assert!(execute(&p).is_ok());
+    }
+    #[test]
+    fn required_checks_cannot_be_omitted_or_downgraded() {
+        let (d, p) = fixture("cp '{verdict}' \"$CONTENT_GATE_VERDICT_FILE\"");
+        assert!(execute(&p).is_ok());
+        let verdict_path = d.path().join("verdict.json");
+        let original = fs::read(&verdict_path).unwrap();
+        for (field, value) in [("id", json!("other")), ("blocking", json!(false))] {
+            let mut verdict: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            verdict["checks"][0][field] = value;
+            fs::write(&verdict_path, verdict.to_string()).unwrap();
+            assert!(execute(&p).is_err(), "{field}");
+        }
+        fs::write(&verdict_path, original).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        for value in [json!([]), json!(["x", "x"]), json!([" "])] {
+            manifest["required_checks"] = value;
+            fs::write(&p, manifest.to_string()).unwrap();
+            assert!(execute(&p).is_err());
+        }
+        manifest.as_object_mut().unwrap().remove("required_checks");
+        fs::write(&p, manifest.to_string()).unwrap();
+        assert!(execute(&p).is_err());
     }
     #[test]
     fn timeout_blocks() {
