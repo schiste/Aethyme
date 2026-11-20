@@ -72,6 +72,20 @@ impl RepositoryBindingScope {
             path: main_root.clone(),
             source,
         })?;
+        Self::from_resolved(
+            main_root,
+            git_common_dir,
+            broker_db_path,
+            allow_recovery_prefix,
+        )
+    }
+
+    pub(super) fn from_resolved(
+        main_root: PathBuf,
+        git_common_dir: PathBuf,
+        broker_db_path: &Path,
+        allow_recovery_prefix: bool,
+    ) -> Result<Self, BrokerError> {
         let repository_key = crate::host_state::repository_key(&main_root, Some(&git_common_dir));
         let repository_uuid = if allow_recovery_prefix {
             read_repository_uuid_marker_for_explicit_recovery(&git_common_dir)?
