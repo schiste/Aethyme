@@ -128,6 +128,8 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     // `gc __trash-catchup` (the worker's trash catch-up lane process) and
     // `gc trash drain`.
     "__trash-catchup",
+    // `gc __retire-lane` (the worker's checkout retirement lane process).
+    "__retire-lane",
     "trash",
     "storage",
     // `gc reclaim` resolves to `reclaim`. A plan attaches its phase timings
@@ -613,7 +615,9 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // The trash catch-up lane process and the operator's `gc trash
         // drain` record their lane (`checkout_trash_catchup`) and drains.
         Some("gc") => match args.get(1).map(String::as_str) {
-            Some("apply" | "sweep" | "__continue-artifacts" | "__trash-catchup") => true,
+            Some(
+                "apply" | "sweep" | "__continue-artifacts" | "__trash-catchup" | "__retire-lane",
+            ) => true,
             Some("trash") => args.get(2).map(String::as_str) == Some("drain"),
             _ => false,
         },
@@ -716,7 +720,10 @@ fn command_records_outcome(args: &[String]) -> bool {
             args.get(1).map(String::as_str)
         ),
         (Some("gates"), Some("affected"))
-            | (Some("gc"), Some("__continue-artifacts" | "__trash-catchup"))
+            | (
+                Some("gc"),
+                Some("__continue-artifacts" | "__trash-catchup" | "__retire-lane")
+            )
     ) && command_records_metric(args)
 }
 
@@ -906,6 +913,19 @@ mod tests {
         assert_eq!(safe_command_surface(&drain).as_deref(), Some("gc.trash"));
         let other = ["gc", "trash", "list"].map(str::to_string);
         assert!(!command_records_metric(&other));
+    }
+
+    /// The checkout retirement lane process writes its own row (labelled,
+    /// no outcome event, like the trash catch-up lane).
+    #[test]
+    fn the_checkout_retirement_lane_writes_a_metric_row() {
+        let lane = ["gc", "__retire-lane", "/repository"].map(str::to_string);
+        assert!(command_records_metric(&lane));
+        assert!(!command_records_outcome(&lane));
+        assert_eq!(
+            safe_command_surface(&lane).as_deref(),
+            Some("gc.__retire-lane")
+        );
     }
 
     #[test]

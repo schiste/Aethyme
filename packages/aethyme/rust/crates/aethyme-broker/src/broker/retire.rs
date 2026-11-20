@@ -848,6 +848,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "deadline" => "checkout_retirement_kept_deadline",
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
         "archive_deferred" => "checkout_retirement_kept_archive_deferred",
+        "volume_turn_unavailable" => "checkout_retirement_kept_volume_turn_unavailable",
         "operation_archive_failed" => "checkout_retirement_kept_operation_archive_failed",
         "holder_alive" => "checkout_retirement_kept_holder_alive",
         "holder_unknown" => "checkout_retirement_kept_holder_unknown",
@@ -972,6 +973,10 @@ pub(crate) struct RetireRun {
     archive_environment_denied: bool,
     /// The plan inspections this run started and how they ended.
     inspections: InspectionStats,
+    /// The host-wide lock a judgement holds for its whole length so one
+    /// Git inspection at a time runs on the checkouts' volume (the
+    /// retirement lane process sets it); `None` judges without it.
+    volume_turn: Option<PathBuf>,
 }
 
 /// How long one lap inspection's Git listing (the eligibility `git status`
@@ -1263,8 +1268,9 @@ pub(crate) struct CheckoutRetirementReport {
     /// Checkouts the closed lap judged this run.
     pub closed_examined: usize,
     /// Why the closed lap stopped: `deadline`, `lap_complete` (the cursor
-    /// wrapped), `process_use_unknown` or `archive_deferred` (both judged
-    /// again first by the next run); `not_reached_open_paths` when the open
+    /// wrapped), `process_use_unknown`, `archive_deferred` or
+    /// `volume_turn_unavailable` (all three judged again first by the next
+    /// run); `not_reached_open_paths` when the open
     /// sessions' paths could not be resolved in time and the lap never ran.
     pub closed_stop: &'static str,
     /// The closed lap ran before the strip passes (a large closed backlog).
@@ -2184,6 +2190,7 @@ impl Broker {
             last_inspection_failure: None,
             archive_environment_denied: false,
             inspections: InspectionStats::default(),
+            volume_turn: None,
         }))
     }
 
@@ -2197,6 +2204,21 @@ impl Broker {
         let _span = crate::phase_telemetry::span("checkout_retirement_judge");
         let _lane = RetirementLaneScope::enter();
         run.keep_detail = None;
+        // One judgement at a time on this volume, host-wide, when the run
+        // asks for it: waited for until the run's deadline.
+        let _volume_turn = match run.volume_turn.clone() {
+            Some(path) => match lane::take_volume_turn(&path, run.deadline) {
+                Some(turn) => Some(turn),
+                None => {
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_volume_turn_unavailable",
+                        std::time::Duration::ZERO,
+                    );
+                    return Ok(RetireOutcome::Kept("volume_turn_unavailable"));
+                }
+            },
+            None => None,
+        };
         let outcome = self.retire_closed_checkout_inner(session_id, run)?;
         crate::phase_telemetry::add(outcome.counter(), std::time::Duration::ZERO);
         // Why `finish` left this checkout, when it said: carried into the
@@ -3071,18 +3093,40 @@ impl Broker {
             } else {
                 share(1, 2, closed_floor)
             };
-            run.deadline = closed_deadline;
-            report.lap_complete =
-                self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
+            // The closed and cleaned laps run under this repository's
+            // retirement lane lock, the one the lane process holds for its
+            // whole life: the kernel lock makes the worker's laps and the
+            // lane process exclusive, so a checkout is never judged by both
+            // and the lap cursors have one writer. When the lane holds it,
+            // both laps are the lane's this run.
+            let lap_lock = crate::host_state::resolve_host_state_dir().map(|(host_dir, _)| {
+                crate::checkout_trash::try_catchup_lane_lock(
+                    &self.checkout_retirement_lane_lock_path(&host_dir),
+                    self.main_root(),
+                )
+            });
+            let lane_process_live = matches!(lap_lock, Some(Ok(None)));
+            if lane_process_live {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_laps_left_to_lane_process",
+                    std::time::Duration::ZERO,
+                );
+                report.closed_stop = "not_reached_lane_process";
+            } else {
+                run.deadline = closed_deadline;
+                report.lap_complete =
+                    self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
+            }
             if report.closed_lap_first {
                 strip_passes(self, &mut run, &mut report);
             }
-            if !report.process_use_unavailable {
+            if !report.process_use_unavailable && !lane_process_live {
                 let cleaned_deadline = share(1, 1, RETIRE_CLEANED_LAP_MIN_SHARE);
                 run.deadline = cleaned_deadline;
                 report.cleaned_lap_complete =
                     self.retirement_lap(&mut run, &mut report, true, cleaned_deadline)?;
             }
+            drop(lap_lock);
             last_inspection_failure = run.last_inspection_failure.take();
             report.inspections = std::mem::take(&mut run.inspections);
         } else {
@@ -3475,14 +3519,18 @@ impl Broker {
                     }
                     RetireOutcome::Kept(code)
                         if code == "process_use_unknown"
+                            || code == "volume_turn_unavailable"
                             || (code == "archive_deferred" && report.examined > 1) =>
                     {
                         // Not a verdict about this checkout: the run
-                        // could not look, or has too little time left
-                        // for its archive. The next run, due soon,
-                        // starts with it. (An archive deferred as the
-                        // run's first judgement is passed over instead,
-                        // so a slow start can never wedge the lap.)
+                        // could not look, has too little time left for
+                        // its archive, or never had its volume's turn.
+                        // The next run, due soon, starts with it. (An
+                        // archive deferred as the run's first judgement
+                        // is passed over instead, so a slow start can
+                        // never wedge the lap. A missing volume turn is
+                        // never passed over: passing over it would pass
+                        // over every checkout after it too.)
                         *report.kept.entry(code.to_string()).or_default() += 1;
                         report.process_use_unavailable |= code == "process_use_unknown";
                         cursor = previous_cursor;
@@ -3523,6 +3571,9 @@ impl Broker {
                         "checkout_retirement_closed_lap_stop_process_use_unknown"
                     }
                     "archive_deferred" => "checkout_retirement_closed_lap_stop_archive_deferred",
+                    "volume_turn_unavailable" => {
+                        "checkout_retirement_closed_lap_stop_volume_turn_unavailable"
+                    }
                     _ => "checkout_retirement_closed_lap_stop_deadline",
                 },
                 std::time::Duration::ZERO,
@@ -4399,6 +4450,8 @@ impl Broker {
         }
     }
 }
+
+mod lane;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -7310,6 +7363,184 @@ mod tests {
         broker
             .cleanup_resolve_retirement_plan_with_context(session.id, false, &context)
             .expect("plans under the later deadline");
+    }
+
+    fn calm_host() -> crate::checkout_trash::HostPressure {
+        crate::checkout_trash::HostPressure::default()
+    }
+
+    /// The lane process judges the closed backlog with the same judgement
+    /// as the worker's laps and ends once both laps reached their end,
+    /// recording its inspections.
+    #[test]
+    fn the_retirement_lane_process_retires_the_backlog_and_ends() {
+        let (_owner, _storage, mut broker) = fixture();
+        let backlog = (0..2)
+            .map(|index| closed(&mut broker, &format!("lane {index}"), |_| {}))
+            .collect::<Vec<_>>();
+        let host = tempfile::tempdir().unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let lane = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.run_checkout_retirement_lane_process(host.path(), calm_host)
+        };
+
+        assert_eq!(lane.end_reason, "backlog_done", "{lane:#?}");
+        assert_eq!(lane.examined, 2, "{lane:#?}");
+        assert_eq!(lane.retired, 2, "{lane:#?}");
+        assert_eq!(lane.inspections_started, 2, "{lane:#?}");
+        assert_eq!(lane.inspections_succeeded, 2, "{lane:#?}");
+        assert!(lane.median_inspection_ms.is_some(), "{lane:#?}");
+        for (session, worktree) in backlog {
+            assert!(retired_away(&worktree));
+            assert!(is_cleaned(&broker, session.id));
+        }
+        assert!(
+            recorder
+                .attachments()
+                .contains_key("checkout_retirement_lane")
+        );
+        assert!(
+            !broker.checkout_retirement_lane_present(host.path()),
+            "the lane lock is let go"
+        );
+    }
+
+    /// A second lane process of the same repository ends at once, and one
+    /// at critical memory pressure ends before judging anything.
+    #[test]
+    fn the_retirement_lane_runs_once_per_repository_and_yields_to_pressure() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree) = closed(&mut broker, "lane bounds", |_| {});
+        let host = tempfile::tempdir().unwrap();
+        {
+            let _held = crate::checkout_trash::try_catchup_lane_lock(
+                &broker.checkout_retirement_lane_lock_path(host.path()),
+                broker.main_root(),
+            )
+            .unwrap()
+            .expect("lock free");
+            assert!(broker.checkout_retirement_lane_present(host.path()));
+            assert!(!broker.checkout_retirement_lane_needed(host.path()));
+            let lane = broker.run_checkout_retirement_lane_process(host.path(), calm_host);
+            assert_eq!(lane.end_reason, "lane_present", "{lane:#?}");
+        }
+
+        let lane = broker.run_checkout_retirement_lane_process(host.path(), critical_memory);
+
+        assert_eq!(lane.end_reason, "pressure", "{lane:#?}");
+        assert_eq!(lane.examined, 0);
+        assert!(worktree.exists());
+    }
+
+    /// A judgement that never had its volume's turn is no verdict: the lap
+    /// stops there with its own reason and leaves the cursor before that
+    /// checkout, instead of passing over it and every checkout after it.
+    #[test]
+    fn a_missing_volume_turn_stops_the_lap_without_moving_the_cursor() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_first, first_worktree) = closed(&mut broker, "turn first", |_| {});
+        let (_second, second_worktree) = closed(&mut broker, "turn second", |_| {});
+        let host = tempfile::tempdir().unwrap();
+        let path = host.path().join("checkout-retirement-volume-1.lock");
+        let _held = super::lane::take_volume_turn(&path, Instant::now() + Duration::from_secs(1))
+            .expect("free turn");
+        // No stored cursor reads as the start of the lap, 0.
+        let cursor_before = broker
+            .store_ref()
+            .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut run = broker
+            .begin_checkout_retirement_run(deadline)
+            .unwrap()
+            .expect("open paths resolve");
+        run.volume_turn = Some(path.clone());
+        let mut report = CheckoutRetirementReport::default();
+
+        let complete = broker
+            .retirement_lap(&mut run, &mut report, false, deadline)
+            .unwrap();
+
+        assert!(!complete, "{report:#?}");
+        assert_eq!(report.closed_stop, "volume_turn_unavailable", "{report:#?}");
+        assert_eq!(
+            report.kept.get("volume_turn_unavailable"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            broker
+                .store_ref()
+                .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
+            cursor_before,
+            "the cursor stays before the checkout that was not judged"
+        );
+        assert!(first_worktree.exists() && second_worktree.exists());
+    }
+
+    /// While the lane lock is held (the lane process lives), the worker's
+    /// run leaves both laps to it; the strip passes still run.
+    #[test]
+    fn the_worker_leaves_its_laps_to_a_live_lane_process() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree) = closed(&mut broker, "lane owns laps", |_| {});
+        let Some((host_dir, _)) = crate::host_state::resolve_host_state_dir() else {
+            return;
+        };
+        let _lane = crate::checkout_trash::try_catchup_lane_lock(
+            &broker.checkout_retirement_lane_lock_path(&host_dir),
+            broker.main_root(),
+        )
+        .unwrap()
+        .expect("lock free");
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.closed_stop, "not_reached_lane_process",
+            "{report:#?}"
+        );
+        assert_eq!(report.examined, 0, "{report:#?}");
+        assert!(worktree.exists());
+    }
+
+    /// A waiter's note names it while fresh, and only then.
+    #[test]
+    fn a_volume_turn_waiter_note_is_fresh_for_a_second() {
+        let host = tempfile::tempdir().unwrap();
+        let note = host.path().join("turn.waiting");
+        std::fs::write(&note, "pid 42 at 10000\n").unwrap();
+        assert_eq!(super::lane::fresh_waiter(&note, 10_500), Some(42));
+        assert_eq!(super::lane::fresh_waiter(&note, 11_000), None);
+        std::fs::write(&note, "garbage").unwrap();
+        assert_eq!(super::lane::fresh_waiter(&note, 10_500), None);
+    }
+
+    /// One judgement at a time per volume: a turn held elsewhere is waited
+    /// for until the deadline, then given up.
+    #[test]
+    fn a_volume_turn_held_elsewhere_is_waited_for_then_given_up() {
+        let host = tempfile::tempdir().unwrap();
+        let path = host.path().join("checkout-retirement-volume-1.lock");
+        let held = super::lane::take_volume_turn(&path, Instant::now() + Duration::from_secs(1))
+            .expect("free turn");
+        let started = Instant::now();
+        assert!(
+            super::lane::take_volume_turn(&path, Instant::now() + Duration::from_millis(600))
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        drop(held);
+        assert!(
+            super::lane::take_volume_turn(&path, Instant::now() + Duration::from_secs(1)).is_some()
+        );
     }
 
     /// `finish` moves the checkout it proved clean into the trash in one
