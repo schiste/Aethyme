@@ -20,12 +20,12 @@ pub(crate) struct BatchRequest {
     members: Vec<BatchMember>,
 }
 
+fn object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl BatchRequest {
     pub(crate) fn parse(base: &str, members: &[String]) -> Option<Self> {
-        fn object_id(value: &str) -> bool {
-            matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }
-
         if !object_id(base) || !(2..=MAX_BATCH_MEMBERS).contains(&members.len()) {
             return None;
         }
@@ -544,9 +544,16 @@ impl Broker {
             && receipt.members.iter().any(|member| {
                 member.session_id == entry.session_id && member.head == entry.head_commit
             })
+            && object_id(&receipt.candidate)
             && repo
-                .commit_tree_id(&receipt.candidate)
-                .is_ok_and(|tree| tree == receipt.tree)
+                .commit_shapes(std::slice::from_ref(&receipt.candidate))
+                .is_ok_and(|shapes| {
+                    shapes.get(&receipt.candidate).is_some_and(|shape| {
+                        shape.tree == receipt.tree
+                            && shape.parents.iter().eq(std::iter::once(&receipt.base)
+                                .chain(receipt.members.iter().map(|member| &member.head)))
+                    })
+                })
             && self
                 .batch_is_current(&repo, &receipt.base, &receipt.members)
                 .unwrap_or(false)

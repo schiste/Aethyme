@@ -79,6 +79,8 @@ enum Completion {
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    boot_id: String,
     // Append order is admission order, even when processes share a clock tick.
     waiters: Vec<Waiter>,
     claims: Vec<Claim>,
@@ -86,6 +88,7 @@ struct State {
 
 pub(super) struct Ticket {
     directory: PathBuf,
+    boot_id: String,
     waiter: Waiter,
     marker: Option<tempfile::NamedTempFile>,
     registered: Cell<bool>,
@@ -154,6 +157,7 @@ impl Ticket {
         {
             return None;
         }
+        let boot_id = crate::host_boot::boot_id()?;
         let session_id = member.session_id;
         let pid = i32::try_from(std::process::id()).ok()?;
         let directory = main.join(".aethyme/run/submit-batch-waiters");
@@ -164,6 +168,7 @@ impl Ticket {
             .ok()?;
         let mut ticket = Self {
             directory,
+            boot_id,
             waiter: Waiter {
                 ticket: marker.path().file_name()?.to_str()?.to_owned(),
                 pid,
@@ -180,7 +185,7 @@ impl Ticket {
             observed: RefCell::default(),
         };
         let ready_at = ticket
-            .edit(CLAIM_DEADLINE, |state| {
+            .edit(CLAIM_DEADLINE, true, |state| {
                 state.reap(&ticket.directory);
                 if state.waiters.len() >= MAX_WAITERS
                     || state.claims.len() >= MAX_WAITERS
@@ -216,7 +221,7 @@ impl Ticket {
     /// Called after acquiring a real slot. Freeze the eligible requests that
     /// are already on disk, with no grace period for further arrivals.
     pub(super) fn admit(&self, ready_cutoff: u128) -> io::Result<Admission> {
-        let admission = self.edit(CLAIM_DEADLINE, |state| {
+        let admission = self.edit(CLAIM_DEADLINE, false, |state| {
             state.reap(&self.directory);
             if state.claim_for(&self.waiter).is_some() {
                 return Admission::Follower;
@@ -264,7 +269,7 @@ impl Ticket {
     }
 
     pub(super) fn complete(&self, receipt: Option<Receipt>) -> io::Result<Option<Receipt>> {
-        self.edit(CLAIM_DEADLINE, |state| {
+        self.edit(CLAIM_DEADLINE, false, |state| {
             let claim = state
                 .claims
                 .iter_mut()
@@ -342,7 +347,12 @@ impl Ticket {
         }
     }
 
-    fn edit<T>(&self, lock_budget: Duration, edit: impl FnOnce(&mut State) -> T) -> io::Result<T> {
+    fn edit<T>(
+        &self,
+        lock_budget: Duration,
+        accept_new_boot: bool,
+        edit: impl FnOnce(&mut State) -> T,
+    ) -> io::Result<T> {
         let started = Instant::now();
         let lock_file = queue_file(&self.directory.join("lock"), true)?;
         let _lock = loop {
@@ -358,6 +368,18 @@ impl Ticket {
             std::thread::sleep(Duration::from_millis(4));
         };
         let mut state = self.read()?;
+        if state.boot_id != self.boot_id {
+            if !accept_new_boot {
+                return Err(io::Error::other(
+                    "submit batch queue belongs to another boot",
+                ));
+            }
+            state.remove_stale_boot_markers(&self.directory);
+            state = State {
+                boot_id: self.boot_id.clone(),
+                ..State::default()
+            };
+        }
         let result = edit(&mut state);
         let mut tmp = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(&mut tmp, &state)?;
@@ -395,6 +417,11 @@ impl Ticket {
         *observed = None;
         let _phase = crate::phase_telemetry::span("submit_queued_batch_read_snapshot");
         let state = read_state(&file, generation.bytes)?;
+        if state.boot_id != self.boot_id {
+            return Err(io::Error::other(
+                "submit batch queue belongs to another boot",
+            ));
+        }
         let claim = state.claim_for(&self.waiter).cloned();
         let result = inspect(claim.as_ref());
         *observed = Some(QueueSnapshot {
@@ -414,7 +441,7 @@ impl Drop for Ticket {
         if !self.registered.get() {
             return;
         }
-        let _ = self.edit(Duration::ZERO, |state| {
+        let _ = self.edit(Duration::ZERO, false, |state| {
             state
                 .waiters
                 .retain(|other| other.ticket != self.waiter.ticket);
@@ -442,6 +469,18 @@ impl State {
         self.claims
             .iter()
             .find(|claim| claim.members.contains(waiter))
+    }
+
+    fn remove_stale_boot_markers(&self, directory: &Path) {
+        for waiter in self
+            .waiters
+            .iter()
+            .chain(self.claims.iter().flat_map(|claim| &claim.members))
+        {
+            if waiter.valid_ticket_name() {
+                let _ = std::fs::remove_file(directory.join(&waiter.ticket));
+            }
+        }
     }
 
     fn reap(&mut self, directory: &Path) {
@@ -569,9 +608,29 @@ mod tests {
         .unwrap()
     }
 
+    fn fixture() -> tempfile::TempDir {
+        crate::host_boot::set_boot_id_for_tests(Some("test-boot"));
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn a_reused_process_witness_from_a_previous_boot_cannot_join() {
+        let root = fixture();
+        let first = enqueue(root.path(), 1, "a");
+        assert!(first.waiter.alive(&first.directory));
+        crate::host_boot::set_boot_id_for_tests(Some("next-boot"));
+        let second = enqueue(root.path(), 2, "b");
+        assert!(first.has_claim().is_err());
+        assert!(!first.waiter.alive(&first.directory));
+        assert!(matches!(
+            second.admit(host_monotonic_ns()).unwrap(),
+            Admission::Single
+        ));
+    }
+
     #[test]
     fn unchanged_observations_keep_the_snapshot_and_new_generation_is_read() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture();
         let first = enqueue(root.path(), 1, "a");
         assert!(!first.has_claim().unwrap());
         let fd = first.observed.borrow().as_ref().unwrap()._file.as_raw_fd();
@@ -600,7 +659,7 @@ mod tests {
 
     #[test]
     fn an_arrival_after_the_cutoff_cannot_join_even_before_claim_publication() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture();
         let first = enqueue(root.path(), 1, "a");
         let cutoff = host_monotonic_ns();
         let late = enqueue(root.path(), 2, "b");
@@ -611,7 +670,7 @@ mod tests {
 
     #[test]
     fn a_solo_fallback_withdraws_even_when_scheduler_lock_is_busy() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture();
         let first = enqueue(root.path(), 1, "a");
         let second = enqueue(root.path(), 2, "b");
         let lock = ExclusiveFileLock::try_acquire(

@@ -2222,11 +2222,10 @@ impl Broker {
                     "reason": "a waiting group was verified as a whole",
                     "queued_batch_candidate": receipt.candidate,
                 });
-                self.store().set_merge_status(
+                self.store().record_queued_batch_supersession(
                     entry.id,
-                    MergeStatus::Superseded,
-                    None,
-                    Some(&details.to_string()),
+                    entry.session_id,
+                    &details.to_string(),
                 )?;
                 return Ok(SubmitOutcome {
                     entry: self.queue_entry(entry.id)?,
