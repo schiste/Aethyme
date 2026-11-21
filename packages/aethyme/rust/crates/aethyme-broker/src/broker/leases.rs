@@ -6405,6 +6405,12 @@ impl Broker {
         } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
         let scratch = self.session_scratch_environment(session_id);
+        // Held until the command has ended: dropping it ends the run.
+        let command_temp = self.command_temp_for_session(session_id);
+        let temp_environment = command_temp
+            .as_ref()
+            .map(crate::command_temp::CommandTemp::environment)
+            .unwrap_or_default();
         self.guarded_exec_with_runner(
             session_id,
             command,
@@ -6425,6 +6431,7 @@ impl Broker {
                     ),
                 ];
                 execution_environment.extend(scratch);
+                execution_environment.extend(temp_environment);
                 execution_environment.extend_from_slice(environment);
 
                 let result = match select_mode() {
@@ -6645,6 +6652,11 @@ impl Broker {
             ),
         ];
         execution_environment.extend(self.session_scratch_environment(session_id));
+        // Held until the step has ended: dropping it ends the run.
+        let command_temp = self.command_temp_for_session(session_id);
+        if let Some(temp) = &command_temp {
+            execution_environment.extend(temp.environment());
+        }
         execution_environment.extend_from_slice(environment);
         self.guarded_exec_with_runner(
             session_id,

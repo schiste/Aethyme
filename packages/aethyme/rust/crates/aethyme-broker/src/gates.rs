@@ -5818,6 +5818,18 @@ fn run_gate_command_inner(
     {
         process.env(crate::session_scratch::SESSION_SCRATCH_ENV, scratch);
     }
+    // A temp directory of its own inside it, so what the command leaves
+    // under `$TMPDIR` goes with the run rather than staying in the system
+    // temp folder. Dropped when this function returns, after the command
+    // and its process group were reaped, whatever the outcome.
+    let command_temp = context
+        .session_id
+        .filter(|session_id| crate::command_temp::remembered_enabled(*session_id))
+        .and_then(crate::session_scratch::remembered_for_commands)
+        .and_then(|scratch| crate::command_temp::CommandTemp::create(&scratch));
+    if let Some(temp) = &command_temp {
+        temp.apply(&mut process);
+    }
     // From the same reading the log header records, so a log always shows
     // the capacity the command sized itself on.
     match crate::gate_admission::idle_cpus(

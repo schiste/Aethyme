@@ -24,13 +24,13 @@
 //! here unlinks anything.
 //!
 //! Commands the broker runs for a session get the path as
-//! [`SESSION_SCRATCH_ENV`]. `TMPDIR` (and `TMP`, `TEMP`) are deliberately not
-//! pointed at it: a pool path on the busiest machine is 87 bytes and holds a
-//! space, so a scratch path is about 130 bytes, past the Unix socket path
-//! limit (104 bytes on macOS, 108 on Linux) before any socket name is added.
-//! Tools that create sockets under the temp directory (SSH and GPG agents,
-//! Python multiprocessing, tmux) would fail, so agents point build output
-//! and temporary files there explicitly instead.
+//! [`SESSION_SCRATCH_ENV`]. `TMPDIR` (and `TMP`, `TEMP`) are not pointed at
+//! the scratch directory itself: a pool path on the busiest machine is 87
+//! bytes and holds a space, so a scratch path is about 130 bytes, past the
+//! Unix socket path limit (104 bytes on macOS, 108 on Linux) before any
+//! socket name is added. Each command instead gets its own run directory
+//! inside it, handed out through a short alias when its path is too long
+//! ([`crate::command_temp`]).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -527,6 +527,149 @@ pub(crate) fn move_to_trash(
     })?;
     row.pending = false;
     remove_container_if_empty(&record.pool, verified.container.as_raw_fd());
+    Ok(TrashedScratch {
+        trash_dir: trash.path().to_path_buf(),
+        entry,
+        row,
+    })
+}
+
+/// One finished command run ([`crate::command_temp`]) waiting in the done
+/// container of a recorded scratch directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinishedRun {
+    pub(crate) name: String,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl FinishedRun {
+    /// The run's path inside `record`'s directory.
+    pub(crate) fn path(&self, record: &ScratchRecord) -> PathBuf {
+        record
+            .path()
+            .join(crate::command_temp::DONE_CONTAINER)
+            .join(&self.name)
+    }
+}
+
+/// The verified done container of `record`'s directory.
+fn open_done_container(record: &ScratchRecord) -> Result<(OwnedFd, u64), Refusal> {
+    let verified = verify(record)?;
+    let entry = openat_dir_nofollow(verified.container.as_raw_fd(), &record.entry)
+        .map_err(|_| Refusal::NotARealDirectory)?;
+    let done = openat_dir_nofollow(entry.as_raw_fd(), crate::command_temp::DONE_CONTAINER)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                Refusal::Missing
+            } else {
+                Refusal::NotARealDirectory
+            }
+        })?;
+    let stat = fstat(done.as_raw_fd()).map_err(|_| Refusal::Failed)?;
+    #[allow(clippy::unnecessary_cast)]
+    let device = stat.st_dev as u64;
+    if !private_directory(&stat) {
+        return Err(Refusal::ForeignContainer);
+    }
+    if device != record.device {
+        return Err(Refusal::CrossesDevice);
+    }
+    Ok((done, device))
+}
+
+/// Finished runs in `record`'s done container, at most `limit`: real
+/// directories with a run name the broker writes, on the record's device.
+/// Anything else there is left alone. Read-only.
+pub(crate) fn finished_runs(record: &ScratchRecord, limit: usize) -> Vec<FinishedRun> {
+    let Ok((done, device)) = open_done_container(record) else {
+        return Vec::new();
+    };
+    let Ok(listing) = std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER))
+    else {
+        return Vec::new();
+    };
+    listing
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| crate::command_temp::is_run_name(name))
+        .filter_map(|name| {
+            let stat = fstatat_nofollow(done.as_raw_fd(), &name).ok()?;
+            #[allow(clippy::unnecessary_cast)]
+            let (run_device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
+            (is_directory(&stat) && run_device == device).then_some(FinishedRun {
+                name,
+                device: run_device,
+                inode,
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
+/// Move one finished run from `record`'s done container into the pool's
+/// checkout trash with one exclusive same-volume rename, exactly as
+/// [`move_to_trash`] moves a whole scratch directory: the scratch directory
+/// verifies, the run is a real directory with the listed identity on the
+/// pool's device, the row is recorded pending first, and the identity is
+/// checked again right before the rename. Nothing is unlinked here.
+pub(crate) fn move_finished_run_to_trash(
+    record: &ScratchRecord,
+    run: &FinishedRun,
+    record_pending: &mut dyn FnMut(
+        &Path,
+        &str,
+        crate::checkout_trash::TrashRow,
+    ) -> Result<(), String>,
+) -> Result<TrashedScratch, Refusal> {
+    let _span = crate::phase_telemetry::span("command_temp_move");
+    if !crate::command_temp::is_run_name(&run.name) {
+        return Err(Refusal::NotARecordedScratch);
+    }
+    let (done, device) = open_done_container(record)?;
+    let same = |done: RawFd| {
+        fstatat_nofollow(done, &run.name).is_ok_and(|stat| {
+            #[allow(clippy::unnecessary_cast)]
+            let identity = (stat.st_dev as u64, stat.st_ino as u64);
+            is_directory(&stat) && identity == (run.device, run.inode)
+        })
+    };
+    if run.device != device || !same(done.as_raw_fd()) {
+        return Err(Refusal::IdentityChanged);
+    }
+    let trash = crate::checkout_trash::open_trash(&record.pool).map_err(|_| Refusal::Failed)?;
+    #[allow(clippy::unnecessary_cast)]
+    let trash_device = fstat(trash.trash_fd()).map_err(|_| Refusal::Failed)?.st_dev as u64;
+    if trash_device != device {
+        return Err(Refusal::CrossesDevice);
+    }
+    let entry = crate::checkout_trash::new_entry_name(record.session_id);
+    let (creator_pid, creator_started_ms) = crate::checkout_trash::this_process_identity();
+    let mut row = crate::checkout_trash::TrashRow {
+        device: run.device,
+        inode: run.inode,
+        session_id: record.session_id,
+        failures: 0,
+        pending: true,
+        creator_pid,
+        creator_started_ms,
+        stripped: true,
+        scratch: true,
+        verification: false,
+    };
+    record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
+    if !same(done.as_raw_fd()) {
+        return Err(Refusal::IdentityChanged);
+    }
+    crate::checkout_trash::rename_noreplace(done.as_raw_fd(), &run.name, trash.trash_fd(), &entry)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::EXDEV) {
+                Refusal::CrossesDevice
+            } else {
+                Refusal::Failed
+            }
+        })?;
+    row.pending = false;
     Ok(TrashedScratch {
         trash_dir: trash.path().to_path_buf(),
         entry,

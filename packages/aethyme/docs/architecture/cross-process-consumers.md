@@ -4213,11 +4213,12 @@ New surface consumers may begin to depend on:
 - The environment variable `AETHYME_SESSION_SCRATCH_DIR` is exported to
   `broker advanced exec` commands, preparation steps, and gate commands run
   for a session (an inherited value is removed from gate commands). `TMPDIR`,
-  `TMP` and `TEMP` are deliberately not changed: on the busiest machine a
-  scratch path is about 130 bytes (and holds a space), past the Unix socket
-  path limit (104 bytes on macOS, 108 on Linux), so tools that create sockets
-  under the temp directory (SSH and GPG agents, Python multiprocessing, tmux)
-  would fail there.
+  `TMP` and `TEMP` never name the scratch directory itself: on the busiest
+  machine a scratch path is about 130 bytes (and holds a space), past the
+  Unix socket path limit (104 bytes on macOS, 108 on Linux), so tools that
+  create sockets under the temp directory (SSH and GPG agents, Python
+  multiprocessing, tmux) would fail there. Each command gets a run directory
+  inside it instead (see "Command temp directories" below).
 - `aethyme storage status --json` adds a `session_scratch` class
   (`directories`, `bytes`, `kept`, `partial`, `bytes_freed_total`,
   `repositories`), written by the retirement lane to
@@ -4268,6 +4269,62 @@ a retirement run when the session has a scratch directory. Counters
 `session_scratch_move`, `session_scratch_retire_pass`,
 `session_scratch_measure`; attachments `session_scratch_retire` and
 `session_scratch_usage`; start phase `session_scratch`.
+
+### Command temp directories (introduced 2026-11-21)
+
+Every command the broker runs for a session -- `git push` and its pre-push
+dry run (so the repository's pre-push hook), gate commands (submit and the
+verification slot), preparation steps and `broker advanced exec` -- gets
+`TMPDIR`, `TMP`, `TEMP` and `AETHYME_COMMAND_TEMP_DIR` naming a fresh
+directory the broker created for that one run,
+`<session scratch>/tmp/r<ms hex>-<pid hex>-<n hex>` (mode 0700), on the
+checkout's volume. When the run directory's path is longer than 64 bytes,
+the variables name a short symbolic link to it instead,
+`<inherited temp dir>/ae<uid>/<pid hex>x<n hex>`, in a private directory
+owned by the user (refused, and the inherited temp folder kept, when that
+directory is a link, foreign, or open to others); socket paths count only the
+link's length while every byte lands on the scratch volume. When even the
+link would be longer than 64 bytes the command keeps the inherited temp
+folder. A command started with `AETHYME_COMMAND_TEMP_DIR` equal to its
+`TMPDIR` (a gate inside a pushed pre-push hook) inherits that run rather
+than nesting one. Commands with no session (the main checkout) and
+`aethyme env exec` are unchanged.
+
+When the command ends, success, failure or timeout alike (the guard drops
+after the supervision reaps the command), the link is removed if it is still
+a link to that run, an empty run directory is removed with one `rmdir`, and
+a non-empty one is renamed into `<session scratch>/tmp-done/`. Each
+`checkout_retirement` run, inside the scratch pass's budget, moves the
+finished runs of open sessions (up to 64 per scratch directory) into the
+pool's checkout trash: no process may use them (the run's open-file
+observation), the scratch directory must verify as for its own retirement,
+the done container must be a private directory on the pool's device, and
+each run must be a real directory with a run name and the identity listed;
+the trash row (`scratch: true`, `stripped: true`) is recorded pending first.
+The paced host deleter unlinks them. A run the broker never finished (it was
+killed) stays inside the session scratch and goes with it. Links of the
+broker's naming whose target is gone are pruned when a new link is made.
+Nothing in the system temp folder that the broker did not create is ever
+touched.
+
+`[command_temp] enabled = false` in `.aethyme/config.toml` (default `true`,
+same trust rule as the other repository policies; an unreadable or invalid
+file keeps the default and counts `command_temp_policy_invalid`) opts a
+repository whose tools need the system temp folder out.
+
+Counters `command_temp_created`, `command_temp_alias_created`,
+`command_temp_inherited`, `command_temp_path_too_long`,
+`command_temp_create_failed`, `command_temp_opted_out`,
+`command_temp_no_scratch`, `command_temp_alias_removed`,
+`command_temp_alias_pruned`, `command_temp_removed_empty`,
+`command_temp_finished`, `command_temp_finish_failed`,
+`command_temp_kept_changed`, `command_temp_retired`,
+`command_temp_kept_in_use`, `command_temp_kept_process_use_unknown`,
+`command_temp_kept_missing`, `command_temp_kept_refused`; spans
+`command_temp_prepare`, `command_temp_policy`, `command_temp_create`,
+`command_temp_finish`, `command_temp_retire`, `command_temp_move`. The
+`session_scratch_retire` attachment gains `command_temps_retired` and
+`command_temps_kept`.
 
 **Session stacks and remote session-branch cleanup (schema v66).** All fields
 below are additive and absent when they do not apply. `broker start --stack-on

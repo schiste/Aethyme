@@ -3430,6 +3430,15 @@ impl Broker {
         let push_shape = (request.provider == OperationProvider::Git)
             .then(|| classify_push(&request.args))
             .flatten();
+        // A push runs the repository's pre-push hook (in the dry run below,
+        // in the push itself, or both): its commands get a temp directory of
+        // this session's, so what they leave under `$TMPDIR` goes with the
+        // run. Held until both commands ended; dropping it ends the run.
+        let command_temp = (effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+            && is_push(&request.args))
+        .then(|| self.command_temp_for_session(request.session_id))
+        .flatten();
         let hooks_ran_outside_lock = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
@@ -3528,6 +3537,9 @@ impl Broker {
             dry_run.args(&pinned[command_index + 1..]);
             dry_run.current_dir(cwd);
             export_push_shape(&mut dry_run, push_shape.as_ref());
+            if let Some(temp) = &command_temp {
+                temp.apply(&mut dry_run);
+            }
             match output_within(
                 dry_run,
                 admission,
@@ -4212,6 +4224,9 @@ impl Broker {
         command.args(&provider_args);
         if request.provider == OperationProvider::Git {
             export_push_shape(&mut command, push_shape.as_ref());
+        }
+        if let Some(temp) = &command_temp {
+            temp.apply(&mut command);
         }
         // Trace2 gives us process-level evidence for the one useful
         // pre-transfer distinction Git itself does not expose in its exit
