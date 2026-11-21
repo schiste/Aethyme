@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.147] - 2026-11-21
+
+### Fixed
+
+- A managed gate cache over its `max_bytes` no longer loses the whole tree. The gate first moves aside superseded cargo unit generations (an older generation of the same package and unit kinds whose fingerprint nothing has read since the newest was built), oldest first, down to three quarters of the cap, with a 5 s limit; the storage worker deletes them off the command path. The whole-tree rotation remains the fallback. On this repository's largest target 10.2 of 14.6 GiB was superseded generations left by version bumps (#1909).
+- The retirement lane releases a closed session's implicit leases, in the same transaction that checks the session is not open, so a checkout held only by them can retire. Explicit claims still keep it (#1910).
+- An orphaned checkout (its Git registration is gone) with a recorded interrupted finish-cleanup proof is resumed through the content-verified removal: tracked files are compared with the pinned commit and anything modified or new refuses the removal. Without the proof it is kept as `orphan_cleanup_refused`. The lane cannot reach the recursive orphan removal (#1910).
+- Keeps that cannot resolve by themselves (`operation_state_unknown`, `ownership_unknown`, `lease_held`, `operation_unresolved`, `orphan_cleanup_refused`) are remembered with the existing back-off instead of being judged on every run. `lease_held` and `operation_unresolved` clear as soon as the lease is released or the operation resolved (#1910).
+
+### Added
+
+- `broker status` notice `cleanup.retirement-kept`: remembered keeps by reason, with up to eight session ids and one detail each (#1910).
+- Span and attachment `managed_cache_prune` (`candidates`, `units`, `bytes`, `deadline_stopped`, `deletion_deferred`, `rebuilt_after_previous_prune`); counters `managed_cache_prune_staged_unit`, `managed_cache_prune_deadline_stop`, `managed_cache_prune_rebuilt_unit` (#1909).
+- Counters `checkout_retirement_keep_condition_cleared` and `checkout_retirement_orphan_recursive_removal_refused`; event `lease.released` with reason `closed_session_implicit_lease` (#1910).
+
+### Known issues
+
+- Orphaned checkouts without a recorded proof, folders with no Git data, and checkouts whose changes are too large for the recovery archive stay on disk. They are now listed in `broker status`.
+
 ## [0.8.146] - 2026-11-21
 
 ### Fixed
