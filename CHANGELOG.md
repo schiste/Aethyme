@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.152] - 2026-11-21
+
+### Fixed
+
+- The abandoned-session close no longer holds the lifecycle claim while it runs its second look. On the busiest repository every background hold of 5 s or more came from this close, 9 to 14 s each, which is what a foreground `start` or `finish` waits behind. The second look now runs under the per-session operation claim only. Before it, the close records a stamp of the checkout's commit state (HEAD commit, session branch tip, index file identity), read from files without running Git; it then takes the lifecycle claim only for the close, re-checks the start reservation, the spawned process and any live session at the same path, compares the stamp, and keeps the session for that pass if anything moved, if a part of the stamp exists but cannot be read, or if those re-checks took 4 s or more. Nothing new may be closed: the change only adds ways to keep a session (#1925).
+
+### Added
+
+- Keep reason `close_claim_budget` with counter `session_abandonment_kept_close_claim_budget`; spans `abandoned_close_claimed` and `abandoned_close_checkout_stamp`; counters `abandoned_close_checkout_moved_before_close`, `abandoned_close_claim_budget`, `abandoned_close_path_reused_before_close` and `abandoned_close_checkout_stamp_unreadable` (#1925).
+
+### Known issues
+
+- A repository that stores refs in the reftable format keeps every abandoned session through this path (the stamp is unreadable there), so such sessions close only through the other lanes.
+
 ## [0.8.151] - 2026-11-21
 
 ### Fixed
