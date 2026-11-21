@@ -2926,6 +2926,26 @@ requested but had neither a hook nor an end of the remote ref read, e.g. an
 empty trace file). The three spans nest inside `push_git_process`; do not add
 them to it.
 
+Changed 2026-11-21. A configured or granted duration (a budget, a reserve,
+a retry delay) is no longer recorded as a timing: it is counted in
+`phase_counts` with a zero `phase_timings_ms` entry, and its value goes to the
+attachment `phase_values_ms` (an object, the largest value seen per name, in
+milliseconds). This applies to `landed_proof_session_budget_doubled`,
+`proof_git_stopped_at_deadline`, `artifact_worker_retirement_share_budget`,
+`artifact_worker_capacity_removal_retry`,
+`artifact_worker_capacity_removal_cache_lane_reserved` and
+`checkout_trash_drain_budget_extended`, whose summed "timings" were budgets
+(the first summed to 1,617,540 s over 21 worker runs on the busiest
+repository). A reader that summed them as time spent must read
+`phase_values_ms` instead. Introduced the same day: every metric line a
+command writes carries `cpu_ms` (`user`, `system`, `children_user`,
+`children_system`: CPU milliseconds of the process and its reaped children,
+from `getrusage`; absent off Unix); the removal lane counts
+`auto_cleanup_memo_miss_absent` and `auto_cleanup_memo_miss_changed` (why a
+closed checkout group is judged in full again); and `checkout_strip_backlog`
+nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
+`checkout_strip_backlog_regenerable` (the per-folder catalogue `lstat`s).
+
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
 where the work happens rather than by each command: `subprocess_git` and

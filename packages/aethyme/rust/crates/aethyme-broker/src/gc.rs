@@ -9438,7 +9438,7 @@ impl Broker {
     ) -> Result<(), BrokerOpError> {
         let remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
         let run_budget = worker_retirement_run_budget(remaining);
-        crate::phase_telemetry::add("artifact_worker_retirement_share_budget", run_budget);
+        crate::phase_telemetry::value("artifact_worker_retirement_share_budget", run_budget);
         if remaining < SESSION_RETIREMENT_WORKER_RESERVE {
             // Removal overran the run: retirement still gets its reserve.
             crate::phase_telemetry::add(
@@ -10903,7 +10903,7 @@ impl Broker {
             },
             &retry_after_ms.map(|at| at.to_string()).unwrap_or_default(),
         )?;
-        crate::phase_telemetry::add(
+        crate::phase_telemetry::value(
             "artifact_worker_capacity_removal_retry",
             Duration::from_millis(retry_ms.map_or(0, |wait| u64::try_from(wait).unwrap_or(0))),
         );
@@ -11002,7 +11002,7 @@ impl Broker {
             "artifact_worker_capacity_removal_apply",
             Duration::from_millis(apply_ms),
         );
-        crate::phase_telemetry::add(
+        crate::phase_telemetry::value(
             "artifact_worker_capacity_removal_cache_lane_reserved",
             limits.cache_lane_reserved,
         );

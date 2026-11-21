@@ -388,7 +388,10 @@ pub(super) fn record_command_metric(
     };
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
-    let details = with_spans(details.unwrap_or_default(), spans);
+    let mut details = with_spans(details.unwrap_or_default(), spans);
+    if let Some(cpu) = process_cpu_ms() {
+        details.entry("cpu_ms").or_insert(cpu);
+    }
     let Ok(cwd) = repository.map_or_else(std::env::current_dir, Ok) else {
         return;
     };
@@ -505,6 +508,41 @@ pub(crate) fn record_hook_metric(
     }
     set_command_metric_details(serde_json::json!({ "hook_delivery": delivery }));
     record_command_metric(&args, 0, started, ended, output_bytes, spans);
+}
+
+/// CPU time this process and its reaped children used, in milliseconds:
+/// `{"user", "system", "children_user", "children_system"}`. A command that
+/// runs for minutes on a shared machine (the detached worker) shows here
+/// whether it computed or waited.
+#[cfg(unix)]
+fn process_cpu_ms() -> Option<serde_json::Value> {
+    fn usage(who: libc::c_int) -> Option<(u64, u64)> {
+        // SAFETY: `rusage` is plain data that `getrusage` fully initialises
+        // on success; it is read only then.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid pointer to a local `rusage` and a valid `who`.
+        if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+            return None;
+        }
+        let millis = |time: libc::timeval| {
+            u64::try_from(time.tv_sec).unwrap_or(0) * 1_000
+                + u64::try_from(time.tv_usec).unwrap_or(0) / 1_000
+        };
+        Some((millis(usage.ru_utime), millis(usage.ru_stime)))
+    }
+    let (user, system) = usage(libc::RUSAGE_SELF)?;
+    let (children_user, children_system) = usage(libc::RUSAGE_CHILDREN).unwrap_or((0, 0));
+    Some(serde_json::json!({
+        "user": user,
+        "system": system,
+        "children_user": children_user,
+        "children_system": children_system,
+    }))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_ms() -> Option<serde_json::Value> {
+    None
 }
 
 /// Fold the spans recorded anywhere during the command into its metric
@@ -753,6 +791,15 @@ mod tests {
         command_metric_enabled, command_records_metric, command_records_outcome, metric_line,
         safe_command_surface, with_spans,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn metric_lines_carry_the_process_cpu_time() {
+        let cpu = super::process_cpu_ms().expect("getrusage works on unix");
+        for field in ["user", "system", "children_user", "children_system"] {
+            assert!(cpu[field].is_u64(), "{field}: {cpu}");
+        }
+    }
 
     #[test]
     fn caller_hints_keep_only_the_executable_name() {
