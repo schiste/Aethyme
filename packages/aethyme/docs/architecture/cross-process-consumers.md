@@ -2967,7 +2967,16 @@ missing or hookless: `push_git_trace_without_hook` (the trace showed no
 `pre-push` hook) and `push_git_process_split_unavailable` (the trace was
 requested but had neither a hook nor an end of the remote ref read, e.g. an
 empty trace file). The three spans nest inside `push_git_process`; do not add
-them to it.
+them to it. Timed-out pushes carry `push_timeout_timing` in the operation
+journal when Trace2 was requested. Its `stage` is `remote_ref_listing`,
+`pre_push_hook`, `transfer` or `unknown`; `process_ms` includes the time
+observed until the child stopped. When known, `before_hook_ms` gives the
+first split boundary. `hook_ms` measures a completed hook (zero with no
+hook); `hook_elapsed_ms` reports time observed during an interrupted hook.
+`after_hook_ms` is present only when transfer started and both split
+boundaries are known. Missing fields represent missing evidence. The
+`push_git_timeout_trace` span times the diagnostic read; these fields never
+change the write outcome or its lock scope.
 
 Changed 2026-11-21. A configured or granted duration (a budget, a reserve,
 a retry delay) is no longer recorded as a timing: it is counted in
