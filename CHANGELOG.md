@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.146] - 2026-11-21
+
+### Fixed
+
+- The retirement lane's inspections no longer starve. The lane ran at a disk priority one tier below ordinary processes, so its reads, and those of its Git children, waited behind every build on the same volume. On the busiest repository one run of 1,319 s examined 24 checkouts, started 16 inspections, finished none and retired nothing; each status timed out at 60 s, while the same command took 0.14 s and 0.36 s from an ordinary shell under the same load. The lane now runs at an ordinary process's disk priority. It keeps its low CPU priority, one inspection per volume and host-pressure pacing. Which checkouts may be retired is unchanged (#1905).
+- `finish` no longer spends its budget on a size walk. The walk only feeds the reported reclaimed bytes and took 14 to 45 s; it is now bounded at 2 s, and a walk that runs out reports no size (#1906).
+- A background strip pass may hold the lifecycle claim for at most 5 s per proof, with its Git deadline matched. On the busiest repository a worker held the claim three times for 80 s in total, and two of three finishes timed out waiting behind it. A proof that runs out is a transient refusal retried on the next pass; what is proven is unchanged (#1906).
+
+### Added
+
+- Each lane run is recorded in meta `checkout_retirement.lane`. After three consecutive runs retire nothing while closed checkouts wait, `broker status` warns with `cleanup.retirement-lane-idle` (#1905).
+- Counter `lifecycle_lock_held_background_long` for background lifecycle holds of 5 s or more (#1906).
+
+### Upgrade notes
+
+- `finish` may report 0 reclaimed bytes for a large checkout: the size is no longer measured past 2 s.
+
 ## [0.8.145] - 2026-11-21
 
 ### Added
