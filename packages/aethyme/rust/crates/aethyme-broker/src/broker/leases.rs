@@ -6411,7 +6411,7 @@ impl Broker {
             .as_ref()
             .map(crate::command_temp::CommandTemp::environment)
             .unwrap_or_default();
-        self.guarded_exec_with_runner(
+        let result = self.guarded_exec_with_runner(
             session_id,
             command,
             record_receipt,
@@ -6573,7 +6573,9 @@ impl Broker {
                 };
                 Ok(result)
             },
-        )
+        );
+        self.finish_command_temp(session_id, command_temp);
+        result
     }
 
     pub(crate) fn start_preparation_exec_supervisor(
@@ -6658,33 +6660,36 @@ impl Broker {
             execution_environment.extend(temp.environment());
         }
         execution_environment.extend_from_slice(environment);
-        self.guarded_exec_with_runner(
-            session_id,
-            command,
-            false,
-            move |session, _observation, artifact_use, _dispatch| {
-                let result = supervisor
-                    .with_artifact_use(artifact_use.take())
-                    .run(
-                        Path::new(&session.worktree_path),
-                        command,
-                        &execution_environment,
-                        heartbeat,
-                    )
-                    .map_err(|error| {
-                        map_preparation_exec_supervisor_error(session_id, command, error)
-                    })?;
-                Ok(GuardedCommandResult {
-                    exit_code: result.exit_code,
-                    succeeded: result.succeeded,
-                    timed_out: result.termination
-                        == crate::inline_exec_supervisor::CommandTermination::TimedOut,
-                    command_started: result.command_started,
-                    process_group_cleanup: "verified",
-                })
-            },
-        )
-        .map(|(report, _, _)| report)
+        let result = self
+            .guarded_exec_with_runner(
+                session_id,
+                command,
+                false,
+                move |session, _observation, artifact_use, _dispatch| {
+                    let result = supervisor
+                        .with_artifact_use(artifact_use.take())
+                        .run(
+                            Path::new(&session.worktree_path),
+                            command,
+                            &execution_environment,
+                            heartbeat,
+                        )
+                        .map_err(|error| {
+                            map_preparation_exec_supervisor_error(session_id, command, error)
+                        })?;
+                    Ok(GuardedCommandResult {
+                        exit_code: result.exit_code,
+                        succeeded: result.succeeded,
+                        timed_out: result.termination
+                            == crate::inline_exec_supervisor::CommandTermination::TimedOut,
+                        command_started: result.command_started,
+                        process_group_cleanup: "verified",
+                    })
+                },
+            )
+            .map(|(report, _, _)| report);
+        self.finish_command_temp(session_id, command_temp);
+        result
     }
 
     fn guarded_exec_with_runner<F>(

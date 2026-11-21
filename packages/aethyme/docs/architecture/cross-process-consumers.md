@@ -4280,32 +4280,55 @@ directory the broker created for that one run,
 `<session scratch>/tmp/r<ms hex>-<pid hex>-<n hex>` (mode 0700), on the
 checkout's volume. When the run directory's path is longer than 64 bytes,
 the variables name a short symbolic link to it instead,
-`<inherited temp dir>/ae<uid>/<pid hex>x<n hex>`, in a private directory
-owned by the user (refused, and the inherited temp folder kept, when that
-directory is a link, foreign, or open to others); socket paths count only the
-link's length while every byte lands on the scratch volume. When even the
-link would be longer than 64 bytes the command keeps the inherited temp
-folder. A command started with `AETHYME_COMMAND_TEMP_DIR` equal to its
-`TMPDIR` (a gate inside a pushed pre-push hook) inherits that run rather
-than nesting one. Commands with no session (the main checkout) and
+`/tmp/ae<uid>/<6 hex>`, in a private directory owned by the user; when that
+directory is a link, foreign, or open to others, the inherited temp folder
+is tried as the base (`<temp>/ae<uid>/<6 hex>`, 62 bytes for macOS's
+49-byte per-user temp folder and uid 501), and when no alias path fits in
+64 bytes (sized on the actual alias) the command keeps the inherited temp
+folder. Socket paths count only the link's length while every byte lands
+on the scratch volume. A command started with `AETHYME_COMMAND_TEMP_DIR`
+equal to its `TMPDIR`, resolving into the same scratch's run container (a
+gate inside a pushed pre-push hook), inherits that run rather than nesting
+one. When the scratch's volume is below the gate headroom (8 GiB or 100,000
+inodes, the classifier the storage sweeps use, read with one `statvfs`, or
+the gate's own reading for a gate) the command keeps the inherited temp
+folder. Commands with no session (the main checkout), coordinated `gh` and
 `aethyme env exec` are unchanged.
 
 When the command ends, success, failure or timeout alike (the guard drops
-after the supervision reaps the command), the link is removed if it is still
-a link to that run, an empty run directory is removed with one `rmdir`, and
-a non-empty one is renamed into `<session scratch>/tmp-done/`. Each
-`checkout_retirement` run, inside the scratch pass's budget, moves the
-finished runs of open sessions (up to 64 per scratch directory) into the
-pool's checkout trash: no process may use them (the run's open-file
-observation), the scratch directory must verify as for its own retirement,
-the done container must be a private directory on the pool's device, and
-each run must be a real directory with a run name and the identity listed;
-the trash row (`scratch: true`, `stripped: true`) is recorded pending first.
-The paced host deleter unlinks them. A run the broker never finished (it was
+after the supervision reaps the command), an empty run directory (same
+device and inode as created) is removed with one `rmdir`, and its link if
+it is still a link to that run. A non-empty one stays where it is, link
+included, so a process the command left behind keeps a working `TMPDIR`;
+the broker writes a marker for it, `<session scratch>/tmp-done/<run name>`
+(a new 0600 regular file in a private directory beside the runs, never
+inside one, JSON `device`, `inode`, optional `alias`, `bytes` and
+`complete` as measured within 100 ms). Each `checkout_retirement` run,
+inside the scratch pass's budget, takes up to 64 marked runs per open
+session's scratch directory: no process may use the run (the run's
+open-file observation), the scratch directory must verify as for its own
+retirement, the run container must be a private directory on the pool's
+device, and the run must be a real directory (a link there is not followed)
+with the marker's identity; the trash row (`scratch: true`,
+`stripped: true`) is recorded pending first and the identity checked again
+before the rename. Then the link (only if still a link to the run) and the
+marker go. The paced host deleter unlinks the run. A run whose directory is
+gone loses its marker and link. A run the broker never finished (it was
 killed) stays inside the session scratch and goes with it. Links of the
 broker's naming whose target is gone are pruned when a new link is made.
 Nothing in the system temp folder that the broker did not create is ever
 touched.
+
+The retirement run is due every 10 minutes when idle (every minute while
+busy) and starts from any broker command that opens the repository's
+broker. A finished run measured at 1 GiB or more (or not measured
+completely), or a session reaching 16 marked runs or 1 GiB of them, makes
+the next step that can -- the end of an exec, a preparation step or a push,
+or the start of the next command or gate run for the session -- request it
+at once, the same request `finish` and `close` make. `broker status` adds
+advice `storage.command-temp-backlog` (notice) when one repository has 64
+or more marked runs or 4 GiB of them awaiting removal; the storage ledger's
+`session_scratch` usage gains `finished_runs` and `finished_run_bytes`.
 
 `[command_temp] enabled = false` in `.aethyme/config.toml` (default `true`,
 same trust rule as the other repository policies; an unreadable or invalid
@@ -4313,18 +4336,22 @@ file keeps the default and counts `command_temp_policy_invalid`) opts a
 repository whose tools need the system temp folder out.
 
 Counters `command_temp_created`, `command_temp_alias_created`,
-`command_temp_inherited`, `command_temp_path_too_long`,
-`command_temp_create_failed`, `command_temp_opted_out`,
-`command_temp_no_scratch`, `command_temp_alias_removed`,
+`command_temp_alias_base_refused`, `command_temp_inherited`,
+`command_temp_path_too_long`, `command_temp_create_failed`,
+`command_temp_opted_out`, `command_temp_no_scratch`,
+`command_temp_skipped_pressure`, `command_temp_alias_removed`,
 `command_temp_alias_pruned`, `command_temp_removed_empty`,
 `command_temp_finished`, `command_temp_finish_failed`,
-`command_temp_kept_changed`, `command_temp_retired`,
+`command_temp_kept_changed`, `command_temp_retirement_requested`,
+`command_temp_retired`, `command_temp_missing_forgotten`,
 `command_temp_kept_in_use`, `command_temp_kept_process_use_unknown`,
-`command_temp_kept_missing`, `command_temp_kept_refused`; spans
+`command_temp_kept_move_failed`, `command_temp_kept_refused`; spans
 `command_temp_prepare`, `command_temp_policy`, `command_temp_create`,
-`command_temp_finish`, `command_temp_retire`, `command_temp_move`. The
-`session_scratch_retire` attachment gains `command_temps_retired` and
-`command_temps_kept`.
+`command_temp_finish`, `command_temp_backlog_check`,
+`command_temp_retire`, `command_temp_move`. The `session_scratch_retire`
+attachment gains `command_temps_retired` and `command_temps_kept`; the
+`session_scratch_usage` attachment gains `finished_runs` and
+`finished_run_bytes`.
 
 **Session stacks and remote session-branch cleanup (schema v66).** All fields
 below are additive and absent when they do not apply. `broker start --stack-on

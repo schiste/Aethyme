@@ -1463,6 +1463,25 @@ fn session_scratch_usage_is_reported_and_advised_when_large() {
         .expect("advice");
     assert_eq!(row.evidence.len(), 1, "{row:?}");
     assert!(row.evidence[0].contains("session 9"), "{row:?}");
+    assert!(
+        advice
+            .iter()
+            .all(|row| row.id != "storage.command-temp-backlog"),
+        "no finished runs, no backlog advice"
+    );
+    let backlog = super::SessionScratchUsage {
+        finished_runs: super::COMMAND_TEMP_BACKLOG_ADVICE_RUNS,
+        finished_run_bytes: 2048,
+        ..super::SessionScratchUsage::default()
+    };
+    super::record_session_scratch_usage(host_state, "/repo/c", backlog).unwrap();
+    let advice = super::cli::status_advice(host_state);
+    let row = advice
+        .iter()
+        .find(|row| row.id == "storage.command-temp-backlog")
+        .expect("backlog advice");
+    assert_eq!(row.evidence.len(), 1, "{row:?}");
+    assert!(row.evidence[0].contains("64 finished"), "{row:?}");
 }
 
 /// A gate cache prune stages its units under the host cache root. The

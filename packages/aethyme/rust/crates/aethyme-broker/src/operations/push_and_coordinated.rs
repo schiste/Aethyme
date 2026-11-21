@@ -4303,6 +4303,8 @@ impl Broker {
         };
         drop(process_span);
         let process_elapsed = process_started.elapsed();
+        // The hook has ended with the push: end its run now.
+        self.finish_command_temp(request.session_id, command_temp);
         let _record_span = push_stage_span(push_stages, "push_git_record");
         let output = match provider_output {
             Ok(output) => output,

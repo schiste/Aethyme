@@ -5822,10 +5822,25 @@ fn run_gate_command_inner(
     // under `$TMPDIR` goes with the run rather than staying in the system
     // temp folder. Dropped when this function returns, after the command
     // and its process group were reaped, whatever the outcome.
+    // Below the gate headroom (this gate's own reading) it keeps the
+    // inherited temp folder, so temp writes add nothing to a full volume.
     let command_temp = context
         .session_id
         .filter(|session_id| crate::command_temp::remembered_enabled(*session_id))
         .and_then(crate::session_scratch::remembered_for_commands)
+        .filter(|_| {
+            let pressured = crate::command_temp::pressured_counts(
+                context.available_bytes,
+                context.available_inodes,
+            );
+            if pressured {
+                crate::phase_telemetry::add(
+                    "command_temp_skipped_pressure",
+                    std::time::Duration::ZERO,
+                );
+            }
+            !pressured
+        })
         .and_then(|scratch| crate::command_temp::CommandTemp::create(&scratch));
     if let Some(temp) = &command_temp {
         temp.apply(&mut process);
