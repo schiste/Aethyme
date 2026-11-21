@@ -1673,9 +1673,12 @@ fn require_absent(path: &Path) -> io::Result<()> {
 }
 
 /// Move an archived record back: anything exactly matching the failed new
-/// record is dropped first, then the plan and receipts, and the unit last
-/// (so a crash part-way leaves a plan without its unit, a known stale
-/// record). Nothing that differs is ever overwritten.
+/// record is dropped first, then the plan, then the unit, then the
+/// receipts. A crash part-way leaves a plan without its unit, which
+/// `broker status` advises about. Nothing that differs is overwritten: the
+/// plan and unit refuse a conflict, and a receipt already in the directory
+/// (a tick writes `last-error.json` without the installer claim) is newer,
+/// so it is kept and the archived copy stays in the archive.
 fn restore_record(
     archive: &Path,
     directory: &Path,
@@ -1687,39 +1690,43 @@ fn restore_record(
         remove_if_exact(&directory.join("plan.json"), plan_bytes)?;
         remove_if_exact(unit_path, unit_bytes)?;
     }
-    let names = [
-        "plan.json",
-        "control.json",
-        "last-pass.json",
-        "last-error.json",
-    ];
-    for name in names {
+    let archived_file = |name: &str| -> io::Result<Option<PathBuf>> {
         let source = archive.join(name);
         match fs::symlink_metadata(&source) {
-            Ok(metadata) if metadata.is_file() => {
-                let target = directory.join(name);
-                require_absent(&target)?;
+            Ok(metadata) if metadata.is_file() => Ok(Some(source)),
+            Ok(_) => Err(invalid("GC service archive holds a non-file path")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    if let Some(source) = archived_file("plan.json")? {
+        let target = directory.join("plan.json");
+        require_absent(&target)?;
+        fs::rename(&source, &target)?;
+        fs::File::open(directory)?.sync_all()?;
+    }
+    if let Some(source) = archived_file("unit.plist")? {
+        require_absent(unit_path)?;
+        move_file(&source, unit_path)?;
+        if let Some(parent) = unit_path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    for name in ["control.json", "last-pass.json", "last-error.json"] {
+        let Some(source) = archived_file(name)? else {
+            continue;
+        };
+        let target = directory.join(name);
+        match fs::symlink_metadata(&target) {
+            // Written since the archive: newer than the archived copy.
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::rename(&source, &target)?;
             }
-            Ok(_) => return Err(invalid("GC service archive holds a non-file path")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
     fs::File::open(directory)?.sync_all()?;
-    let unit = archive.join("unit.plist");
-    match fs::symlink_metadata(&unit) {
-        Ok(metadata) if metadata.is_file() => {
-            require_absent(unit_path)?;
-            move_file(&unit, unit_path)?;
-            if let Some(parent) = unit_path.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
-        }
-        Ok(_) => return Err(invalid("GC service archive holds a non-file path")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
     // The emptied archive directory goes; one still holding anything stays.
     if let Err(error) = fs::remove_dir(archive)
         && error.kind() != io::ErrorKind::DirectoryNotEmpty
@@ -2089,6 +2096,22 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
             commands: vec![
                 REFRESH_COMMAND.into(),
                 "aethyme broker gc service status --json".into(),
+            ],
+        });
+    }
+    if record.plan_bytes.is_some() && !record.unit_present {
+        return Some(RepairAdvice {
+            id: "storage.gc-service-unit-missing",
+            reason: "the scheduled GC sweep service has its plan but no unit file, so launchd has nothing to load after a logout or restart; install replaces such a record once launchd confirms the label is not loaded",
+            summary: "this repository's scheduled GC sweep service has a plan but no unit file",
+            evidence: vec![format!(
+                "plan {} for runtime {} is recorded; the unit file is missing",
+                record.plan_digest.as_deref().unwrap_or("unreadable"),
+                record.runtime_version.as_deref().unwrap_or("unknown")
+            )],
+            commands: vec![
+                "aethyme broker gc service status --json".into(),
+                "aethyme broker gc service plan".into(),
             ],
         });
     }
@@ -3131,6 +3154,69 @@ mod tests {
         assert_eq!(outcome.outcome, "refreshed_not_loaded", "{outcome:?}");
         assert_eq!(fs::read(&plan.unit_path).unwrap(), fresh.unit.as_bytes());
         assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn restoring_keeps_a_newer_receipt_and_still_restores_the_unit() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_private(&plan.directory.join("last-error.json"), b"{\"older\":true}");
+        let mut out = RefreshOutcome::new(&plan.repository_uuid);
+        {
+            let _claim = crate::pr_watch_service_install::claim_service_directory(
+                &plan.home,
+                &plan.directory,
+                plan.uid,
+            )
+            .unwrap();
+            let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+            let archive = archive_record(&record).unwrap();
+            assert!(archive.join("last-error.json").is_file());
+            out.outcome = "refresh_failed_unrestored";
+            out.archived_to = Some(archive);
+            write_refresh_receipt(&plan.home, &plan.repository_uuid, &out).unwrap();
+        }
+        // The still-loaded job's tick fails without a plan and leaves a
+        // newer error receipt, without the installer claim.
+        write_private(&plan.directory.join("last-error.json"), b"{\"newer\":true}");
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&newer_runtime(&plan)),
+            |_, _| Ok(LabelState::Unknown),
+            |_| panic!("nothing is run without launchd's answer"),
+        );
+        assert_eq!(outcome.outcome, "label_state_unknown", "{outcome:?}");
+        assert_eq!(
+            fs::read(plan.directory.join("plan.json")).unwrap(),
+            serde_json::to_vec(&plan).unwrap()
+        );
+        assert_eq!(fs::read(&plan.unit_path).unwrap(), plan.unit.as_bytes());
+        assert_eq!(
+            fs::read(plan.directory.join("last-error.json")).unwrap(),
+            b"{\"newer\":true}"
+        );
+        let archive = out.archived_to.unwrap();
+        assert_eq!(
+            fs::read(archive.join("last-error.json")).unwrap(),
+            b"{\"older\":true}"
+        );
+        load(&plan.home, &plan.repository_uuid).unwrap();
+    }
+
+    #[test]
+    fn a_plan_without_its_unit_is_advised() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        fs::remove_file(&plan.unit_path).unwrap();
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-unit-missing");
     }
 
     fn unconfirmed_control(plan: &Plan) {
