@@ -117,11 +117,13 @@ fn blocks(text: &str, prefix: &str) -> String {
 const GROUP_TEXT: &[(&str, &str)] = &[
     (
         "content-gate",
-        r#"aethyme content-gate — evaluate an Aexeo v1 content change
+        r#"aethyme content-gate — evaluate or compare content-gate evidence
 
   aethyme content-gate run <manifest.json>
     Run an uncached content check against a fresh verdict and current inputs.
     The publication host must revalidate and synchronize the final decision.
+  aethyme content-gate compare-v2 <manifest.json>
+    Compare experimental v2 evidence offline; never authorizes publication.
 "#,
     ),
     (

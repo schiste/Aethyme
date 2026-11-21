@@ -15,7 +15,7 @@ Hot path:
                               bounded source spans for Explore targets
 
 Content checks:
-  content-gate run <manifest.json>
+  content-gate <run|compare-v2> <manifest.json>
                               evaluate an uncached Aexeo content change
 
 Agent broker:
