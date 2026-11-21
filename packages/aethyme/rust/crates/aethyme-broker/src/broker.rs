@@ -3231,6 +3231,39 @@ fn push_checkout_retirement_advice(
     push_trash_backlog_advice(view, progress, crate::clock::epoch_ms());
 }
 
+/// The retirement lane retiring nothing for several runs in a row while
+/// closed checkouts wait: a lane that examines and retires none says so.
+fn push_retirement_lane_advice(
+    view: &mut StatusView,
+    lane: &retire::RetirementLaneRecord,
+    closed_folders: usize,
+) {
+    if closed_folders == 0 || lane.runs_without_retirement < retire::RETIRE_LANE_IDLE_ADVICE_AT {
+        return;
+    }
+    view.advice.push(StatusAdvice {
+        id: "cleanup.retirement-lane-idle",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "the background retirement lane judges closed checkouts continuously; several runs in a row retired none while closed checkouts wait",
+        summary: format!(
+            "the checkout retirement lane retired nothing in {} run(s) in a row; {} closed checkout(s) wait",
+            lane.runs_without_retirement, closed_folders
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![format!(
+            "last run: examined {}, inspections started {}, succeeded {}, failed {}, cut by deadline {}; ended {}",
+            lane.last_examined,
+            lane.last_inspections_started,
+            lane.last_inspections_succeeded,
+            lane.last_inspections_failed,
+            lane.last_inspections_cut_by_deadline,
+            lane.last_end_reason
+        )],
+        commands: Vec::new(),
+    });
+}
+
 /// A trash whose deletion does not keep up: entries over a day old, or more
 /// entries after each of several runs in a row. Space moved into the trash
 /// is not free until the deleter removes it.

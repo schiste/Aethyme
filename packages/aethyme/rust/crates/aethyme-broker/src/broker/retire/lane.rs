@@ -98,6 +98,61 @@ pub(super) fn fresh_waiter(note: &Path, now_ms: i64) -> Option<u32> {
     (now_ms.saturating_sub(at_ms) < RETIRE_LANE_WAITER_FRESH_MS).then_some(pid)
 }
 
+/// Meta key: the retirement lane's run record ([`RetirementLaneRecord`]).
+pub(crate) const CHECKOUT_RETIREMENT_LANE_RECORD_KEY: &str = "checkout_retirement.lane";
+/// Lane runs in a row that retired nothing, with closed checkouts waiting,
+/// before `broker status` says so.
+pub(crate) const RETIRE_LANE_IDLE_ADVICE_AT: u32 = 3;
+
+/// What the last lane runs did, for `broker status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetirementLaneRecord {
+    /// Lane runs in a row (that examined anything or ran a slice) that
+    /// retired nothing; reset by a run that retired one.
+    #[serde(default)]
+    pub runs_without_retirement: u32,
+    #[serde(default)]
+    pub last_examined: usize,
+    #[serde(default)]
+    pub last_inspections_started: usize,
+    #[serde(default)]
+    pub last_inspections_succeeded: usize,
+    #[serde(default)]
+    pub last_inspections_failed: usize,
+    #[serde(default)]
+    pub last_inspections_cut_by_deadline: usize,
+    #[serde(default)]
+    pub last_end_reason: String,
+    #[serde(default)]
+    pub last_at_ms: i64,
+}
+
+/// The record after a lane run: a run that retired one resets the count;
+/// one that ran no slice (another lane, no pool, refused listing) leaves it.
+pub(crate) fn next_lane_record(
+    previous: &RetirementLaneRecord,
+    lane: &RetirementLaneReport,
+    now_ms: i64,
+) -> RetirementLaneRecord {
+    let runs_without_retirement = if lane.retired > 0 {
+        0
+    } else if lane.slices > 0 {
+        previous.runs_without_retirement.saturating_add(1)
+    } else {
+        previous.runs_without_retirement
+    };
+    RetirementLaneRecord {
+        runs_without_retirement,
+        last_examined: lane.examined,
+        last_inspections_started: lane.inspections_started,
+        last_inspections_succeeded: lane.inspections_succeeded,
+        last_inspections_failed: lane.inspections_failed,
+        last_inspections_cut_by_deadline: lane.inspections_cut_by_deadline,
+        last_end_reason: lane.end_reason.to_string(),
+        last_at_ms: now_ms,
+    }
+}
+
 /// Take the host-wide turn lock at `path`, asking every
 /// [`RETIRE_LANE_TURN_POLL`] until `deadline`. `None` when it stayed held
 /// (or could not be opened) until then.
@@ -256,6 +311,30 @@ impl Broker {
         true
     }
 
+    /// The retirement lane's run record.
+    pub(crate) fn checkout_retirement_lane_record(&self) -> RetirementLaneRecord {
+        self.meta_json(CHECKOUT_RETIREMENT_LANE_RECORD_KEY)
+    }
+
+    /// Record `lane`'s run (see [`next_lane_record`]).
+    fn record_checkout_retirement_lane_run(&self, lane: &RetirementLaneReport) {
+        let record = next_lane_record(
+            &self.checkout_retirement_lane_record(),
+            lane,
+            crate::clock::epoch_ms(),
+        );
+        if record.runs_without_retirement >= RETIRE_LANE_IDLE_ADVICE_AT {
+            crate::phase_telemetry::add("checkout_retirement_lane_idle_runs", Duration::ZERO);
+        }
+        crate::warn_unrecorded(
+            "record the checkout retirement lane run",
+            self.store_ref().meta_set(
+                CHECKOUT_RETIREMENT_LANE_RECORD_KEY,
+                &serde_json::to_string(&record).unwrap_or_default(),
+            ),
+        );
+    }
+
     /// Whether the worker should start the retirement lane process: the
     /// last strip pass counted closed checkouts on disk, and no lane
     /// process of this repository is alive.
@@ -295,6 +374,7 @@ impl Broker {
             },
             Duration::ZERO,
         );
+        self.record_checkout_retirement_lane_run(&lane);
         crate::phase_telemetry::attach(
             "checkout_retirement_lane",
             serde_json::to_value(&lane).unwrap_or_default(),
