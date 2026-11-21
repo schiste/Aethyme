@@ -1614,12 +1614,27 @@ impl Broker {
     /// being in the trash. A lock someone else placed, environments that
     /// cannot be destroyed, or a refused rename leave it where it is.
     pub(crate) fn trash_verification_slot(&self, slot: &Path, session_id: i64) -> bool {
+        self.trash_verification_slot_with_temporary_root(
+            slot,
+            session_id,
+            &std::env::temp_dir().join("aethyme-run"),
+        )
+    }
+
+    /// [`Self::trash_verification_slot`] with the temporary-directory slot
+    /// fallback named explicitly (tests place slots there).
+    fn trash_verification_slot_with_temporary_root(
+        &self,
+        slot: &Path,
+        session_id: i64,
+        temporary_root: &Path,
+    ) -> bool {
         let _span = crate::phase_telemetry::span("verification_slot_trash");
         // A slot placed in the system temporary directory's fallback
         // (`<temp>/aethyme-run/`, used when no worktree root can hold it)
         // keeps Git's removal: a reboot or the system cleaner can empty that
         // directory, trash and all.
-        if slot_is_under_temporary_root(slot, &std::env::temp_dir().join("aethyme-run")) {
+        if slot_is_under_temporary_root(slot, temporary_root) {
             crate::phase_telemetry::add(
                 "verification_slot_trash_skipped_temporary",
                 std::time::Duration::ZERO,
@@ -6757,7 +6772,11 @@ mod tests {
         std::fs::write(checkout.root().join("gate-output.log"), "built\n").unwrap();
         let path = slot.path().to_path_buf();
 
-        assert!(broker.trash_verification_slot(&path, session.id));
+        assert!(broker.trash_verification_slot_with_temporary_root(
+            &path,
+            session.id,
+            Path::new("/no-such-temporary-root")
+        ));
         assert!(!path.exists(), "the slot's path is free at once");
         let rows = broker
             .checkout_trash_rows()
@@ -6797,7 +6816,11 @@ mod tests {
         let path = slot.path().to_path_buf();
         for _ in 0..2 {
             slot.materialize(broker.repo_handle(), &head).unwrap();
-            assert!(broker.trash_verification_slot(&path, session.id));
+            assert!(broker.trash_verification_slot_with_temporary_root(
+                &path,
+                session.id,
+                Path::new("/no-such-temporary-root")
+            ));
             assert!(!path.exists());
         }
         let rows = broker
@@ -6827,8 +6850,18 @@ mod tests {
             "verification slots never count as strip"
         );
 
-        let temporary = std::env::temp_dir().join("aethyme-run/key/merge-sim/slot");
-        assert!(!broker.trash_verification_slot(&temporary, session.id));
+        // The slot fixtures here live in the temporary fallback themselves:
+        // the public entry point keeps Git's removal for them.
+        slot.materialize(broker.repo_handle(), &head).unwrap();
+        let in_temporary =
+            slot_is_under_temporary_root(&path, &std::env::temp_dir().join("aethyme-run"));
+        assert_eq!(
+            !broker.trash_verification_slot(&path, session.id),
+            in_temporary
+        );
+        let elsewhere = std::env::temp_dir().join("aethyme-run/key/merge-sim/slot");
+        assert!(!broker.trash_verification_slot(&elsewhere, session.id));
+        slot.cleanup();
     }
 
     /// Rows whose trash directory's parent vanished (a temporary directory a
