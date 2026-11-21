@@ -76,6 +76,14 @@ pub(crate) struct BranchFacts {
 }
 
 /// The deletion rule, as a pure function.
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs after the unclaimed judging, before the slice takes
+    /// the lifecycle claim to delete.
+    pub(crate) static AFTER_JUDGING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn record_keep(summary: &mut MergedBranchSummary, reason: &'static str) {
     *summary
         .kept_by_reason
@@ -412,6 +420,12 @@ impl crate::Broker {
         let mut processed = judged;
         let mut deleted = 0usize;
         if !to_delete.is_empty() {
+            #[cfg(test)]
+            AFTER_JUDGING.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
             let Some(_lock) = crate::file_lock::try_acquire_repository_lifecycle_lock(
                 self.main_root(),
                 LIFECYCLE_LANE,

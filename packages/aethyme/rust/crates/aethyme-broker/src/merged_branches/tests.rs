@@ -417,3 +417,90 @@ fn the_slice_judges_without_the_lifecycle_claim_and_takes_it_only_to_delete() {
     assert_eq!(summary.deleted, 1, "{summary:?}");
     assert!(!branch_exists(&root, "agent/merged"));
 }
+
+/// Runs the slice with `between` executed after the unclaimed judging and
+/// before the claimed delete.
+fn run_with_change_after_judging(
+    fixture: &Fixture,
+    between: impl FnMut() + 'static,
+) -> MergedBranchSummary {
+    AFTER_JUDGING.with(|hook| *hook.borrow_mut() = Some(Box::new(between)));
+    let summary = fixture.broker.run_merged_branch_lane();
+    AFTER_JUDGING.with(|hook| *hook.borrow_mut() = None);
+    summary
+}
+
+#[test]
+fn a_commit_added_after_judging_keeps_the_branch() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    let judged = git(&root, &["rev-parse", "agent/merged"]);
+
+    let repository = root.clone();
+    let summary = run_with_change_after_judging(&fixture, move || {
+        let tree = git(&repository, &["rev-parse", "HEAD^{tree}"]);
+        let tip = git(&repository, &["rev-parse", "agent/merged"]);
+        let late = git(
+            &repository,
+            &["commit-tree", &tree, "-p", &tip, "-m", "late"],
+        );
+        git(
+            &repository,
+            &["update-ref", "refs/heads/agent/merged", &late],
+        );
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("delete_failed").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+    assert_ne!(git(&root, &["rev-parse", "agent/merged"]), judged);
+}
+
+#[test]
+fn a_session_registered_on_the_branch_after_judging_keeps_it() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    let db = fixture.broker.store_ref().db_path().to_path_buf();
+    let reopened = root.with_file_name("reopened-after-judging");
+
+    let summary = run_with_change_after_judging(&fixture, move || {
+        open_session_on(&db, "agent/merged", &reopened);
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("session_not_cleaned").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+}
+
+#[test]
+fn a_recovery_archive_written_after_judging_keeps_the_branch() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    let session = fixture.session("agent/merged", false);
+    let archive_root = fixture.broker.recovery_archive_root().unwrap();
+
+    let summary = run_with_change_after_judging(&fixture, move || {
+        std::fs::create_dir_all(archive_root.join(format!("{session}-archive"))).unwrap();
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("recovery_archive").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+}
