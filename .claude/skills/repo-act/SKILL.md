@@ -103,7 +103,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   both arms. Keep PATH and the tool environment stable so unrelated discovery
   caches behave normally. Count an avoided execution only when a reused verdict
   points to a fresh producer in that pair with the same execution profile.
-  Record pair wall time and child work separately.
+  Record pair wall time and child work separately. To assess opportunistic
+  batching, give both arms the same ready-time schedule and runner capacity.
+  Measure ready-to-landing time including queue wait, alongside gate
+  executions and total gate work. Include a lone ready change, staggered
+  arrivals and changes that are already waiting. Timing from the point when
+  all members are ready cannot show whether batching delayed the first one.
 
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and verify the actual `SessionStart` payload arrives in
