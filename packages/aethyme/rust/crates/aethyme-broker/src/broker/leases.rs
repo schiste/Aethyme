@@ -1024,10 +1024,13 @@ const ABANDONED_CLOSE_CLAIM_BUDGET: std::time::Duration = std::time::Duration::f
 struct AbandonmentCheckoutStamp {
     head: Option<String>,
     branch_tip: Option<String>,
-    /// `(device, inode, modification seconds, nanoseconds, length)`.
-    index: Option<(u64, u64, i64, i64, u64)>,
+    index: Option<IndexIdentity>,
     unreadable: bool,
 }
+
+/// An index file's `(device, inode, modification seconds, nanoseconds,
+/// length)`.
+type IndexIdentity = (u64, u64, i64, i64, u64);
 
 impl AbandonmentCheckoutStamp {
     fn complete(&self) -> bool {
@@ -1162,7 +1165,7 @@ fn read_ref_commit(common_dir: &std::path::Path, name: &str) -> Result<Option<St
 }
 
 /// The identity of a checkout's index file; `Ok(None)` when it has none.
-fn index_identity(git_dir: &std::path::Path) -> Result<Option<(u64, u64, i64, i64, u64)>, ()> {
+fn index_identity(git_dir: &std::path::Path) -> Result<Option<IndexIdentity>, ()> {
     use std::os::unix::fs::MetadataExt as _;
     match std::fs::symlink_metadata(git_dir.join("index")) {
         Ok(index) => Ok(Some((
