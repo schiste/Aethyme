@@ -143,6 +143,42 @@ pub(crate) fn value(name: &'static str, configured: Duration) {
     });
 }
 
+/// Accumulate one occurrence of `elapsed` under `key` in the attachment
+/// `name`: `{key: {"count", "total_ms", "max_ms"}}`. For a breakdown whose
+/// keys are not known in advance (which claim held a lock, say). `key` must
+/// name an operation, never a path or an id. Free when no command is
+/// recording.
+pub(crate) fn add_keyed(name: &'static str, key: &str, elapsed: Duration) {
+    ACTIVE.with(|active| {
+        if let Some(recorder) = active.borrow().as_ref()
+            && let Ok(mut accumulated) = recorder.0.lock()
+        {
+            let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let object = accumulated
+                .attachments
+                .entry(name)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if let serde_json::Value::Object(keys) = object {
+                let entry = keys
+                    .entry(key.to_string())
+                    .or_insert_with(|| serde_json::json!({"count": 0, "total_ms": 0, "max_ms": 0}));
+                let read = |entry: &serde_json::Value, field: &str| {
+                    entry
+                        .get(field)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                };
+                let updated = serde_json::json!({
+                    "count": read(entry, "count").saturating_add(1),
+                    "total_ms": read(entry, "total_ms").saturating_add(millis),
+                    "max_ms": read(entry, "max_ms").max(millis),
+                });
+                *entry = updated;
+            }
+        }
+    });
+}
+
 /// Attach one structured field, `name`, to the command's metric line. For
 /// facts that are not durations, such as a lock's queue position or who held
 /// it. An object merges into an object already attached under that name (its
@@ -340,6 +376,24 @@ mod tests {
         assert_eq!(
             recorder.attachments().get("phase_values_ms"),
             Some(&serde_json::json!({"budget": 3_600_000}))
+        );
+    }
+
+    #[test]
+    fn keyed_occurrences_accumulate_count_total_and_max() {
+        let recorder = Recorder::default();
+        {
+            let _installed = install(recorder.clone());
+            add_keyed("holders", "retire strip.rs:10", Duration::from_secs(6));
+            add_keyed("holders", "retire strip.rs:10", Duration::from_secs(9));
+            add_keyed("holders", "gc gc.rs:20", Duration::from_secs(5));
+        }
+        assert_eq!(
+            recorder.attachments().get("holders"),
+            Some(&serde_json::json!({
+                "retire strip.rs:10": {"count": 2, "total_ms": 15_000, "max_ms": 9_000},
+                "gc gc.rs:20": {"count": 1, "total_ms": 5_000, "max_ms": 5_000},
+            }))
         );
     }
 

@@ -420,6 +420,7 @@ fn describe_lifecycle_holder(path: &Path) -> String {
 /// never waits: it yields and the streak carries over to the next detached
 /// pass. A [`ForegroundLifecycleTryClaim`] scope on this thread skips the
 /// yielding.
+#[track_caller]
 pub(crate) fn try_acquire_repository_lifecycle_lock(
     main_root: &Path,
     lane: &'static str,
@@ -451,6 +452,7 @@ pub(crate) fn try_acquire_repository_lifecycle_lock(
     // command's queued claims, which a maintenance claim must not overwrite.
     crate::phase_telemetry::add("lifecycle_lock_nonblocking_acquired", Duration::ZERO);
     lock.lifecycle_held_since = Some((Instant::now(), LifecycleClaimKind::Nonblocking));
+    lock.lifecycle_holder = Some((lane, std::panic::Location::caller()));
     Ok(Some(lock))
 }
 
@@ -529,6 +531,7 @@ fn background_lane_due_for_promotion(previous: Option<BackgroundYields>, now_ns:
 
 /// A queued waiter exists: yield once more, or, when the lane has yielded long
 /// enough, queue for a bounded turn.
+#[track_caller]
 fn yield_or_promote_background_lane(
     main_root: &Path,
     lane: &'static str,
@@ -616,6 +619,7 @@ fn yield_or_promote_background_lane(
     match result {
         Ok(mut lock) => {
             lock.lifecycle_held_since = Some((Instant::now(), LifecycleClaimKind::Promoted));
+            lock.lifecycle_holder = Some((lane, std::panic::Location::caller()));
             Ok(Some(lock))
         }
         // A turn that did not come within the bound is an ordinary busy
@@ -1629,6 +1633,9 @@ pub(crate) struct ExclusiveFileLock {
     /// Set on a repository lifecycle claim: when and how it was acquired, so
     /// dropping the guard records the hold and clears the holder record.
     lifecycle_held_since: Option<(Instant, LifecycleClaimKind)>,
+    /// A background claim's lane and the source line that asked for it, so
+    /// a long hold names its holder on the metric line.
+    lifecycle_holder: Option<(&'static str, &'static std::panic::Location<'static>)>,
 }
 
 impl ExclusiveFileLock {
@@ -1638,6 +1645,7 @@ impl ExclusiveFileLock {
         Ok(Self {
             file,
             lifecycle_held_since: None,
+            lifecycle_holder: None,
         })
     }
 
@@ -1661,6 +1669,7 @@ impl ExclusiveFileLock {
             Ok(()) => Ok(Some(Self {
                 file,
                 lifecycle_held_since: None,
+                lifecycle_holder: None,
             })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error),
@@ -1681,6 +1690,22 @@ impl Drop for ExclusiveFileLock {
             // can be traced to its holder.
             if kind != LifecycleClaimKind::Foreground && held >= LONG_BACKGROUND_LIFECYCLE_HOLD {
                 crate::phase_telemetry::add("lifecycle_lock_held_background_long", held);
+                // Which claim it was: its lane and the source line that
+                // asked for it (an operation's place in Aethyme's own
+                // source, never a path or id of the user's).
+                let holder = self.lifecycle_holder.map_or_else(
+                    || "unknown".to_string(),
+                    |(lane, location)| {
+                        let file = location.file();
+                        let file = file.rsplit_once("/src/").map_or(file, |(_, rest)| rest);
+                        format!("{lane} {file}:{}", location.line())
+                    },
+                );
+                crate::phase_telemetry::add_keyed(
+                    "lifecycle_lock_background_long_holders",
+                    &holder,
+                    held,
+                );
             }
             if kind == LifecycleClaimKind::Foreground {
                 crate::phase_telemetry::attach(
@@ -2156,6 +2181,33 @@ mod tests {
         drop(claim);
         live.kill().ok();
         live.wait().ok();
+    }
+
+    /// A background claim remembers its lane and the source line that
+    /// asked for it, which a long hold reports as its holder.
+    #[test]
+    fn a_background_claim_records_its_lane_and_the_line_that_asked() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let line = line!() + 1;
+        let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane")
+            .unwrap()
+            .unwrap();
+        let (lane, location) = claim.lifecycle_holder.unwrap();
+        assert_eq!(lane, "test_lane");
+        assert!(location.file().ends_with("file_lock.rs"), "{location}");
+        assert_eq!(location.line(), line);
+        // A short hold names nobody.
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            drop(claim);
+        }
+        assert!(
+            !recorder
+                .attachments()
+                .contains_key("lifecycle_lock_background_long_holders")
+        );
     }
 
     #[test]
