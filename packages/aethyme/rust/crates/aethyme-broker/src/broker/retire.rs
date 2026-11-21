@@ -4551,6 +4551,7 @@ impl Broker {
 }
 
 mod lane;
+pub(crate) use lane::{RETIRE_LANE_IDLE_ADVICE_AT, RetirementLaneRecord};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -7675,6 +7676,56 @@ mod tests {
         assert_eq!(run.inspections.started, 0, "{report:#?}");
         assert_eq!(cursor(&broker), before);
         assert!(worktree.exists());
+    }
+
+    /// Lane runs that retire nothing count up (a run that ran no slice
+    /// leaves the count), and one that retires resets it; the lane's own
+    /// run records it.
+    #[test]
+    fn lane_runs_that_retire_nothing_are_counted_for_status() {
+        let idle = super::lane::RetirementLaneReport {
+            examined: 24,
+            inspections_started: 16,
+            inspections_failed: 12,
+            inspections_cut_by_deadline: 4,
+            slices: 5,
+            end_reason: "backlog_done",
+            ..Default::default()
+        };
+        let mut record = super::RetirementLaneRecord::default();
+        for _ in 0..super::RETIRE_LANE_IDLE_ADVICE_AT {
+            record = super::lane::next_lane_record(&record, &idle, 1);
+        }
+        assert_eq!(
+            record.runs_without_retirement,
+            super::RETIRE_LANE_IDLE_ADVICE_AT
+        );
+        assert_eq!(record.last_inspections_failed, 12);
+        let no_slice = super::lane::RetirementLaneReport {
+            end_reason: "lane_present",
+            ..Default::default()
+        };
+        assert_eq!(
+            super::lane::next_lane_record(&record, &no_slice, 2).runs_without_retirement,
+            super::RETIRE_LANE_IDLE_ADVICE_AT
+        );
+        let retired = super::lane::RetirementLaneReport {
+            retired: 1,
+            slices: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::lane::next_lane_record(&record, &retired, 3).runs_without_retirement,
+            0
+        );
+
+        let (_owner, _storage, mut broker) = fixture();
+        let host = tempfile::tempdir().unwrap();
+        let lane = broker.run_checkout_retirement_lane_process(host.path(), calm_host);
+        assert_eq!(lane.retired, 0, "{lane:#?}");
+        let stored = broker.checkout_retirement_lane_record();
+        assert_eq!(stored.last_end_reason, lane.end_reason);
+        assert!(stored.last_at_ms > 0);
     }
 
     /// One judgement at a time per volume: a turn held elsewhere is waited
