@@ -375,3 +375,45 @@ fn a_branch_whose_session_path_has_a_start_reservation_is_kept() {
     assert_eq!(summary.deleted, 1, "{summary:?}");
     assert!(!branch_exists(&root, "agent/merged"));
 }
+
+/// Judging needs no lifecycle claim: a slice that finds nothing to delete
+/// records its verdicts while a foreground command holds the claim, and
+/// one that finds a merged branch yields only its delete.
+#[test]
+fn the_slice_judges_without_the_lifecycle_claim_and_takes_it_only_to_delete() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    let tree = git(&root, &["rev-parse", "HEAD^{tree}"]);
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    let ahead = git(
+        &root,
+        &["commit-tree", &tree, "-p", &head, "-m", "unmerged"],
+    );
+    git(&root, &["branch", "agent/unmerged", &ahead]);
+    fixture.session("agent/unmerged", false);
+    let main_root = fixture.broker.main_root().to_path_buf();
+
+    let claim = crate::file_lock::acquire_repository_lifecycle_lock(&main_root).unwrap();
+    let summary = fixture.broker.run_merged_branch_lane();
+    assert_eq!(summary.skipped, None, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("unmerged").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    let summary = fixture.broker.run_merged_branch_lane();
+    assert_eq!(
+        summary.skipped.as_deref(),
+        Some("yielded_to_foreground"),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+    drop(claim);
+
+    let summary = fixture.broker.run_merged_branch_lane();
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert!(!branch_exists(&root, "agent/merged"));
+}

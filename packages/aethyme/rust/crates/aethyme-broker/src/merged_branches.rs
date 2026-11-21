@@ -34,6 +34,10 @@ const DELETES_PER_RUN: usize = 100;
 const SLICE_BUDGET: Duration = Duration::from_secs(20);
 /// The lifecycle-lock lane name.
 const LIFECYCLE_LANE: &str = "merged_branches";
+/// The longest one slice holds the lifecycle claim: deletions it has not
+/// reached by then wait for the next slice. A background hold past this is
+/// what keeps a foreground `finish` or `start` waiting.
+const CLAIM_HOLD_BUDGET: Duration = Duration::from_secs(5);
 /// Status advice id.
 pub(crate) const ADVICE_ID: &str = "cleanup.merged-session-branches";
 
@@ -72,6 +76,14 @@ pub(crate) struct BranchFacts {
 }
 
 /// The deletion rule, as a pure function.
+fn record_keep(summary: &mut MergedBranchSummary, reason: &'static str) {
+    *summary
+        .kept_by_reason
+        .entry(reason.to_string())
+        .or_default() += 1;
+    crate::phase_telemetry::add(keep_counter(reason), Duration::ZERO);
+}
+
 pub(crate) fn judge(facts: BranchFacts) -> Verdict {
     if facts.session_not_cleaned {
         return Verdict::Keep("session_not_cleaned");
@@ -346,14 +358,6 @@ impl crate::Broker {
             return Ok(());
         }
         after_listing();
-        let Some(_lock) = crate::file_lock::try_acquire_repository_lifecycle_lock(
-            self.main_root(),
-            LIFECYCLE_LANE,
-        )
-        .ok()
-        .flatten() else {
-            return Err("yielded_to_foreground");
-        };
         let cursor = self.store_ref().meta_get(CURSOR_KEY).ok().flatten();
         let start = cursor
             .as_deref()
@@ -363,57 +367,100 @@ impl crate::Broker {
                     .position(|(name, _, _)| name.as_str() > cursor)
             })
             .unwrap_or(0);
-        let mut last = cursor.clone().unwrap_or_default();
-        let mut deleted = 0usize;
-        for (name, tip, sessions) in candidates
+        let window: Vec<_> = candidates
             .iter()
             .cycle()
             .skip(start)
             .take(CHECKS_PER_RUN.min(candidates.len()))
+            .collect();
+        // Judge from facts read without the lifecycle claim: the ancestry of
+        // two fixed commits (Git), the recovery archives (directory
+        // listings), the sessions and checkouts listed above. Holding the
+        // claim for that kept a foreground `finish` or `start` waiting for
+        // the whole slice budget (7 to 26 s per run on the busiest
+        // repository). A branch judged for deletion is judged again under
+        // the claim, just before the delete, which itself refuses a tip that
+        // moved; nothing judged kept is touched.
+        let mut judged = 0usize;
+        let mut to_delete = Vec::new();
         {
-            if started.elapsed() >= SLICE_BUDGET || deleted >= DELETES_PER_RUN {
-                crate::phase_telemetry::add("merged_branches_slice_budget", Duration::ZERO);
-                break;
+            let _span = crate::phase_telemetry::span("merged_branches_judge");
+            for (index, (name, tip, sessions)) in window.iter().enumerate() {
+                if started.elapsed() >= SLICE_BUDGET {
+                    crate::phase_telemetry::add("merged_branches_slice_budget", Duration::ZERO);
+                    break;
+                }
+                judged = index + 1;
+                let facts = BranchFacts {
+                    session_not_cleaned: sessions.iter().any(|session| {
+                        session.cleanup_state != crate::SessionCleanupState::Cleaned
+                    }),
+                    checked_out: checked_out.contains(name),
+                    recovery_archive: sessions
+                        .iter()
+                        .any(|session| self.has_restorable_state(session) != Some(false)),
+                    merged: repo.is_ancestor_checked(tip, &default.commit).ok(),
+                };
+                match judge(facts) {
+                    Verdict::Delete => to_delete.push(index),
+                    Verdict::Keep(reason) => record_keep(summary, reason),
+                }
             }
-            last.clone_from(name);
-            let facts = BranchFacts {
-                session_not_cleaned: sessions
-                    .iter()
-                    .any(|session| session.cleanup_state != crate::SessionCleanupState::Cleaned),
-                checked_out: checked_out.contains(name),
-                recovery_archive: sessions
-                    .iter()
-                    .any(|session| self.has_restorable_state(session) != Some(false)),
-                merged: repo.is_ancestor_checked(tip, &default.commit).ok(),
+        }
+        // The lane's last processed branch: everything up to it was judged
+        // and, when judged for deletion, deleted or kept under the claim.
+        let mut processed = judged;
+        let mut deleted = 0usize;
+        if !to_delete.is_empty() {
+            let Some(_lock) = crate::file_lock::try_acquire_repository_lifecycle_lock(
+                self.main_root(),
+                LIFECYCLE_LANE,
+            )
+            .ok()
+            .flatten() else {
+                return Err("yielded_to_foreground");
             };
-            // The facts above were read before the lifecycle claim; a
-            // checkout started or reopened meanwhile could use the branch.
-            // Under the claim, judge it again just before the delete, which
-            // itself refuses a tip that moved.
-            let verdict = match judge(facts) {
-                Verdict::Delete => match self.keep_reason_now(name) {
+            let _span = crate::phase_telemetry::span("merged_branches_claimed");
+            let claimed = Instant::now();
+            for index in to_delete {
+                if deleted >= DELETES_PER_RUN || claimed.elapsed() >= CLAIM_HOLD_BUDGET {
+                    crate::phase_telemetry::add(
+                        if deleted >= DELETES_PER_RUN {
+                            "merged_branches_slice_budget"
+                        } else {
+                            "merged_branches_claim_budget"
+                        },
+                        Duration::ZERO,
+                    );
+                    // Resume from this branch next run.
+                    processed = index;
+                    break;
+                }
+                let (name, tip, _) = window[index];
+                // The facts above were read before the lifecycle claim; a
+                // checkout started or reopened meanwhile could use the
+                // branch. Under the claim, judge it again just before the
+                // delete, which itself refuses a tip that moved.
+                let verdict = match self.keep_reason_now(name) {
                     Some(reason) => Verdict::Keep(reason),
                     None => match repo.delete_branch_ref_checked(name, tip) {
                         Ok(()) => Verdict::Delete,
                         Err(_) => Verdict::Keep("delete_failed"),
                     },
-                },
-                keep => keep,
-            };
-            match verdict {
-                Verdict::Delete => {
-                    deleted += 1;
-                    crate::phase_telemetry::add("merged_branches_deleted", Duration::ZERO);
-                }
-                Verdict::Keep(reason) => {
-                    *summary
-                        .kept_by_reason
-                        .entry(reason.to_string())
-                        .or_default() += 1;
-                    crate::phase_telemetry::add(keep_counter(reason), Duration::ZERO);
+                };
+                match verdict {
+                    Verdict::Delete => {
+                        deleted += 1;
+                        crate::phase_telemetry::add("merged_branches_deleted", Duration::ZERO);
+                    }
+                    Verdict::Keep(reason) => record_keep(summary, reason),
                 }
             }
         }
+        let last = match processed.checked_sub(1) {
+            Some(index) => window[index].0.clone(),
+            None => cursor.clone().unwrap_or_default(),
+        };
         summary.deleted = deleted as u64;
         summary.deleted_total = summary.deleted_total.saturating_add(deleted as u64);
         crate::warn_unrecorded(
