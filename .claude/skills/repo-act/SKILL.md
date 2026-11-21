@@ -963,8 +963,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   listener against host-wide `netstat` and group-scoped `lsof` using counts only;
   check command exit status and stderr without logging connection details. Test
   both the normal and authorized elevated environment: elevation alone does not
-  prove `netstat` can see the host socket table. An empty or incomplete global
-  listing is unverified, not evidence that all listeners are owned; do not replace
+  prove `netstat` can see the host socket table. Check that the TCP rows include
+  the test listener: a nonempty general listing may contain no TCP sockets.
+  An empty or incomplete global listing is unverified, not evidence that all
+  listeners are owned; do not replace
   it with group-only `lsof`, which may omit other processes.
 
 ## Useful Commands
