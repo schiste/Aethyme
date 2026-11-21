@@ -14,7 +14,7 @@
 # - Rust gates use broker-managed, repository-scoped caches. The contract
 #   check has a separate cache from workspace tests. The broker exports each
 #   safe path, serializes writers for that cache across clones, reports cache
-#   provenance, and rotates before a run when the 12 GiB budget is exceeded.
+#   provenance, and rotates before a run when the 8 GiB budget is exceeded.
 #   Authoritative disposable builds keep incremental compilation disabled and
 #   reduce debug information so useful artifacts stay compact.
 # - Gate outputs must be gitignored or they change the working-tree hash
@@ -135,7 +135,7 @@ triggers = [
 
 [gate.managed_cache]
 key = "rust-workspace-v3"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 # 2026-11-12: every Rust gate draws its cost from the host build pool, the
 # same pool `packages/aethyme/scripts/with-host-capacity.sh` reserves for a
@@ -226,7 +226,7 @@ triggers = [".aethyme/gates.toml"]
 
 [gate.managed_cache]
 key = "rust-workspace-v3"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 [[gate.resources]]
 key = "host_build"
@@ -247,7 +247,7 @@ triggers = ["install.sh", "scripts/pilot-*.jq", "packages/aethyme/rust/crates/ae
 
 [gate.managed_cache]
 key = "rust-workspace-v3"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 [[gate.resources]]
 key = "host_build"
@@ -284,7 +284,7 @@ triggers = [".github/workflows/**"]
 
 [gate.managed_cache]
 key = "rust-workspace-v3"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 [[gate.resources]]
 key = "host_build"
@@ -322,7 +322,7 @@ triggers = [".aethyme/gates.toml"]
 
 [gate.managed_cache]
 key = "rust-workspace-v3"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 [[gate.resources]]
 key = "host_build"
@@ -381,7 +381,7 @@ max_load_per_cpu = 3.0
 # own bounded cache; fast-guards and cargo-test still share their artifacts.
 [gate.managed_cache]
 key = "rust-contract-v1"
-max_bytes = 12884901888
+max_bytes = 8589934592
 
 [[gate.resources]]
 key = "host_build"
