@@ -1101,8 +1101,13 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     // Again at the end: a pass runs for minutes, and what a gate staged
     // after its start would otherwise wait for the next pass.
     let phase = Instant::now();
+    let mut beat_end = || {
+        if let Some(lock) = lock.as_deref_mut() {
+            lock.beat();
+        }
+    };
     for root in &ledger.roots {
-        evict::sweep_aside(&root.path, &mut beat);
+        evict::sweep_aside(&root.path, &mut beat_end);
     }
     report.phases_ms.insert("sweep_end".into(), elapsed(phase));
     report.phases_ms.insert("total".into(), elapsed(started));
