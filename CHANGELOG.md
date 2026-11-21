@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.150] - 2026-11-21
+
+### Fixed
+
+- A staged managed-cache prune is reclaimed promptly. The storage worker swept staged entries only at the start of a pass, so a prune staged 33 s into a pass kept 5 GiB for more than ten minutes. The worker now also sweeps at the end of each pass, a gate that stages a prune starts the worker when none runs, and any command that finds a staged entry older than five minutes in the host cache root starts one even while the ledger is fresh. Deletion stays off the command path (#1920).
+- The merged-branch slice stops starting deletions after 4 s of its lifecycle claim, so the delete in progress ends inside the 5 s bound. What is proven before each delete is unchanged (#1921).
+
+### Added
+
+- `broker status` advice `storage.staged-deletion-pending`: bytes, entries and the oldest entry's age once a staged entry is older than five minutes; counters `storage_staged_deletion_worker_started` and `storage_staged_deletion_worker_running` (#1920).
+- Attachment `lifecycle_lock_background_long_holders`: each background lifecycle hold of 5 s or more, keyed by lane and the Aethyme source location that asked for the claim, with `count`, `total_ms` and `max_ms` (#1921).
+
 ## [0.8.149] - 2026-11-21
 
 ### Fixed
