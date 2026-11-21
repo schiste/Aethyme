@@ -637,6 +637,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         &["root", "min_free_bytes", "max_checkouts", "sparse_paths"],
     ),
     ("worktree_freshness", &["max_age_seconds"]),
+    ("command_temp", &["enabled"]),
     ("session", &["guidance"]),
     (
         "remote_branches",
@@ -1333,6 +1334,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   [worktrees] sparse_paths  optional tracked directories for new session checkouts
 #   [worktree_freshness] max_age_seconds  prior-observation stale threshold (default 900)
 #     An age at or above the threshold is stale; zero marks all prior observations stale.
+#   [command_temp] enabled  per-command TMPDIR inside the session scratch (default true)
 #   [session] guidance  working agreement `broker start` shows (default built in; [] disables)
 # Unknown keys are generally ignored; typed policy sections refuse invalid
 # values before acting. Certify warns on unknown keys.

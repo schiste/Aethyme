@@ -24,13 +24,13 @@
 //! here unlinks anything.
 //!
 //! Commands the broker runs for a session get the path as
-//! [`SESSION_SCRATCH_ENV`]. `TMPDIR` (and `TMP`, `TEMP`) are deliberately not
-//! pointed at it: a pool path on the busiest machine is 87 bytes and holds a
-//! space, so a scratch path is about 130 bytes, past the Unix socket path
-//! limit (104 bytes on macOS, 108 on Linux) before any socket name is added.
-//! Tools that create sockets under the temp directory (SSH and GPG agents,
-//! Python multiprocessing, tmux) would fail, so agents point build output
-//! and temporary files there explicitly instead.
+//! [`SESSION_SCRATCH_ENV`]. `TMPDIR` (and `TMP`, `TEMP`) are not pointed at
+//! the scratch directory itself: a pool path on the busiest machine is 87
+//! bytes and holds a space, so a scratch path is about 130 bytes, past the
+//! Unix socket path limit (104 bytes on macOS, 108 on Linux) before any
+//! socket name is added. Each command instead gets its own run directory
+//! inside it, handed out through a short alias when its path is too long
+//! ([`crate::command_temp`]).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -534,6 +534,195 @@ pub(crate) fn move_to_trash(
     })
 }
 
+/// One finished command run ([`crate::command_temp`]) of a recorded scratch
+/// directory: its marker in the done container and what it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinishedRun {
+    pub(crate) name: String,
+    pub(crate) marker: crate::command_temp::FinishedMarker,
+}
+
+impl FinishedRun {
+    /// The run's path inside `record`'s directory (it stays in the live
+    /// container until it is retired).
+    pub(crate) fn path(&self, record: &ScratchRecord) -> PathBuf {
+        record
+            .path()
+            .join(crate::command_temp::LIVE_CONTAINER)
+            .join(&self.name)
+    }
+}
+
+/// The verified sub-container `name` of `record`'s directory: a private
+/// directory owned by this user on the pool's device.
+fn open_run_container(record: &ScratchRecord, name: &str) -> Result<OwnedFd, Refusal> {
+    let verified = verify(record)?;
+    let entry = openat_dir_nofollow(verified.container.as_raw_fd(), &record.entry)
+        .map_err(|_| Refusal::NotARealDirectory)?;
+    let container = openat_dir_nofollow(entry.as_raw_fd(), name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            Refusal::Missing
+        } else {
+            Refusal::NotARealDirectory
+        }
+    })?;
+    let stat = fstat(container.as_raw_fd()).map_err(|_| Refusal::Failed)?;
+    if !private_directory(&stat) {
+        return Err(Refusal::ForeignContainer);
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let device = stat.st_dev as u64;
+    if device != record.device {
+        return Err(Refusal::CrossesDevice);
+    }
+    Ok(container)
+}
+
+/// Read the marker `name` in the done container, never following a link.
+fn read_marker(done: RawFd, name: &str) -> Option<crate::command_temp::FinishedMarker> {
+    let stat = fstatat_nofollow(done, name).ok()?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    let c_marker = c_name(name).ok()?;
+    // SAFETY: `c_marker` is NUL-terminated and `done` is open.
+    let fd = checked(unsafe {
+        libc::openat(
+            done,
+            c_marker.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })
+    .ok()?;
+    // SAFETY: `fd` was just opened and is owned here.
+    let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let mut text = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, crate::command_temp::MARKER_MAX_BYTES as u64),
+        &mut text,
+    )
+    .ok()?;
+    serde_json::from_slice(&text).ok()
+}
+
+/// Finished runs of `record`'s directory, at most `limit`: markers (regular
+/// files with a run name the broker writes) in its verified done container.
+/// Anything else there is left alone. Read-only.
+pub(crate) fn finished_runs(record: &ScratchRecord, limit: usize) -> Vec<FinishedRun> {
+    let Ok(done) = open_run_container(record, crate::command_temp::DONE_CONTAINER) else {
+        return Vec::new();
+    };
+    let Ok(listing) = std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER))
+    else {
+        return Vec::new();
+    };
+    listing
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| crate::command_temp::is_run_name(name))
+        .filter_map(|name| {
+            let marker = read_marker(done.as_raw_fd(), &name)?;
+            Some(FinishedRun { name, marker })
+        })
+        .take(limit)
+        .collect()
+}
+
+/// Remove `run`'s marker from `record`'s done container (only a regular
+/// file: `unlinkat` without flags never removes a directory).
+pub(crate) fn forget_finished_run(record: &ScratchRecord, run: &FinishedRun) {
+    let Ok(done) = open_run_container(record, crate::command_temp::DONE_CONTAINER) else {
+        return;
+    };
+    if !crate::command_temp::is_run_name(&run.name) {
+        return;
+    }
+    if let Ok(name) = c_name(&run.name) {
+        // SAFETY: `name` is NUL-terminated and `done` is an open directory.
+        unsafe {
+            libc::unlinkat(done.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
+}
+
+/// Move one finished run from `record`'s live container into the pool's
+/// checkout trash with one exclusive same-volume rename, exactly as
+/// [`move_to_trash`] moves a whole scratch directory: the scratch directory
+/// verifies, the live container is private and on the pool's device, the
+/// run is a real directory (never a link, which is not followed) with the
+/// identity its marker recorded, the row is recorded pending first, and the
+/// identity is checked again right before the rename. Nothing is unlinked.
+pub(crate) fn move_finished_run_to_trash(
+    record: &ScratchRecord,
+    run: &FinishedRun,
+    record_pending: &mut dyn FnMut(
+        &Path,
+        &str,
+        crate::checkout_trash::TrashRow,
+    ) -> Result<(), String>,
+) -> Result<TrashedScratch, Refusal> {
+    let _span = crate::phase_telemetry::span("command_temp_move");
+    if !crate::command_temp::is_run_name(&run.name) {
+        return Err(Refusal::NotARecordedScratch);
+    }
+    let live = open_run_container(record, crate::command_temp::LIVE_CONTAINER)?;
+    let identity = (run.marker.device, run.marker.inode);
+    let check = |live: RawFd| match fstatat_nofollow(live, &run.name) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Err(Refusal::Missing),
+        Err(_) => Err(Refusal::Failed),
+        Ok(stat) if !is_directory(&stat) => Err(Refusal::NotARealDirectory),
+        Ok(stat) => {
+            #[allow(clippy::unnecessary_cast)]
+            let found = (stat.st_dev as u64, stat.st_ino as u64);
+            if found == identity {
+                Ok(())
+            } else {
+                Err(Refusal::IdentityChanged)
+            }
+        }
+    };
+    check(live.as_raw_fd())?;
+    if run.marker.device != record.device {
+        return Err(Refusal::CrossesDevice);
+    }
+    let trash = crate::checkout_trash::open_trash(&record.pool).map_err(|_| Refusal::Failed)?;
+    #[allow(clippy::unnecessary_cast)]
+    let trash_device = fstat(trash.trash_fd()).map_err(|_| Refusal::Failed)?.st_dev as u64;
+    if trash_device != record.device {
+        return Err(Refusal::CrossesDevice);
+    }
+    let entry = crate::checkout_trash::new_entry_name(record.session_id);
+    let (creator_pid, creator_started_ms) = crate::checkout_trash::this_process_identity();
+    let mut row = crate::checkout_trash::TrashRow {
+        device: run.marker.device,
+        inode: run.marker.inode,
+        session_id: record.session_id,
+        failures: 0,
+        pending: true,
+        creator_pid,
+        creator_started_ms,
+        stripped: true,
+        scratch: true,
+        verification: false,
+    };
+    record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
+    check(live.as_raw_fd())?;
+    crate::checkout_trash::rename_noreplace(live.as_raw_fd(), &run.name, trash.trash_fd(), &entry)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::EXDEV) {
+                Refusal::CrossesDevice
+            } else {
+                Refusal::Failed
+            }
+        })?;
+    row.pending = false;
+    Ok(TrashedScratch {
+        trash_dir: trash.path().to_path_buf(),
+        entry,
+        row,
+    })
+}
+
 /// Remove a container that holds nothing but its marker, so an emptied pool
 /// is left as it was found. `rmdir` refuses a container that gained an entry
 /// meanwhile (and a link in its place); the marker is then written again.
@@ -817,6 +1006,62 @@ mod tests {
         );
         std::fs::write(container.join("notes.txt"), b"mine").unwrap();
         assert!(!container_holds_only_scratch(&container));
+    }
+
+    /// A finished run is found by its marker and moved into the trash; a
+    /// run swapped for a symbolic link before the move is not followed.
+    #[test]
+    fn a_finished_run_moves_and_a_swapped_link_is_not_followed() {
+        let (_owner, pool) = pool();
+        let record = create(&pool, 21).unwrap();
+        let bases = [PathBuf::from("/tmp")];
+        let mut record_pending =
+            |_: &Path, _: &str, _: crate::checkout_trash::TrashRow| Ok::<(), String>(());
+        let temp =
+            crate::command_temp::CommandTemp::create_in(&record.path(), &bases, false).unwrap();
+        std::fs::write(temp.run_dir().join("left.tmp"), b"x").unwrap();
+        drop(temp);
+        let runs = finished_runs(&record, 10);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let moved = move_finished_run_to_trash(&record, &runs[0], &mut record_pending).unwrap();
+        assert!(
+            moved
+                .trash_dir
+                .join(&moved.entry)
+                .join("left.tmp")
+                .is_file()
+        );
+        assert!(moved.row.scratch && moved.row.stripped);
+        forget_finished_run(&record, &runs[0]);
+        assert!(finished_runs(&record, 10).is_empty());
+
+        let temp =
+            crate::command_temp::CommandTemp::create_in(&record.path(), &bases, false).unwrap();
+        let run = temp.run_dir();
+        std::fs::write(run.join("left.tmp"), b"x").unwrap();
+        drop(temp);
+        let runs = finished_runs(&record, 10);
+        assert_eq!(runs.len(), 1);
+        let target = pool.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"not the broker's").unwrap();
+        std::fs::remove_file(run.join("left.tmp")).unwrap();
+        std::fs::remove_dir(&run).unwrap();
+        std::os::unix::fs::symlink(&target, &run).unwrap();
+        assert_eq!(
+            move_finished_run_to_trash(&record, &runs[0], &mut record_pending).err(),
+            Some(Refusal::NotARealDirectory)
+        );
+        assert!(
+            target.join("keep.txt").is_file(),
+            "a link is never followed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&run)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

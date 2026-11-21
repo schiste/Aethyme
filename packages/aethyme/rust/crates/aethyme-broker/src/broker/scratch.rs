@@ -32,6 +32,10 @@ const SCRATCH_MEASURE_BUDGET: Duration = Duration::from_secs(2);
 const SUPERSEDED_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 /// Unrecorded container entries named per run, at most.
 const UNRECORDED_NAMES_MAX: usize = 20;
+/// Finished command runs moved per scratch directory per run, at most.
+const FINISHED_RUNS_PER_PASS: usize = 64;
+/// Finished command runs counted per scratch directory for the ledger.
+const FINISHED_RUNS_COUNTED_MAX: usize = 4096;
 
 /// The instruction shown with an available scratch directory.
 pub(crate) const SCRATCH_INSTRUCTION: &str = "Put build output (pass it as a tool's --target-dir, --out-dir or output path) and temporary files in this directory instead of the system temp folder; commands the broker runs for the session get it as $AETHYME_SESSION_SCRATCH_DIR, and the broker removes it when the session is finished, closed or cleaned.";
@@ -84,6 +88,11 @@ pub(crate) struct ScratchRetireReport {
     pub unrecorded: Vec<String>,
     /// The run's deadline stopped the pass; the next run goes on.
     pub more_remaining: bool,
+    /// Finished command runs ([`crate::command_temp`]) of open sessions
+    /// moved into the trash.
+    pub command_temps_retired: usize,
+    /// Finished command runs kept (in use, or refused), retried next run.
+    pub command_temps_kept: usize,
 }
 
 /// The phase counter of one keep, by reason.
@@ -230,6 +239,85 @@ impl Broker {
         ))
     }
 
+    /// A temp directory for one command the broker runs for the session
+    /// ([`crate::command_temp`]): `None` when the repository opted out, the
+    /// session has no scratch directory, or the command keeps the inherited
+    /// temp folder (each counted). Dropping it ends the run.
+    pub(crate) fn command_temp_for_session(
+        &self,
+        session_id: i64,
+    ) -> Option<crate::command_temp::CommandTemp> {
+        let _span = crate::phase_telemetry::span("command_temp_prepare");
+        if !self.remember_command_temp_policy(session_id) {
+            crate::phase_telemetry::add("command_temp_opted_out", Duration::ZERO);
+            return None;
+        }
+        let Some(scratch) = self.ensure_session_scratch(session_id).path else {
+            crate::phase_telemetry::add("command_temp_no_scratch", Duration::ZERO);
+            return None;
+        };
+        // Temp writes land on the pool's volume: below the gate headroom
+        // (the classifier the storage sweeps use) the command keeps the
+        // inherited temp folder.
+        if crate::command_temp::pressured(crate::disk_headroom::available_headroom(&scratch)) {
+            crate::phase_telemetry::add("command_temp_skipped_pressure", Duration::ZERO);
+            return None;
+        }
+        crate::command_temp::CommandTemp::create(&scratch)
+    }
+
+    /// Read the repository's `[command_temp]` policy and remember it for the
+    /// commands this process spawns for `session_id` (gates); true when on.
+    /// Also asks for the retirement run when the session's finished runs
+    /// are past their threshold.
+    pub(crate) fn remember_command_temp_policy(&self, session_id: i64) -> bool {
+        let enabled = crate::command_temp::CommandTempPolicy::load(self.main_root()).enabled;
+        crate::command_temp::remember_enabled(session_id, enabled);
+        self.request_retirement_for_command_temps(session_id);
+        enabled
+    }
+
+    /// End a command's run (dropping its guard) and check the session's
+    /// finished runs against the request thresholds.
+    pub(crate) fn finish_command_temp(
+        &self,
+        session_id: i64,
+        temp: Option<crate::command_temp::CommandTemp>,
+    ) {
+        if let Some(temp) = temp {
+            drop(temp);
+            self.request_retirement_for_command_temps(session_id);
+        }
+    }
+
+    /// Request the checkout retirement run (the same request finish and
+    /// close make) when a run finished past a threshold in this process, or
+    /// when `session_id`'s finished runs awaiting removal reach
+    /// [`crate::command_temp::RETIREMENT_REQUEST_RUNS`] or
+    /// [`crate::command_temp::RETIREMENT_REQUEST_BYTES`]. Nothing is deleted
+    /// here; below the thresholds the periodic run takes them.
+    pub(crate) fn request_retirement_for_command_temps(&self, session_id: i64) {
+        let _span = crate::phase_telemetry::span("command_temp_backlog_check");
+        let mut wanted = crate::command_temp::take_retirement_wanted();
+        if !wanted && let Some(record) = self.current_scratch_record(session_id) {
+            let finished = crate::session_scratch::finished_runs(
+                &record,
+                crate::command_temp::RETIREMENT_REQUEST_RUNS,
+            );
+            let bytes = finished
+                .iter()
+                .map(|run| run.marker.bytes)
+                .fold(0_u64, u64::saturating_add);
+            wanted = finished.len() >= crate::command_temp::RETIREMENT_REQUEST_RUNS
+                || bytes >= crate::command_temp::RETIREMENT_REQUEST_BYTES
+                || finished.iter().any(|run| run.marker.large());
+        }
+        if wanted {
+            crate::phase_telemetry::add("command_temp_retirement_requested", Duration::ZERO);
+            self.request_checkout_retirement_run();
+        }
+    }
+
     /// Replace the session's scratch directory with a fresh one (`start
     /// --reuse`): the old one is marked replaced, so the retirement lane
     /// removes it once no process uses it, and a new one is created.
@@ -370,6 +458,7 @@ impl Broker {
                     }
                 };
             if !eligible {
+                self.retire_finished_command_temps(record, run, deadline, &mut report);
                 continue;
             }
             report.examined += 1;
@@ -469,6 +558,8 @@ impl Broker {
                 "forgotten_missing": report.forgotten_missing,
                 "kept": report.kept,
                 "more_remaining": report.more_remaining,
+                "command_temps_retired": report.command_temps_retired,
+                "command_temps_kept": report.command_temps_kept,
             }),
         );
         for (pool, recorded) in &pools {
@@ -483,6 +574,81 @@ impl Broker {
             }
         }
         report
+    }
+
+    /// Move the finished command runs of an open session's scratch
+    /// directory into the pool's trash: none may be in use (the run's
+    /// open-file observation), and each must verify
+    /// ([`crate::session_scratch::move_finished_run_to_trash`]). The paced
+    /// host deleter unlinks them later, after its own observation.
+    fn retire_finished_command_temps(
+        &self,
+        record: &ScratchRecord,
+        run: &mut RetireRun,
+        deadline: Instant,
+        report: &mut ScratchRetireReport,
+    ) {
+        let finished = crate::session_scratch::finished_runs(record, FINISHED_RUNS_PER_PASS);
+        if finished.is_empty() {
+            return;
+        }
+        let _span = crate::phase_telemetry::span("command_temp_retire");
+        let Ok(snapshot) = run.process_use() else {
+            report.command_temps_kept += finished.len();
+            crate::phase_telemetry::add("command_temp_kept_process_use_unknown", Duration::ZERO);
+            return;
+        };
+        for finished_run in &finished {
+            if Instant::now() >= deadline {
+                report.more_remaining = true;
+                return;
+            }
+            let path = finished_run.path(record);
+            if crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, &path).is_some() {
+                report.command_temps_kept += 1;
+                crate::phase_telemetry::add("command_temp_kept_in_use", Duration::ZERO);
+                continue;
+            }
+            let moved = crate::session_scratch::move_finished_run_to_trash(
+                record,
+                finished_run,
+                &mut |dir, entry, row| self.record_checkout_trash_row(dir, entry, row),
+            );
+            match moved {
+                Ok(moved) => {
+                    crate::warn_unrecorded(
+                        "confirm a command temp directory's trash entry",
+                        self.record_checkout_trash_row(&moved.trash_dir, &moved.entry, moved.row),
+                    );
+                    if let Some(alias) = &finished_run.marker.alias {
+                        crate::command_temp::remove_alias(alias, &path);
+                    }
+                    crate::session_scratch::forget_finished_run(record, finished_run);
+                    report.command_temps_retired += 1;
+                    crate::phase_telemetry::add("command_temp_retired", Duration::ZERO);
+                }
+                Err(Refusal::Missing) => {
+                    // The run is gone (removed by hand): drop its marker and
+                    // its alias, which no longer resolves.
+                    if let Some(alias) = &finished_run.marker.alias {
+                        crate::command_temp::remove_alias(alias, &path);
+                    }
+                    crate::session_scratch::forget_finished_run(record, finished_run);
+                    crate::phase_telemetry::add("command_temp_missing_forgotten", Duration::ZERO);
+                }
+                Err(refusal) => {
+                    report.command_temps_kept += 1;
+                    crate::phase_telemetry::add(
+                        if refusal == Refusal::Failed {
+                            "command_temp_kept_move_failed"
+                        } else {
+                            "command_temp_kept_refused"
+                        },
+                        Duration::ZERO,
+                    );
+                }
+            }
+        }
     }
 
     /// Measure the live scratch directories (bounded) and write this
@@ -531,6 +697,15 @@ impl Broker {
             if record.keep.as_deref().is_some_and(is_refusal_keep) {
                 usage.refused += 1;
             }
+            // Finished command runs awaiting removal, from their markers
+            // (sizes measured at finish; nothing is walked again here).
+            for finished in crate::session_scratch::finished_runs(record, FINISHED_RUNS_COUNTED_MAX)
+            {
+                usage.finished_runs += 1;
+                usage.finished_run_bytes = usage
+                    .finished_run_bytes
+                    .saturating_add(finished.marker.bytes);
+            }
         }
         crate::phase_telemetry::attach(
             "session_scratch_usage",
@@ -542,6 +717,8 @@ impl Broker {
                 "refused": usage.refused,
                 "partial": usage.partial,
                 "bytes_freed_this_run": freed,
+                "finished_runs": usage.finished_runs,
+                "finished_run_bytes": usage.finished_run_bytes,
             }),
         );
         if let Some((host_state, _)) = crate::host_state::resolve_host_state_dir() {
@@ -607,6 +784,12 @@ mod tests {
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
         (owner, storage, broker)
+    }
+
+    fn run_retirement(
+        broker: &mut crate::Broker,
+    ) -> super::super::retire::CheckoutRetirementReport {
+        run(broker)
     }
 
     fn run(broker: &mut crate::Broker) -> super::super::retire::CheckoutRetirementReport {
@@ -924,6 +1107,100 @@ mod tests {
         assert_eq!(report.scratch.retired, 1, "{report:#?}");
         assert!(!first.exists(), "the replaced one is retired");
         assert!(second.is_dir(), "the open session keeps its fresh one");
+    }
+
+    /// A command's run directory is inside the session scratch; what the
+    /// command left there stays in place with a marker beside it, then
+    /// reaches the trash through the retirement run and the paced deleter
+    /// while the session stays open, its alias and marker going with it.
+    #[test]
+    fn a_finished_command_run_is_retired_through_the_trash() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, scratch) = started(&mut broker, "command temp retired");
+        let temp = broker
+            .command_temp_for_session(session.id)
+            .expect("a command temp directory");
+        let run = temp.run_dir();
+        let tmpdir = temp.tmpdir();
+        assert!(run.starts_with(&scratch));
+        std::fs::write(run.join("leftover.tmp"), b"left by the hook").unwrap();
+        let name = run.file_name().unwrap().to_owned();
+        broker.finish_command_temp(session.id, Some(temp));
+        assert!(run.join("leftover.tmp").is_file(), "kept in place");
+        let marker = scratch
+            .join(crate::command_temp::DONE_CONTAINER)
+            .join(&name);
+        assert!(marker.is_file());
+
+        let report = run_retirement(&mut broker);
+
+        assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
+        assert!(!run.exists(), "moved into the trash");
+        assert!(!marker.exists(), "marker dropped");
+        if tmpdir != run {
+            assert!(std::fs::symlink_metadata(&tmpdir).is_err(), "alias removed");
+        }
+        assert!(scratch.is_dir(), "the open session keeps its scratch");
+        assert!(
+            broker
+                .checkout_trash_rows()
+                .values()
+                .flat_map(|entries| entries.values())
+                .all(|row| !row.scratch),
+            "the deleter removed the entry"
+        );
+    }
+
+    #[test]
+    fn a_finished_command_run_in_use_is_kept() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _scratch) = started(&mut broker, "command temp in use");
+        let temp = broker.command_temp_for_session(session.id).unwrap();
+        let run = temp.run_dir();
+        std::fs::write(run.join("out"), b"x").unwrap();
+        drop(temp);
+        using(&run);
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.command_temps_kept, 1, "{report:#?}");
+        assert!(run.join("out").is_file());
+    }
+
+    /// Past the count threshold, finishing a run requests the retirement
+    /// run; below it, nothing is requested.
+    #[test]
+    fn many_finished_runs_request_the_retirement_run() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _scratch) = started(&mut broker, "command temp backlog");
+        run_retirement(&mut broker);
+        let due_later =
+            |broker: &crate::Broker| !broker.checkout_retirement_due(crate::clock::epoch_ms());
+        assert!(due_later(&broker), "the run scheduled its next pass");
+        let _ = crate::command_temp::take_retirement_wanted();
+        for index in 0..crate::command_temp::RETIREMENT_REQUEST_RUNS {
+            let temp = broker.command_temp_for_session(session.id).unwrap();
+            std::fs::write(temp.run_dir().join("out"), b"x").unwrap();
+            broker.finish_command_temp(session.id, Some(temp));
+            if index + 1 < crate::command_temp::RETIREMENT_REQUEST_RUNS {
+                assert!(due_later(&broker), "below the threshold at {index}");
+            }
+        }
+        assert!(
+            broker.checkout_retirement_due(crate::clock::epoch_ms()),
+            "requested at the threshold"
+        );
+    }
+
+    #[test]
+    fn a_repository_can_opt_out_of_command_temp_directories() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _scratch) = started(&mut broker, "command temp opt out");
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[command_temp]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(broker.command_temp_for_session(session.id).is_none());
+        assert!(!crate::command_temp::remembered_enabled(session.id));
     }
 
     #[test]
