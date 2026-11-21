@@ -577,6 +577,49 @@ pub(crate) fn move_worktree_to_trash(
     session_id: i64,
     record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
 ) -> Result<TrashedCheckout, String> {
+    move_worktree_to_trash_as(
+        repo,
+        common_dir,
+        pool,
+        worktree,
+        session_id,
+        false,
+        record_pending,
+    )
+}
+
+/// [`move_worktree_to_trash`] for a broker-created worktree that is not the
+/// session's checkout (a submit verification slot): its row is recorded as
+/// `stripped`, regenerable content, so nothing reads it as the session's
+/// checkout having gone into the trash.
+pub(crate) fn move_verification_worktree_to_trash(
+    repo: &crate::git::GitRepo,
+    common_dir: &Path,
+    pool: &Path,
+    worktree: &Path,
+    session_id: i64,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
+) -> Result<TrashedCheckout, String> {
+    move_worktree_to_trash_as(
+        repo,
+        common_dir,
+        pool,
+        worktree,
+        session_id,
+        true,
+        record_pending,
+    )
+}
+
+fn move_worktree_to_trash_as(
+    repo: &crate::git::GitRepo,
+    common_dir: &Path,
+    pool: &Path,
+    worktree: &Path,
+    session_id: i64,
+    stripped: bool,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
+) -> Result<TrashedCheckout, String> {
     let _span = crate::phase_telemetry::span("checkout_trash_move");
     if worktree.parent() != Some(pool) {
         return Err(format!(
@@ -628,7 +671,7 @@ pub(crate) fn move_worktree_to_trash(
         pending: true,
         creator_pid,
         creator_started_ms,
-        stripped: false,
+        stripped,
         scratch: false,
     };
     record_pending(&trash.path, &entry, row)?;

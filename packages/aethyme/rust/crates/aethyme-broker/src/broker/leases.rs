@@ -4626,7 +4626,19 @@ impl Broker {
                 .collect::<Vec<_>>();
             let _span = crate::phase_telemetry::span("implicit_lease_scan_all");
             let scanned = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
-                implicit_lease_paths(session, &rules, &refs)
+                // Only the acting session decides anything here; every
+                // other session's changes feed overlap reports, which never
+                // refuse, so their answers may be reused.
+                implicit_lease_paths(
+                    session,
+                    &rules,
+                    &refs,
+                    if acting == Some(session.id) {
+                        ChangedFilesScan::Acting
+                    } else {
+                        ChangedFilesScan::Peer
+                    },
+                )
             });
             pending_implicit_leases.extend(
                 sessions
@@ -4643,7 +4655,9 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            let Some(paths) = implicit_lease_paths(&session, &rules, &refs) else {
+            let Some(paths) =
+                implicit_lease_paths(&session, &rules, &refs, ChangedFilesScan::Acting)
+            else {
                 // `baseline_refs`, baseline and
                 // changed-file helpers deliberately hide ordinary Git
                 // failures behind `Option`. A timeout is different: a
@@ -5440,7 +5454,9 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            if let Some(paths) = implicit_lease_paths(&session, &rules, &refs) {
+            if let Some(paths) =
+                implicit_lease_paths(&session, &rules, &refs, ChangedFilesScan::Acting)
+            {
                 refreshed.insert(session.id, paths);
             }
         }
@@ -6971,10 +6987,23 @@ struct GuardedCommandResult {
 
 /// The paths a lease refresh records as `session`'s implicit leases, or
 /// `None` where the refresh leaves them as they are.
+/// Whose changed paths a lease refresh scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedFilesScan {
+    /// The session the command acts for, or a scan feeding a decision (a
+    /// lease claim): reuses an answer only where the command already allows
+    /// reuse (`agents`, `status`).
+    Acting,
+    /// Another session, whose paths only feed overlap reports: may reuse a
+    /// watcher-proven answer in any command.
+    Peer,
+}
+
 fn implicit_lease_paths(
     session: &crate::types::Session,
     rules: &crate::leases::LeaseIgnoreRules,
     refs: &crate::merge::BaselineRefs,
+    scan: ChangedFilesScan,
 ) -> Option<Vec<String>> {
     let _span = crate::phase_telemetry::span("implicit_lease_scan");
     let checkout = {
@@ -6991,7 +7020,11 @@ fn implicit_lease_paths(
             .unwrap_or_else(|| "HEAD".to_string())
     };
     let _span = crate::phase_telemetry::span("implicit_lease_changed_files");
-    let changed = crate::worktree_watch::changed_files(&checkout, &base).ok()?;
+    let changed = match scan {
+        ChangedFilesScan::Acting => crate::worktree_watch::changed_files(&checkout, &base),
+        ChangedFilesScan::Peer => crate::worktree_watch::changed_files_for_peer(&checkout, &base),
+    }
+    .ok()?;
     Some(
         changed
             .into_iter()

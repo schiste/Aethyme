@@ -165,12 +165,35 @@ pub(crate) fn directory() -> Option<PathBuf> {
 /// `checkout.changed_files(base)`, reusing the previous answer when the
 /// watcher shows the worktree unchanged and this command allowed reuse.
 pub(crate) fn changed_files(checkout: &GitRepo, base: &str) -> Result<Vec<String>, GitError> {
+    changed_files_with(checkout, base, REUSE_ALLOWED.load(Ordering::Relaxed))
+}
+
+/// [`changed_files`] for another session than the one a deciding command
+/// acts for: its changed paths only feed overlap reports, which never
+/// refuse anything, so its answer may be reused (within the watcher's
+/// publication window) even when this command decides. The acting
+/// session's own scan always asks Git.
+pub(crate) fn changed_files_for_peer(
+    checkout: &GitRepo,
+    base: &str,
+) -> Result<Vec<String>, GitError> {
+    if !REUSE_ALLOWED.load(Ordering::Relaxed) {
+        count("changed_files_peer_reuse");
+    }
+    changed_files_with(checkout, base, true)
+}
+
+fn changed_files_with(
+    checkout: &GitRepo,
+    base: &str,
+    reuse_allowed: bool,
+) -> Result<Vec<String>, GitError> {
     let switched_off = std::env::var_os(SWITCH_ENV).is_some_and(|value| value == "off");
     if switched_off {
         count("changed_files_reuse_switched_off");
         return checkout.changed_files(base);
     }
-    if !REUSE_ALLOWED.load(Ordering::Relaxed) {
+    if !reuse_allowed {
         count("changed_files_reuse_not_allowed");
         return checkout.changed_files(base);
     }
@@ -1555,6 +1578,43 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// What a peer scan reuses is exactly what Git answers now, for an
+    /// unchanged worktree and after a change: the overlap reports a submit
+    /// builds from peers' changed paths are the same either way.
+    #[test]
+    fn a_remembered_answer_equals_a_fresh_one() {
+        let mut fixture = Fixture::new();
+        fixture.start_watcher();
+        std::fs::write(fixture.checkout.root().join("peer-work.txt"), "x\n").unwrap();
+        let remembered = fixture.ask_until(Source::Reused);
+        assert_eq!(
+            remembered,
+            fixture.checkout.changed_files(&fixture.base).unwrap(),
+            "unchanged worktree"
+        );
+        std::fs::write(fixture.checkout.root().join("tracked.txt"), "changed\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (files, _) = fixture.ask();
+            if files == fixture.checkout.changed_files(&fixture.base).unwrap()
+                && files.contains(&"tracked.txt".to_string())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the change was never answered: {files:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let remembered = fixture.ask_until(Source::Reused);
+        assert_eq!(
+            remembered,
+            fixture.checkout.changed_files(&fixture.base).unwrap(),
+            "after a change"
+        );
     }
 
     #[test]

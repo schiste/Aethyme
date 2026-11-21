@@ -404,6 +404,39 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
+
+- **Peer scans reuse watcher-proven answers.** A lease refresh scans each
+  coordinating session's changed paths. On the busiest repository that is
+  about 31 sessions per submit, each `git diff` plus `ls-files` taking about
+  1.5 s, which is 47 s of summed worker time and 7.4 s of wall time
+  (`implicit_lease_scan_all`).
+  - Only the acting session's answer feeds a decision. Every other session's
+    paths feed overlap reports, which never refuse (`audit_submit_ownership`
+    reports another session's overlapping lease and never refuses it).
+  - Peer scans therefore reuse the worktree watcher's stored answer in any
+    command, `submit` included. That answer is keyed on the watcher counter,
+    the baseline commit and the index identity, and HEAD is not part of
+    `git diff <base>`.
+  - The acting session, and every lease-claim scan, still asks Git.
+  - Counter (introduced): `changed_files_peer_reuse`, counted when a peer scan
+    uses the watcher in a command that does not otherwise allow reuse.
+    Hits and misses keep the existing `changed_files_reused` and
+    `changed_files_miss_<reason>` counters.
+- **The verification slot goes into the trash.** At the end of submit, the
+  merge-simulation slot's worktree is moved into the trash of the directory
+  holding the slots, with one same-volume rename. Its Git registration is
+  dropped, and the paced host deleter unlinks it later. This replaces Git
+  removing the whole tree inline, which took 21 s per submit on the busiest
+  repository.
+  - The trash row is `stripped` and recorded for the submitting session, so
+    it is never read as that session's checkout being in the trash.
+  - A lock someone else placed, environments that cannot be destroyed, or a
+    refused rename fall back to Git's removal as before.
+  - Span (introduced): `verification_slot_trash`.
+  - Counters (introduced): `verification_slot_trashed` and
+    `verification_slot_trash_fell_back_to_git`.
+
 ## Early close when nothing can be lost (2026-11-20)
 
 The abandonment window (`session_abandoned_after_hours`, for example `1`) may
