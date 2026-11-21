@@ -2354,7 +2354,7 @@ fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
     }
     if parsed.positional.len() != 2 {
         return Err(UsageError::Message(
-            "gc service accepts exactly one action: plan, install, status, activate, deactivate, or uninstall".into(),
+            "gc service accepts exactly one action: plan, install, status, refresh, activate, deactivate, or uninstall".into(),
         ));
     }
     let action = parsed.positional[1].as_str();
@@ -2451,6 +2451,36 @@ fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
+        "refresh" => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "gc service refresh does not accept --confirm".into(),
+                ));
+            }
+            let home = crate::gc_sweep_service::control_home()?;
+            let uuid = crate::gc_sweep_service::uuid_for_current_repository()?;
+            let outcome = crate::gc_sweep_service::refresh_current(&home, &uuid);
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                out!(
+                    "GC sweep service refresh: {} (scheduler {})",
+                    outcome.outcome,
+                    outcome.scheduler_state
+                );
+                if let (Some(previous), Some(current)) =
+                    (&outcome.previous_runtime_version, &outcome.runtime_version)
+                {
+                    out!("  runtime: {previous} -> {current}");
+                }
+                if let Some(path) = &outcome.archived_to {
+                    out!("  previous record archived to {}", path.display());
+                }
+                if let Some(error) = &outcome.error {
+                    out!("  Warning: {error}");
+                }
+            }
+        }
         "status" | "activate" | "deactivate" | "uninstall" => {
             let confirmation = if action == "status" {
                 if parsed.confirm.is_some() {
@@ -2473,7 +2503,7 @@ fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown GC service action {other:?}; expected plan, install, status, activate, deactivate, or uninstall"
+                "unknown GC service action {other:?}; expected plan, install, status, refresh, activate, deactivate, or uninstall"
             )));
         }
     }
@@ -2607,11 +2637,23 @@ fn preflight_managed_gc_tick(
             "managed GC service accepts only the fixed `broker gc sweep --json` invocation".into(),
         ));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
-    let snapshot = Broker::open_snapshot(&cwd)?;
-    crate::gc_sweep_service::preflight_managed_tick(&snapshot)
-        .map_err(|error| UsageError::Message(format!("managed GC tick preflight refused: {error}")))
+    let preflight = (|| {
+        let cwd = std::env::current_dir()
+            .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+        let snapshot = Broker::open_snapshot(&cwd)?;
+        crate::gc_sweep_service::preflight_managed_tick(&snapshot).map_err(|error| {
+            UsageError::Message(format!("managed GC tick preflight refused: {error}"))
+        })
+    })();
+    if let Err(error) = &preflight {
+        // The service's output goes to /dev/null: leave the refusal on disk.
+        let message = match error {
+            UsageError::Message(message) | UsageError::Exit { message, .. } => message.as_str(),
+            UsageError::Help | UsageError::SilentExit(_) => "managed GC tick preflight refused",
+        };
+        crate::gc_sweep_service::record_tick_failure(message);
+    }
+    preflight
 }
 
 /// Private detached-worker entry point. It is absent from help and refuses to

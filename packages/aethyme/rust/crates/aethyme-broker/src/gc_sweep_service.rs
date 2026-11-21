@@ -18,6 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLAN_SCHEMA: &str = "aethyme.gc-sweep-service-plan/v1";
 const CONTROL_SCHEMA: &str = "aethyme.gc-sweep-service-control/v1";
 const RECEIPT_SCHEMA: &str = "aethyme.gc-sweep-service-last-pass/v1";
+const REFRESH_SCHEMA: &str = "aethyme.gc-sweep-service-refresh/v1";
+const ERROR_SCHEMA: &str = "aethyme.gc-sweep-service-last-error/v1";
+/// The command that rebinds this repository's service to the running runtime.
+pub(crate) const REFRESH_COMMAND: &str = "aethyme broker gc service refresh";
 const SERVICE_DIRECTORY: &str = "Library/Application Support/Aethyme/gc-sweep-services";
 const UNIT_DIRECTORY: &str = "Library/LaunchAgents";
 const SERVICE_ENV_UUID: &str = "AETHYME_GC_SWEEP_SERVICE_UUID";
@@ -747,6 +751,32 @@ pub(crate) fn control(
     action: &str,
     confirmation: Option<&str>,
 ) -> io::Result<Value> {
+    if action == "status"
+        && let Ok((repository, marker_uuid)) = current_repository()
+        && automatic_refresh_proof(home, uuid, &marker_uuid, &repository).is_ok()
+    {
+        let refreshed = refresh_current(home, uuid);
+        // A refresh that stopped part-way leaves no loadable plan: report
+        // the refresh itself rather than failing the status call.
+        let mut status =
+            control_with(home, uuid, "status", None, launchctl).unwrap_or_else(|error| {
+                json!({
+                    "schema": CONTROL_SCHEMA,
+                    "action": "status",
+                    "installation_state": "unreadable_after_refresh",
+                    "error": bounded_error(&error.to_string()),
+                    "next_action": REFRESH_COMMAND,
+                    "delivery_proven": false
+                })
+            });
+        if let Some(object) = status.as_object_mut() {
+            object.insert(
+                "automatic_refresh".into(),
+                serde_json::to_value(&refreshed).map_err(io::Error::other)?,
+            );
+        }
+        return Ok(status);
+    }
     if matches!(action, "status" | "uninstall")
         && let Some(result) = control_dead_record(
             home,
@@ -789,6 +819,9 @@ fn control_with(
             .unwrap_or("stale_or_unavailable");
         let control = read_control(&plan)?;
         let last_pass = read_last_pass(&plan)?;
+        let last_error = read_bounded_json(&plan.directory.join("last-error.json"), plan.uid);
+        let last_refresh = read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid);
+        let next_action = (!plan.router.exists()).then_some(REFRESH_COMMAND);
         return Ok(json!({
             "schema": CONTROL_SCHEMA,
             "action": "status",
@@ -799,6 +832,9 @@ fn control_with(
             "runtime_state": runtime_state,
             "control": control,
             "last_pass": last_pass,
+            "last_error": last_error,
+            "last_refresh": last_refresh,
+            "next_action": next_action,
             "delivery_proven": false
         }));
     }
@@ -1105,7 +1141,12 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
             fs::File::open(parent)?.sync_all()?;
         }
     }
-    for name in ["plan.json", "control.json", "last-pass.json"] {
+    for name in [
+        "plan.json",
+        "control.json",
+        "last-pass.json",
+        "last-error.json",
+    ] {
         let source = record.directory.join(name);
         match fs::symlink_metadata(&source) {
             Ok(metadata) if metadata.is_file() => {
@@ -1338,6 +1379,472 @@ fn existing_installation_with(
     }
     let state = label_state(record.uid, &record.label)?;
     Ok(Some(record.describe(state)))
+}
+
+/// What one service refresh did. Written to `last-refresh.json` beside the
+/// plan and reported by `update` and `gc service refresh`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RefreshOutcome {
+    pub(crate) schema: &'static str,
+    pub(crate) repository_uuid: String,
+    /// `not_installed`, `not_verifiable`, `already_current`,
+    /// `label_state_unknown`, `refresh_failed`, `refreshed_not_loaded`,
+    /// `refreshed_and_reloaded`, `refreshed_reload_unconfirmed` or
+    /// `refreshed_bootstrap_unconfirmed`.
+    pub(crate) outcome: &'static str,
+    pub(crate) scheduler_state: &'static str,
+    pub(crate) previous_plan_digest: Option<String>,
+    pub(crate) previous_runtime_version: Option<String>,
+    pub(crate) plan_digest: Option<String>,
+    pub(crate) runtime_version: Option<String>,
+    pub(crate) archived_to: Option<PathBuf>,
+    /// Whether the previous runtime bundle must outlive this update: launchd
+    /// may still run it (loaded and not provably reloaded, or unknown).
+    pub(crate) keep_previous_runtime: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) observed_at_unix_ms: u64,
+}
+
+impl RefreshOutcome {
+    fn new(uuid: &str) -> Self {
+        Self {
+            schema: REFRESH_SCHEMA,
+            repository_uuid: uuid.to_string(),
+            outcome: "refresh_failed",
+            scheduler_state: "unknown",
+            previous_plan_digest: None,
+            previous_runtime_version: None,
+            plan_digest: None,
+            runtime_version: None,
+            archived_to: None,
+            // Kept until something proves launchd no longer runs it.
+            keep_previous_runtime: true,
+            error: None,
+            observed_at_unix_ms: now_unix_ms().unwrap_or(0),
+        }
+    }
+}
+
+/// Rebind one recorded service to `runtime`, under its installer claim.
+///
+/// The recorded plan must load and verify (namespace, label, generation,
+/// digest, and the unit file's bytes equal to the plan's rendered unit), so
+/// nothing a recorded field names is trusted beyond what that check proves.
+/// Launchd decides what happens next: unknown changes nothing; not loaded
+/// archives the record and publishes the new plan and unit; loaded does the
+/// same, then boots the label out and bootstraps the new unit. Never fails:
+/// every error lands in the returned outcome.
+fn refresh_record_with(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    runtime: Result<&RuntimePair, &str>,
+    mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+    mut run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+) -> RefreshOutcome {
+    let _span = crate::phase_telemetry::span("gc_service_refresh");
+    let mut outcome = RefreshOutcome::new(uuid);
+    if let Err(error) = refresh_steps(
+        home,
+        uuid,
+        uid,
+        runtime,
+        &mut label_state,
+        &mut run,
+        &mut outcome,
+    ) {
+        outcome.error = Some(bounded_error(&error.to_string()));
+    }
+    if outcome.outcome != "not_installed" {
+        crate::warn_unrecorded(
+            "record the GC service refresh",
+            write_refresh_receipt(home, uuid, &outcome),
+        );
+    }
+    let counter = match outcome.outcome {
+        "refreshed_not_loaded" | "refreshed_and_reloaded" => Some("gc_service_refreshed"),
+        "refreshed_reload_unconfirmed" | "refreshed_bootstrap_unconfirmed" => {
+            Some("gc_service_refresh_reload_unconfirmed")
+        }
+        "label_state_unknown" => Some("gc_service_refresh_label_unknown"),
+        "refresh_failed" | "not_verifiable" => Some("gc_service_refresh_failed"),
+        _ => None,
+    };
+    if let Some(counter) = counter {
+        crate::phase_telemetry::add(counter, Duration::ZERO);
+    }
+    outcome
+}
+
+fn refresh_steps(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    runtime: Result<&RuntimePair, &str>,
+    label_state: &mut impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+    run: &mut impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+    out: &mut RefreshOutcome,
+) -> io::Result<()> {
+    use crate::scheduled_service::launchd::LabelState;
+    crate::store::repository_identity::validate_uuid_v4(uuid).map_err(io::Error::other)?;
+    if !read_record(home, uuid, uid)?.exists() {
+        out.outcome = "not_installed";
+        out.keep_previous_runtime = false;
+        return Ok(());
+    }
+    let directory = expected_directory(home, uuid);
+    let claim = crate::pr_watch_service_install::claim_service_directory(home, &directory, uid)?;
+    out.outcome = "not_verifiable";
+    let (plan, bytes) = load(home, uuid)?;
+    out.previous_plan_digest = Some(plan.digest.clone());
+    out.previous_runtime_version = Some(plan.runtime_version.clone());
+    let record = read_record(home, uuid, uid)?;
+    if record.plan_bytes.as_deref() != Some(bytes.as_slice()) || !record.unit_present {
+        return Err(invalid("GC service record changed while claiming refresh"));
+    }
+    if let Ok(runtime) = runtime
+        && plan.router == runtime.router
+        && plan.router_sha256 == runtime.router_sha256
+        && plan.engine_sha256 == runtime.engine_sha256
+    {
+        out.outcome = "already_current";
+        out.keep_previous_runtime = false;
+        out.scheduler_state = "unchanged";
+        out.plan_digest = Some(plan.digest.clone());
+        out.runtime_version = Some(plan.runtime_version.clone());
+        return Ok(());
+    }
+    // A probe that could not run proves nothing either way.
+    let state = label_state(uid, &plan.label).unwrap_or_else(|error| {
+        out.error = Some(bounded_error(&error.to_string()));
+        LabelState::Unknown
+    });
+    out.scheduler_state = label_state_name(state);
+    if state == LabelState::Unknown {
+        // No proof either way: record the attempt and change nothing.
+        out.outcome = "label_state_unknown";
+        return Ok(());
+    }
+    out.outcome = "refresh_failed";
+    out.keep_previous_runtime = state == LabelState::Loaded;
+    let runtime = runtime.map_err(invalid)?;
+    let fresh = Plan::from_runtime(&plan.repository, uuid, &plan.home, uid, runtime)?;
+    out.plan_digest = Some(fresh.digest.clone());
+    out.runtime_version = Some(fresh.runtime_version.clone());
+    out.archived_to = Some(archive_record(&record)?);
+    let fresh_bytes = serde_json::to_vec(&fresh).map_err(io::Error::other)?;
+    crate::pr_watch_service_install::install_exact_files_claimed(
+        &fresh.home,
+        &fresh.directory,
+        &fresh.unit_path,
+        uid,
+        &[("plan.json", fresh_bytes.as_slice())],
+        fresh.unit.as_bytes(),
+        &claim,
+    )?;
+    if state == LabelState::NotLoaded {
+        out.outcome = "refreshed_not_loaded";
+        return Ok(());
+    }
+    reload_refreshed(&fresh, run, out)
+}
+
+/// Replace a loaded job with the refreshed unit: bootout, then bootstrap,
+/// with a control receipt before and after.
+fn reload_refreshed(
+    plan: &Plan,
+    run: &mut impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+    out: &mut RefreshOutcome,
+) -> io::Result<()> {
+    use crate::scheduled_service::launchd::Observation;
+    let receipt = |scheduler_state: &str, operation_result: &str| -> io::Result<ControlReceipt> {
+        Ok(ControlReceipt {
+            schema: CONTROL_SCHEMA.to_string(),
+            plan_digest: plan.digest.clone(),
+            generation: plan.generation.clone(),
+            action: "refresh".to_string(),
+            scheduler_state: scheduler_state.to_string(),
+            operation_result: operation_result.to_string(),
+            observed_at_unix_ms: now_unix_ms()?,
+        })
+    };
+    write_control(plan, &receipt("unknown", "attempting")?)?;
+    let bootout = run(&[
+        "bootout".to_string(),
+        format!("gui/{}/{}", plan.uid, plan.label),
+    ])?;
+    if bootout != Observation::Success {
+        // The old job may still be loaded and still names the old runtime.
+        write_control(plan, &receipt("unknown", observation_name(&bootout))?)?;
+        out.outcome = "refreshed_reload_unconfirmed";
+        out.scheduler_state = "unknown";
+        return Ok(());
+    }
+    // The old job is unloaded: nothing runs the previous runtime any more.
+    out.keep_previous_runtime = false;
+    let bootstrap = run(&[
+        "bootstrap".to_string(),
+        format!("gui/{}", plan.uid),
+        plan.unit_path.to_string_lossy().into_owned(),
+    ])?;
+    let (scheduler_state, operation_result, outcome) = match bootstrap {
+        Observation::Success => ("loaded", "acknowledged", "refreshed_and_reloaded"),
+        Observation::Refused => ("unknown", "refused", "refreshed_bootstrap_unconfirmed"),
+        Observation::Unknown => ("unknown", "unknown", "refreshed_bootstrap_unconfirmed"),
+    };
+    write_control(plan, &receipt(scheduler_state, operation_result)?)?;
+    out.scheduler_state = scheduler_state;
+    out.outcome = outcome;
+    Ok(())
+}
+
+fn write_bounded_receipt(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_RECEIPT_BYTES {
+        return Err(invalid("GC service receipt exceeds its write budget"));
+    }
+    let target = directory.join(name);
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(invalid("GC service receipt path is not a file"));
+        }
+        _ => {}
+    }
+    crate::atomic_file::with_synced_temporary(&target, bytes, |temporary| {
+        fs::rename(temporary, &target)
+    })?;
+    fs::File::open(directory)?.sync_all()
+}
+
+fn write_refresh_receipt(home: &Path, uuid: &str, outcome: &RefreshOutcome) -> io::Result<()> {
+    let directory = expected_directory(home, uuid);
+    if !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(outcome).map_err(io::Error::other)?;
+    write_bounded_receipt(&directory, "last-refresh.json", &bytes)
+}
+
+fn read_bounded_json(path: &Path, uid: u32) -> Option<Value> {
+    read_receipt_bytes(path, uid)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+/// What a self-update did to the GC services bound to its installation.
+#[derive(Debug, Default)]
+pub(crate) struct UpdateRefresh {
+    /// Version bundles cleanup must keep this time: a service may still run them.
+    pub(crate) protected_bundles: Vec<std::ffi::OsString>,
+    pub(crate) outcomes: Vec<RefreshOutcome>,
+}
+
+/// Refresh every service whose recorded runtime lies in a bundle of
+/// `managed_root` that this update is about to remove (one not `selected`
+/// by `current` or `previous`) or that is already gone. Called after the
+/// selector switch and before cleanup; it never fails the update.
+#[cfg(target_os = "macos")]
+pub(crate) fn refresh_for_update(
+    managed_root: &Path,
+    selected: &[std::ffi::OsString],
+    new_router: &Path,
+) -> UpdateRefresh {
+    let _span = crate::phase_telemetry::span("gc_service_refresh_for_update");
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return UpdateRefresh::default();
+    };
+    let Ok(home) = absolute_directory(&home) else {
+        return UpdateRefresh::default();
+    };
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return UpdateRefresh::default();
+    }
+    refresh_for_update_with(
+        &home,
+        uid,
+        managed_root,
+        selected,
+        || runtime_pair(new_router),
+        crate::scheduled_service::launchd::label_state,
+        launchctl,
+    )
+}
+
+fn refresh_for_update_with(
+    home: &Path,
+    uid: u32,
+    managed_root: &Path,
+    selected: &[std::ffi::OsString],
+    runtime: impl FnOnce() -> io::Result<RuntimePair>,
+    mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+    mut run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+) -> UpdateRefresh {
+    let mut report = UpdateRefresh::default();
+    let Ok(entries) = fs::read_dir(home.join(SERVICE_DIRECTORY)) else {
+        return report;
+    };
+    let mut uuids: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| crate::store::repository_identity::validate_uuid_v4(name).is_ok())
+        .collect();
+    uuids.sort();
+    let versions = managed_root.join("versions");
+    let mut runtime = Some(runtime);
+    let mut resolved: Option<Result<RuntimePair, String>> = None;
+    for uuid in uuids {
+        let Ok(record) = read_record(home, &uuid, uid) else {
+            continue;
+        };
+        // The recorded router only selects candidates and names the bundle
+        // to keep; the refresh itself acts on the verified plan.
+        let Some(router) = record.router.as_deref() else {
+            continue;
+        };
+        let Some(version_directory) = router.parent() else {
+            continue;
+        };
+        if version_directory.parent() != Some(versions.as_path()) {
+            continue;
+        }
+        let Some(bundle) = version_directory.file_name() else {
+            continue;
+        };
+        let doomed = !selected.iter().any(|name| name == bundle) || !router.exists();
+        if !doomed {
+            continue;
+        }
+        let pair = resolved.get_or_insert_with(|| match runtime.take() {
+            Some(resolve) => resolve().map_err(|error| error.to_string()),
+            None => Err("the new runtime pair was not resolved".to_string()),
+        });
+        let outcome = refresh_record_with(
+            home,
+            &uuid,
+            uid,
+            pair.as_ref().map_err(String::as_str),
+            &mut label_state,
+            &mut run,
+        );
+        if outcome.keep_previous_runtime {
+            report.protected_bundles.push(bundle.to_os_string());
+        }
+        report.outcomes.push(outcome);
+    }
+    report
+}
+
+/// `gc service refresh`: rebind this repository's service to the running
+/// installer-managed runtime.
+#[cfg(target_os = "macos")]
+pub(crate) fn refresh_current(home: &Path, uuid: &str) -> RefreshOutcome {
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    let runtime = std::env::current_exe()
+        .and_then(|current| runtime_pair(&current))
+        .map_err(|error| error.to_string());
+    refresh_record_with(
+        home,
+        uuid,
+        uid,
+        runtime.as_ref().map_err(String::as_str),
+        crate::scheduled_service::launchd::label_state,
+        launchctl,
+    )
+}
+
+/// Whether a foreground command may refresh this repository's service by
+/// itself: the recorded runtime is gone, the uuid read from the
+/// repository's marker is the service's, the recorded plan verifies (its
+/// label is exactly `com.aethyme.gc-sweep.<uuid>` and the unit file's bytes
+/// equal its rendered unit), and it names this repository.
+fn automatic_refresh_proof(
+    home: &Path,
+    uuid: &str,
+    marker_uuid: &str,
+    repository: &Path,
+) -> Result<(), &'static str> {
+    if uuid != marker_uuid {
+        return Err("service_uuid_differs_from_repository_marker");
+    }
+    let (plan, _) = load(home, uuid).map_err(|_| "recorded_plan_or_unit_not_verified")?;
+    if plan.label != format!("com.aethyme.gc-sweep.{uuid}") {
+        return Err("label_differs");
+    }
+    if plan.repository != repository {
+        return Err("plan_names_another_repository");
+    }
+    if plan.router.exists() {
+        return Err("recorded_runtime_present");
+    }
+    Ok(())
+}
+
+/// Evidence for the `storage.gc-service-runtime-missing` status advice: a
+/// plan is recorded for this repository and the runtime it names is gone.
+pub(crate) fn runtime_missing_evidence(home: &Path, uuid: &str, uid: u32) -> Option<Vec<String>> {
+    let record = read_record(home, uuid, uid).ok()?;
+    if record.plan_bytes.is_none() || record.runtime_present() != Some(false) {
+        return None;
+    }
+    let mut evidence = vec![format!(
+        "the recorded runtime {} is no longer installed; launchd cannot start the job",
+        record.runtime_version.as_deref().unwrap_or("unknown")
+    )];
+    if !record.unit_present {
+        evidence.push("the unit file is missing too".into());
+    }
+    if let Some(refresh) = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
+        && let Some(outcome) = refresh.get("outcome").and_then(Value::as_str)
+    {
+        evidence.push(format!("last refresh attempt: {outcome}"));
+    }
+    Some(evidence)
+}
+
+/// Record why a managed tick refused to run, beside `last-pass.json`, so a
+/// failing service is not silent (its output goes to /dev/null).
+#[cfg(target_os = "macos")]
+pub(crate) fn record_tick_failure(error: &str) {
+    let Ok(uuid) = std::env::var(SERVICE_ENV_UUID) else {
+        return;
+    };
+    let generation = std::env::var(SERVICE_ENV_GENERATION).ok();
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    crate::warn_unrecorded(
+        "record the GC service tick failure",
+        write_tick_failure(&home, &uuid, uid, generation.as_deref(), error),
+    );
+}
+
+fn write_tick_failure(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    generation: Option<&str>,
+    error: &str,
+) -> io::Result<()> {
+    crate::store::repository_identity::validate_uuid_v4(uuid).map_err(io::Error::other)?;
+    let home = absolute_directory(home)?;
+    let directory = expected_directory(&home, uuid);
+    crate::pr_watch_service_install::lifecycle::check_directories(&home, &directory, uid, true)?;
+    let receipt = json!({
+        "schema": ERROR_SCHEMA,
+        "repository_uuid": uuid,
+        "generation": generation.filter(|value| valid_hex_digest(value)),
+        "observed_at_unix_ms": now_unix_ms()?,
+        "error": bounded_error(error),
+    });
+    let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+    write_bounded_receipt(&directory, "last-error.json", &bytes)?;
+    crate::phase_telemetry::add("gc_service_tick_refused", Duration::ZERO);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1871,6 +2378,417 @@ mod tests {
             .is_err()
         );
         assert!(source.is_file());
+    }
+
+    /// A newer runtime pair beside the fixture's, as an update installs it.
+    fn newer_runtime(plan: &Plan) -> RuntimePair {
+        let version_directory = plan.managed_root.join("versions/v0.8.51-test");
+        fs::create_dir_all(&version_directory).unwrap();
+        let router = version_directory.join("aethyme");
+        let engine = version_directory.join("aethyme-engine-cli");
+        fs::write(&router, b"newer router fixture").unwrap();
+        fs::write(&engine, b"newer engine fixture").unwrap();
+        fs::set_permissions(&router, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+        RuntimePair {
+            managed_root: plan.managed_root.clone(),
+            version_directory,
+            runtime_version: "0.8.51".into(),
+            runtime_build_identity: "0.8.51 (build_revision=fixture)".into(),
+            router_sha256: binary_digest(&router).unwrap(),
+            engine_sha256: binary_digest(&engine).unwrap(),
+            router,
+            engine,
+        }
+    }
+
+    fn refreshed_plan(plan: &Plan, runtime: &RuntimePair) -> Plan {
+        Plan::from_runtime(
+            &plan.repository,
+            &plan.repository_uuid,
+            &plan.home,
+            plan.uid,
+            runtime,
+        )
+        .unwrap()
+    }
+
+    fn assert_unchanged(plan: &Plan) {
+        assert_eq!(
+            fs::read(plan.directory.join("plan.json")).unwrap(),
+            serde_json::to_vec(plan).unwrap()
+        );
+        assert_eq!(fs::read(&plan.unit_path).unwrap(), plan.unit.as_bytes());
+        assert!(archived_plans(plan).is_empty());
+    }
+
+    #[test]
+    fn refresh_of_a_loaded_service_republishes_and_rebootstraps_it() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let fresh = refreshed_plan(&plan, &runtime);
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, label| {
+                assert_eq!(label, plan.label);
+                Ok(LabelState::Loaded)
+            },
+            |args| {
+                calls.push(args.to_vec());
+                Ok(Observation::Success)
+            },
+        );
+        assert_eq!(outcome.outcome, "refreshed_and_reloaded", "{outcome:?}");
+        assert_eq!(outcome.scheduler_state, "loaded");
+        assert!(!outcome.keep_previous_runtime);
+        assert_eq!(outcome.plan_digest.as_deref(), Some(fresh.digest.as_str()));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            [
+                "bootout".to_string(),
+                format!("gui/{}/{}", plan.uid, plan.label)
+            ]
+        );
+        assert_eq!(calls[1][0], "bootstrap");
+        assert_eq!(calls[1][2], fresh.unit_path.to_string_lossy());
+        assert_eq!(
+            fs::read(plan.directory.join("plan.json")).unwrap(),
+            serde_json::to_vec(&fresh).unwrap()
+        );
+        assert_eq!(fs::read(&plan.unit_path).unwrap(), fresh.unit.as_bytes());
+        let archive = outcome.archived_to.clone().unwrap();
+        assert_eq!(
+            fs::read(archive.join("plan.json")).unwrap(),
+            serde_json::to_vec(&plan).unwrap()
+        );
+        assert_eq!(
+            fs::read(archive.join("unit.plist")).unwrap(),
+            plan.unit.as_bytes()
+        );
+        let control = read_control(&fresh).unwrap().unwrap();
+        assert_eq!(control.action, "refresh");
+        assert_eq!(control.scheduler_state, "loaded");
+        assert_eq!(control.operation_result, "acknowledged");
+        let receipt =
+            read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid).unwrap();
+        assert_eq!(receipt["outcome"], "refreshed_and_reloaded");
+        // The refreshed record loads and is current: a second refresh is a no-op.
+        let again = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| panic!("launchd is not asked about a current record"),
+            |_| panic!("launchctl is not run for a current record"),
+        );
+        assert_eq!(again.outcome, "already_current");
+    }
+
+    #[test]
+    fn refresh_of_an_unloaded_service_republishes_without_launchctl() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let fresh = refreshed_plan(&plan, &runtime);
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(outcome.outcome, "refreshed_not_loaded", "{outcome:?}");
+        assert!(!outcome.keep_previous_runtime);
+        assert_eq!(fs::read(&plan.unit_path).unwrap(), fresh.unit.as_bytes());
+        assert_eq!(archived_plans(&plan).len(), 1);
+        assert!(read_control(&fresh).unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_with_an_unknown_label_changes_nothing_and_keeps_the_old_bundle() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let selected = [std::ffi::OsString::from("v0.8.51-test")];
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &selected,
+            || Ok(runtime.clone()),
+            |_, _| Ok(LabelState::Unknown),
+            |_| panic!("nothing is run without launchd's answer"),
+        );
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].outcome, "label_state_unknown");
+        assert_eq!(
+            report.protected_bundles,
+            vec![std::ffi::OsString::from("v0.8.50-test")]
+        );
+        assert_unchanged(&plan);
+        // The attempt is recorded beside the plan.
+        let receipt =
+            read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid).unwrap();
+        assert_eq!(receipt["outcome"], "label_state_unknown");
+    }
+
+    #[test]
+    fn update_refresh_skips_services_whose_bundle_stays() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let selected = [
+            std::ffi::OsString::from("v0.8.51-test"),
+            std::ffi::OsString::from("v0.8.50-test"),
+        ];
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &selected,
+            || panic!("no runtime is resolved when no service needs it"),
+            |_, _| panic!("launchd is not asked"),
+            |_| panic!("launchctl is not run"),
+        );
+        assert!(report.outcomes.is_empty());
+        assert!(report.protected_bundles.is_empty());
+        // Another installation's services are never touched.
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.home.join("other-install/.aethyme-managed"),
+            &[],
+            || panic!("no runtime is resolved for another installation"),
+            |_, _| panic!("launchd is not asked"),
+            |_| panic!("launchctl is not run"),
+        );
+        assert!(report.outcomes.is_empty());
+        assert_unchanged(&plan);
+    }
+
+    #[test]
+    fn a_refresh_failure_is_reported_and_never_fails_the_update() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let selected = [std::ffi::OsString::from("v0.8.51-test")];
+        // The new pair cannot be verified and launchd says the job is loaded:
+        // nothing changes, the error is reported, the old bundle is kept.
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &selected,
+            || Err(io::Error::other("new runtime pair is not verifiable")),
+            |_, _| Ok(LabelState::Loaded),
+            |_| panic!("launchctl is not run when the refresh failed"),
+        );
+        let outcome = &report.outcomes[0];
+        assert_eq!(outcome.outcome, "refresh_failed");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not verifiable"))
+        );
+        assert_eq!(
+            report.protected_bundles,
+            vec![std::ffi::OsString::from("v0.8.50-test")]
+        );
+        assert_unchanged(&plan);
+        // Not loaded: nothing can run the old bundle, so it is not kept.
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &selected,
+            || Err(io::Error::other("new runtime pair is not verifiable")),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("launchctl is not run"),
+        );
+        assert_eq!(report.outcomes[0].outcome, "refresh_failed");
+        assert!(report.protected_bundles.is_empty());
+        // A launchctl that cannot be run is an error in the outcome too.
+        let runtime = newer_runtime(&plan);
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &selected,
+            || Ok(runtime.clone()),
+            |_, _| Err(io::Error::other("launchctl unavailable")),
+            |_| panic!("launchctl is not run"),
+        );
+        assert_eq!(report.outcomes[0].outcome, "label_state_unknown");
+        assert!(report.outcomes[0].error.is_some());
+        assert_eq!(
+            report.protected_bundles,
+            vec![std::ffi::OsString::from("v0.8.50-test")]
+        );
+        assert_unchanged(&plan);
+    }
+
+    #[test]
+    fn a_service_mid_tick_keeps_its_bundle_and_is_left_alone() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        // A running tick holds the installer claim for its whole pass.
+        let tick =
+            crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid).unwrap();
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &[std::ffi::OsString::from("v0.8.51-test")],
+            || Ok(runtime.clone()),
+            |_, _| panic!("launchd is not asked without the claim"),
+            |_| panic!("launchctl is not run without the claim"),
+        );
+        drop(tick);
+        assert_eq!(report.outcomes[0].outcome, "refresh_failed");
+        assert_eq!(
+            report.protected_bundles,
+            vec![std::ffi::OsString::from("v0.8.50-test")]
+        );
+        assert_unchanged(&plan);
+    }
+
+    #[test]
+    fn a_refused_bootout_keeps_the_old_bundle() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let mut calls = 0;
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Loaded),
+            |_| {
+                calls += 1;
+                Ok(Observation::Refused)
+            },
+        );
+        assert_eq!(calls, 1, "no bootstrap after a refused bootout");
+        assert_eq!(outcome.outcome, "refreshed_reload_unconfirmed");
+        assert!(outcome.keep_previous_runtime);
+    }
+
+    #[test]
+    fn a_unit_that_differs_from_its_plan_is_never_repaired_automatically() {
+        let (temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let missing = temp.path().join("gone");
+        // Bind the record to a runtime that is gone, as two updates leave it.
+        let mut stale = RuntimePair {
+            managed_root: plan.managed_root.clone(),
+            version_directory: plan.managed_root.join("versions/v0.8.40-gone"),
+            runtime_version: plan.runtime_version.clone(),
+            runtime_build_identity: plan.runtime_build_identity.clone(),
+            router: PathBuf::new(),
+            engine: PathBuf::new(),
+            router_sha256: plan.router_sha256.clone(),
+            engine_sha256: plan.engine_sha256.clone(),
+        };
+        stale.router = stale.version_directory.join("aethyme");
+        stale.engine = stale.version_directory.join("aethyme-engine-cli");
+        let stale_plan = refreshed_plan(&plan, &stale);
+        fs::remove_file(plan.directory.join("plan.json")).unwrap();
+        fs::remove_file(&plan.unit_path).unwrap();
+        install_fixture(&stale_plan);
+        automatic_refresh_proof(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+        )
+        .unwrap();
+        // Another repository's marker, or another repository: advice only.
+        assert!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                "00000000-0000-4000-8000-000000000000",
+                &plan.repository
+            )
+            .is_err()
+        );
+        assert!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &missing
+            )
+            .is_err()
+        );
+        assert!(
+            runtime_missing_evidence(&plan.home, &plan.repository_uuid, plan.uid)
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("no longer installed"))
+        );
+        // The unit no longer matches the plan's rendered unit.
+        fs::remove_file(&stale_plan.unit_path).unwrap();
+        fs::write(&stale_plan.unit_path, b"<plist>edited</plist>").unwrap();
+        fs::set_permissions(&stale_plan.unit_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository
+            ),
+            Err("recorded_plan_or_unit_not_verified")
+        );
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| panic!("launchd is not asked about an unverified record"),
+            |_| panic!("launchctl is not run for an unverified record"),
+        );
+        assert_eq!(outcome.outcome, "not_verifiable");
+        assert_eq!(
+            fs::read(&stale_plan.unit_path).unwrap(),
+            b"<plist>edited</plist>"
+        );
+        assert!(archived_plans(&plan).is_empty());
+    }
+
+    #[test]
+    fn a_refused_tick_leaves_a_bounded_last_error() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_tick_failure(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Some("not-a-digest"),
+            &"x".repeat(32_768),
+        )
+        .unwrap();
+        let path = plan.directory.join("last-error.json");
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_RECEIPT_BYTES as u64);
+        let receipt = read_bounded_json(&path, plan.uid).unwrap();
+        assert_eq!(receipt["schema"], ERROR_SCHEMA);
+        assert!(receipt["generation"].is_null());
+        assert_eq!(receipt["error"].as_str().unwrap().len(), 256);
+        // The uuid comes from the environment: it must name a namespace.
+        assert!(write_tick_failure(&plan.home, "../escape", plan.uid, None, "error").is_err());
+        // An uninstalled repository gets no directory created for it.
+        let other = "00000000-0000-4000-8000-000000000000";
+        assert!(write_tick_failure(&plan.home, other, plan.uid, None, "error").is_err());
+        assert!(!expected_directory(&plan.home, other).exists());
     }
 
     #[test]
