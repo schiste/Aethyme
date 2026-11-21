@@ -429,8 +429,18 @@ and documents from before 0.8.110) as `true`.
   dropped, and the paced host deleter unlinks it later. This replaces Git
   removing the whole tree inline, which took 21 s per submit on the busiest
   repository.
-  - The trash row is `stripped` and recorded for the submitting session, so
-    it is never read as that session's checkout being in the trash.
+  - The trash row is `stripped` and `verification` (a new row field),
+    recorded for the submitting session. It is never read as that session's
+    checkout being in the trash, and its bytes count as neither strip nor
+    scratch. The drain counts them in `verification_entries_removed`, and the
+    counter is `verification_slot_trash_entries_removed`.
+  - A slot placed in the temporary-directory fallback (`<temp>/aethyme-run/`)
+    keeps Git's removal (counter: `verification_slot_trash_skipped_temporary`).
+  - The drain now drops rows whose trash directory's parent no longer exists
+    and is not an unmounted removable volume: nothing is left to delete there.
+    It counts them in `vanished_rows_dropped`, and the counter is
+    `checkout_trash_vanished_rows_dropped`. Such rows used to be kept forever
+    and held the trash "behind".
   - A lock someone else placed, environments that cannot be destroyed, or a
     refused rename fall back to Git's removal as before.
   - Span (introduced): `verification_slot_trash`.

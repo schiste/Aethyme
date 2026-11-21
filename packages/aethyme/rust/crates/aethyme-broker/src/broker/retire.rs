@@ -1615,6 +1615,17 @@ impl Broker {
     /// cannot be destroyed, or a refused rename leave it where it is.
     pub(crate) fn trash_verification_slot(&self, slot: &Path, session_id: i64) -> bool {
         let _span = crate::phase_telemetry::span("verification_slot_trash");
+        // A slot placed in the system temporary directory's fallback
+        // (`<temp>/aethyme-run/`, used when no worktree root can hold it)
+        // keeps Git's removal: a reboot or the system cleaner can empty that
+        // directory, trash and all.
+        if slot_is_under_temporary_root(slot, &std::env::temp_dir().join("aethyme-run")) {
+            crate::phase_telemetry::add(
+                "verification_slot_trash_skipped_temporary",
+                std::time::Duration::ZERO,
+            );
+            return false;
+        }
         let Some(pool) = slot.parent() else {
             crate::phase_telemetry::add(
                 "verification_slot_trash_fell_back_to_git",
@@ -4754,6 +4765,18 @@ impl Broker {
 mod lane;
 pub(crate) use lane::{RETIRE_LANE_IDLE_ADVICE_AT, RetirementLaneRecord};
 
+/// Whether `slot` lies under `temporary` (the system temporary directory's
+/// slot fallback), comparing resolved paths where they resolve.
+fn slot_is_under_temporary_root(slot: &Path, temporary: &Path) -> bool {
+    let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let temporary = resolve(temporary);
+    let slot = slot
+        .parent()
+        .map(|parent| resolve(parent).join(slot.file_name().unwrap_or_default()))
+        .unwrap_or_else(|| slot.to_path_buf());
+    slot.starts_with(&temporary)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -6680,6 +6703,7 @@ mod tests {
                     creator_started_ms: 0,
                     stripped: false,
                     scratch: false,
+                    verification: false,
                 },
             )
             .unwrap();
@@ -6756,6 +6780,98 @@ mod tests {
         let drained = broker
             .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
         assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// Two submits in a row reuse one slot path, each moving it into the
+    /// trash; a slot directory deleted behind the broker's back (its Git
+    /// registration left) still materializes again; a slot in the
+    /// temporary-directory fallback keeps Git's removal.
+    #[test]
+    fn verification_slots_are_reused_across_trash_moves_and_leftovers() {
+        let (owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("submitting twice", None).unwrap();
+        let main = broker.main_root().to_path_buf();
+        let head = broker.repo_handle().head_commit().unwrap();
+        let mut slot =
+            crate::verification::ExactTreeVerificationSlot::acquire(&main, "merge-sim").unwrap();
+        let path = slot.path().to_path_buf();
+        for _ in 0..2 {
+            slot.materialize(broker.repo_handle(), &head).unwrap();
+            assert!(broker.trash_verification_slot(&path, session.id));
+            assert!(!path.exists());
+        }
+        let rows = broker
+            .checkout_trash_rows()
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| row.verification && row.stripped));
+
+        // The leftover after a failed registration removal: the directory
+        // is gone, Git still lists it.
+        slot.materialize(broker.repo_handle(), &head).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        let again = slot.materialize(broker.repo_handle(), &head).unwrap();
+        assert!(again.root().join("base.txt").exists());
+        slot.cleanup();
+
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker
+            .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 2, "{drained:?}");
+        assert_eq!(drained.verification_entries_removed, 2);
+        assert_eq!(
+            (drained.stripped_entries_removed, drained.stripped_bytes),
+            (0, 0),
+            "verification slots never count as strip"
+        );
+
+        let temporary = std::env::temp_dir().join("aethyme-run/key/merge-sim/slot");
+        assert!(!broker.trash_verification_slot(&temporary, session.id));
+    }
+
+    /// Rows whose trash directory's parent vanished (a temporary directory a
+    /// reboot cleared) are dropped: nothing is left to delete.
+    #[test]
+    fn rows_of_a_vanished_trash_are_dropped() {
+        let (owner, _storage, broker) = fixture();
+        let pool = owner.path().join("vanishing-pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        let trash = crate::checkout_trash::open_trash(&pool).unwrap();
+        let trash_dir = trash.path().to_path_buf();
+        drop(trash);
+        broker
+            .record_checkout_trash_row(
+                &trash_dir,
+                &crate::checkout_trash::new_entry_name(7),
+                crate::checkout_trash::TrashRow {
+                    device: 1,
+                    inode: 2,
+                    session_id: 7,
+                    failures: 0,
+                    pending: false,
+                    creator_pid: 0,
+                    creator_started_ms: 0,
+                    stripped: true,
+                    scratch: false,
+                    verification: true,
+                },
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&pool).unwrap();
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker
+            .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.vanished_rows_dropped, 1, "{drained:?}");
+        assert!(
+            broker
+                .checkout_trash_rows()
+                .values()
+                .all(std::collections::BTreeMap::is_empty),
+            "{:?}",
+            broker.checkout_trash_rows()
+        );
     }
 
     /// An automatic close with time left retires the checkout inline.
