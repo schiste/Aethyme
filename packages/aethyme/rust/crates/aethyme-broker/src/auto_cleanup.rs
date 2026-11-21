@@ -4172,6 +4172,7 @@ fn run_proof_git(
     }
     let limit = proof_git_output_limit();
     let mut command = proof_git_command(dir, args);
+    crate::git::prepare_git_child_io(&mut command);
     match capture_proof_git(&mut command, budget, limit, matched) {
         Ok(OwnedGroupEnd::Output(LimitedOutput::Completed(output))) => {
             if output.status.success() {

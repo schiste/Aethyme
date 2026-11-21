@@ -10465,6 +10465,12 @@ impl Broker {
             } else {
                 None
             };
+            // Whether this repository's retirement lane process was alive
+            // (it inspects one checkout at a time on the volume) while this
+            // pass judged: the overlap of the two lanes' Git reads, measured
+            // per pass (counter with the pass's time).
+            let lane_live = crate::host_state::resolve_host_state_dir()
+                .is_some_and(|(host_dir, _)| self.checkout_retirement_lane_present(&host_dir));
             let pass_started = Instant::now();
             let pass = {
                 let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
@@ -10477,6 +10483,12 @@ impl Broker {
                 )
             };
             let pass_elapsed = pass_started.elapsed();
+            if lane_live {
+                crate::phase_telemetry::add(
+                    "artifact_worker_capacity_removal_pass_while_retirement_lane_live",
+                    pass_elapsed,
+                );
+            }
             let pass_git_removal = crate::auto_cleanup::take_git_removal_time();
             git_removal_time += pass_git_removal;
             let pass = match pass {

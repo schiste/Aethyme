@@ -382,6 +382,33 @@ mod tests {
         assert!(!current_io_policy().is_empty());
     }
 
+    /// Only a Git read is known read-only; a write, a deletion, an unknown
+    /// subcommand and a bare option list keep the throttle.
+    #[test]
+    fn git_subcommands_are_classified_read_only_conservatively() {
+        use crate::git::git_subcommand_is_read_only as read_only;
+        assert!(read_only(&[
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "-z"
+        ]));
+        assert!(read_only(&["-C", "/w", "rev-parse", "HEAD"]));
+        assert!(read_only(&["diff", "--binary"]));
+        assert!(read_only(&["worktree", "list", "--porcelain"]));
+        assert!(read_only(&["config", "--get", "user.name"]));
+        assert!(!read_only(&["worktree", "remove", "--force", "/w"]));
+        assert!(!read_only(&["worktree", "prune"]));
+        assert!(!read_only(&["commit", "-m", "x"]));
+        assert!(!read_only(&["gc", "--auto"]));
+        assert!(!read_only(&["config", "user.name", "x"]));
+        assert!(!read_only(&["update-ref", "--stdin"]));
+        assert!(!read_only(&["bundle", "create", "-", "HEAD"]));
+        assert!(!read_only(&["some-new-command"]));
+        assert!(!read_only(&["-c", "a=b"]));
+    }
+
     /// A Git child runs at an ordinary disk priority only for a throttled
     /// process and never for a Git deletion.
     #[test]

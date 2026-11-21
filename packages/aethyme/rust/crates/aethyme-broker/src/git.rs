@@ -1284,42 +1284,77 @@ pub(crate) fn git_command() -> Command {
     } else if DROP_INHERITED_GIT_ENVIRONMENT.with(std::cell::Cell::get) {
         remove_git_environment(&mut command);
     }
-    give_git_child_ordinary_io(&mut command);
     command
 }
 
-thread_local! {
-    /// Set while this thread runs a Git deletion (`git worktree remove`):
-    /// it keeps the process's throttled disk policy, which paces deletion.
-    static GIT_KEEPS_INHERITED_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Keeps this thread's Git children at the process's inherited disk policy
-/// until dropped: for Git commands that delete.
-pub(crate) struct GitKeepsInheritedIoScope(bool);
-
-impl GitKeepsInheritedIoScope {
-    pub(crate) fn enter() -> Self {
-        Self(GIT_KEEPS_INHERITED_IO.with(|cell| cell.replace(true)))
+/// Git subcommands that only read, judged from the arguments: the only
+/// Git children of a throttled process given an ordinary disk priority.
+/// Anything not known to be a read keeps the inherited throttle.
+pub(crate) fn git_subcommand_is_read_only(args: &[&str]) -> bool {
+    let mut words = args.iter().copied();
+    let subcommand = loop {
+        match words.next() {
+            Some("-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace") => {
+                words.next();
+            }
+            Some(option) if option.starts_with('-') => {}
+            Some(subcommand) => break subcommand,
+            None => return false,
+        }
+    };
+    let rest = words.collect::<Vec<_>>();
+    match subcommand {
+        "status" | "diff" | "diff-index" | "diff-files" | "diff-tree" | "ls-files" | "ls-tree"
+        | "rev-parse" | "rev-list" | "merge-base" | "for-each-ref" | "show-ref" | "cat-file"
+        | "log" | "show" | "name-rev" | "describe" | "check-ignore" | "check-attr"
+        | "count-objects" | "var" | "grep" | "blame" => true,
+        "worktree" | "stash" => rest.first() == Some(&"list"),
+        "bundle" => matches!(rest.first(), Some(&"verify" | &"list-heads")),
+        "config" => rest.iter().any(|word| {
+            matches!(
+                *word,
+                "--get" | "--get-all" | "--get-regexp" | "-l" | "--list"
+            )
+        }),
+        _ => false,
     }
 }
 
-impl Drop for GitKeepsInheritedIoScope {
-    fn drop(&mut self) {
-        GIT_KEEPS_INHERITED_IO.with(|cell| cell.set(self.0));
-    }
-}
-
-/// A Git child of a process at `IOPOL_THROTTLE` (the detached worker, which
-/// is throttled to pace its deletions) runs at an ordinary process's disk
-/// priority, unless this thread runs a Git deletion. On the busiest
-/// repository the worker's status proofs took 16.1 s each (70 of them) and
-/// its cleanup status checks 9.9 s (114), while the same status in the
-/// retirement lane, at an ordinary priority, took a median 0.87 s.
+/// Before spawning a Git child of a process at `IOPOL_THROTTLE` (the
+/// detached worker, throttled to pace its deletions): no Git child starts
+/// automatic maintenance (`gc.auto=0`, `maintenance.auto=false`, through
+/// Git's environment configuration), and only a read-only one
+/// ([`git_subcommand_is_read_only`]) runs at an ordinary process's disk
+/// priority. On the busiest repository the worker's status proofs took
+/// 16.1 s each (70) and its cleanup status checks 9.9 s (114), while the
+/// same status in the retirement lane, at an ordinary priority, took a
+/// median 0.87 s. Everything else keeps the throttle.
 #[cfg_attr(not(unix), allow(unused_variables))]
-fn give_git_child_ordinary_io(command: &mut Command) {
-    let keeps_inherited = GIT_KEEPS_INHERITED_IO.with(std::cell::Cell::get);
-    if !crate::gc::git_child_wants_ordinary_io(crate::gc::current_io_policy(), keeps_inherited) {
+pub(crate) fn prepare_git_child_io(command: &mut Command) {
+    if crate::gc::current_io_policy() != "throttle" {
+        return;
+    }
+    if !command
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new("GIT_CONFIG_COUNT"))
+    {
+        command
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "gc.auto")
+            .env("GIT_CONFIG_VALUE_0", "0")
+            .env("GIT_CONFIG_KEY_1", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_1", "false");
+    }
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if !crate::gc::git_child_wants_ordinary_io(
+        crate::gc::current_io_policy(),
+        !git_subcommand_is_read_only(&args),
+    ) {
+        crate::phase_telemetry::add("git_child_kept_throttle", Duration::ZERO);
         return;
     }
     #[cfg(unix)]
@@ -3325,6 +3360,7 @@ fn run_git_process_output(
     args: &[&str],
     budget: Duration,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(&mut command);
     let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
@@ -3368,6 +3404,7 @@ fn run_git_process_output_in_owned_group(
     budget: Duration,
     writers_quiescent: &mut bool,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(&mut command);
     let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
@@ -10019,9 +10056,6 @@ impl GitRepo {
         worktree: &Path,
         force: bool,
     ) -> Result<(), GitError> {
-        // Git deletes here: it keeps the process's disk policy, which paces
-        // the worker's deletions.
-        let _keeps_inherited_io = GitKeepsInheritedIoScope::enter();
         // Whatever judged this checkout removable ran on this process's Git;
         // a deletion never rests on a cached verdict about that Git.
         ensure_fresh_git_verdict()?;
@@ -10332,6 +10366,7 @@ pub(crate) fn run_git_process_output_limited(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(command);
     let effective_deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
     let remaining = effective_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
