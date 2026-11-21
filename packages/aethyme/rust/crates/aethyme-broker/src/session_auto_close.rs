@@ -3109,6 +3109,7 @@ mod lane_tests {
             Reason::StartReserved,
             Reason::LifecycleBusy,
             Reason::DeadlineReached,
+            Reason::CloseClaimBudget,
             Reason::WorkingTreeNotExamined,
             Reason::GateRunning,
             Reason::GatesUnknown,
@@ -3164,6 +3165,7 @@ mod lane_tests {
                 | Reason::StartReserved
                 | Reason::LifecycleBusy
                 | Reason::DeadlineReached
+                | Reason::CloseClaimBudget
                 | Reason::WorkingTreeNotExamined
                 | Reason::GateRunning
                 | Reason::GatesUnknown
