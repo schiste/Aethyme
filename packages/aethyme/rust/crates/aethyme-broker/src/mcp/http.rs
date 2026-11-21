@@ -266,20 +266,45 @@ pub fn wait_owned(
     child: &mut Child,
     within: Duration,
 ) -> Result<(), String> {
+    wait_owned_within(
+        within,
+        || listen::check(port, group),
+        || {
+            child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| status.to_string())
+        },
+    )
+}
+
+/// A listener may appear between the two independent OS snapshots. Retry that
+/// inconclusive observation within the existing readiness deadline; never use
+/// the server without a subsequent, positively verified observation.
+fn wait_owned_within(
+    within: Duration,
+    mut observe: impl FnMut() -> Listeners,
+    mut exited: impl FnMut() -> Option<String>,
+) -> Result<(), String> {
     let deadline = Instant::now() + within;
+    let mut unavailable = None;
     loop {
-        match listen::check(port, group) {
+        match observe() {
             Listeners::Ours => return Ok(()),
             Listeners::None => {}
+            Listeners::Unverifiable(why) if why == listen::LISTING_EMPTY => {
+                unavailable = Some(format!("listener_unverifiable:{why}"));
+            }
             verdict => return Err(verdict.reason().unwrap_or_default()),
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(status) = exited() {
             return Err(format!("exited_before_listening:{status}"));
         }
         if Instant::now() >= deadline {
-            return Err("listen_timeout".into());
+            return Err(unavailable.unwrap_or_else(|| "listen_timeout".into()));
         }
-        thread::sleep(READY_POLL);
+        thread::sleep(READY_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -977,6 +1002,36 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn readiness_retries_inconsistent_snapshots_but_never_accepts_unknown_ownership() {
+        let mut observations = [
+            Listeners::Unverifiable(listen::LISTING_EMPTY.into()),
+            Listeners::Ours,
+        ]
+        .into_iter();
+        assert!(
+            wait_owned_within(
+                Duration::from_secs(1),
+                || observations.next().unwrap(),
+                || None,
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            wait_owned_within(
+                Duration::ZERO,
+                || Listeners::Unverifiable(listen::LISTING_EMPTY.into()),
+                || None,
+            ),
+            Err(format!("listener_unverifiable:{}", listen::LISTING_EMPTY))
+        );
+        assert_eq!(
+            wait_owned_within(Duration::from_secs(1), || Listeners::NotOurs, || None),
+            Err("listener_not_ours".into())
+        );
+    }
 
     #[test]
     fn urls_ports_and_placeholders() {
