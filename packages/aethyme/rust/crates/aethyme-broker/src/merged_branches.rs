@@ -75,7 +75,6 @@ pub(crate) struct BranchFacts {
     pub(crate) merged: Option<bool>,
 }
 
-/// The deletion rule, as a pure function.
 #[cfg(test)]
 thread_local! {
     /// Test seam: runs after the unclaimed judging, before the slice takes
@@ -92,6 +91,7 @@ fn record_keep(summary: &mut MergedBranchSummary, reason: &'static str) {
     crate::phase_telemetry::add(keep_counter(reason), Duration::ZERO);
 }
 
+/// The deletion rule, as a pure function.
 pub(crate) fn judge(facts: BranchFacts) -> Verdict {
     if facts.session_not_cleaned {
         return Verdict::Keep("session_not_cleaned");
