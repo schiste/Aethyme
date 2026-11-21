@@ -9363,6 +9363,34 @@ impl Broker {
                         }
                         continue;
                     }
+                    // A closed checkout the retirement lane owns (kept on
+                    // purpose, remembered, or already in its trash): removal
+                    // refuses it at its last step anyway, so its proof is
+                    // not run again here. On the busiest repository the
+                    // removal lane's 70 status proofs in 23 runs took 16.1 s
+                    // each and selected nothing.
+                    if group
+                        .sessions
+                        .iter()
+                        .any(|session| self.checkout_retirement_owns(session.id))
+                    {
+                        crate::phase_telemetry::add(
+                            "auto_cleanup_skipped_retirement_lane_owns",
+                            Duration::ZERO,
+                        );
+                        report.kept.push(AutoKeptCheckout {
+                            worktree: group.worktree.to_string_lossy().into_owned(),
+                            sessions: group.sessions.iter().map(|session| session.id).collect(),
+                            reason: "the checkout retirement lane owns this closed checkout (kept on purpose or in its trash)".into(),
+                            code: "retirement_lane_owns".into(),
+                            ..Default::default()
+                        });
+                        if priority.is_none() {
+                            cursor.after_session_id = cursor_session_id;
+                            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                        }
+                        continue;
+                    }
                     // Remembered: kept for a reason only a change lifts, and
                     // nothing it depended on changed.
                     if !upstream_checked

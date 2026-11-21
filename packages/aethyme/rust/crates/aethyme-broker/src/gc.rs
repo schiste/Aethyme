@@ -4003,6 +4003,17 @@ pub(crate) fn raise_retirement_lane_priority() -> background_priority::DeleterPr
     background_priority::raise_for_retirement_lane()
 }
 
+/// See `background_priority::raise_child_before_exec`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn raise_git_child_before_exec() {
+    background_priority::raise_child_before_exec();
+}
+
+/// See `background_priority::git_child_wants_ordinary_io`.
+pub(crate) fn git_child_wants_ordinary_io(io_policy: &str, keeps_inherited: bool) -> bool {
+    background_priority::git_child_wants_ordinary_io(io_policy, keeps_inherited)
+}
+
 /// Set the checkout trash deleter process to unthrottled disk I/O (macOS;
 /// see `background_priority::raise_for_trash_deleter`).
 pub(crate) fn raise_trash_deleter_priority() -> background_priority::DeleterPriority {

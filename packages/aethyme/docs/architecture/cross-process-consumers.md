@@ -3757,6 +3757,15 @@ Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
   - `broker status` shows the Notice `cleanup.retirement-kept`: the remembered keeps by reason, with up to 8 session ids and one detail each.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-21 (worker Git reads at an ordinary disk priority). In 23 worker runs on 0.8.146 on the busiest repository the removal lane's status proofs took 16.1 s each (`proof_uncommitted_check`, 70) and its cleanup status checks 9.9 s (`auto_cleanup_check_status`, 114). Capacity selection took 57.7 s a run and selected nothing. Meanwhile the retirement lane's same status took a median 0.87 s at an ordinary priority.
+  - The worker sets process-scope `IOPOL_THROTTLE` and the background band (`lower_current_process`) to pace its deletions, as its drain's `io_policy` `throttle` shows. Every Git child inherits that policy, so the gap is I/O wait, not a longer walk.
+
+  Now:
+  - `git_command` gives a Git child of a throttled process (macOS `throttle`) an ordinary process's disk policy. A `pre_exec` hook in the child leaves the background band and sets process-scope `IOPOL_IMPORTANT` before `exec` (counter `git_child_ordinary_io`). Linux keeps the inherited class.
+  - Git deletion keeps the worker's pace: `worktree_remove_registered` (`git worktree remove`, `git worktree prune`) runs inside `GitKeepsInheritedIoScope`. The worker's own file deletions, the trash drain and the strip's renames are in-process and unchanged.
+  - The removal lane no longer proves a closed checkout the retirement lane owns (a remembered keep, or already in its trash): removal refused it at its last step anyway. It is kept as `retirement_lane_owns` without a Git call (counter `auto_cleanup_skipped_retirement_lane_owns`).
+  - Unchanged: the strip pass's backlog census (33.4 s a run) is the worker's own `lstat` of checkout folders and stays throttled.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises

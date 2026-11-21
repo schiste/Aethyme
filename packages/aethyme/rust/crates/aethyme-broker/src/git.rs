@@ -1284,7 +1284,58 @@ pub(crate) fn git_command() -> Command {
     } else if DROP_INHERITED_GIT_ENVIRONMENT.with(std::cell::Cell::get) {
         remove_git_environment(&mut command);
     }
+    give_git_child_ordinary_io(&mut command);
     command
+}
+
+thread_local! {
+    /// Set while this thread runs a Git deletion (`git worktree remove`):
+    /// it keeps the process's throttled disk policy, which paces deletion.
+    static GIT_KEEPS_INHERITED_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keeps this thread's Git children at the process's inherited disk policy
+/// until dropped: for Git commands that delete.
+pub(crate) struct GitKeepsInheritedIoScope(bool);
+
+impl GitKeepsInheritedIoScope {
+    pub(crate) fn enter() -> Self {
+        Self(GIT_KEEPS_INHERITED_IO.with(|cell| cell.replace(true)))
+    }
+}
+
+impl Drop for GitKeepsInheritedIoScope {
+    fn drop(&mut self) {
+        GIT_KEEPS_INHERITED_IO.with(|cell| cell.set(self.0));
+    }
+}
+
+/// A Git child of a process at `IOPOL_THROTTLE` (the detached worker, which
+/// is throttled to pace its deletions) runs at an ordinary process's disk
+/// priority, unless this thread runs a Git deletion. On the busiest
+/// repository the worker's status proofs took 16.1 s each (70 of them) and
+/// its cleanup status checks 9.9 s (114), while the same status in the
+/// retirement lane, at an ordinary priority, took a median 0.87 s.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn give_git_child_ordinary_io(command: &mut Command) {
+    let keeps_inherited = GIT_KEEPS_INHERITED_IO.with(std::cell::Cell::get);
+    if !crate::gc::git_child_wants_ordinary_io(crate::gc::current_io_policy(), keeps_inherited) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook runs in the child between fork and exec and only
+        // makes integer-only system calls on that child, which are
+        // async-signal-safe; it allocates nothing and takes no lock.
+        unsafe {
+            command.pre_exec(|| {
+                crate::gc::raise_git_child_before_exec();
+                Ok(())
+            });
+        }
+        crate::phase_telemetry::add("git_child_ordinary_io", Duration::ZERO);
+    }
 }
 
 thread_local! {
@@ -9968,6 +10019,9 @@ impl GitRepo {
         worktree: &Path,
         force: bool,
     ) -> Result<(), GitError> {
+        // Git deletes here: it keeps the process's disk policy, which paces
+        // the worker's deletions.
+        let _keeps_inherited_io = GitKeepsInheritedIoScope::enter();
         // Whatever judged this checkout removable ran on this process's Git;
         // a deletion never rests on a cached verdict about that Git.
         ensure_fresh_git_verdict()?;
