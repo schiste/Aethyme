@@ -959,6 +959,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
 
+- For macOS MCP listener-verification failures, compare an ephemeral loopback
+  listener against host-wide `netstat` and group-scoped `lsof` using counts only;
+  check command exit status and stderr without logging connection details. Test
+  both the normal and authorized elevated environment: elevation alone does not
+  prove `netstat` can see the host socket table. An empty or incomplete global
+  listing is unverified, not evidence that all listeners are owned; do not replace
+  it with group-only `lsof`, which may omit other processes.
+
 ## Useful Commands
 
 - `fast_test`: `packages/aethyme/scripts/test-like-ci.sh`

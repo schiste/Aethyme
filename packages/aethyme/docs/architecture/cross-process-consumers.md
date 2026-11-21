@@ -2946,6 +2946,10 @@ closed checkout group is judged in full again); and `checkout_strip_backlog`
 nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
 `checkout_strip_backlog_regenerable` (the per-folder catalogue `lstat`s).
 
+Changed 2026-11-21 (worker census and activity waits). The checkout backlog census remembers the folders it found to be retired checkouts' tombstones in meta key `checkout_strip.backlog_tombstones` (JSON: path to `[device, inode, modification time in ns]`) and judges a folder whose identity is unchanged from one `lstat` (count `checkout_strip_backlog_tombstone_remembered`); a census that could list every pool replaces the memory, one that could not keeps what it did not see. Counts are unchanged. The changed-file activity probe remembers, for the rest of the process (one command or one worker run), a checkout whose `git status` ran out of its 2 s, and answers the next probe of it as that timeout did without running Git (count `worktree_status_activity_unavailable_remembered`); a failed call is not remembered.
+
+Changed 2026-11-21 (transcripts cadence). The detached worker's transcripts lane (every repository's worker runs it; its work is host-wide) records each pass in `<host state>/transcripts/last-worker-pass.json` (`at_ms`, `idle`: nothing eligible, within budget, first-run gate open). After an idle pass the next worker pass on the host waits 15 minutes (count `transcripts_worker_pass_not_due` on the skipping worker's line); a pass that found work or ran out of budget, an unreadable record, or a clock that went back runs it at once. Manual `transcripts` commands are unaffected.
+
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
 where the work happens rather than by each command: `subprocess_git` and
@@ -3757,6 +3761,21 @@ Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
   - `broker status` shows the Notice `cleanup.retirement-kept`: the remembered keeps by reason, with up to 8 session ids and one detail each.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-21 (worker Git reads at an ordinary disk priority). In 23 worker runs on 0.8.146 on the busiest repository the removal lane's status proofs took 16.1 s each (`proof_uncommitted_check`, 70) and its cleanup status checks 9.9 s (`auto_cleanup_check_status`, 114). Capacity selection took 57.7 s a run and selected nothing. Meanwhile the retirement lane's same status took a median 0.87 s at an ordinary priority.
+  - The worker sets process-scope `IOPOL_THROTTLE` and the background band (`lower_current_process`) to pace its deletions, as its drain's `io_policy` `throttle` shows. Every Git child inherits that policy, so the gap is I/O wait, not a longer walk.
+
+  Now:
+  - Before the Git runners spawn a child of a throttled process (macOS `throttle`), `prepare_git_child_io` classifies its subcommand from the arguments (`git_subcommand_is_read_only`).
+    - Only a known read runs at an ordinary process's disk priority: `status`, `diff`, `diff-index`, `diff-files`, `diff-tree`, `ls-files`, `ls-tree`, `rev-parse`, `rev-list`, `merge-base`, `for-each-ref`, `show-ref`, `cat-file`, `log`, `show`, `name-rev`, `describe`, `check-ignore`, `check-attr`, `count-objects`, `var`, `grep`, `blame`, `worktree list`, `stash list`, `bundle verify`/`list-heads`, and `config` with `--get`/`--get-all`/`--get-regexp`/`-l`/`--list`. A `pre_exec` hook in the child leaves the background band and sets process-scope `IOPOL_IMPORTANT` before `exec` (counter `git_child_ordinary_io`).
+    - Every other Git child keeps the inherited throttle (counter `git_child_kept_throttle`): any write, any deletion (`worktree remove`, `worktree prune`), and anything not known to be a read.
+    - Every Git child of a throttled process also gets `gc.auto=0` and `maintenance.auto=false` through Git's environment configuration (`GIT_CONFIG_COUNT`, unless the command already sets it), so none starts automatic maintenance.
+    - The runners covered are `run_git_process_output`, `_in_owned_group`, `_limited` and the removal proofs' `run_proof_git`; any other spawn keeps the throttle.
+    - Linux keeps the inherited class.
+  - The worker's own file deletions, the trash drain and the strip's renames are in-process and unchanged.
+  - Overlap with the retirement lane is measured. A capacity-removal pass that ran while this repository's retirement lane process was alive counts `artifact_worker_capacity_removal_pass_while_retirement_lane_live` with the pass's time.
+  - The removal lane no longer proves a closed checkout the retirement lane owns (a remembered keep, or already in its trash): removal refused it at its last step anyway. It is kept as `retirement_lane_owns` without a Git call (counter `auto_cleanup_skipped_retirement_lane_owns`).
+  - Unchanged: the strip pass's backlog census (33.4 s a run) is the worker's own `lstat` of checkout folders and stays throttled.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
@@ -3993,6 +4012,8 @@ Changed 2026-11-18 (archive re-review). A gc plan keeps an orphaned worktree roo
 ### Merged branches of cleaned sessions are deleted locally
 
 The detached worker deletes a local `refs/heads/<branch>` when every session that used it is cleaned with no restorable state (`Broker::has_restorable_state`: not open or closed, no recovery archive), its tip is an ancestor of the remote default branch as last fetched (a missing tracking ref skips the slice; a stale one only keeps more), no worktree has it checked out, and the ref still names the judged tip (`update-ref -d <ref> <tip>`). Sessions, restorable state, Git's worktree registrations (`HEAD`, a rebase's `head-name`, a bisect's `BISECT_START`) and the start reservations of the sessions' paths (`start_reserved`) are re-read under the lifecycle claim immediately before each delete. A slice judges at most 200 branches and deletes at most 100, from cursor meta key `merged_branches.cursor`; meta key `merged_branches.summary` records `at`, `cleaned_session_branches`, `deleted`, `deleted_total`, `kept_by_reason` and `skipped`. Status advice `cleanup.merged-session-branches` (severity `notice`) appears while branches of cleaned sessions remain. `[cleanup] delete_merged_session_branches = false` turns it off. No remote branch or remote-tracking ref is deleted and nothing is fetched. Command metrics carry `merged_branches_deleted`, `merged_branches_kept_<reason>` and the `merged_branches` attachment.
+
+Changed 2026-11-21 (shorter claim). A slice judges every branch of its window from facts read without the repository lifecycle claim: ancestry of the judged tip and the fetched default commit, restorable state, sessions and worktree registrations. It takes the claim only when a branch is judged for deletion, judges each such branch again under it just before its delete (unchanged), and holds it at most 5 s; deletions not reached by then resume from that branch on the next slice. A slice that finds nothing to delete never takes the claim, so it no longer yields (`skipped: yielded_to_foreground`) to a foreground holder. On the busiest repository the old slice held the claim for its whole 20 s budget in most worker runs (`lifecycle_lock_held_background_long` 7 to 26 s). New span `merged_branches_judge` (judging, unclaimed) and `merged_branches_claimed` (the claimed part), and count `merged_branches_claim_budget` (the 5 s hold stopped the deletions).
 
 ### Background cleanup reads `[cleanup]` from the default branch when the primary checkout is behind
 
