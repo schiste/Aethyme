@@ -777,6 +777,28 @@ pub(crate) fn control(
         }
         return Ok(status);
     }
+    if action == "status"
+        && let Ok((repository, marker_uuid)) = current_repository()
+    {
+        let retry = retry_unconfirmed_load_with(
+            home,
+            uuid,
+            &marker_uuid,
+            &repository,
+            crate::scheduled_service::launchd::label_state,
+            launchctl,
+        )
+        .unwrap_or_else(|error| {
+            Some(json!({"retried": false, "error": bounded_error(&error.to_string())}))
+        });
+        if let Some(retry) = retry {
+            let mut status = control_with(home, uuid, "status", None, launchctl)?;
+            if let Some(object) = status.as_object_mut() {
+                object.insert("load_retry".into(), retry);
+            }
+            return Ok(status);
+        }
+    }
     if matches!(action, "status" | "uninstall")
         && let Some(result) = control_dead_record(
             home,
@@ -1292,7 +1314,26 @@ fn control_dead_record(
     // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
     let uid = unsafe { libc::geteuid() };
     let record = read_record(home, uuid, uid)?;
-    if !record.exists() || (record.unit_present && record.plan_bytes.is_some()) {
+    if !record.exists() {
+        // A refresh that could not restore the record leaves it archived.
+        return Ok(
+            (action == "status")
+                .then(|| interrupted_refresh_archive(&record.directory, uid))
+                .flatten()
+                .map(|archive| {
+                    json!({
+                        "schema": CONTROL_SCHEMA,
+                        "action": "status",
+                        "installation_state": "refresh_interrupted",
+                        "archived_record": archive,
+                        "last_refresh": read_bounded_json(&record.directory.join("last-refresh.json"), uid),
+                        "next_action": REFRESH_COMMAND,
+                        "delivery_proven": false
+                    })
+                }),
+        );
+    }
+    if record.unit_present && record.plan_bytes.is_some() {
         return Ok(None);
     }
     if action == "uninstall" {
@@ -1388,7 +1429,8 @@ pub(crate) struct RefreshOutcome {
     pub(crate) schema: &'static str,
     pub(crate) repository_uuid: String,
     /// `not_installed`, `not_verifiable`, `already_current`,
-    /// `label_state_unknown`, `refresh_failed`, `refreshed_not_loaded`,
+    /// `label_state_unknown`, `refresh_failed`, `refresh_failed_restored`,
+    /// `refresh_failed_unrestored`, `refreshed_not_loaded`,
     /// `refreshed_and_reloaded`, `refreshed_reload_unconfirmed` or
     /// `refreshed_bootstrap_unconfirmed`.
     pub(crate) outcome: &'static str,
@@ -1401,6 +1443,8 @@ pub(crate) struct RefreshOutcome {
     /// Whether the previous runtime bundle must outlive this update: launchd
     /// may still run it (loaded and not provably reloaded, or unknown).
     pub(crate) keep_previous_runtime: bool,
+    /// The version bundle a self-update kept for this service, when it did.
+    pub(crate) kept_bundle: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) observed_at_unix_ms: u64,
 }
@@ -1419,6 +1463,7 @@ impl RefreshOutcome {
             archived_to: None,
             // Kept until something proves launchd no longer runs it.
             keep_previous_runtime: true,
+            kept_bundle: None,
             error: None,
             observed_at_unix_ms: now_unix_ms().unwrap_or(0),
         }
@@ -1467,7 +1512,10 @@ fn refresh_record_with(
             Some("gc_service_refresh_reload_unconfirmed")
         }
         "label_state_unknown" => Some("gc_service_refresh_label_unknown"),
-        "refresh_failed" | "not_verifiable" => Some("gc_service_refresh_failed"),
+        "refresh_failed"
+        | "refresh_failed_restored"
+        | "refresh_failed_unrestored"
+        | "not_verifiable" => Some("gc_service_refresh_failed"),
         _ => None,
     };
     if let Some(counter) = counter {
@@ -1487,12 +1535,25 @@ fn refresh_steps(
 ) -> io::Result<()> {
     use crate::scheduled_service::launchd::LabelState;
     crate::store::repository_identity::validate_uuid_v4(uuid).map_err(io::Error::other)?;
-    if !read_record(home, uuid, uid)?.exists() {
-        out.outcome = "not_installed";
-        out.keep_previous_runtime = false;
-        return Ok(());
-    }
     let directory = expected_directory(home, uuid);
+    if !read_record(home, uuid, uid)?.exists() {
+        // A refresh that could neither publish nor put the old record back
+        // left it in its archive: put it back first, then refresh it.
+        let Some(archive) = interrupted_refresh_archive(&directory, uid) else {
+            out.outcome = "not_installed";
+            out.keep_previous_runtime = false;
+            return Ok(());
+        };
+        let _claim =
+            crate::pr_watch_service_install::claim_service_directory(home, &directory, uid)?;
+        if read_record(home, uuid, uid)?.exists() {
+            return Err(invalid("GC service record changed while claiming refresh"));
+        }
+        let unit_path = home
+            .join(UNIT_DIRECTORY)
+            .join(format!("com.aethyme.gc-sweep.{uuid}.plist"));
+        restore_record(&archive, &directory, &unit_path, None)?;
+    }
     let claim = crate::pr_watch_service_install::claim_service_directory(home, &directory, uid)?;
     out.outcome = "not_verifiable";
     let (plan, bytes) = load(home, uuid)?;
@@ -1531,22 +1592,158 @@ fn refresh_steps(
     let fresh = Plan::from_runtime(&plan.repository, uuid, &plan.home, uid, runtime)?;
     out.plan_digest = Some(fresh.digest.clone());
     out.runtime_version = Some(fresh.runtime_version.clone());
-    out.archived_to = Some(archive_record(&record)?);
-    let fresh_bytes = serde_json::to_vec(&fresh).map_err(io::Error::other)?;
-    crate::pr_watch_service_install::install_exact_files_claimed(
-        &fresh.home,
-        &fresh.directory,
-        &fresh.unit_path,
-        uid,
-        &[("plan.json", fresh_bytes.as_slice())],
-        fresh.unit.as_bytes(),
-        &claim,
-    )?;
+    let archive = archive_record(&record)?;
+    out.archived_to = Some(archive.clone());
+    publish_or_restore(&fresh, &record, &archive, &claim, restore_record, out)?;
     if state == LabelState::NotLoaded {
         out.outcome = "refreshed_not_loaded";
         return Ok(());
     }
     reload_refreshed(&fresh, run, out)
+}
+
+/// Publish the refreshed plan and unit; when that fails, put the archived
+/// record back exactly so a failed refresh never leaves the service with no
+/// record at all. If even that fails, `last-refresh.json` says so and names
+/// the archive, and `refresh` (which `status` advises) restores it first.
+fn publish_or_restore(
+    fresh: &Plan,
+    record: &InstallationRecord,
+    archive: &Path,
+    claim: &crate::file_lock::ExclusiveFileLock,
+    restore: impl FnOnce(&Path, &Path, &Path, Option<(&[u8], &[u8])>) -> io::Result<()>,
+    out: &mut RefreshOutcome,
+) -> io::Result<()> {
+    let fresh_bytes = serde_json::to_vec(fresh).map_err(io::Error::other)?;
+    let Err(publish) = crate::pr_watch_service_install::install_exact_files_claimed(
+        &fresh.home,
+        &fresh.directory,
+        &fresh.unit_path,
+        fresh.uid,
+        &[("plan.json", fresh_bytes.as_slice())],
+        fresh.unit.as_bytes(),
+        claim,
+    ) else {
+        return Ok(());
+    };
+    match restore(
+        archive,
+        &record.directory,
+        &record.unit_path,
+        Some((fresh_bytes.as_slice(), fresh.unit.as_bytes())),
+    ) {
+        Ok(()) => {
+            out.outcome = "refresh_failed_restored";
+            out.archived_to = None;
+            Err(publish)
+        }
+        Err(restore) => {
+            out.outcome = "refresh_failed_unrestored";
+            Err(invalid(format!(
+                "publishing the refreshed service failed ({publish}) and restoring the previous record failed ({restore})"
+            )))
+        }
+    }
+}
+
+/// Remove `path` only when it holds exactly `bytes` (what a failed publish
+/// may have left of the new record).
+fn remove_if_exact(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            if fs::read(path)? == bytes {
+                fs::remove_file(path)?;
+            }
+            Ok(())
+        }
+        Ok(_) => Err(invalid("GC service record holds a non-file path")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_absent(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(invalid(
+            "GC service restore found a file where the previous record goes",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Move an archived record back: anything exactly matching the failed new
+/// record is dropped first, then the plan and receipts, and the unit last
+/// (so a crash part-way leaves a plan without its unit, a known stale
+/// record). Nothing that differs is ever overwritten.
+fn restore_record(
+    archive: &Path,
+    directory: &Path,
+    unit_path: &Path,
+    fresh: Option<(&[u8], &[u8])>,
+) -> io::Result<()> {
+    let _span = crate::phase_telemetry::span("gc_service_record_restore");
+    if let Some((plan_bytes, unit_bytes)) = fresh {
+        remove_if_exact(&directory.join("plan.json"), plan_bytes)?;
+        remove_if_exact(unit_path, unit_bytes)?;
+    }
+    let names = [
+        "plan.json",
+        "control.json",
+        "last-pass.json",
+        "last-error.json",
+    ];
+    for name in names {
+        let source = archive.join(name);
+        match fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.is_file() => {
+                let target = directory.join(name);
+                require_absent(&target)?;
+                fs::rename(&source, &target)?;
+            }
+            Ok(_) => return Err(invalid("GC service archive holds a non-file path")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::File::open(directory)?.sync_all()?;
+    let unit = archive.join("unit.plist");
+    match fs::symlink_metadata(&unit) {
+        Ok(metadata) if metadata.is_file() => {
+            require_absent(unit_path)?;
+            move_file(&unit, unit_path)?;
+            if let Some(parent) = unit_path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        Ok(_) => return Err(invalid("GC service archive holds a non-file path")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // The emptied archive directory goes; anything left in it stays.
+    let _ = fs::remove_dir(archive);
+    crate::phase_telemetry::add("gc_service_record_restored", Duration::ZERO);
+    Ok(())
+}
+
+/// The archive an interrupted refresh left the record in, when
+/// `last-refresh.json` says so and names a numeric archive of this
+/// service's own `archive/` directory (never any other path).
+fn interrupted_refresh_archive(directory: &Path, uid: u32) -> Option<PathBuf> {
+    let refresh = read_bounded_json(&directory.join("last-refresh.json"), uid)?;
+    if refresh.get("outcome").and_then(Value::as_str) != Some("refresh_failed_unrestored") {
+        return None;
+    }
+    let named = PathBuf::from(refresh.get("archived_to")?.as_str()?);
+    let stamp = named.file_name()?.to_str()?;
+    if stamp.parse::<u64>().is_err() {
+        return None;
+    }
+    let archive = directory.join(RECORD_ARCHIVE_DIRECTORY).join(stamp);
+    if named != archive || !fs::symlink_metadata(&archive).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    Some(archive)
 }
 
 /// Replace a loaded job with the refreshed unit: bootout, then bootstrap,
@@ -1672,11 +1869,38 @@ pub(crate) fn refresh_for_update(
     )
 }
 
+/// The whole walk inside one self-update gets this long; services not
+/// reached in time keep their bundle and are picked up later.
+const UPDATE_REFRESH_BUDGET: Duration = Duration::from_secs(30);
+
 fn refresh_for_update_with(
     home: &Path,
     uid: u32,
     managed_root: &Path,
     selected: &[std::ffi::OsString],
+    runtime: impl FnOnce() -> io::Result<RuntimePair>,
+    label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+    run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+) -> UpdateRefresh {
+    refresh_for_update_within(
+        home,
+        uid,
+        managed_root,
+        selected,
+        std::time::Instant::now() + UPDATE_REFRESH_BUDGET,
+        runtime,
+        label_state,
+        run,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_for_update_within(
+    home: &Path,
+    uid: u32,
+    managed_root: &Path,
+    selected: &[std::ffi::OsString],
+    deadline: std::time::Instant,
     runtime: impl FnOnce() -> io::Result<RuntimePair>,
     mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
     mut run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
@@ -1716,6 +1940,22 @@ fn refresh_for_update_with(
         if !doomed {
             continue;
         }
+        if std::time::Instant::now() >= deadline {
+            // Out of budget: launchd was not asked, so this is unknown. The
+            // bundle stays; the next update or `gc service status` retries.
+            let mut outcome = RefreshOutcome::new(&uuid);
+            outcome.outcome = "label_state_unknown";
+            outcome.error = Some("the update's GC service refresh budget was spent".into());
+            outcome.kept_bundle = bundle.to_str().map(str::to_string);
+            crate::warn_unrecorded(
+                "record the GC service refresh",
+                write_refresh_receipt(home, &uuid, &outcome),
+            );
+            crate::phase_telemetry::add("gc_service_refresh_budget_spent", Duration::ZERO);
+            report.protected_bundles.push(bundle.to_os_string());
+            report.outcomes.push(outcome);
+            continue;
+        }
         let pair = resolved.get_or_insert_with(|| match runtime.take() {
             Some(resolve) => resolve().map_err(|error| error.to_string()),
             None => Err("the new runtime pair was not resolved".to_string()),
@@ -1728,7 +1968,9 @@ fn refresh_for_update_with(
             &mut label_state,
             &mut run,
         );
+        let mut outcome = outcome;
         if outcome.keep_previous_runtime {
+            outcome.kept_bundle = bundle.to_str().map(str::to_string);
             report.protected_bundles.push(bundle.to_os_string());
         }
         report.outcomes.push(outcome);
@@ -1782,26 +2024,169 @@ fn automatic_refresh_proof(
     Ok(())
 }
 
-/// Evidence for the `storage.gc-service-runtime-missing` status advice: a
-/// plan is recorded for this repository and the runtime it names is gone.
-pub(crate) fn runtime_missing_evidence(home: &Path, uuid: &str, uid: u32) -> Option<Vec<String>> {
+/// A `broker status` advice row about this repository's scheduled GC
+/// service: each is a way for the service to be silently gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct RepairAdvice {
+    pub(crate) id: &'static str,
+    pub(crate) reason: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) evidence: Vec<String>,
+    pub(crate) commands: Vec<String>,
+}
+
+/// Whether the last control receipt meant the job to be loaded and nothing
+/// confirmed it: an activation or refresh refused, unknown or interrupted.
+fn load_unconfirmed(control: &ControlReceipt) -> bool {
+    matches!(control.action.as_str(), "activate" | "refresh")
+        && !matches!(
+            control.operation_result.as_str(),
+            "acknowledged" | "observed_loaded"
+        )
+}
+
+/// What `broker status` should say about this repository's service, from
+/// files only (no launchctl): the recorded runtime is gone; a refresh left
+/// the record in its archive; or a load was meant and never confirmed.
+pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairAdvice> {
     let record = read_record(home, uuid, uid).ok()?;
-    if record.plan_bytes.is_none() || record.runtime_present() != Some(false) {
+    if !record.exists() {
+        let archive = interrupted_refresh_archive(&record.directory, uid)?;
+        return Some(RepairAdvice {
+            id: "storage.gc-service-record-interrupted",
+            reason: "a refresh archived the scheduled GC service's record, could not publish the new one and could not put the old one back; launchd may still hold the job, but no record remains",
+            summary: "this repository's scheduled GC sweep service record was left in its archive by a failed refresh",
+            evidence: vec![format!("archived record: {}", archive.display())],
+            commands: vec![REFRESH_COMMAND.into()],
+        });
+    }
+    if record.plan_bytes.is_some() && record.runtime_present() == Some(false) {
+        let mut evidence = vec![format!(
+            "the recorded runtime {} is no longer installed; launchd cannot start the job",
+            record.runtime_version.as_deref().unwrap_or("unknown")
+        )];
+        if !record.unit_present {
+            evidence.push("the unit file is missing too".into());
+        }
+        if let Some(refresh) = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
+            && let Some(outcome) = refresh.get("outcome").and_then(Value::as_str)
+        {
+            evidence.push(format!("last refresh attempt: {outcome}"));
+        }
+        return Some(RepairAdvice {
+            id: "storage.gc-service-runtime-missing",
+            reason: "the scheduled GC sweep service is pinned to one exact runtime, and self-update removed it; launchd cannot start the job, so scheduled sweeps have stopped",
+            summary: "this repository's scheduled GC sweep service names a runtime that is no longer installed",
+            evidence,
+            commands: vec![
+                REFRESH_COMMAND.into(),
+                "aethyme broker gc service status --json".into(),
+            ],
+        });
+    }
+    let (plan, _) = load(home, uuid).ok()?;
+    let control = read_control(&plan).ok().flatten()?;
+    if !load_unconfirmed(&control) {
         return None;
     }
-    let mut evidence = vec![format!(
-        "the recorded runtime {} is no longer installed; launchd cannot start the job",
-        record.runtime_version.as_deref().unwrap_or("unknown")
-    )];
-    if !record.unit_present {
-        evidence.push("the unit file is missing too".into());
+    Some(RepairAdvice {
+        id: "storage.gc-service-load-unconfirmed",
+        reason: "the scheduled GC sweep service was meant to be loaded, but launchd never confirmed it (a refused or unknown bootstrap); if it is not loaded, scheduled sweeps have stopped",
+        summary: "this repository's scheduled GC sweep service was meant to be loaded and launchd did not confirm it",
+        evidence: vec![format!(
+            "last control: {} {} (scheduler {})",
+            control.action, control.operation_result, control.scheduler_state
+        )],
+        commands: vec![
+            "aethyme broker gc service status --json".into(),
+            format!(
+                "aethyme broker gc service activate --confirm {}",
+                plan.digest
+            ),
+        ],
+    })
+}
+
+/// `gc service status` retries the bootstrap of a service whose last
+/// activation or refresh was never confirmed, under the same proofs as the
+/// automatic refresh (marker uuid, verified plan and unit, this repository,
+/// runtime present) and only when launchd says the label is not loaded.
+fn retry_unconfirmed_load_with(
+    home: &Path,
+    uuid: &str,
+    marker_uuid: &str,
+    repository: &Path,
+    mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+    mut run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
+) -> io::Result<Option<Value>> {
+    use crate::scheduled_service::launchd::{LabelState, Observation};
+    if uuid != marker_uuid {
+        return Ok(None);
     }
-    if let Some(refresh) = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
-        && let Some(outcome) = refresh.get("outcome").and_then(Value::as_str)
+    let Ok((plan, bytes)) = load(home, uuid) else {
+        return Ok(None);
+    };
+    if plan.repository != repository || !plan.router.exists() {
+        return Ok(None);
+    }
+    if !read_control(&plan)
+        .ok()
+        .flatten()
+        .is_some_and(|control| load_unconfirmed(&control))
     {
-        evidence.push(format!("last refresh attempt: {outcome}"));
+        return Ok(None);
     }
-    Some(evidence)
+    let _span = crate::phase_telemetry::span("gc_service_load_retry");
+    let _claim = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)?;
+    if load(home, uuid)?.1 != bytes {
+        return Err(invalid(
+            "GC service installation changed while claiming a retry",
+        ));
+    }
+    let state = label_state(plan.uid, &plan.label).unwrap_or(LabelState::Unknown);
+    let receipt = |scheduler_state: &str, operation_result: &str| -> io::Result<ControlReceipt> {
+        Ok(ControlReceipt {
+            schema: CONTROL_SCHEMA.to_string(),
+            plan_digest: plan.digest.clone(),
+            generation: plan.generation.clone(),
+            action: "activate".to_string(),
+            scheduler_state: scheduler_state.to_string(),
+            operation_result: operation_result.to_string(),
+            observed_at_unix_ms: now_unix_ms()?,
+        })
+    };
+    match state {
+        LabelState::Unknown => {
+            return Ok(Some(
+                json!({"retried": false, "scheduler_state": "unknown"}),
+            ));
+        }
+        LabelState::Loaded => {
+            // Loaded after all: record the observation so the advice clears.
+            write_control(&plan, &receipt("loaded", "observed_loaded")?)?;
+            return Ok(Some(json!({"retried": false, "scheduler_state": "loaded"})));
+        }
+        LabelState::NotLoaded => {}
+    }
+    write_control(&plan, &receipt("unknown", "attempting")?)?;
+    let observation = run(&[
+        "bootstrap".to_string(),
+        format!("gui/{}", plan.uid),
+        plan.unit_path.to_string_lossy().into_owned(),
+    ])?;
+    let (scheduler_state, operation_result) = match observation {
+        Observation::Success => ("loaded", "acknowledged"),
+        Observation::Refused => ("unknown", "refused"),
+        Observation::Unknown => ("unknown", "unknown"),
+    };
+    write_control(&plan, &receipt(scheduler_state, operation_result)?)?;
+    crate::phase_telemetry::add("gc_service_load_retried", Duration::ZERO);
+    Ok(Some(json!({
+        "retried": true,
+        "scheduler_state": scheduler_state,
+        "operation_result": operation_result
+    })))
 }
 
 /// Record why a managed tick refused to run, beside `last-pass.json`, so a
@@ -2660,6 +3045,207 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_publish_puts_the_previous_record_back() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        // A directory where the publisher's scratch file goes makes every
+        // publish fail after the record was archived.
+        fs::create_dir(plan.directory.join(".install.pending")).unwrap();
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Loaded),
+            |_| panic!("nothing is reloaded after a failed publish"),
+        );
+        assert_eq!(outcome.outcome, "refresh_failed_restored", "{outcome:?}");
+        assert!(outcome.error.is_some());
+        assert!(outcome.keep_previous_runtime, "the old job is still loaded");
+        assert_unchanged(&plan);
+        load(&plan.home, &plan.repository_uuid).unwrap();
+    }
+
+    #[test]
+    fn an_unrestored_refresh_is_advised_and_repaired_by_refresh() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let fresh = refreshed_plan(&plan, &runtime);
+        let mut out = RefreshOutcome::new(&plan.repository_uuid);
+        {
+            let claim = crate::pr_watch_service_install::claim_service_directory(
+                &plan.home,
+                &plan.directory,
+                plan.uid,
+            )
+            .unwrap();
+            let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+            let archive = archive_record(&record).unwrap();
+            fs::create_dir(plan.directory.join(".install.pending")).unwrap();
+            let error = publish_or_restore(
+                &fresh,
+                &record,
+                &archive,
+                &claim,
+                |_, _, _, _| Err(io::Error::other("injected restore failure")),
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("injected restore failure"));
+            assert_eq!(out.outcome, "refresh_failed_unrestored");
+            out.archived_to = Some(archive);
+            write_refresh_receipt(&plan.home, &plan.repository_uuid, &out).unwrap();
+        }
+        assert!(!plan.directory.join("plan.json").exists());
+        assert!(!plan.unit_path.exists());
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-record-interrupted");
+        assert_eq!(advice.commands, vec![REFRESH_COMMAND.to_string()]);
+        let status =
+            control_dead_record(&plan.home, &plan.repository_uuid, "status", None, |_, _| {
+                panic!("status of an interrupted refresh needs no launchd answer")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["installation_state"], "refresh_interrupted");
+        assert_eq!(status["next_action"], REFRESH_COMMAND);
+        // `refresh` puts the record back, then refreshes it.
+        fs::remove_dir(plan.directory.join(".install.pending")).unwrap();
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is not bootstrapped"),
+        );
+        assert_eq!(outcome.outcome, "refreshed_not_loaded", "{outcome:?}");
+        assert_eq!(fs::read(&plan.unit_path).unwrap(), fresh.unit.as_bytes());
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    fn unconfirmed_control(plan: &Plan) {
+        write_control(
+            plan,
+            &ControlReceipt {
+                schema: CONTROL_SCHEMA.to_string(),
+                plan_digest: plan.digest.clone(),
+                generation: plan.generation.clone(),
+                action: "refresh".to_string(),
+                scheduler_state: "unknown".to_string(),
+                operation_result: "refused".to_string(),
+                observed_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_load_is_advised_and_retried_by_status() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        unconfirmed_control(&plan);
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-load-unconfirmed");
+        assert!(advice.commands.contains(&format!(
+            "aethyme broker gc service activate --confirm {}",
+            plan.digest
+        )));
+        // Another repository's marker: no retry, no launchd call.
+        assert!(
+            retry_unconfirmed_load_with(
+                &plan.home,
+                &plan.repository_uuid,
+                "00000000-0000-4000-8000-000000000000",
+                &plan.repository,
+                |_, _| panic!("launchd is not asked"),
+                |_| panic!("launchctl is not run"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Unknown: nothing is run and the advice stays.
+        let retry = retry_unconfirmed_load_with(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+            |_, _| Ok(LabelState::Unknown),
+            |_| panic!("launchctl is not run without launchd's answer"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retry["retried"], false);
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_some());
+        // Not loaded: bootstrapped once, and the acknowledgement clears it.
+        let mut calls = Vec::new();
+        let retry = retry_unconfirmed_load_with(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+            |_, _| Ok(LabelState::NotLoaded),
+            |args| {
+                calls.push(args.to_vec());
+                Ok(Observation::Success)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retry["retried"], true);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "bootstrap");
+        assert_eq!(
+            read_control(&plan).unwrap().unwrap().operation_result,
+            "acknowledged"
+        );
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        // Loaded after all: the observation clears the advice without a call.
+        unconfirmed_control(&plan);
+        retry_unconfirmed_load_with(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+            |_, _| Ok(LabelState::Loaded),
+            |_| panic!("a loaded job is not bootstrapped again"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    #[test]
+    fn the_update_walk_stops_at_its_budget_and_keeps_the_bundle() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let report = refresh_for_update_within(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            &[std::ffi::OsString::from("v0.8.51-test")],
+            std::time::Instant::now(),
+            || panic!("no runtime is resolved past the budget"),
+            |_, _| panic!("launchd is not asked past the budget"),
+            |_| panic!("launchctl is not run past the budget"),
+        );
+        let outcome = &report.outcomes[0];
+        assert_eq!(outcome.outcome, "label_state_unknown");
+        assert_eq!(outcome.kept_bundle.as_deref(), Some("v0.8.50-test"));
+        assert_eq!(
+            report.protected_bundles,
+            vec![std::ffi::OsString::from("v0.8.50-test")]
+        );
+        assert_unchanged(&plan);
+        let receipt =
+            read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid).unwrap();
+        assert_eq!(receipt["outcome"], "label_state_unknown");
+    }
+
+    #[test]
     fn a_refused_bootout_keeps_the_old_bundle() {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
@@ -2731,8 +3317,9 @@ mod tests {
             .is_err()
         );
         assert!(
-            runtime_missing_evidence(&plan.home, &plan.repository_uuid, plan.uid)
+            repair_advice(&plan.home, &plan.repository_uuid, plan.uid)
                 .unwrap()
+                .evidence
                 .iter()
                 .any(|line| line.contains("no longer installed"))
         );

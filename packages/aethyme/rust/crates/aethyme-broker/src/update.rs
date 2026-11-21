@@ -1639,6 +1639,11 @@ fn render_execution(report: &UpdateExecutionReport, json: bool) -> Result<(), St
                 Some(error) => println!("  Warning: GC service {uuid}: {result}: {error}"),
                 None => println!("  GC service {uuid}: {result}"),
             }
+            if let Some(bundle) = outcome["kept_bundle"].as_str() {
+                println!(
+                    "  Kept runtime bundle {bundle} for GC service {uuid} ({result}): launchd may still run it; the next update or `aethyme broker gc service refresh` releases it"
+                );
+            }
         }
         println!("Next: {}", report.repository_next_action);
     }

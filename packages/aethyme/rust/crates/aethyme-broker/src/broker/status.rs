@@ -803,9 +803,10 @@ impl Broker {
         }
     }
 
-    /// Warn when this repository's scheduled GC service names a runtime that
-    /// is no longer installed: launchd then fails to start it every 900 s
-    /// without a trace. A few metadata reads under the user's Library.
+    /// Warn when this repository's scheduled GC service is silently gone: it
+    /// names a runtime that is no longer installed, a refresh left its record
+    /// archived, or a load was meant and never confirmed. A few file reads
+    /// under the user's Library; no launchctl.
     #[cfg(target_os = "macos")]
     fn push_gc_service_runtime_advice(&self, view: &mut StatusView) {
         let _span = crate::phase_telemetry::span("status_gc_service_runtime");
@@ -822,22 +823,18 @@ impl Broker {
         };
         // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
         let uid = unsafe { libc::geteuid() };
-        let Some(evidence) = crate::gc_sweep_service::runtime_missing_evidence(&home, &uuid, uid)
-        else {
+        let Some(advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid) else {
             return;
         };
         view.advice.push(StatusAdvice {
-            id: "storage.gc-service-runtime-missing",
+            id: advice.id,
             severity: StatusAdviceSeverity::Warning,
-            reason: "the scheduled GC sweep service is pinned to one exact runtime, and self-update removed it; launchd cannot start the job, so scheduled sweeps have stopped",
-            summary: "this repository's scheduled GC sweep service names a runtime that is no longer installed".into(),
+            reason: advice.reason,
+            summary: advice.summary.into(),
             session_id: None,
             queue_entry_id: None,
-            evidence,
-            commands: vec![
-                crate::gc_sweep_service::REFRESH_COMMAND.into(),
-                "aethyme broker gc service status --json".into(),
-            ],
+            evidence: advice.evidence,
+            commands: advice.commands,
         });
     }
 
