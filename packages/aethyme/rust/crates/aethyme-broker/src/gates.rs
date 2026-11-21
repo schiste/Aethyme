@@ -3088,11 +3088,40 @@ fn prepare_managed_gate_cache_in(
         Err(error) => return Err(error),
     };
     let bytes_before = usage_before.bytes;
-    let rotated_before_run = bytes_before > policy.max_bytes;
+    // Over its ceiling, first remove superseded build units (earlier
+    // generations of a unit nothing has read since its successor was built)
+    // down to three quarters of the ceiling, so the next build keeps what it
+    // uses. Rotate the whole tree only when that did not bring it under the
+    // ceiling. This gate already holds the cache's exclusive lease.
+    let mut bytes_after_prune = bytes_before;
+    if bytes_before > policy.max_bytes {
+        let _span = crate::phase_telemetry::span("managed_cache_prune");
+        let low_water = policy.max_bytes / 4 * 3;
+        let pruned = crate::cargo_target_prune::prune_superseded_units(
+            &directory,
+            bytes_before.saturating_sub(low_water),
+        );
+        bytes_after_prune = bytes_before.saturating_sub(pruned.bytes);
+        crate::phase_telemetry::attach(
+            "managed_cache_prune",
+            serde_json::json!({
+                "candidates": pruned.candidates,
+                "units": pruned.units,
+                "bytes": pruned.bytes,
+            }),
+        );
+        if pruned.units > 0 {
+            progress.report(&format!(
+                "gate {gate_name} pruned {} superseded build units ({} bytes) from managed cache {}",
+                pruned.units, pruned.bytes, policy.key
+            ));
+        }
+    }
+    let rotated_before_run = bytes_after_prune > policy.max_bytes;
     if rotated_before_run {
         progress.report(&format!(
             "gate {gate_name} rotating managed cache {} ({} bytes exceeds {} bytes)",
-            policy.key, bytes_before, policy.max_bytes
+            policy.key, bytes_after_prune, policy.max_bytes
         ));
         let retired = repository_root.join(format!(
             ".{}.retired-{}-{}",
@@ -10098,6 +10127,68 @@ end = 55999
         assert_eq!(
             std::fs::read_to_string(checkout.join("src/lib.rs")).unwrap(),
             "pub fn a() {}\n"
+        );
+    }
+
+    /// Over its ceiling, a cargo target first loses the build units a newer
+    /// generation superseded; it is rotated only when that is not enough, so
+    /// the next build keeps the units it uses.
+    #[test]
+    fn managed_cache_over_its_ceiling_prunes_superseded_units_before_rotating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("gates/repository/cargo");
+        let profile = directory.join("debug");
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write = |path: &Path, bytes: usize, seconds: u64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0_u8; bytes]).unwrap();
+            let when = base + Duration::from_secs(seconds);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(when)
+                        .set_accessed(when),
+                )
+                .unwrap();
+        };
+        for (hash, seconds) in [("aaaaaaaaaaaaaaaa", 10), ("bbbbbbbbbbbbbbbb", 100)] {
+            write(
+                &profile.join(format!(".fingerprint/work-{hash}/lib-work")),
+                1,
+                seconds,
+            );
+            write(
+                &profile.join(format!("deps/libwork-{hash}.rlib")),
+                600,
+                seconds,
+            );
+        }
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: 1_000,
+        };
+
+        let runtime = prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(runtime.provenance.bytes_before, 1_202);
+        assert!(!runtime.provenance.rotated_before_run);
+        assert!(!profile.join("deps/libwork-aaaaaaaaaaaaaaaa.rlib").exists());
+        assert!(profile.join("deps/libwork-bbbbbbbbbbbbbbbb.rlib").exists());
+        assert!(
+            profile
+                .join(".fingerprint/work-bbbbbbbbbbbbbbbb/lib-work")
+                .exists()
         );
     }
 

@@ -32,6 +32,7 @@ pub mod base_incidents;
 mod blockers;
 mod bounded_output;
 mod broker;
+mod cargo_target_prune;
 mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
