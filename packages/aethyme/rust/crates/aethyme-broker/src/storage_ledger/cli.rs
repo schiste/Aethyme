@@ -680,6 +680,13 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
             commands: vec!["aethyme storage status --json".into()],
         });
     }
+    if let Some(item) = staged_deletion_advice(
+        crate::host_state::default_host_cache_dir()
+            .map(|cache| check::staged_deletions(&cache))
+            .unwrap_or_default(),
+    ) {
+        advice.push(item);
+    }
     if summary.unclassified_entries > 0 {
         advice.push(crate::StatusAdvice {
             id: "storage.unclassified",
@@ -698,6 +705,58 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
         });
     }
     advice
+}
+
+/// `storage.staged-deletion-pending`: entries moved aside for the storage
+/// worker (a gate cache prune's staging directory, an interrupted eviction)
+/// still present after [`check::STAGED_DELETION_WAIT`]. The next command
+/// starts the worker when none runs; this says the space has not come back.
+pub(super) fn staged_deletion_advice(
+    staged: Vec<check::StagedDeletion>,
+) -> Option<crate::StatusAdvice> {
+    let wait_ms = u64::try_from(check::STAGED_DELETION_WAIT.as_millis()).unwrap_or(u64::MAX);
+    let waiting: Vec<_> = staged
+        .into_iter()
+        .filter(|staged| staged.age_ms >= wait_ms)
+        .collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    let known: u64 = waiting.iter().filter_map(|staged| staged.bytes).sum();
+    let unmeasured = waiting
+        .iter()
+        .filter(|staged| staged.bytes.is_none())
+        .count();
+    let oldest_minutes = waiting
+        .iter()
+        .map(|staged| staged.age_ms)
+        .max()
+        .unwrap_or(0)
+        / 60_000;
+    let mut evidence = vec![format!(
+        "{} staged in the host cache root, the oldest {oldest_minutes} minute(s) ago",
+        waiting.len()
+    )];
+    if unmeasured > 0 {
+        evidence.push(format!("{unmeasured} of them without a recorded size"));
+    }
+    Some(crate::StatusAdvice {
+        id: "storage.staged-deletion-pending",
+        severity: crate::StatusAdviceSeverity::Notice,
+        reason: "space moved aside for deletion has not been reclaimed yet; the storage worker deletes it in the background, never on a command's path",
+        summary: format!(
+            "{} awaiting deletion by the storage worker",
+            if known > 0 {
+                human(known)
+            } else {
+                "staged entries".to_string()
+            }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme storage status --json".into()],
+    })
 }
 
 /// `storage.session-scratch-large`: one repository's session scratch
