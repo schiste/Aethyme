@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.153] - 2026-11-21
+
+### Fixed
+
+- A stale GC sweep service installation can be replaced and removed. A record left by an older version, whose launch unit was gone, made `gc service install` refuse ("service file differs") and `status`, `activate`, `deactivate` and `uninstall` fail ("service file is missing"). `install` now replaces a record only when it is provably dead: launchd answers that the label is not loaded in both the gui and user domains, and the unit or the recorded runtime is missing. The old record is moved into `archive/<ms>/` beside it (newest five kept), never deleted. `uninstall` finishes removing a dead record. Both decide under the installer claim (#1929, #1930).
+- The GC sweep service survives self-update. Its unit binds one versioned runtime, and self-update removed that version after two updates, so the job failed to start every 900 s with no output. Self-update now refreshes each service bound to a version it is about to remove, after the recorded plan and unit verify: not loaded, the record is archived and the new plan and unit published; loaded, the job is also booted out and bootstrapped; an unknown launchd answer changes nothing and keeps the old version. A refresh failure never fails the update, a failed publish restores the previous record, and the walk stops at 30 s (#1930).
+- The managed gate caches of this repository are capped at 8 GiB per key, down from 12 GiB (#1928).
+
+### Added
+
+- `aethyme broker gc service refresh [--json]`. `gc service status` reports `stale_record` and `refresh_interrupted`, refreshes a service of this repository whose runtime is gone, and retries one bootstrap for a load that was never confirmed; `gc service plan` reports `existing_installation` (#1929, #1930).
+- `broker status` advice `storage.gc-service-runtime-missing`, `storage.gc-service-record-interrupted`, `storage.gc-service-load-unconfirmed` and `storage.gc-service-unit-missing`, each with the repair command. `broker status` only reads (#1930).
+- Receipts `last-refresh.json` and `last-error.json` beside `last-pass.json`; `gc_service_refresh` in the update report, with one line per version kept and why; span `gc_service_record_archive`, counter `gc_service_record_archived` (#1929, #1930).
+
+### Known issues
+
+- The PR watch service binds a versioned runtime the same way and is not refreshed at self-update yet.
+- Only the gui domain is reloaded; a job loaded only in the user domain keeps its old version.
+
 ## [0.8.152] - 2026-11-21
 
 ### Fixed
