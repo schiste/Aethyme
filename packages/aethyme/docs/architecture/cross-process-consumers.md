@@ -176,6 +176,14 @@ a `tcp_port` lease (`repository = "aethyme-mcp-hub"`) in the host resource
 registry, and `status --json` adds `port` per upstream and
 `last_listen_ms` / `http_sessions_ended` per key. Entries gain
 `require_argv`, `http_path`, `http_auth` and `http_unauthenticated`.
+Readiness of a private HTTP server is timed by the phase span
+`mcp_http_listen_wait`; each re-check after the two macOS listener
+snapshots raced (the group held more listeners than `netstat` showed) adds
+one `mcp_http_listen_transient_retry` count (at most five per wait; the
+hub's own watcher re-checks the same way, and its count lands only where a
+phase recorder is installed on that thread). Refusal reasons are unchanged: a race that
+persists still ends as `listener_unverifiable:listener_listing_empty` or
+`listener_unverifiable:listener_count_mismatch`.
 
 Managed servers add two more external consumers. `aethyme mcp intercept
 install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,

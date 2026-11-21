@@ -53,6 +53,11 @@ pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(100);
+/// How many times readiness looks again after the two listener snapshots
+/// raced before refusing. The race resolves by the next poll, so a verdict
+/// still inconsistent after these is persistent (a listing that hides the
+/// server's sockets) and refused well inside [`LISTEN_TIMEOUT`].
+pub(crate) const TRANSIENT_RETRIES: u32 = 5;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_LINE: usize = 64 * 1024;
@@ -266,6 +271,7 @@ pub fn wait_owned(
     child: &mut Child,
     within: Duration,
 ) -> Result<(), String> {
+    let _span = crate::phase_telemetry::span("mcp_http_listen_wait");
     wait_owned_within(
         within,
         || listen::check(port, group),
@@ -279,30 +285,34 @@ pub fn wait_owned(
     )
 }
 
-/// A listener may appear between the two independent OS snapshots. Retry that
-/// inconclusive observation within the existing readiness deadline; never use
-/// the server without a subsequent, positively verified observation.
+/// The polling behind [`wait_owned`]. A listener bound between the two OS
+/// snapshots makes one observation inconsistent ([`Listeners::transient`]):
+/// that alone is looked at again, at most [`TRANSIENT_RETRIES`] times and
+/// within `within`, and the server is used only on a later verified `Ours`.
+/// Every other verdict, an unverifiable listing included, refuses at once.
 fn wait_owned_within(
     within: Duration,
     mut observe: impl FnMut() -> Listeners,
     mut exited: impl FnMut() -> Option<String>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + within;
-    let mut unavailable = None;
+    let mut retries = 0;
     loop {
-        match observe() {
+        let verdict = observe();
+        match &verdict {
             Listeners::Ours => return Ok(()),
             Listeners::None => {}
-            Listeners::Unverifiable(why) if why == listen::LISTING_EMPTY => {
-                unavailable = Some(format!("listener_unverifiable:{why}"));
+            raced if raced.transient() && retries < TRANSIENT_RETRIES => {
+                retries += 1;
+                crate::phase_telemetry::add("mcp_http_listen_transient_retry", Duration::ZERO);
             }
-            verdict => return Err(verdict.reason().unwrap_or_default()),
+            refused => return Err(refused.reason().unwrap_or_default()),
         }
         if let Some(status) = exited() {
             return Err(format!("exited_before_listening:{status}"));
         }
         if Instant::now() >= deadline {
-            return Err(unavailable.unwrap_or_else(|| "listen_timeout".into()));
+            return Err(verdict.reason().unwrap_or_else(|| "listen_timeout".into()));
         }
         thread::sleep(READY_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
@@ -1003,33 +1013,102 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn readiness_retries_inconsistent_snapshots_but_never_accepts_unknown_ownership() {
-        let mut observations = [
-            Listeners::Unverifiable(listen::LISTING_EMPTY.into()),
-            Listeners::Ours,
-        ]
-        .into_iter();
-        assert!(
-            wait_owned_within(
-                Duration::from_secs(1),
-                || observations.next().unwrap(),
-                || None,
-            )
-            .is_ok()
+    /// Run `wait_owned_within` over a scripted sequence of verdicts (the
+    /// last repeats); the result and how many observations it took.
+    fn readiness(within: Duration, script: &[Listeners]) -> (Result<(), String>, usize) {
+        let mut seen = 0;
+        let result = wait_owned_within(
+            within,
+            || {
+                seen += 1;
+                script[(seen - 1).min(script.len() - 1)].clone()
+            },
+            || None,
         );
+        (result, seen)
+    }
 
+    fn raced(why: &str) -> Listeners {
+        Listeners::Inconsistent(why.into())
+    }
+
+    #[test]
+    fn readiness_retries_a_snapshot_race_and_accepts_only_a_later_ours() {
+        for why in [listen::LISTING_EMPTY, listen::COUNT_MISMATCH] {
+            assert_eq!(
+                readiness(LISTEN_TIMEOUT, &[raced(why), Listeners::Ours]),
+                (Ok(()), 2)
+            );
+            assert_eq!(
+                readiness(
+                    LISTEN_TIMEOUT,
+                    &[Listeners::None, raced(why), raced(why), Listeners::Ours]
+                ),
+                (Ok(()), 4)
+            );
+        }
+        // A race that ends in someone else's listener is refused, not used.
         assert_eq!(
-            wait_owned_within(
-                Duration::ZERO,
-                || Listeners::Unverifiable(listen::LISTING_EMPTY.into()),
-                || None,
+            readiness(
+                LISTEN_TIMEOUT,
+                &[raced(listen::LISTING_EMPTY), Listeners::NotOurs]
             ),
-            Err(format!("listener_unverifiable:{}", listen::LISTING_EMPTY))
+            (Err("listener_not_ours".into()), 2)
+        );
+    }
+
+    #[test]
+    fn readiness_refuses_every_other_verdict_at_once() {
+        // One observation each: no wait, whatever time is left.
+        for (verdict, reason) in [
+            // An empty `netstat` table (an agent sandbox) is not a race.
+            (
+                Listeners::Unverifiable(listen::LISTING_EMPTY.into()),
+                "listener_unverifiable:listener_listing_empty",
+            ),
+            (
+                Listeners::Unverifiable("lsof_failed".into()),
+                "listener_unverifiable:lsof_failed",
+            ),
+            (Listeners::NotOurs, "listener_not_ours"),
+            (Listeners::NotLoopback, "not_loopback"),
+        ] {
+            assert_eq!(
+                readiness(LISTEN_TIMEOUT, &[verdict, Listeners::Ours]),
+                (Err(reason.into()), 1)
+            );
+        }
+    }
+
+    #[test]
+    fn a_persistent_race_ends_unverifiable_well_before_the_timeout() {
+        let started = Instant::now();
+        let (result, seen) = readiness(LISTEN_TIMEOUT, &[raced(listen::LISTING_EMPTY)]);
+        assert_eq!(
+            result,
+            Err("listener_unverifiable:listener_listing_empty".into())
+        );
+        assert_eq!(seen, TRANSIENT_RETRIES as usize + 1);
+        assert!(started.elapsed() < LISTEN_TIMEOUT / 4);
+        // At the deadline a race still reports what it is, not a timeout.
+        assert_eq!(
+            readiness(Duration::ZERO, &[raced(listen::COUNT_MISMATCH)]),
+            (
+                Err("listener_unverifiable:listener_count_mismatch".into()),
+                1
+            )
         );
         assert_eq!(
-            wait_owned_within(Duration::from_secs(1), || Listeners::NotOurs, || None),
-            Err("listener_not_ours".into())
+            readiness(Duration::ZERO, &[Listeners::None]),
+            (Err("listen_timeout".into()), 1)
+        );
+        assert_eq!(
+            wait_owned_within(
+                LISTEN_TIMEOUT,
+                || raced(listen::LISTING_EMPTY),
+                || Some("exit status: 1".into())
+            ),
+            Err("exited_before_listening:exit status: 1".into())
         );
     }
 

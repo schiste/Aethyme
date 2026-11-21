@@ -455,14 +455,23 @@ the same way:
   user's sockets (`netstat -an -p tcp`, reading only the leading address
   columns, never a pid or process name) and the listening sockets the
   server's own process group holds (`lsof` limited to that group). Where
-  either cannot be read, or the listing is empty or misses a listener the
-  group holds (an agent sandbox can make `netstat` print nothing), the
-  server is not used (`listener_unverifiable:listener_listing_empty`).
+  either cannot be read, or the `netstat` table is empty (an agent sandbox
+  can make it print nothing), the server is not used
+  (`listener_unverifiable:listener_listing_empty`). `lsof` runs after
+  `netstat`, so a listener the server binds between the two shows only in
+  the second: when the group holds more listeners than `netstat` showed
+  (`listener_listing_empty` when it showed none on the port,
+  `listener_count_mismatch` otherwise), the port is looked at again, at
+  most five more times at the usual 100 ms poll, and the server is used
+  only once a later look proves every listener its own. Still inconsistent
+  after that (a listing that hides the server's sockets), it is refused as
+  `listener_unverifiable` with that reason.
 - **Unverifiable is not unhealthy.** `listener_unverifiable` and
   `token_probe_inconclusive` stop that server and refuse the attach at
-  once, so `connect` takes its private path or `--fallback` without
-  waiting, but they leave no unhealthy mark and count as no crash: the
-  next attach tries again. `aethyme mcp status` shows when a hub cannot
+  once (after the short re-check above for an inconsistent listing, never
+  the 30-second listen deadline), so `connect` takes its private path or
+  `--fallback` without waiting, but they leave no unhealthy mark and count
+  as no crash: the next attach tries again. `aethyme mcp status` shows when a hub cannot
   verify (`http_unverifiable`), for example because the hub itself started
   in a sandbox. One that does not listen within 30
   seconds is killed and counts as a crash.
