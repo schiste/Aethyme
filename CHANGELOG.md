@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.149] - 2026-11-21
+
+### Fixed
+
+- The worker's merged-branch slice no longer holds the lifecycle claim while it judges. It took the claim as soon as a candidate branch existed and ran its ancestry and recovery-archive checks under it, for most of its 20 s budget; on the busiest repository half the worker runs held the claim 7 to 26 s, which is what a foreground `finish` waits behind. The slice now judges without the claim, takes it only when a branch was judged for deletion, re-judges each branch under the claim immediately before the delete, and holds it at most 5 s. What may be deleted is unchanged: the delete is still an atomic compare-and-delete that refuses a moved tip (#1915).
+- The strip backlog census remembers its tombstone folders by device, inode and modification time, and judges an unchanged one from a single lookup instead of re-reading about 140 folders in full every run (82 to 89 s on the slow runs). Counts are unchanged (#1916).
+- A checkout whose activity status ran out of time is remembered for the rest of the process, so the same checkout is not probed, and timed out, several times in one run (52 to 59 s a run) (#1916).
+- The transcripts lane no longer runs after every worker run of every repository. Its work is host-wide and the host ran 189 passes in 10.7 h, 24,011 s in total, of which five found anything eligible. After an idle pass the next worker pass on the host waits 15 minutes; a pass after one that found work, ran out of budget or left an unreadable record runs at once. Archiving rules are unchanged and manual `transcripts` commands are unaffected (#1917).
+
+### Added
+
+- Spans `merged_branches_judge` and `merged_branches_claimed`; counters `merged_branches_claim_budget`, `checkout_strip_backlog_tombstone_remembered`, `worktree_status_activity_unavailable_remembered` and `transcripts_worker_pass_not_due`; meta key `checkout_strip.backlog_tombstones` (#1915, #1916, #1917).
+
 ## [0.8.148] - 2026-11-21
 
 ### Fixed
