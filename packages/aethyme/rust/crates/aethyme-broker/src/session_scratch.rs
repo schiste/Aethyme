@@ -491,6 +491,7 @@ pub(crate) fn move_to_trash(
         creator_started_ms,
         stripped: true,
         scratch: true,
+        verification: false,
     };
     record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
     // The identity once more, on the pinned container, right before the

@@ -498,6 +498,11 @@ pub(crate) struct ExactTreeVerificationSlot {
 }
 
 impl ExactTreeVerificationSlot {
+    /// Where the slot's checkout lives.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     #[cfg(test)]
     pub(crate) fn acquire(main_root: &Path, namespace: &str) -> Result<Self, BrokerOpError> {
         let root_plan = default_worktree_root_plan(main_root);
