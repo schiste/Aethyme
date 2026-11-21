@@ -566,6 +566,35 @@ fn orphan_object_volume_matches(
     }
 }
 
+thread_local! {
+    /// Set while the retirement lane resumes an orphan's interrupted
+    /// cleanup: only the content-verified removal may act.
+    static ORPHAN_RESUME_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an orphan may be removed by the recursive
+/// [`Broker::remove_proven_orphan_worktree`] on this thread: not while an
+/// [`OrphanResumeOnlyScope`] is held.
+pub(super) fn orphan_tree_removal_allowed() -> bool {
+    !ORPHAN_RESUME_ONLY.with(std::cell::Cell::get)
+}
+
+/// Limits orphan removal on this thread to the content-verified
+/// interrupted-cleanup path until dropped.
+pub(super) struct OrphanResumeOnlyScope(bool);
+
+impl OrphanResumeOnlyScope {
+    pub(super) fn enter() -> Self {
+        Self(ORPHAN_RESUME_ONLY.with(|cell| cell.replace(true)))
+    }
+}
+
+impl Drop for OrphanResumeOnlyScope {
+    fn drop(&mut self) {
+        ORPHAN_RESUME_ONLY.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Rewrite a volume-UUID re-proven orphan proof's root and `.git` pointer
 /// devices to today's numbers of the same objects, so the removal's fd-level
 /// checks compare against the live mount. Each object must keep its inode
@@ -4601,6 +4630,19 @@ impl Broker {
         Ok(())
     }
 
+    /// The interrupted finish-cleanup proof of an orphaned checkout, as the
+    /// cleanup that acts on it judges it (`Finish` lane), for the retirement
+    /// lane's decision to resume it.
+    pub(super) fn interrupted_finish_orphan_cleanup_proof_for_retirement(
+        &self,
+        session: &Session,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        self.interrupted_finish_orphan_cleanup_proof_in_lane(
+            session,
+            crate::auto_cleanup::OwnershipReproofLane::Finish,
+        )
+    }
+
     fn resume_interrupted_finish_orphan_cleanup(
         &mut self,
         session: &Session,
@@ -4725,6 +4767,19 @@ impl Broker {
         worktree_path: &Path,
         force: bool,
     ) -> Result<(String, String), BrokerOpError> {
+        // The retirement lane resumes an orphan only through the
+        // content-verified interrupted-cleanup removal, never this
+        // recursive one.
+        if !orphan_tree_removal_allowed() {
+            crate::phase_telemetry::add(
+                "checkout_retirement_orphan_recursive_removal_refused",
+                std::time::Duration::ZERO,
+            );
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the retirement lane removes an orphan only through its content-verified interrupted cleanup; preserved the checkout".into(),
+            });
+        }
         let current = self.store.session(session.id)?;
         let Some(item) = item else {
             return Err(BrokerOpError::DirtyWorktree {

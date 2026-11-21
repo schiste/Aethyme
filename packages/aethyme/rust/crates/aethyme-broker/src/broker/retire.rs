@@ -1799,8 +1799,39 @@ impl Broker {
         let backoff = RETIRE_KEEP_BACKOFF_MS[usize::try_from(keep.attempts.saturating_sub(1))
             .unwrap_or(2)
             .min(2)];
-        checkout_keep_key(Path::new(&session.worktree_path)).as_deref() == Some(keep.key.as_str())
-            && now_ms.saturating_sub(keep.at_ms) < backoff
+        let holds = checkout_keep_key(Path::new(&session.worktree_path)).as_deref()
+            == Some(keep.key.as_str())
+            && now_ms.saturating_sub(keep.at_ms) < backoff;
+        if holds && !self.remembered_keep_condition_holds(session.id, &keep.reason) {
+            // Its lease was released or its operation reconciled: judged
+            // again now, not after the back-off.
+            crate::phase_telemetry::add(
+                "checkout_retirement_keep_condition_cleared",
+                std::time::Duration::ZERO,
+            );
+            self.forget_keep(session.id);
+            return false;
+        }
+        holds
+    }
+
+    /// Whether the condition a remembered `lease_held` or
+    /// `operation_unresolved` keep stands for still holds (one database
+    /// read); other reasons are left to the key and the back-off.
+    fn remembered_keep_condition_holds(&self, session_id: i64, reason: &str) -> bool {
+        match reason {
+            "lease_held" => !matches!(
+                self.store_ref().unreleased_unexpired_leases_for_sessions_at(
+                    &[session_id],
+                    crate::clock::epoch_ms(),
+                ),
+                Ok(leases) if leases.is_empty()
+            ),
+            "operation_unresolved" => self
+                .session_operations_unresolved_since_boot(session_id)
+                .unwrap_or(true),
+            _ => true,
+        }
     }
 
     fn remember_keep(&self, session: &Session, reason: &'static str, detail: Option<String>) {
@@ -2566,10 +2597,10 @@ impl Broker {
     }
 
     /// Retire an orphaned checkout of this repository (its Git registration
-    /// is gone) through the same path as `aethyme broker finish cleanup
-    /// <id>`: non-forced, so it acts only with the recorded interrupted
-    /// finish-cleanup proof and every check that command makes; any refusal
-    /// keeps it (`orphan_cleanup_refused`, remembered with its reason).
+    /// is gone) by resuming its interrupted finish cleanup: only with the
+    /// recorded proof (`Finish` lane), through `Broker::cleanup` without
+    /// force and only its content-verified orphan removal; any refusal keeps
+    /// it (`orphan_cleanup_refused`, remembered with its reason).
     fn resume_orphan_cleanup(
         &mut self,
         session_id: i64,
@@ -2577,10 +2608,26 @@ impl Broker {
         run: &mut RetireRun,
     ) -> Result<RetireOutcome, BrokerOpError> {
         let _phase = crate::phase_telemetry::span("checkout_retirement_phase_orphan_cleanup");
+        // Only an orphan with the recorded interrupted finish-cleanup proof,
+        // as the cleanup that acts on it judges it, is resumed; and only
+        // through the content-verified removal (the recursive orphan removal
+        // refuses inside `OrphanResumeOnlyScope`), which keeps every path
+        // that changed or appeared after the proof.
+        let session = self.store_ref().session(session_id)?;
+        if self
+            .interrupted_finish_orphan_cleanup_proof_for_retirement(&session)
+            .is_none()
+        {
+            run.keep_detail = Some(
+                "orphaned checkout without a recorded interrupted finish-cleanup proof; nothing proves its content is held elsewhere".into(),
+            );
+            return Ok(RetireOutcome::Kept("orphan_cleanup_refused"));
+        }
         crate::phase_telemetry::add(
             "checkout_retirement_orphan_cleanup_attempted",
             std::time::Duration::ZERO,
         );
+        let _resume_only = super::cleanup::OrphanResumeOnlyScope::enter();
         match self.cleanup(session_id, false) {
             Ok(()) if std::fs::symlink_metadata(worktree).is_err() => {
                 crate::phase_telemetry::add(
@@ -7870,10 +7917,22 @@ mod tests {
     #[test]
     fn an_unproven_orphan_is_kept_remembered_and_not_judged_every_run() {
         let (_owner, _storage, mut broker) = fixture();
-        let (session, worktree) = closed(&mut broker, "orphaned checkout", |_| {});
-        let pointer = std::fs::read_to_string(worktree.join(".git")).unwrap();
-        let admin = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
-        std::fs::remove_dir_all(&admin).unwrap();
+        let (session, worktree) = closed(&mut broker, "orphaned checkout", |worktree| {
+            std::fs::write(worktree.join("base.txt"), "uncommitted change\n").unwrap();
+            std::fs::write(worktree.join("untracked.txt"), b"untracked bytes \x00\x01").unwrap();
+        });
+        remove_admin_directory(&worktree);
+        let intact = |worktree: &Path| {
+            assert_eq!(
+                std::fs::read(worktree.join("base.txt")).unwrap(),
+                b"uncommitted change\n",
+                "nothing was removed or changed"
+            );
+            assert_eq!(
+                std::fs::read(worktree.join("untracked.txt")).unwrap(),
+                b"untracked bytes \x00\x01"
+            );
+        };
 
         let first = run(&mut broker);
 
@@ -7882,7 +7941,7 @@ mod tests {
             Some(&1),
             "{first:#?}"
         );
-        assert!(worktree.join("base.txt").exists(), "nothing was removed");
+        intact(&worktree);
         assert_eq!(
             broker
                 .checkout_retirement_keeps()
@@ -7896,7 +7955,115 @@ mod tests {
             None,
             "{second:#?}"
         );
-        assert!(worktree.join("base.txt").exists());
+        intact(&worktree);
+    }
+
+    /// The checkout's Git registration removed, as an interrupted removal
+    /// leaves it.
+    fn remove_admin_directory(worktree: &Path) {
+        let pointer = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        let admin = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        std::fs::remove_dir_all(&admin).unwrap();
+    }
+
+    /// A landed session whose `finish` recorded its interrupted-cleanup
+    /// proof and then stopped after Git dropped the registration.
+    fn proven_orphan(broker: &mut crate::Broker, label: &str) -> (crate::Session, PathBuf) {
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = false\n",
+        )
+        .unwrap();
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("session-change.txt"), "landed\n").unwrap();
+        git(&worktree, &["add", "session-change.txt"]);
+        git(&worktree, &["commit", "-qm", "landed change"]);
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &session.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let mut proof = crate::git::GitRepo::discover(&worktree)
+            .unwrap()
+            .finish_cleanup_recovery_proof(&branch_ref)
+            .expect("a landed linked checkout yields a recovery proof");
+        proof.schema_version = 3;
+        let policy = crate::AutoCleanupPolicy::load(broker.main_root()).unwrap();
+        proof.disposable_ignored_root_prefixes =
+            crate::auto_cleanup::disposable_ignored_directory_prefixes(&worktree, &policy).unwrap();
+        let payload = crate::events::session_finish_cleanup_started_payload_with_proof(
+            true,
+            true,
+            Some(&proof),
+        );
+        broker
+            .store()
+            .begin_finish_cleanup(session.id, &payload)
+            .unwrap();
+        remove_admin_directory(&worktree);
+        (session, worktree)
+    }
+
+    /// An orphan whose checkout changed after its proof (a tracked file
+    /// modified, a new file added) is kept, every byte intact: the lane only
+    /// resumes through the content-verified removal.
+    #[test]
+    fn a_proven_orphan_changed_after_its_proof_is_kept_intact() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = proven_orphan(&mut broker, "changed proven orphan");
+        std::fs::write(worktree.join("base.txt"), "changed after the proof\n").unwrap();
+        std::fs::write(worktree.join("late.txt"), "new after the proof\n").unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            run(&mut broker)
+        };
+
+        assert_eq!(
+            report.kept.get("orphan_cleanup_refused"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("base.txt")).unwrap(),
+            b"changed after the proof\n"
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("late.txt")).unwrap(),
+            b"new after the proof\n"
+        );
+        assert_eq!(
+            broker
+                .store_ref()
+                .session(session.id)
+                .unwrap()
+                .cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("checkout_retirement_orphan_recursive_removal_refused")
+                .copied(),
+            None,
+            "the recursive removal was never reached"
+        );
+    }
+
+    /// Inside the lane's scope the recursive orphan removal is refused, so
+    /// the lane can only reach the content-verified one.
+    #[test]
+    fn the_lane_scope_refuses_the_recursive_orphan_removal() {
+        assert!(super::super::cleanup::orphan_tree_removal_allowed());
+        {
+            let _scope = super::super::cleanup::OrphanResumeOnlyScope::enter();
+            assert!(!super::super::cleanup::orphan_tree_removal_allowed());
+        }
+        assert!(super::super::cleanup::orphan_tree_removal_allowed());
     }
 
     /// A folder with no usable Git registration still gets a keep key (its
