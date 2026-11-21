@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.148] - 2026-11-21
+
+### Fixed
+
+- The background worker's read-only Git calls no longer inherit its throttled disk priority. On macOS a throttled process's Git child that is a known read (status, diff, worktree list and similar) now runs at an ordinary disk priority; writes, deletions such as `worktree remove` and `prune`, and unknown subcommands keep the throttle, and so do the worker's own removals and the trash drain. On the busiest repository the worker's uncommitted-work proofs took 16.1 s each and its cleanup status checks 9.9 s each, against a median of 0.87 s for the same command in the retirement lane; capacity selection cost 58 s a run and selected nothing (#1913).
+- Git children of a throttled process run with `gc.auto=0` and `maintenance.auto=false`, so none starts automatic maintenance (#1913).
+- The removal lane no longer proves checkouts the retirement lane owns. They were refused at the last step anyway; they are now kept as `retirement_lane_owns` without a Git call (#1913).
+- Six phase names recorded a configured budget or delay as elapsed time, which inflated summed timings; `landed_proof_session_budget_doubled` alone read as about 18,000 s per occurrence. They are now counted with a zero timing and their value goes to the new `phase_values_ms` attachment. A reader that summed those names must read `phase_values_ms` (#1912).
+
+### Added
+
+- `cpu_ms` on every metric line a command writes: `user`, `system`, `children_user`, `children_system` (#1912).
+- Counters `auto_cleanup_memo_miss_absent` and `auto_cleanup_memo_miss_changed`; spans `checkout_strip_backlog_folders` and `checkout_strip_backlog_regenerable` (#1912).
+- Counters `git_child_ordinary_io`, `git_child_kept_throttle`, `auto_cleanup_skipped_retirement_lane_owns` and `artifact_worker_capacity_removal_pass_while_retirement_lane_live` (#1913).
+
 ## [0.8.147] - 2026-11-21
 
 ### Fixed
