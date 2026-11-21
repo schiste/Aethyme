@@ -2124,7 +2124,7 @@ impl Broker {
             .map_or(0, |(streak, _)| *streak);
         let budget = doubled_proof_budget(landed_proof_base_budget(session_id), streak);
         if streak > 0 {
-            crate::phase_telemetry::add("landed_proof_session_budget_doubled", budget);
+            crate::phase_telemetry::value("landed_proof_session_budget_doubled", budget);
         }
         budget
     }

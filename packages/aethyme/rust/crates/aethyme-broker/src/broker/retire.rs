@@ -3402,7 +3402,7 @@ impl Broker {
         }
         let drain_deadline = trash_drain_deadline(deadline, Instant::now(), window, trash_behind);
         if drain_deadline > deadline && !self.checkout_trash_rows().is_empty() {
-            crate::phase_telemetry::add(
+            crate::phase_telemetry::value(
                 "checkout_trash_drain_budget_extended",
                 drain_deadline.saturating_duration_since(deadline),
             );

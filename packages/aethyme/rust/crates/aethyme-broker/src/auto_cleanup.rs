@@ -4193,7 +4193,7 @@ fn run_proof_git(
             ))
         }
         Ok(OwnedGroupEnd::Output(LimitedOutput::Deadline) | OwnedGroupEnd::Stopped) => {
-            crate::phase_telemetry::add("proof_git_stopped_at_deadline", budget);
+            crate::phase_telemetry::value("proof_git_stopped_at_deadline", budget);
             Err(format!(
                 "git {}: stopped at its time budget",
                 args.join(" ")
@@ -9404,6 +9404,22 @@ impl Broker {
                             })
                             .map(|entry| fast_judging::remembered_kept(&worktree_key, entry))
                     });
+                    if remembered.is_none() {
+                        // Why this group is judged in full again: never kept
+                        // (or forgotten), or a remembered verdict that no
+                        // longer holds because something it depended on
+                        // changed. Read together with the status checks
+                        // that follow, these say which full judgments repeat
+                        // a verdict.
+                        crate::phase_telemetry::add(
+                            if memo.entries.contains_key(&worktree_key) {
+                                "auto_cleanup_memo_miss_changed"
+                            } else {
+                                "auto_cleanup_memo_miss_absent"
+                            },
+                            Duration::ZERO,
+                        );
+                    }
                     if let Some(kept) = remembered {
                         // Nothing the verdict depended on changed: keep it
                         // without judging it again.

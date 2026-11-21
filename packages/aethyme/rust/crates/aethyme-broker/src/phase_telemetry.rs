@@ -114,6 +114,35 @@ fn record(name: &'static str, start: Instant, end: Instant) {
     });
 }
 
+/// Record a duration that was configured or granted (a budget, a reserve,
+/// a retry delay), not one that elapsed. It must not go into
+/// `phase_timings_ms`, where it would be summed as time spent: on the busiest
+/// repository `landed_proof_session_budget_doubled` summed to 1,617,540 s
+/// over 21 worker runs. The occurrence is counted (`phase_counts`, with a
+/// zero timing) and the value goes to the `phase_values_ms` attachment, the
+/// largest seen per name.
+pub(crate) fn value(name: &'static str, configured: Duration) {
+    add(name, Duration::ZERO);
+    ACTIVE.with(|active| {
+        if let Some(recorder) = active.borrow().as_ref()
+            && let Ok(mut accumulated) = recorder.0.lock()
+        {
+            let millis = u64::try_from(configured.as_millis()).unwrap_or(u64::MAX);
+            let values = accumulated
+                .attachments
+                .entry("phase_values_ms")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if let serde_json::Value::Object(fields) = values {
+                let largest = fields
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(millis, |seen| seen.max(millis));
+                fields.insert(name.to_string(), largest.into());
+            }
+        }
+    });
+}
+
 /// Attach one structured field, `name`, to the command's metric line. For
 /// facts that are not durations, such as a lock's queue position or who held
 /// it. An object merges into an object already attached under that name (its
@@ -295,6 +324,23 @@ mod tests {
         );
         assert_eq!(attachments.get("scalar"), Some(&serde_json::json!(2)));
         assert!(!attachments.contains_key("ignored"));
+    }
+
+    #[test]
+    fn configured_values_are_counted_not_timed() {
+        let recorder = Recorder::default();
+        {
+            let _installed = install(recorder.clone());
+            value("budget", Duration::from_secs(3_600));
+            value("budget", Duration::from_secs(60));
+        }
+        let (millis, counts) = recorder.totals();
+        assert_eq!(millis.get("budget"), Some(&0));
+        assert_eq!(counts.get("budget"), Some(&2));
+        assert_eq!(
+            recorder.attachments().get("phase_values_ms"),
+            Some(&serde_json::json!({"budget": 3_600_000}))
+        );
     }
 
     #[test]

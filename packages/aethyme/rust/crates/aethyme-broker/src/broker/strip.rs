@@ -2080,6 +2080,7 @@ impl Broker {
         };
         let mut folders = BTreeSet::new();
         let mut tombstones = BTreeSet::new();
+        let folder_census = crate::phase_telemetry::span("checkout_strip_backlog_folders");
         for session in live.iter().chain(closed.iter()) {
             if folders.contains(session.worktree_path.as_str())
                 || tombstones.contains(session.worktree_path.as_str())
@@ -2105,6 +2106,7 @@ impl Broker {
                 None => backlog.regenerable_partial = true,
             }
         }
+        drop(folder_census);
         backlog.folders = folders.len();
         let closed_folders = closed
             .iter()
@@ -2117,6 +2119,7 @@ impl Broker {
             crate::phase_telemetry::add("checkout_strip_backlog_deferred", Duration::ZERO);
             return backlog;
         }
+        let _regenerable = crate::phase_telemetry::span("checkout_strip_backlog_regenerable");
         for path in closed_folders {
             if Instant::now() >= deadline {
                 backlog.regenerable_partial = true;
