@@ -269,6 +269,8 @@ const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
 /// Hidden `broker gc` action of the trash catch-up lane process.
 pub(crate) const TRASH_CATCHUP_ACTION: &str = "__trash-catchup";
+/// Hidden `broker gc` action of the checkout retirement lane process.
+pub(crate) const RETIRE_LANE_ACTION: &str = "__retire-lane";
 /// When the worker that started a trash catch-up lane process started
 /// (epoch ms), for its `catchup_start_delay_ms`.
 pub(crate) const TRASH_CATCHUP_WORKER_STARTED_ENV: &str = "AETHYME_TRASH_CATCHUP_WORKER_STARTED_MS";
@@ -3992,6 +3994,13 @@ pub(crate) fn wait_for_host_deleter_slot(
 /// thing in the worker process, before any thread or child exists.
 pub(crate) fn lower_artifact_worker_priority() -> BackgroundPriority {
     background_priority::lower_current_process()
+}
+
+/// Set the checkout retirement lane process to normal disk priority and
+/// reduced CPU priority (macOS; see
+/// `background_priority::raise_for_retirement_lane`).
+pub(crate) fn raise_retirement_lane_priority() -> background_priority::DeleterPriority {
+    background_priority::raise_for_retirement_lane()
 }
 
 /// Set the checkout trash deleter process to unthrottled disk I/O (macOS;
@@ -9202,6 +9211,10 @@ impl Broker {
         // `lower_artifact_worker_priority`) and a thread cannot lift itself
         // out of a throttled process.
         let lane_started = self.start_checkout_trash_catchup_lane(worker_started, "worker_start");
+        // Closed checkouts waiting: the retirement lane process judges them
+        // continuously at normal disk priority, instead of this worker's
+        // closed lap sharing its throttled 180 s window.
+        self.start_checkout_retirement_lane();
         let result = self.run_artifact_sweep_recovery_worker_lanes();
         release_worker_lock();
         if !lane_started {
@@ -9299,6 +9312,70 @@ impl Broker {
         }
     }
 
+    /// Start the checkout retirement lane process (`broker gc
+    /// __retire-lane`), detached like this worker, when this worker may
+    /// (the same gates as the trash catch-up lane) and
+    /// `checkout_retirement_lane_needed` says closed checkouts wait with no
+    /// lane process of this repository alive. `true` when it was started.
+    fn start_checkout_retirement_lane(&mut self) -> bool {
+        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
+            || crate::host_state::path_is_ephemeral(self.main_root())
+            || artifact_worker_post_boot_hold_now().is_some()
+        {
+            return false;
+        }
+        let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+        let Some(host_dir) = host_dir else {
+            return false;
+        };
+        if !self.checkout_retirement_lane_needed(&host_dir) {
+            return false;
+        }
+        // A lane started from a worker that cannot list processes (a worker
+        // inherited from a sandboxed agent command) would inherit the same
+        // sandbox and judge nothing: probe once, and leave the lane to an
+        // unsandboxed worker (the managed GC sweep's, or one an operator's
+        // command starts). A probe that only ran out of time still starts
+        // it: the lane runs at normal disk priority and retries longer.
+        if self.checkout_retirement_listing_refused() {
+            return false;
+        }
+        let Some((router, _engine)) = artifact_worker_binaries() else {
+            crate::phase_telemetry::add(
+                "checkout_retirement_lane_runtime_unverified",
+                Duration::ZERO,
+            );
+            return false;
+        };
+        let Ok(canonical_root) = std::fs::canonicalize(self.main_root()) else {
+            return false;
+        };
+        let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
+        let Ok(mut command) = self.detached_worker_command(
+            &router,
+            &canonical_root,
+            gate_scope.as_deref(),
+            &["broker", "gc", RETIRE_LANE_ACTION],
+        ) else {
+            crate::phase_telemetry::add("checkout_retirement_lane_storage_context", Duration::ZERO);
+            return false;
+        };
+        configure_artifact_worker_process_group(&mut command);
+        match crate::bounded_output::spawn_serialized(&mut command) {
+            Ok(_child) => {
+                crate::phase_telemetry::add("checkout_retirement_lane_spawned", Duration::ZERO);
+                true
+            }
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_lane_spawn_failed",
+                    Duration::ZERO,
+                );
+                false
+            }
+        }
+    }
+
     /// The detached worker's measurement lane, under the host-wide
     /// measurement slot. Its request stays durable when it cannot finish.
     fn run_preparation_cache_measurement_worker_lane(&mut self) {
@@ -9361,7 +9438,7 @@ impl Broker {
     ) -> Result<(), BrokerOpError> {
         let remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
         let run_budget = worker_retirement_run_budget(remaining);
-        crate::phase_telemetry::add("artifact_worker_retirement_share_budget", run_budget);
+        crate::phase_telemetry::value("artifact_worker_retirement_share_budget", run_budget);
         if remaining < SESSION_RETIREMENT_WORKER_RESERVE {
             // Removal overran the run: retirement still gets its reserve.
             crate::phase_telemetry::add(
@@ -10826,7 +10903,7 @@ impl Broker {
             },
             &retry_after_ms.map(|at| at.to_string()).unwrap_or_default(),
         )?;
-        crate::phase_telemetry::add(
+        crate::phase_telemetry::value(
             "artifact_worker_capacity_removal_retry",
             Duration::from_millis(retry_ms.map_or(0, |wait| u64::try_from(wait).unwrap_or(0))),
         );
@@ -10925,7 +11002,7 @@ impl Broker {
             "artifact_worker_capacity_removal_apply",
             Duration::from_millis(apply_ms),
         );
-        crate::phase_telemetry::add(
+        crate::phase_telemetry::value(
             "artifact_worker_capacity_removal_cache_lane_reserved",
             limits.cache_lane_reserved,
         );
@@ -11243,13 +11320,35 @@ impl Broker {
                     return Ok(());
                 }
             };
-            if crate::stale_session_policy::last_pass_process_table_denied() {
+            let process_table_denied =
+                crate::stale_session_policy::last_pass_process_table_denied();
+            // Sessions whose verdict did not need the process listing were
+            // judged anyway: a closed or landed session, or a keep for any
+            // other reason. Only the holder checks were deferred.
+            let judged_without_listing = report.sessions_retired > 0
+                || report.landed_sessions_examined > 0
+                || report.abandonment_sessions_closed > 0
+                || report
+                    .abandonment_sessions_kept
+                    .values()
+                    .any(|count| *count > 0);
+            if process_table_denied && judged_without_listing {
+                // Keep going: the next pass judges the sessions after these.
+                // Only the sessions kept as `holder_process_table_denied`
+                // wait for a worker that can list processes.
+                crate::phase_telemetry::add(
+                    "session_retirement_continued_process_table_denied",
+                    Duration::ZERO,
+                );
+            }
+            if process_table_denied && !judged_without_listing {
                 // This worker inherited a sandboxed caller's sandbox and
-                // cannot list processes: another pass would only defer every
-                // session again. Stop the lane with the request pending (the
-                // refusal is recorded for `broker status`), so the next
-                // worker, started by a command that can list processes or by
-                // the managed sweep, judges them.
+                // cannot list processes, and this pass judged nothing else:
+                // another pass would only defer every session again. Stop
+                // the lane with the request pending (the refusal is recorded
+                // for `broker status`), so the next worker, started by a
+                // command that can list processes or by the managed sweep,
+                // judges them.
                 crate::phase_telemetry::add(
                     "session_retirement_stopped_process_table_denied",
                     Duration::ZERO,

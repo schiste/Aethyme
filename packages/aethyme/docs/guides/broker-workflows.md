@@ -1663,3 +1663,28 @@ parent and the participating heads as subsequent parents. Individual pull
 requests and prefixes still require verification on their own candidate.
 A repeated batch can reuse cacheable gate verdicts for the same tree,
 definition and execution profile. Use `--no-cache` for fresh gate execution.
+
+### Share verification when the ordinary queue is busy
+
+When your repository provides an authorized way to land one combined candidate,
+each participating session can opt in by naming the same coordinator session:
+
+```sh
+aethyme broker submit queued "$COORDINATOR" --session "$OWN_SESSION" --json
+```
+
+The coordinator must also run this command for its own session. Publish
+the member heads first. If the ordinary verification pool is saturated, each
+compatible submit joins the waiting queue. When a submit acquires a slot, it
+can take up to sixteen already waiting participants. The group needs the same
+fetched base and cache mode, with distinct heads and disjoint changed paths.
+The broker preserves their order in the waiting queue and runs the exact
+combined candidate through the normal graph and gate policy.
+
+Each participant receives the same combined candidate and gate verdict.
+The named coordinator may use the repository's authorized group merge
+workflow, subject to its merge permissions and required provider checks.
+Other participants can wait for that result. If a slot opens with only one
+eligible submit, that submit starts immediately. An incompatible, stale,
+or failed group falls back to ordinary verification. Use ordinary
+`broker submit` for repositories that land each pull request separately.

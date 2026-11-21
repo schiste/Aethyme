@@ -449,6 +449,10 @@ pub(crate) enum AbandonmentKeepReason {
     LifecycleBusy,
     /// The pass deadline ran out during the running-work checks.
     DeadlineReached,
+    /// The working-tree status the work class depends on could not be taken
+    /// to the end (its deadline cut it, or Git failed): the session was not
+    /// examined this pass, and nothing about its work is recorded.
+    WorkingTreeNotExamined,
     /// A gate runs for the session.
     GateRunning,
     /// The gate inventory could not be read or verified.
@@ -541,6 +545,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "start_reserved",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::DeadlineReached => "deadline_reached",
+            Self::WorkingTreeNotExamined => "working_tree_not_examined",
             Self::GateRunning => "gate_running",
             Self::GatesUnknown => "gates_unknown",
             Self::OperationUnresolved => "operation_unresolved",
@@ -604,6 +609,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "session_abandonment_kept_start_reserved",
             Self::LifecycleBusy => "session_abandonment_kept_lifecycle_busy",
             Self::DeadlineReached => "session_abandonment_kept_deadline_reached",
+            Self::WorkingTreeNotExamined => "session_abandonment_kept_working_tree_not_examined",
             Self::GateRunning => "session_abandonment_kept_gate_running",
             Self::GatesUnknown => "session_abandonment_kept_gates_unknown",
             Self::OperationUnresolved => "session_abandonment_kept_operation_unresolved",
@@ -1635,6 +1641,19 @@ impl Broker {
             SessionCloseLane::Abandonment,
         )?;
         if outcome == AbandonedSessionCloseOutcome::Closed {
+            if process_table.early_safe_close() {
+                crate::phase_telemetry::add(
+                    "session_abandonment_safe_closed",
+                    std::time::Duration::ZERO,
+                );
+                if let Ok(closed) = self.store_ref().session(session_id) {
+                    crate::stale_session_policy::record_early_close(
+                        self.store(),
+                        &closed.worktree_path,
+                        crate::clock::epoch_ms(),
+                    );
+                }
+            }
             process_table.clear_keep_reason();
             self.retire_inline_after_close(session_id, deadline);
         } else {
@@ -1776,11 +1795,23 @@ impl Broker {
         // The look under both claims decides the close: its working-tree
         // answer is taken now, never remembered (an unstaged edit or a new
         // untracked file does not change the index the memory is keyed by).
-        let class = if under_claims {
-            self.stale_work_class_fresh(session)
-        } else {
-            self.stale_work_class(session)
-        };
+        let (class, examined) = self.stale_work_class_examined(
+            session,
+            if under_claims {
+                stale::TreeCheck::Fresh
+            } else {
+                stale::TreeCheck::MayRemember
+            },
+        );
+        if !examined {
+            // Not examined is not uncommitted work: nothing is remembered,
+            // no closing-soon note is left, and the next pass asks again.
+            return Err(keep_with(
+                process_table,
+                AbandonmentKeepReason::WorkingTreeNotExamined,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
+        }
         let activity_ms = activity_ms.max(session.created_at);
         let not_due = |revisit_at_ms: Option<i64>| {
             if let Some(revisit_at_ms) = revisit_at_ms {
@@ -1808,6 +1839,24 @@ impl Broker {
             session.id,
             stale::ClassRecord { class, due_at_ms },
         );
+        // Before the class window, the session may still close now when
+        // nothing on it can be lost: evaluated afresh on every look, and the
+        // look under both claims is the one right before the close. A
+        // session that fails keeps today's path below (closing-soon note,
+        // then the archive-verified close at the class window).
+        let class_window_reached = matches!(verdict, stale::StaleClassVerdict::Due { .. });
+        process_table.note_early_safe_close(false);
+        if !class_window_reached {
+            match self.abandonment_safety_check(session) {
+                Ok(()) => {
+                    process_table.note_early_safe_close(true);
+                    return Ok(class);
+                }
+                Err(reason) => {
+                    crate::phase_telemetry::add(reason.telemetry_name(), std::time::Duration::ZERO);
+                }
+            }
+        }
         match verdict {
             stale::StaleClassVerdict::Due { .. } => Ok(class),
             stale::StaleClassVerdict::NotDue { revisit_at_ms, .. } => {
@@ -2075,7 +2124,7 @@ impl Broker {
             .map_or(0, |(streak, _)| *streak);
         let budget = doubled_proof_budget(landed_proof_base_budget(session_id), streak);
         if streak > 0 {
-            crate::phase_telemetry::add("landed_proof_session_budget_doubled", budget);
+            crate::phase_telemetry::value("landed_proof_session_budget_doubled", budget);
         }
         budget
     }
@@ -2698,11 +2747,40 @@ impl Broker {
             match self.follow_up_protected(&candidate, follow_up_on_spawned_checkout) {
                 Ok(false) => {}
                 Ok(true) | Err(_) => {
-                    return Ok(keep_with(
-                        process_table,
-                        AbandonmentKeepReason::FollowUpProtected,
-                        AbandonedSessionCloseOutcome::NotDue,
-                    ));
+                    // The protection exists so a follow-up is not closed
+                    // while its work could still matter. A follow-up idle
+                    // past the abandonment window with nothing to lose (the
+                    // early-close rule, evaluated now and again under both
+                    // claims) closes like any other session: `start
+                    // --reuse` resumes it exactly.
+                    let idle_past_window = matches!(
+                        crate::decide_abandonment(
+                            &SessionActivity {
+                                session_id,
+                                last_activity_at: candidate.last_activity_at,
+                                created_at: candidate.created_at,
+                                agent_alive: None,
+                                closed: false,
+                            },
+                            decision_now_ms,
+                            abandon_after_ms,
+                        ),
+                        crate::AbandonmentVerdict::Abandoned { .. }
+                    );
+                    let safe = lane == SessionCloseLane::Abandonment
+                        && idle_past_window
+                        && self.abandonment_safety_check(&candidate).is_ok();
+                    if !safe {
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::FollowUpProtected,
+                            AbandonedSessionCloseOutcome::NotDue,
+                        ));
+                    }
+                    crate::phase_telemetry::add(
+                        "session_abandonment_follow_up_safe",
+                        std::time::Duration::ZERO,
+                    );
                 }
             }
         }
@@ -2733,7 +2811,13 @@ impl Broker {
                 ));
             }
         };
-        let database_activity = fs_activity.max(candidate.last_activity_at).max(merged_at);
+        // An agent that only reads (tool calls, no writes, no broker
+        // command) still signals through its PreToolUse hook.
+        let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), session_id);
+        let database_activity = fs_activity
+            .max(candidate.last_activity_at)
+            .max(merged_at)
+            .max(hook_activity);
         if !matches!(
             crate::decide_abandonment(
                 &SessionActivity {
@@ -3413,7 +3497,10 @@ impl Broker {
         // The opt-in abandonment lane tolerates the live holder's own working
         // directory; the landed lane does not: an agent sitting in its
         // worktree is using it.
-        let exempt_holder = if require_landed || moved_on_to.is_some() {
+        // A session closing early (before its class window) tolerates no
+        // process in its checkout, not even its recorded holder's.
+        let early_safe = process_table.early_safe_close();
+        let exempt_holder = if require_landed || moved_on_to.is_some() || early_safe {
             None
         } else {
             live_task_holder.as_ref().map(|agent| agent.pid)
@@ -3425,6 +3512,7 @@ impl Broker {
         let process_use_checked = task_lease_binding_present
             || merged_lane
             || no_work_lane
+            || early_safe
             || moved_on_to.is_some()
             || (lane == SessionCloseLane::Abandonment
                 && holder.liveness == crate::session_holder::RecordedHolderLiveness::Unbound);
@@ -3898,6 +3986,24 @@ impl Broker {
         // new uncommitted work since the first look changes its window.
         let stale_class = if lane == SessionCloseLane::Abandonment {
             match self.stale_class_gate(&current, activity_at, observed_at, process_table, true) {
+                // The early-close rule first held here, under the claims,
+                // after the process checks ran on the first look's verdict
+                // (no rule held then): they may have exempted the holder's
+                // working directory or skipped the open-file observation. An
+                // early close needs those checks without the exemption, so
+                // this look keeps the session; the next pass starts from the
+                // rule holding and runs them in full.
+                Ok(_) if process_table.early_safe_close() && !early_safe => {
+                    crate::phase_telemetry::add(
+                        "session_abandonment_early_rule_first_held_under_claims",
+                        std::time::Duration::ZERO,
+                    );
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::WorkClassNotDue,
+                        AbandonedSessionCloseOutcome::NotDue,
+                    ));
+                }
                 Ok(class) => Some(class),
                 Err(kept) => return Ok(kept),
             }
@@ -3975,7 +4081,13 @@ impl Broker {
                         crate::session_auto_close::CLOSE_REASON_INACTIVE_NO_WORK,
                     )
                 } else if let Some(class) = stale_class {
-                    crate::session_auto_close::with_work_class(&payload, class.code())
+                    let payload =
+                        crate::session_auto_close::with_work_class(&payload, class.code());
+                    if process_table.early_safe_close() {
+                        crate::session_auto_close::with_early_close(&payload)
+                    } else {
+                        payload
+                    }
                 } else {
                     payload
                 }

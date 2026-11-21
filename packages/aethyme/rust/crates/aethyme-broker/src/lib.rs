@@ -32,6 +32,7 @@ pub mod base_incidents;
 mod blockers;
 mod bounded_output;
 mod broker;
+mod cargo_target_prune;
 mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
@@ -256,6 +257,7 @@ pub use representation::{
     SessionContent, content_at as representation_content_at, find_landing, landing_base,
     plan_digest as representation_plan_digest, session_content, work_landed,
 };
+mod abandonment_safety;
 mod pr_overlap;
 mod repository_contract;
 mod resources;
@@ -460,10 +462,11 @@ pub use measurement::{
     BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
 };
 pub use merge::{
-    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
-    SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
-    SubmissionIntegrationState, SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION,
-    VERIFIED_AGAINST_LOCAL_DEFAULT, VERIFIED_AGAINST_UPSTREAM, VerificationBase,
+    ACTION_REQUIRED_RELPATH, BatchMember, PromoteConfig, QueuedBatchReceipt,
+    SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict,
+    SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_LOCAL_DEFAULT,
+    VERIFIED_AGAINST_UPSTREAM, VerificationBase,
 };
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,

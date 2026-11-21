@@ -2996,8 +2996,22 @@ fn prepare_managed_gate_cache(
     let root = storage.cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
-    let mut runtime =
-        prepare_managed_gate_cache_in(policy, repository, progress, gate_name, &root)?;
+    // Pruned units are handed to the storage worker, which removes the
+    // host cache root's `.aethyme-storage-evicting-*` leftovers in the
+    // background on every pass; with the worker off, they go inline.
+    let deferred_deletion = storage
+        .resource_db_path()
+        .ok()
+        .and_then(|registry| registry.parent().map(Path::to_path_buf))
+        .is_some_and(|host_state| crate::storage_ledger::check::enabled(&host_state));
+    let mut runtime = prepare_managed_gate_cache_in(
+        policy,
+        repository,
+        progress,
+        gate_name,
+        &root,
+        deferred_deletion,
+    )?;
     if let Some(runtime) = runtime.as_mut() {
         let files = checkout
             .working_state_files()
@@ -3065,12 +3079,21 @@ fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error
     )
 }
 
+/// The pruned-units record inside a managed cache: which units the last
+/// prune staged, read by the next gate to count rebuilds.
+const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+
+/// How long a gate may spend moving superseded units out of its managed
+/// cache before it runs its command.
+const MANAGED_CACHE_PRUNE_BUDGET: Duration = Duration::from_secs(5);
+
 fn prepare_managed_gate_cache_in(
     policy: Option<&ManagedGateCache>,
     repository: &str,
     progress: &dyn GateProgressSink,
     gate_name: &str,
     root: &Path,
+    deferred_deletion: bool,
 ) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
     let Some(policy) = policy else {
         return Ok(None);
@@ -3088,11 +3111,95 @@ fn prepare_managed_gate_cache_in(
         Err(error) => return Err(error),
     };
     let bytes_before = usage_before.bytes;
-    let rotated_before_run = bytes_before > policy.max_bytes;
+    // Units the previous prune staged that cargo has since rebuilt with the
+    // same hash: the prune misjudged them as unused.
+    let marker = directory.join(PRUNED_UNITS_MARKER);
+    if let Ok(text) = std::fs::read_to_string(&marker) {
+        let staged: Vec<String> = text.lines().map(str::to_string).collect();
+        let rebuilt = crate::cargo_target_prune::rebuilt_units(&directory, &staged);
+        crate::phase_telemetry::attach(
+            "managed_cache_prune",
+            serde_json::json!({"rebuilt_after_previous_prune": rebuilt}),
+        );
+        for _ in 0..rebuilt {
+            crate::phase_telemetry::add(
+                "managed_cache_prune_rebuilt_unit",
+                std::time::Duration::ZERO,
+            );
+        }
+        crate::warn_unrecorded(
+            "remove the pruned-units record",
+            std::fs::remove_file(&marker),
+        );
+    }
+    // Over its ceiling, first move superseded build units (earlier
+    // generations of a unit nothing has read since its successor was built)
+    // out of the tree, down to three quarters of the ceiling, so the next
+    // build keeps what it uses. The in-band part only renames, within
+    // MANAGED_CACHE_PRUNE_BUDGET; deletion is deferred. Rotate the whole tree
+    // only when that did not bring it under the ceiling. This gate already
+    // holds the cache's exclusive lease.
+    let mut bytes_after_prune = bytes_before;
+    if bytes_before > policy.max_bytes {
+        let _span = crate::phase_telemetry::span("managed_cache_prune");
+        let low_water = policy.max_bytes / 4 * 3;
+        let staging = root.join(format!(
+            ".aethyme-storage-evicting-{}-{}-pruned",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let pruned = crate::cargo_target_prune::prune_superseded_units(
+            &directory,
+            &staging,
+            bytes_before.saturating_sub(low_water),
+            Instant::now() + MANAGED_CACHE_PRUNE_BUDGET,
+        );
+        bytes_after_prune = bytes_before.saturating_sub(pruned.bytes);
+        crate::phase_telemetry::attach(
+            "managed_cache_prune",
+            serde_json::json!({
+                "candidates": pruned.candidates,
+                "units": pruned.units,
+                "bytes": pruned.bytes,
+                "deadline_stopped": pruned.deadline_stopped,
+                "deletion_deferred": deferred_deletion,
+            }),
+        );
+        for _ in 0..pruned.units {
+            crate::phase_telemetry::add(
+                "managed_cache_prune_staged_unit",
+                std::time::Duration::ZERO,
+            );
+        }
+        if pruned.deadline_stopped {
+            crate::phase_telemetry::add(
+                "managed_cache_prune_deadline_stop",
+                std::time::Duration::ZERO,
+            );
+        }
+        if pruned.units > 0 {
+            progress.report(&format!(
+                "gate {gate_name} pruned {} superseded build units ({} bytes) from managed cache {}",
+                pruned.units, pruned.bytes, policy.key
+            ));
+            crate::warn_unrecorded(
+                "record the pruned units",
+                std::fs::write(&marker, pruned.staged.join("\n")),
+            );
+        }
+        if staging.exists() && !deferred_deletion {
+            let _span = crate::phase_telemetry::span("managed_cache_prune_inline_delete");
+            crate::warn_unrecorded(
+                "delete the pruned units",
+                crate::storage_ledger::evict::delete_tree(&staging, &mut || {}, None).map(drop),
+            );
+        }
+    }
+    let rotated_before_run = bytes_after_prune > policy.max_bytes;
     if rotated_before_run {
         progress.report(&format!(
             "gate {gate_name} rotating managed cache {} ({} bytes exceeds {} bytes)",
-            policy.key, bytes_before, policy.max_bytes
+            policy.key, bytes_after_prune, policy.max_bytes
         ));
         let retired = repository_root.join(format!(
             ".{}.retired-{}-{}",
@@ -10101,6 +10208,135 @@ end = 55999
         );
     }
 
+    /// Over its ceiling, a cargo target first loses the build units a newer
+    /// generation superseded; it is rotated only when that is not enough, so
+    /// the next build keeps the units it uses.
+    #[test]
+    fn managed_cache_over_its_ceiling_prunes_superseded_units_before_rotating() {
+        for deferred_deletion in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let directory = tmp.path().join("gates/repository/cargo");
+            let profile = directory.join("debug");
+            write_unit_generations(&profile);
+            let policy = ManagedGateCache {
+                key: "cargo".into(),
+                max_bytes: 1_000,
+            };
+
+            let runtime = prepare_managed_gate_cache_in(
+                Some(&policy),
+                "repository",
+                &StderrGateProgressSink,
+                "test",
+                tmp.path(),
+                deferred_deletion,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(runtime.provenance.bytes_before, 1_202);
+            assert!(!runtime.provenance.rotated_before_run);
+            assert!(!profile.join("deps/libwork-aaaaaaaaaaaaaaaa.rlib").exists());
+            assert!(profile.join("deps/libwork-bbbbbbbbbbbbbbbb.rlib").exists());
+            assert!(
+                profile
+                    .join(".fingerprint/work-bbbbbbbbbbbbbbbb/lib-work")
+                    .exists()
+            );
+            // Staged in the host cache root for the storage worker, or
+            // deleted inline when that worker is off.
+            let staging: Vec<_> = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".aethyme-storage-evicting-"))
+                .collect();
+            assert_eq!(staging.len(), usize::from(deferred_deletion), "{staging:?}");
+            assert_eq!(
+                std::fs::read_to_string(directory.join(PRUNED_UNITS_MARKER)).unwrap(),
+                "debug/.fingerprint/work-aaaaaaaaaaaaaaaa"
+            );
+        }
+    }
+
+    fn write_unit_generations(profile: &Path) {
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write = |path: &Path, bytes: usize, seconds: u64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0_u8; bytes]).unwrap();
+            let when = base + Duration::from_secs(seconds);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(when)
+                        .set_accessed(when),
+                )
+                .unwrap();
+        };
+        for (hash, seconds) in [("aaaaaaaaaaaaaaaa", 10), ("bbbbbbbbbbbbbbbb", 100)] {
+            write(
+                &profile.join(format!(".fingerprint/work-{hash}/lib-work")),
+                1,
+                seconds,
+            );
+            write(
+                &profile.join(format!("deps/libwork-{hash}.rlib")),
+                600,
+                seconds,
+            );
+        }
+    }
+
+    /// The gate after a prune counts the units cargo rebuilt with a pruned
+    /// hash, so a misjudged access time shows up in the metrics.
+    #[test]
+    fn the_gate_after_a_prune_counts_units_rebuilt_with_a_pruned_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("gates/repository/cargo");
+        let profile = directory.join("debug");
+        write_unit_generations(&profile);
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: 1_000,
+        };
+        let prepare = || {
+            prepare_managed_gate_cache_in(
+                Some(&policy),
+                "repository",
+                &StderrGateProgressSink,
+                "test",
+                tmp.path(),
+                false,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        prepare();
+        // Cargo rebuilds the pruned generation.
+        std::fs::create_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            prepare();
+        }
+
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("managed_cache_prune_rebuilt_unit"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            recorder.attachments()["managed_cache_prune"]["rebuilt_after_previous_prune"],
+            1
+        );
+        assert!(!directory.join(PRUNED_UNITS_MARKER).exists());
+    }
+
     #[test]
     fn missing_managed_cache_is_measured_as_empty_before_creation() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10117,6 +10353,7 @@ end = 55999
             &StderrGateProgressSink,
             "test",
             tmp.path(),
+            false,
         )
         .unwrap()
         .unwrap();
@@ -10144,6 +10381,7 @@ end = 55999
             &StderrGateProgressSink,
             "test",
             tmp.path(),
+            false,
         )
         .unwrap()
         .unwrap();
