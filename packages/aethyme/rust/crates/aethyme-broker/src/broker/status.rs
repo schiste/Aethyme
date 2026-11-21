@@ -56,6 +56,14 @@ impl Broker {
             &self.checkout_retirement_too_large(),
             &self.checkout_retirement_in_progress(),
         );
+        push_retirement_lane_advice(
+            &mut view,
+            &self.checkout_retirement_lane_record(),
+            self.checkout_retirement_progress()
+                .strip
+                .backlog
+                .closed_folders,
+        );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         self.push_package_store_volume_advice(&mut view);
@@ -979,6 +987,14 @@ impl Broker {
             &self.checkout_retirement_progress(),
             &self.checkout_retirement_too_large(),
             &self.checkout_retirement_in_progress(),
+        );
+        push_retirement_lane_advice(
+            &mut view,
+            &self.checkout_retirement_lane_record(),
+            self.checkout_retirement_progress()
+                .strip
+                .backlog
+                .closed_folders,
         );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);

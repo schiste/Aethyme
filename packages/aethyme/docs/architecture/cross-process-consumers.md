@@ -3701,6 +3701,18 @@ Covered by `broker/retire.rs`, `gc/background_priority.rs` and `cli/telemetry.rs
   - A lap does not start an inspection it cannot give its whole 60 s allowance. With less time left before the plan (whose context capture counts toward it), the checkout is kept as `inspection_deferred` (counter `checkout_retirement_kept_inspection_deferred`, not remembered), and the lap stops there with its cursor before that checkout (`closed_stop` `inspection_deferred`). With 50 or more closed checkouts waiting, the worker's closed-lap floor is now 75 s instead of 45 s, so one inspection with its allowance always fits. The lane process's 5-minute slices give each inspection its allowance except near a slice's end, where the same rule defers it to the next slice.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-21 (retirement lane at an ordinary process's disk priority). On 0.8.144 on the busiest repository the first lane run (1,319 s, 5 slices) examined 24 closed checkouts and retired none.
+  - All 16 inspections it started stopped in the eligibility `git status` at the 60 s allowance: 12 failed on the allowance and 4 were cut by the slice's deadline. The 15 `git_timeout_not_started` are each failure's follow-up `rev-parse --is-shallow-repository` for its message, which runs under the same expired deadline. A deadline reused from earlier is not the cause.
+  - Timed once in an ordinary shell under a load of 25 to 28, the same read-only command took 0.14 s on one of those checkouts and 0.36 s on another closed checkout.
+  - A sample of the lane process showed every thread blocked in single `stat` and `read` calls on the checkouts' volume.
+  - Cause: at `IOPOL_STANDARD` (tier 1), the lane's I/O, and its Git children's (they inherit it), waited behind the agents' builds (tier 0) on the same volume.
+
+  Now:
+  - The lane process sets `IOPOL_IMPORTANT`, an ordinary process's policy (attachment `checkout_retirement_lane_priority` `io_policy` `important`), keeping CPU niceness 10. It stays bounded by one judgement at a time per volume and by host-pressure pacing.
+  - Each lane run records its outcome (meta key `checkout_retirement.lane`: `runs_without_retirement`, and the last run's `examined`, inspections started, succeeded, failed and cut, end reason, time). A run that retires one resets the count; a run that ran no slice leaves it.
+  - From 3 runs in a row that retired nothing while closed checkouts wait, `broker status` shows the Warning `cleanup.retirement-lane-idle` with the last run's counts, and the lane counts `checkout_retirement_lane_idle_runs`.
+Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
