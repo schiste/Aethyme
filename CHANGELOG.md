@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.151] - 2026-11-21
+
+### Fixed
+
+- `submit` no longer removes its verification slot inline. The slot's worktree is moved into the trash beside it with one rename, its Git registration dropped, and the paced deleter removes the tree later; Git's removal remains the fallback and is always used for a slot under the temporary root. On the busiest repository the inline removal took about 21 s a submit (#1924).
+- The lease refresh reuses the watcher-proven changed-file answer for every session other than the acting one, in any command including `submit`. The acting session and lease-claim scans still ask Git, so every decision rests on a fresh answer; peers' paths feed only advisory overlap reports (#1924).
+- The trash drain drops rows whose trash directory's parent is gone, instead of keeping them forever and re-spawning the catch-up lane. Rows on a removable volume that is not mounted are kept (#1924).
+
+### Added
+
+- Span `verification_slot_trash`; counters `verification_slot_trashed`, `verification_slot_trash_fell_back_to_git`, `verification_slot_trash_skipped_temporary`, `verification_slot_trash_entries_removed`, `checkout_trash_vanished_rows_dropped` and `changed_files_peer_reuse`. Trash rows carry a `verification` flag, so slot bytes are not counted as freed by strip (#1924).
+
 ## [0.8.150] - 2026-11-21
 
 ### Fixed
