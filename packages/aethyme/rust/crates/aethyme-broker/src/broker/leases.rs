@@ -997,7 +997,6 @@ pub(crate) fn is_broker_state_file(
     first.starts_with("broker.db") || first.ends_with(".lock")
 }
 
-/// The checkout's HEAD commit, or `None` when it cannot be read.
 #[cfg(test)]
 thread_local! {
     /// Test seams around the abandoned-session close: after its second look,
@@ -1017,59 +1016,87 @@ const ABANDONED_CLOSE_CLAIM_BUDGET: std::time::Duration = std::time::Duration::f
 /// in a session's checkout moves: its HEAD commit, the session branch's tip
 /// and the identity of the checkout's index file. Read from files only (no
 /// Git), so taking it under the lifecycle claim is a few reads. A part that
-/// cannot be read is `None`, and the close keeps the session.
+/// is not there (no checkout, no such branch, no index) is `None`, which
+/// compares equal only to another `None`; a part that is there but cannot
+/// be read or understood makes the stamp `unreadable`, and the close keeps
+/// the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AbandonmentCheckoutStamp {
     head: Option<String>,
     branch_tip: Option<String>,
     /// `(device, inode, modification seconds, nanoseconds, length)`.
     index: Option<(u64, u64, i64, i64, u64)>,
+    unreadable: bool,
 }
 
 impl AbandonmentCheckoutStamp {
     fn complete(&self) -> bool {
-        self.head.is_some() && self.branch_tip.is_some() && self.index.is_some()
+        !self.unreadable
+    }
+}
+
+/// A file's text: `Ok(None)` when it does not exist, `Err` when it exists
+/// but cannot be read.
+fn read_optional(path: &std::path::Path) -> Result<Option<String>, ()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
 fn abandonment_checkout_stamp(session: &crate::types::Session) -> AbandonmentCheckoutStamp {
     let _span = crate::phase_telemetry::span("abandoned_close_checkout_stamp");
     let worktree = std::path::Path::new(&session.worktree_path);
-    let Some((git_dir, common_dir)) = checkout_git_dirs(worktree) else {
-        return AbandonmentCheckoutStamp {
-            head: None,
-            branch_tip: None,
-            index: None,
-        };
+    let mut stamp = AbandonmentCheckoutStamp {
+        head: None,
+        branch_tip: None,
+        index: None,
+        unreadable: false,
     };
-    AbandonmentCheckoutStamp {
-        head: read_head_commit(&git_dir, &common_dir),
-        branch_tip: read_ref_commit(&common_dir, &format!("refs/heads/{}", session.branch)),
-        index: index_identity(&git_dir),
-    }
+    let (git_dir, common_dir) = match checkout_git_dirs(worktree) {
+        Ok(Some(dirs)) => dirs,
+        Ok(None) => return stamp,
+        Err(()) => {
+            stamp.unreadable = true;
+            return stamp;
+        }
+    };
+    let head = read_head_commit(&git_dir, &common_dir);
+    let tip = read_ref_commit(&common_dir, &format!("refs/heads/{}", session.branch));
+    let index = index_identity(&git_dir);
+    stamp.unreadable = head.is_err() || tip.is_err() || index.is_err();
+    stamp.head = head.ok().flatten();
+    stamp.branch_tip = tip.ok().flatten();
+    stamp.index = index.ok().flatten();
+    stamp
 }
 
 /// A checkout's own Git directory and the repository's common directory,
 /// through its `.git` entry: a directory (both the same), or a linked
 /// worktree's `gitdir:` file whose directory names the common one in its
-/// `commondir` file.
+/// `commondir` file. `Ok(None)` when the checkout has no `.git` entry.
 fn checkout_git_dirs(
     worktree: &std::path::Path,
-) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, ()> {
     let dot_git = worktree.join(".git");
-    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
     if metadata.is_dir() {
-        return Some((dot_git.clone(), dot_git));
+        return Ok(Some((dot_git.clone(), dot_git)));
     }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
-    let target = std::path::PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    let text = read_optional(&dot_git)?.ok_or(())?;
+    let target = std::path::PathBuf::from(text.trim().strip_prefix("gitdir:").ok_or(())?.trim());
     let git_dir = if target.is_absolute() {
         target
     } else {
         worktree.join(target)
     };
-    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(text) => {
+    let common_dir = match read_optional(&git_dir.join("commondir"))? {
+        Some(text) => {
             let common = std::path::PathBuf::from(text.trim());
             if common.is_absolute() {
                 common
@@ -1077,65 +1104,80 @@ fn checkout_git_dirs(
                 git_dir.join(common)
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-        Err(_) => return None,
+        None => git_dir.clone(),
     };
-    Some((git_dir, common_dir))
+    Ok(Some((git_dir, common_dir)))
 }
 
-fn object_id(text: &str) -> Option<String> {
+fn object_id(text: &str) -> Result<String, ()> {
     let id = text.trim();
-    (matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| id.to_ascii_lowercase())
+    if matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id.to_ascii_lowercase())
+    } else {
+        Err(())
+    }
 }
 
 /// The commit HEAD names: detached, or through the branch it points at.
-fn read_head_commit(git_dir: &std::path::Path, common_dir: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+fn read_head_commit(
+    git_dir: &std::path::Path,
+    common_dir: &std::path::Path,
+) -> Result<Option<String>, ()> {
+    let Some(text) = read_optional(&git_dir.join("HEAD"))? else {
+        return Ok(None);
+    };
     match text.trim().strip_prefix("ref:") {
         Some(target) => read_ref_commit(common_dir, target.trim()),
-        None => object_id(&text),
+        None => object_id(&text).map(Some),
     }
 }
 
 /// A branch or other ref under the common directory: its loose file, else
-/// its line in `packed-refs`. `None` when neither names it.
-fn read_ref_commit(common_dir: &std::path::Path, name: &str) -> Option<String> {
+/// its line in `packed-refs`. `Ok(None)` when neither names it.
+fn read_ref_commit(common_dir: &std::path::Path, name: &str) -> Result<Option<String>, ()> {
     if !name.starts_with("refs/")
         || name
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
-        return None;
+        return Err(());
     }
-    match std::fs::read_to_string(common_dir.join(name)) {
-        Ok(text) => return object_id(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
+    if let Some(text) = read_optional(&common_dir.join(name))? {
+        return object_id(&text).map(Some);
     }
-    let packed = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
-    packed
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
-        .find_map(|line| {
-            let (id, reference) = line.split_once(' ')?;
-            (reference.trim() == name).then(|| object_id(id)).flatten()
-        })
+    let Some(packed) = read_optional(&common_dir.join("packed-refs"))? else {
+        return Ok(None);
+    };
+    for line in packed.lines() {
+        if line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        if let Some((id, reference)) = line.split_once(' ')
+            && reference.trim() == name
+        {
+            return object_id(id).map(Some);
+        }
+    }
+    Ok(None)
 }
 
-/// The identity of a checkout's index file.
-fn index_identity(git_dir: &std::path::Path) -> Option<(u64, u64, i64, i64, u64)> {
+/// The identity of a checkout's index file; `Ok(None)` when it has none.
+fn index_identity(git_dir: &std::path::Path) -> Result<Option<(u64, u64, i64, i64, u64)>, ()> {
     use std::os::unix::fs::MetadataExt as _;
-    let index = std::fs::symlink_metadata(git_dir.join("index")).ok()?;
-    Some((
-        index.dev(),
-        index.ino(),
-        index.mtime(),
-        index.mtime_nsec(),
-        index.len(),
-    ))
+    match std::fs::symlink_metadata(git_dir.join("index")) {
+        Ok(index) => Ok(Some((
+            index.dev(),
+            index.ino(),
+            index.mtime(),
+            index.mtime_nsec(),
+            index.len(),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
+/// The checkout's HEAD commit, or `None` when it cannot be read.
 fn current_checkout_head(worktree: &std::path::Path) -> Option<String> {
     crate::git::GitRepo::discover(worktree)
         .ok()?
