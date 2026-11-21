@@ -3713,6 +3713,11 @@ Covered by `broker/retire.rs` tests.
   - From 3 runs in a row that retired nothing while closed checkouts wait, `broker status` shows the Warning `cleanup.retirement-lane-idle` with the last run's counts, and the lane counts `checkout_retirement_lane_idle_runs`.
 Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
 
+- Changed 2026-11-21 (fast finish). On 0.8.144 on the busiest repository three of four finishes took 60 s, two of them failing on the lifecycle-claim wait. The finish that retired spent 2.2 s in `finish_retire_move`. The rest was `finish_size_walk_unlocked` (14.7 to 45.0 s) and `lifecycle_lock_wait` (13.3 to 34.8 s, `waited_behind` `broker gc __continue-artifacts`). The overlapping worker run held the claim 3 times for 80 s in all: the checkout strip pass's proofs, whose `git status` ran under the claim to the pass's deadline (`proof_git_stopped_at_deadline` 3, 23.7 s each). Now:
+  - `finish` walks the checkout for its reported `reclaimed_bytes` for at most 2 s (`FINISH_SIZE_WALK_BUDGET`, `directory_usage_bounded`, never following links). A walk that runs out records no size, reported as 0 exactly like a failed walk (counter `finish_size_walk_budget_stopped`); eligibility never reads the size.
+  - A background strip's proofs run under the lifecycle claim for at most 5 s (`STRIP_PROOF_UNDER_CLAIM_BUDGET`, with the Git deadline set to match). A proof that runs out is a transient refusal, tried again by the next pass (counter `checkout_strip_proof_claim_budget_stopped`). What a strip proves is unchanged.
+  - A background lifecycle hold of 5 s or more is counted with its time (`lifecycle_lock_held_background_long`), so a slow foreground command can be traced to its holder.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises

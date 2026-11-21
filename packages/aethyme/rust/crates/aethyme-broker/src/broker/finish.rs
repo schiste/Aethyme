@@ -3,6 +3,9 @@ use super::*;
 /// Bound on the ownership re-proof `finish` makes before recording its
 /// recovery proof when no landing deadline is set.
 const FINISH_REPROOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest `finish` walks a checkout to report the bytes its removal
+/// reclaims.
+const FINISH_SIZE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Broker {
     /// Retrieve the latest durable finish handoff for one session.
@@ -273,9 +276,23 @@ impl Broker {
         let _span = crate::phase_telemetry::span("finish_size_walk_unlocked");
         let mut records = crate::measurement::SizeRecords::default();
         let path = Path::new(&session.worktree_path);
-        if path.exists()
-            && let Ok(usage) = crate::disk_headroom::directory_usage_without_following_links(path)
-        {
+        // Bounded: the size only feeds the reported `reclaimed_bytes`, and
+        // on the busiest repository the unbounded walk took 14 to 45 s of
+        // each 60 s finish. A walk that runs out records nothing (size
+        // unknown, reported as 0), exactly like a walk that failed.
+        let deadline = std::time::Instant::now() + FINISH_SIZE_WALK_BUDGET;
+        let usage = if path.exists() {
+            crate::disk_headroom::directory_usage_bounded(path, deadline)
+        } else {
+            None
+        };
+        if usage.is_none() && path.exists() && std::time::Instant::now() >= deadline {
+            crate::phase_telemetry::add(
+                "finish_size_walk_budget_stopped",
+                std::time::Duration::ZERO,
+            );
+        }
+        if let Some(usage) = usage {
             records.record_usage(
                 &session.worktree_path,
                 usage.bytes,
