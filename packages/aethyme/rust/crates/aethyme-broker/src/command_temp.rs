@@ -706,7 +706,7 @@ mod tests {
         let (_owner, deep) = long_scratch();
         let owner = short_base();
         let base = base_of_length(owner.path(), 49);
-        let temp = CommandTemp::create_in(&deep, &[base.clone()], false).unwrap();
+        let temp = CommandTemp::create_in(&deep, std::slice::from_ref(&base), false).unwrap();
         let alias = temp.tmpdir();
         assert!(alias.starts_with(&base), "{alias:?}");
         assert_eq!(
@@ -731,7 +731,7 @@ mod tests {
         std::fs::create_dir(&linked).unwrap();
         std::os::unix::fs::symlink(&elsewhere, linked.join(format!("ae{}", uid()))).unwrap();
         assert_eq!(
-            CommandTemp::create_in(&deep, &[linked.clone()], false).err(),
+            CommandTemp::create_in(&deep, std::slice::from_ref(&linked), false).err(),
             Some(Unavailable::Failed)
         );
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
@@ -761,7 +761,7 @@ mod tests {
     fn a_too_long_alias_base_falls_back_to_the_inherited_folder() {
         let (_owner, deep) = long_scratch();
         assert_eq!(
-            CommandTemp::create_in(&deep, &[deep.clone()], false).err(),
+            CommandTemp::create_in(&deep, std::slice::from_ref(&deep), false).err(),
             Some(Unavailable::PathTooLong)
         );
         let live = deep.join(LIVE_CONTAINER);
