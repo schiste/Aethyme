@@ -56,6 +56,7 @@ impl Broker {
             &self.checkout_retirement_too_large(),
             &self.checkout_retirement_in_progress(),
         );
+        push_retirement_keeps_advice(&mut view, &self.checkout_retirement_keeps());
         push_retirement_lane_advice(
             &mut view,
             &self.checkout_retirement_lane_record(),
@@ -988,6 +989,7 @@ impl Broker {
             &self.checkout_retirement_too_large(),
             &self.checkout_retirement_in_progress(),
         );
+        push_retirement_keeps_advice(&mut view, &self.checkout_retirement_keeps());
         push_retirement_lane_advice(
             &mut view,
             &self.checkout_retirement_lane_record(),
