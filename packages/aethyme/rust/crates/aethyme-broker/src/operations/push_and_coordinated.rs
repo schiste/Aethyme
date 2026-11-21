@@ -479,6 +479,39 @@ fn push_process_split(
     ])
 }
 
+/// Attribute the stopped process without treating an incomplete trace as proof
+/// that a remote write did or did not happen.
+fn push_timeout_timing(trace: &GitTransferTrace, elapsed: Duration) -> serde_json::Value {
+    let stage = if trace.push_refs_started {
+        "transfer"
+    } else if trace.pre_push_hook_started_ms.is_some() && trace.pre_push_hook_ms.is_none() {
+        "pre_push_hook"
+    } else if trace.remote_refs_list_started && !trace.remote_refs_list_finished {
+        "remote_ref_listing"
+    } else {
+        "unknown"
+    };
+    let before = trace
+        .pre_push_hook_started_ms
+        .or(trace.remote_refs_read_ms)
+        .map(Duration::from_millis)
+        .filter(|before| *before <= elapsed);
+    let mut timing = json!({ "stage": stage, "process_ms": elapsed.as_millis() });
+    if let Some(before) = before {
+        timing["before_hook_ms"] = json!(before.as_millis());
+        if stage == "pre_push_hook" {
+            timing["hook_elapsed_ms"] = json!((elapsed - before).as_millis());
+        }
+    }
+    if let Some([_, (_, hook), (_, after)]) = push_process_split(trace, elapsed) {
+        timing["hook_ms"] = json!(hook.as_millis());
+        if stage == "transfer" {
+            timing["after_hook_ms"] = json!(after.as_millis());
+        }
+    }
+    timing
+}
+
 impl GitTransferTrace {
     /// Whether the push provably ended before it could send any ref update.
     ///
@@ -4300,6 +4333,13 @@ impl Broker {
                         &push_planning,
                     ),
                 );
+                if push_stages && let Some(trace) = &git_trace {
+                    let _span = crate::phase_telemetry::span("push_git_timeout_trace");
+                    details["push_timeout_timing"] = push_timeout_timing(
+                        &inspect_git_transfer_trace(trace.path()),
+                        process_elapsed,
+                    );
+                }
                 if let Some(liveness) = operation_liveness {
                     add_operation_liveness(&mut details, liveness);
                 }
