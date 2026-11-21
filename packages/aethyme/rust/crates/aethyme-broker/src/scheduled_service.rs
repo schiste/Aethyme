@@ -145,6 +145,36 @@ pub(crate) mod launchd {
         Unknown,
     }
 
+    /// Whether launchd has a label loaded, as `launchctl print` answers:
+    /// exit 0 is loaded, exit 113 ("could not find service") is not loaded,
+    /// and anything else (another exit, a timeout) proves nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LabelState {
+        Loaded,
+        NotLoaded,
+        Unknown,
+    }
+
+    /// Ask launchd whether `gui/<uid>/<label>` is loaded.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn label_state(uid: u32, label: &str) -> io::Result<LabelState> {
+        use crate::bounded_output::{LimitedOutput, output_limited};
+        use std::process::Command;
+        use std::time::Duration;
+        let output = output_limited(
+            Command::new("/bin/launchctl").args(["print", &format!("gui/{uid}/{label}")]),
+            Duration::from_secs(10),
+            64 * 1024,
+        )?;
+        Ok(match output {
+            LimitedOutput::Completed(output) if output.status.success() => LabelState::Loaded,
+            LimitedOutput::Completed(output) if output.status.code() == Some(113) => {
+                LabelState::NotLoaded
+            }
+            _ => LabelState::Unknown,
+        })
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn launchctl(args: &[String]) -> io::Result<Observation> {
         use crate::bounded_output::{LimitedOutput, output_limited};

@@ -2366,9 +2366,39 @@ fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
                 ));
             }
             let plan = crate::gc_sweep_service::service_plan()?;
+            // An installation already recorded under this repository's
+            // namespace, and whether `install` may replace it.
+            let existing = crate::gc_sweep_service::existing_installation_for(&plan)?;
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&plan)?);
+                let mut value = serde_json::to_value(&plan)?;
+                if let (Some(object), Some(existing)) = (value.as_object_mut(), existing.clone()) {
+                    object.insert("existing_installation".into(), existing);
+                }
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
+                if let Some(existing) = &existing
+                    && existing["same_plan"] != true
+                {
+                    out!(
+                        "An installation is recorded for this repository (plan {}, runtime {}, unit {}, scheduler {}).",
+                        existing["recorded_plan_digest"]
+                            .as_str()
+                            .unwrap_or("unreadable"),
+                        existing["recorded_runtime_version"]
+                            .as_str()
+                            .unwrap_or("unknown"),
+                        existing["unit_file"].as_str().unwrap_or("unknown"),
+                        existing["scheduler_state"].as_str().unwrap_or("unknown")
+                    );
+                    match existing["replaceable_because"].as_str() {
+                        Some(reason) => out!(
+                            "  install will archive it beside its directory and replace it: {reason}"
+                        ),
+                        None => out!(
+                            "  install will refuse to replace it: deactivate and uninstall it first"
+                        ),
+                    }
+                }
                 out!(
                     "GC sweep service plan {} (generation {})",
                     plan.digest,
