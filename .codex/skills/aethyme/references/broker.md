@@ -774,3 +774,7 @@ When using `broker advanced insights --json` to investigate recurring friction,
 read its window and coverage alongside its counts; absent session activity is
 unknown, not proof of no friction. Report lists, command metrics, and insights
 can have different coverage and retention.
+
+`aethyme broker advanced events --json` emits one event object per line
+(JSON Lines). Parse each line separately instead of loading the output as one
+JSON document.
