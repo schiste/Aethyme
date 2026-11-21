@@ -1125,6 +1125,15 @@ pub(crate) fn set_process_use_snapshot_for_tests(
 pub(crate) fn retirement_run_process_use_snapshot(
     budget: Duration,
 ) -> crate::reclaim::OpenFileSnapshot {
+    retirement_run_process_use_snapshot_with_limit(budget, budget)
+}
+
+/// [`retirement_run_process_use_snapshot`] allowing `lsof` up to `limit`
+/// (within `budget`), for the retry of an observation that ran out of time.
+pub(crate) fn retirement_run_process_use_snapshot_with_limit(
+    budget: Duration,
+    limit: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
     #[cfg(test)]
     if let Some(snapshot) = TEST_PROCESS_USE_QUEUE
         .with(|queue| queue.borrow_mut().pop_front())
@@ -1132,7 +1141,10 @@ pub(crate) fn retirement_run_process_use_snapshot(
     {
         return snapshot;
     }
-    crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget)
+    if limit <= Duration::from_secs(10) {
+        return crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget);
+    }
+    crate::reclaim::open_file_snapshot_under_with_limit(Path::new("/"), budget, limit)
 }
 
 /// One host-wide open-file observation for a checkout trash deleter run,
@@ -1214,6 +1226,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// When the last session kept for recent activity can first be due: its
     /// newest activity plus the window it was judged against.
     not_due_before_ms: std::cell::Cell<Option<i64>>,
+    /// The session being judged passed the early-close safety rule
+    /// (`abandonment_safety`) before its class window.
+    early_safe_close: std::cell::Cell<bool>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -1397,6 +1412,18 @@ impl RecordedHolderProcessTable {
     pub(crate) fn clear_keep_reason(&self) {
         self.keep_reason.set(None);
         self.not_due_before_ms.set(None);
+        self.early_safe_close.set(false);
+    }
+
+    /// Record whether the session being judged passed the early-close safety
+    /// rule in its latest look.
+    pub(crate) fn note_early_safe_close(&self, safe: bool) {
+        self.early_safe_close.set(safe);
+    }
+
+    /// Whether the session being judged passed the early-close safety rule.
+    pub(crate) fn early_safe_close(&self) -> bool {
+        self.early_safe_close.get()
     }
 
     /// Record that the session being judged cannot be due before `at_ms`

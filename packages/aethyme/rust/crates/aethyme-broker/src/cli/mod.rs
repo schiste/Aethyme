@@ -742,6 +742,11 @@ Usage:
       advance, push, sync, finish, close, git, gh and adopt --reuse refuse
       another live agent; --take-over moves the session to the caller and
       records a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker submit queued <coordinator-id> --session <id> [--no-cache] [--json]
+      Opt into whole-group verification with published sessions already waiting
+      for a verification slot and naming the same coordinator. Start ordinary
+      verification immediately when a slot is free. A group verdict applies
+      only to the combined candidate and authorizes no ref or provider writes.
   aethyme broker submit preverify <head> <base> --session <id> [--json]
       Warm reusable gates on the pinned candidate. A regular submit still verifies it.
   aethyme broker submit batch <base> <session=head>... --session <id> [--no-cache] [--json]
@@ -2751,9 +2756,9 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     };
     // Validate submit's optional exact-candidate requests before
     // advisory delivery or session admission touches broker state.
-    let (early_verification, batch_verification) = if subcommand == "submit" {
+    let (early_verification, batch_verification, queued_coordinator) = if subcommand == "submit" {
         match parsed.positional.as_slice() {
-            [] => (false, None),
+            [] => (false, None, None),
             [action, base, members @ ..] if action == "batch" => (
                 false,
                 Some(crate::merge::BatchRequest::parse(base, members).ok_or_else(|| {
@@ -2761,6 +2766,15 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
                         message: "submit batch requires an exact fetched base and two to sixteen distinct session=head pairs".into(),
                         code: crate::exit_status::USAGE,
                     }
+                })?),
+                None,
+            ),
+            [action, id] if action == "queued" => (
+                false,
+                None,
+                Some(id.parse::<i64>().ok().filter(|id| *id > 0).ok_or_else(|| UsageError::Exit {
+                    message: "submit queued requires a positive coordinator session ID".into(),
+                    code: crate::exit_status::USAGE,
                 })?),
             ),
             [action, head, base]
@@ -2770,12 +2784,14 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
                             && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
                     }) =>
             {
-                (true, None)
+                (true, None, None)
             }
             [unknown, ..] => {
                 return Err(UsageError::Exit {
                     message: if unknown == "preverify" {
                         "submit preverify requires an exact published head and fetched base object ID".into()
+                    } else if unknown == "queued" {
+                        "submit queued requires a coordinator session ID".into()
                     } else {
                         surface::unsupported_submit_subcommand(unknown)
                     },
@@ -2784,7 +2800,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             }
         }
     } else {
-        (false, None)
+        (false, None, None)
     };
     if subcommand == "advance" && !parsed.positional.is_empty() {
         return Err(UsageError::Exit {
@@ -2942,7 +2958,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "submit" if batch_verification.is_some() => {
             submit::run_submit_batch(parsed, batch_verification.expect("validated batch request"))?
         }
-        "submit" => run_submit(parsed)?,
+        "submit" => run_submit(parsed, queued_coordinator)?,
         "advance" => advance::run_advance(parsed)?,
         "push" => run_push(parsed)?,
         "sync" => run_sync(parsed)?,

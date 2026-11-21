@@ -60,6 +60,9 @@ use std::time::{Duration, Instant};
 /// Checkouts the strip pass looks at per run, at most. Each costs a few
 /// cheap Git reads and O(1) renames, so this is a cap, not a budget.
 pub(crate) const STRIP_CHECKOUTS_PER_RUN: usize = 200;
+/// The longest a background strip's proofs run under the lifecycle claim,
+/// which a foreground `start` or `finish` waits for.
+const STRIP_PROOF_UNDER_CLAIM_BUDGET: Duration = Duration::from_secs(5);
 /// Meta key: sessions whose checkout the strip pass already handled, with
 /// the close time it saw (JSON: session id to `closed_at`), so the next run
 /// does not list the same checkout again. A session closed again later (it
@@ -1894,6 +1897,14 @@ impl Broker {
         {
             return Refused(code);
         }
+        // The proofs run under the claim, and a foreground `start` or
+        // `finish` waits for it: on the busiest repository three proofs ran
+        // their `git status` to the pass's deadline (23.7 s) under it while
+        // finishes waited 13 to 35 s. Under the claim they get at most
+        // `STRIP_PROOF_UNDER_CLAIM_BUDGET`; a proof that runs out is a
+        // transient refusal, tried again by the next pass.
+        let claim_deadline = deadline.min(Instant::now() + STRIP_PROOF_UNDER_CLAIM_BUDGET);
+        let _claim_git_deadline = crate::git::limit_git_until(claim_deadline);
         let stripped = self.prove_and_move(
             StripTarget {
                 session_id: session.id,
@@ -1901,10 +1912,16 @@ impl Broker {
                 pool: &pool,
             },
             &candidates,
-            deadline,
+            claim_deadline,
             venv_markers,
             report,
         );
+        if Instant::now() >= claim_deadline && claim_deadline < deadline {
+            crate::phase_telemetry::add(
+                "checkout_strip_proof_claim_budget_stopped",
+                Duration::ZERO,
+            );
+        }
         CheckoutStrip::Done(stripped.len())
     }
 
@@ -2063,6 +2080,7 @@ impl Broker {
         };
         let mut folders = BTreeSet::new();
         let mut tombstones = BTreeSet::new();
+        let folder_census = crate::phase_telemetry::span("checkout_strip_backlog_folders");
         for session in live.iter().chain(closed.iter()) {
             if folders.contains(session.worktree_path.as_str())
                 || tombstones.contains(session.worktree_path.as_str())
@@ -2088,6 +2106,7 @@ impl Broker {
                 None => backlog.regenerable_partial = true,
             }
         }
+        drop(folder_census);
         backlog.folders = folders.len();
         let closed_folders = closed
             .iter()
@@ -2100,6 +2119,7 @@ impl Broker {
             crate::phase_telemetry::add("checkout_strip_backlog_deferred", Duration::ZERO);
             return backlog;
         }
+        let _regenerable = crate::phase_telemetry::span("checkout_strip_backlog_regenerable");
         for path in closed_folders {
             if Instant::now() >= deadline {
                 backlog.regenerable_partial = true;

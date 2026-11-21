@@ -3,6 +3,9 @@ use super::*;
 /// Bound on the ownership re-proof `finish` makes before recording its
 /// recovery proof when no landing deadline is set.
 const FINISH_REPROOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest `finish` walks a checkout to report the bytes its removal
+/// reclaims.
+const FINISH_SIZE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Broker {
     /// Retrieve the latest durable finish handoff for one session.
@@ -273,9 +276,23 @@ impl Broker {
         let _span = crate::phase_telemetry::span("finish_size_walk_unlocked");
         let mut records = crate::measurement::SizeRecords::default();
         let path = Path::new(&session.worktree_path);
-        if path.exists()
-            && let Ok(usage) = crate::disk_headroom::directory_usage_without_following_links(path)
-        {
+        // Bounded: the size only feeds the reported `reclaimed_bytes`, and
+        // on the busiest repository the unbounded walk took 14 to 45 s of
+        // each 60 s finish. A walk that runs out records nothing (size
+        // unknown, reported as 0), exactly like a walk that failed.
+        let deadline = std::time::Instant::now() + FINISH_SIZE_WALK_BUDGET;
+        let usage = if path.exists() {
+            crate::disk_headroom::directory_usage_bounded(path, deadline)
+        } else {
+            None
+        };
+        if usage.is_none() && path.exists() && std::time::Instant::now() >= deadline {
+            crate::phase_telemetry::add(
+                "finish_size_walk_budget_stopped",
+                std::time::Duration::ZERO,
+            );
+        }
+        if let Some(usage) = usage {
             records.record_usage(
                 &session.worktree_path,
                 usage.bytes,
@@ -320,6 +337,7 @@ impl Broker {
             !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
         report.cleanup_safe |= recovery_retry;
         if !report.cleanup_safe {
+            self.record_finish_keep(report.session_id, "cleanup_plan_unsafe");
             report.status = FinishStatus::Closed;
             report.cleanup.requested = true;
             report.cleanup.recovery_action =
@@ -452,10 +470,18 @@ impl Broker {
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
         let removal = crate::phase_telemetry::span("finish_claim_removal");
+        // The checkout this claim just proved clean and delivered leaves the
+        // pool by one rename into the trash (`finish_retire_move`); the
+        // deleter removes it later, once no process uses it.
+        let finish_retirement = super::retire::FinishRetirementScope::enter(report.session_id);
         let removed = crate::git::without_git_deadline(|| {
             self.cleanup_without_archive_under_lifecycle_claim(&cleanup_session, false)
         });
+        drop(finish_retirement);
         drop(removal);
+        if removed.is_err() {
+            self.record_finish_keep(report.session_id, "removal_failed");
+        }
         match removed {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
@@ -1118,7 +1144,24 @@ impl Broker {
         if report.cleanup_safe && broker_owned && !options.keep_worktree && auto_cleanup_enabled {
             self.run_finish_cleanup(&mut report, &session)?;
             return Ok(report);
-        } else if report.cleanup_safe {
+        }
+        // Why the checkout stays in the pool, on the session, for the
+        // retirement lane (`finish_retire_kept_<reason>`).
+        self.record_finish_keep(
+            session_id,
+            if options.keep_worktree {
+                "keep_worktree"
+            } else if !report.cleanup_safe && !report.dirty_paths.is_empty() {
+                "dirty"
+            } else if !report.cleanup_safe {
+                "not_proven_safe"
+            } else if !broker_owned {
+                "not_broker_owned"
+            } else {
+                "policy_disabled"
+            },
+        );
+        if report.cleanup_safe {
             if broker_owned && !options.keep_worktree && !auto_cleanup_enabled {
                 report.cleanup.kept = true;
                 if auto_cleanup_policy.is_err() {

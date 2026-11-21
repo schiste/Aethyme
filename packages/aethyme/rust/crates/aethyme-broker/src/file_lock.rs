@@ -1083,7 +1083,7 @@ fn describe_lifecycle_queue(
 /// order and staleness survive the clock being set forward or back. It
 /// restarts at boot; tickets from before a reboot belong to dead processes.
 #[cfg(unix)]
-fn host_monotonic_ns() -> u128 {
+pub(crate) fn host_monotonic_ns() -> u128 {
     // SAFETY: timespec is plain integers (and, on some targets, padding), for
     // which all-zero bytes are a valid value.
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
@@ -1096,7 +1096,7 @@ fn host_monotonic_ns() -> u128 {
 }
 
 #[cfg(not(unix))]
-fn host_monotonic_ns() -> u128 {
+pub(crate) fn host_monotonic_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos())
@@ -1668,11 +1668,20 @@ impl ExclusiveFileLock {
     }
 }
 
+/// A background lifecycle hold at least this long is counted on its own.
+const LONG_BACKGROUND_LIFECYCLE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
         if let Some((since, kind)) = self.lifecycle_held_since {
             let held = since.elapsed();
             crate::phase_telemetry::add("lifecycle_lock_held", held);
+            // A background hold long enough to keep a foreground command
+            // waiting, counted with its time, so a slow `finish` or `start`
+            // can be traced to its holder.
+            if kind != LifecycleClaimKind::Foreground && held >= LONG_BACKGROUND_LIFECYCLE_HOLD {
+                crate::phase_telemetry::add("lifecycle_lock_held_background_long", held);
+            }
             if kind == LifecycleClaimKind::Foreground {
                 crate::phase_telemetry::attach(
                     "lifecycle_lock",

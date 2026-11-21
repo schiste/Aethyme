@@ -404,6 +404,118 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Early close when nothing can be lost (2026-11-20)
+
+The abandonment window (`session_abandoned_after_hours`, for example `1`) may
+now close an idle session before the window of its work class (`[cleanup]
+stale_*_close_after_hours`), but only when nothing on the session can be lost.
+The rule is evaluated afresh on every look, and again under both claims right
+before the close transaction. It runs cheapest first (`abandonment_safety.rs`)
+and requires all of these:
+
+- no merge, rebase, cherry-pick, revert or bisect in progress;
+- no stash made on the session branch;
+- every tip (HEAD and the branch) is contained in the default branch, in the
+  session branch as the remote holds it now (`ls-remote`, never the local
+  tracking ref, which outlives a remote deletion), or in a merged
+  pull-request head. The diff base gets no exemption;
+- no staged change, no unstaged change, and no untracked file that Git does
+  not ignore.
+
+Anything that cannot be read counts as unsafe. A session that fails the rule
+keeps today's path: a closing-soon note, then the archive-verified close at
+its class window. A session closing early tolerates no process in its
+checkout, its holder's included: the open-file check runs whatever the holder
+evidence says.
+
+A follow-up session that the landed lanes protect also closes at the
+abandonment window when it passes the rule. Without that, a one-hour window
+would be forced up to the landed window for those sessions. `start --reuse`
+resumes such a session at the same HEAD.
+
+An agent's `PreToolUse` hook now counts as activity. The hook writes the file
+`.git/aethyme/hook-activity-<session>.json` in the main checkout at most once
+a minute, and the close path reads its modification time, so an agent that
+only reads is not idle.
+
+The work-class classification no longer drops a tip equal to the diff base.
+An adopted session whose HEAD carries commits nobody pushed is now `unpushed`,
+not `landed`.
+
+- **Checked under the claims before closing.** If the rule fails on the
+  first look but holds under the claims, the session is kept for that look
+  (`session_abandonment_early_rule_first_held_under_claims`), because the
+  process checks ran without the early-close strictness. The next pass starts
+  from the rule holding and runs them in full.
+- **Hidden index entries.** An entry flagged assume-unchanged or skip-worktree
+  hides changes from status, so such a checkout counts as not examined.
+- **Diff base.** The exemption differs by place. The early rule exempts no tip
+  equal to the diff base. The work-class computation, which only picks the
+  class window, drops such a tip when the base is contained in the upstream
+  default branch or in the primary checkout's HEAD.
+- **Reading the rule without a waiting period.** Each early close is recorded
+  on its `session.abandoned` event as `early_close: {rule:
+  "nothing_on_the_session_can_be_lost", checks: [...]}`, listing the checks it
+  passed. The meta key `stale_sessions.early_closed` holds `{checkout path:
+  at_ms}`, keyed by checkout so that a retired checkout reused as a new
+  session still counts. A `start --reuse` of that checkout within 24 h counts
+  `session_abandonment_safe_closed_then_resumed` and is recorded in
+  `stale_sessions.early_resumed`. `broker status` attaches
+  `session_abandonment_early_close_24h: {closed, resumed_within_24h}` and
+  warns with `sessions.early-close-resumed` when any were resumed: the agent
+  still wanted the session.
+- **Counters (introduced).**
+  - `session_abandonment_safe_closed`: a session closed by the early rule.
+  - `session_abandonment_kept_unsafe_<reason>`, where `<reason>` is one of
+    `in_progress`, `stash`, `head_not_contained`, `branch_not_contained`,
+    `staged`, `unstaged`, `untracked`, `unreadable` or `not_examined`.
+  - `session_abandonment_follow_up_safe`.
+  - `abandonment_safety_safe` and `abandonment_safety_unsafe`.
+- **Spans (introduced).** `abandonment_safety_check`, and
+  `abandonment_safety_remote` for the `ls-remote`.
+
+## Abandonment lane: no stop on a refused listing, its own time, and why sessions stay (2026-11-20)
+
+What may close is unchanged. This only changes how often the lane judges.
+
+- **Refused process listing.** A detached worker started from a sandboxed
+  agent command inherits the sandbox and is refused the process listing. The
+  lane used to stop on such a pass. It now stops only when that pass judged
+  nothing else. Otherwise it goes on, and only the sessions whose verdict
+  needs the listing (`holder_process_table_denied`) wait for a worker that can
+  list processes. Counter: `session_retirement_continued_process_table_denied`.
+- **Own time for abandonment.** In each page of the oldest-first lap, a
+  landed proof may start only while more than a third of the page's time is
+  left, and must finish before that third begins. The third is kept for the
+  abandonment judgements of the sessions after it, which need no Git. The
+  cursor is not held for skipped landed proofs: they come in a later lap or in
+  the likely-landed queue. Counter:
+  `landed_proof_stopped_for_abandonment_reserve`.
+- **Not examined is not dirty.** A working-tree status that cannot be taken to
+  the end (its deadline cut it, or Git failed) is "not examined". The session
+  is kept for this pass as `working_tree_not_examined`, with no class record
+  and no closing-soon note, and the answer is not remembered as uncommitted
+  work. Counters: `stale_work_clean_not_examined` and
+  `session_abandonment_kept_working_tree_not_examined`.
+- **Why each session stays (meta, introduced).**
+  `stale_sessions.last_keep` maps each open session to its last abandonment
+  keep `{reason, at_ms}`; a close forgets it.
+  `stale_sessions.abandonment_last_judged_at` records the last time the lane
+  judged a session (closed, or kept for a reason other than a refused
+  listing).
+- **Status advice (introduced).**
+  - `sessions.abandonment-held` (info): "N session(s) past the abandonment
+    window are held: X by <reason>, ...".
+  - `sessions.abandonment-lane-idle` (warning): sessions are idle past the
+    window and the lane has judged none for over an hour.
+  - `retention.invalid` (warning): `.aethyme/broker.toml [retention]` cannot
+    be read, which disables every automatic close. A fractional
+    `session_abandoned_after_hours` such as `0.5` used to disable the lane
+    silently.
+- **Attachment (introduced).** `abandonment_lane_last_judged_age_ms` on the
+  `status` metric line, or `null` when nothing was ever judged. Span:
+  `status_abandonment_lane_advice`.
+
 ## No committed graph: nothing to regenerate (2026-11-19)
 
 A repository can declare `[graph] authority = "committed_fragments"` without
@@ -2243,6 +2355,7 @@ running hooks.
 | Source | Invokes / assumes | Failure mode |
 |---|---|---|
 | Readers of gate outcomes: `aethyme broker advanced gates run --json` (one `GateRunOutcome` per gate) and any wrapper auditing where a gate's artifacts came from | Each outcome of a gate with `[gate.managed_cache]` carries `managed_cache.sources_refreshed`: the number of the tree's files (tracked plus untracked, non-ignored; symlinks and deleted paths skipped) whose mtime the broker advanced to "now" before the command ran, so Cargo rebuilds every workspace member from the tree under test instead of reusing another worktree's artifacts from the shared `CARGO_TARGET_DIR`. Content is untouched, so the tree hash the verdict is keyed on does not change. A refresh that fails records the gate as `error`/`environment` without running the command. | Additive field. A reader that rejects unknown keys in `managed_cache` breaks. Removing the refresh, or making it best-effort, reopens #391: a gate can execute a foreign tree's library and record pass or fail against its own tree. Gates run by a broker older than the release carrying this field still share artifacts across worktrees. |
+| Readers of gate outcomes and command metrics for gates with `[gate.managed_cache]` (introduced 2026-11-21) | A managed cache measured above its `max_bytes` before a run first moves its superseded cargo build units out of the tree: an older generation of a unit (same package, same unit kinds in `.fingerprint/<package>-<hash>/`) whose fingerprint nothing has read since the newest generation was built, oldest first, its fingerprint first, then its `deps/` and `examples/` files and its `build/` directory, until the tree is at most three quarters of `max_bytes` or 5 s have passed. The in-band step only renames, into one `<host cache>/.aethyme-storage-evicting-<pid>-<ms>-pruned` directory per prune; the storage worker deletes it in the background on its next pass (it removes every `.aethyme-storage-evicting-*` entry of the host cache root), and a gate whose host has the storage worker off (`AETHYME_STORAGE_LEDGER=0`, or an ephemeral host state) deletes it inline. `managed_cache.rotated_before_run` is `true` only when the tree is still over `max_bytes` after that, and then the whole tree is rotated as before (renamed and deleted inline). `managed_cache.bytes_before` stays the size measured before pruning. When it moved anything the gate prints `gate <name> pruned <n> superseded build units (<bytes> bytes) from managed cache <key>`, and the rotation line names the size after pruning. The prune records the staged units in `<cache>/.aethyme-pruned-units`; the next gate counts those cargo rebuilt with the same hash and removes the record. Command metric lines gain span `managed_cache_prune` (and `managed_cache_prune_inline_delete`), zero-duration counts `managed_cache_prune_staged_unit`, `managed_cache_prune_deadline_stop` and `managed_cache_prune_rebuilt_unit`, and attachment `managed_cache_prune` (`candidates`, `units`, `bytes`, `deadline_stopped`, `deletion_deferred`, and `rebuilt_after_previous_prune` on the gate after a prune). The prune runs inside the gate, under the cache's exclusive host resource lease the gate already holds. | Additive. A reader that took `rotated_before_run: false` with `bytes_before > max_bytes` to be impossible must now allow it. |
 
 ### Main reconcile fast-forward (introduced 2026-09-27, #374 section 1)
 
@@ -2812,6 +2925,26 @@ missing or hookless: `push_git_trace_without_hook` (the trace showed no
 requested but had neither a hook nor an end of the remote ref read, e.g. an
 empty trace file). The three spans nest inside `push_git_process`; do not add
 them to it.
+
+Changed 2026-11-21. A configured or granted duration (a budget, a reserve,
+a retry delay) is no longer recorded as a timing: it is counted in
+`phase_counts` with a zero `phase_timings_ms` entry, and its value goes to the
+attachment `phase_values_ms` (an object, the largest value seen per name, in
+milliseconds). This applies to `landed_proof_session_budget_doubled`,
+`proof_git_stopped_at_deadline`, `artifact_worker_retirement_share_budget`,
+`artifact_worker_capacity_removal_retry`,
+`artifact_worker_capacity_removal_cache_lane_reserved` and
+`checkout_trash_drain_budget_extended`, whose summed "timings" were budgets
+(the first summed to 1,617,540 s over 21 worker runs on the busiest
+repository). A reader that summed them as time spent must read
+`phase_values_ms` instead. Introduced the same day: every metric line a
+command writes carries `cpu_ms` (`user`, `system`, `children_user`,
+`children_system`: CPU milliseconds of the process and its reaped children,
+from `getrusage`; absent off Unix); the removal lane counts
+`auto_cleanup_memo_miss_absent` and `auto_cleanup_memo_miss_changed` (why a
+closed checkout group is judged in full again); and `checkout_strip_backlog`
+nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
+`checkout_strip_backlog_regenerable` (the per-folder catalogue `lstat`s).
 
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
@@ -3551,6 +3684,79 @@ Covered by `broker/retire.rs` tests.
   - The `checkout_retirement` attachment adds `inspections`: `started`, `succeeded`, `failed` (`inspection_failed`), `cut_by_deadline`, `refused`, `median_succeeded_ms`.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-20 (finish retires through the trash). On the busiest repository's last 400 finishes:
+  - 181 (45 %) removed the checkout inline with `git worktree remove`: a median 48 s, p90 109 s, while holding the repository lifecycle claim, so every start and finish waited. Those finishes took a median 72 s, including a 13 s unlocked size walk.
+  - 153 (38 %) kept it because the caller passed `--keep-worktree`.
+  - 60 (15 %) kept it as not proven safe (dirty paths, or commits not on a delivery target).
+  - 6 failed the removal.
+
+  Now:
+  - When `finish` removes a checkout it proved clean and delivered under the claim, the removal moves it into the checkout trash in one rename (`remove_checkout_through_trash`: registration removed, reflog-only commits pinned, an operation in progress refuses) instead of `git worktree remove`. The deleter removes the entry later, and only once no process uses it. So `finish` takes no open-file observation, and a process in the checkout (usually the finishing caller's shell) does not refuse the move. Anything the move refuses falls back to `git worktree remove`, as before. New span `finish_retire_move`; counters `finish_retire_trashed`, `finish_retire_git_fallback`, `finish_retire_holder_check_deferred_to_deleter`.
+  - When `finish` leaves the checkout in the pool it records why on the session (meta key `checkout_retirement.finish_keeps`: session id to `reason`, `at_ms`; at most 16,384) and counts `finish_retire_kept_<reason>`. The reasons are `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`, `policy_disabled`, `cleanup_plan_unsafe` and `removal_failed`. The retirement lane still judges the checkout with the same rules. It counts `checkout_retirement_judged_after_finish_keep`, carries the finish reason into its remembered keep's detail (`finish kept it: <reason>`), and forgets the record once the checkout is retired.
+Covered by `broker/retire.rs` tests.
+
+- Changed 2026-11-20 (checkout retirement lane process). The busiest repository started 295 sessions and finished 124 in a day, while the worker's closed lap (about 80 s of a 180 s, throttled window, a few times an hour, about 13 s per plan) retired 18; about 300 closed checkouts wait. Now:
+  - New detached process `broker gc __retire-lane <root>` (`broker/retire/lane.rs`).
+    - Start: the worker starts it at the start of its run, with the trash catch-up lane, when its environment gates pass (worker environment, durable repository, past the post-boot hold) and the last strip pass counted closed checkouts on disk (`checkout_retirement_lane_needed`). Counters `checkout_retirement_lane_spawned`, `_spawn_failed`, `_runtime_unverified`, `_storage_context`.
+    - Invocation and priority: it runs the worker entry's invocation checks, then leaves the macOS background band, sets process-scope `IOPOL_STANDARD` (normal disk priority, below the trash deleter's `IOPOL_IMPORTANT`) and CPU niceness 10. Linux keeps the inherited class. Attachment `checkout_retirement_lane_priority`.
+    - Opening: it opens its broker without startup GC maintenance.
+  - Bounds.
+    - One lane process per repository (`checkout-retirement-lane-<key>.lock` in the host state directory, key = 16 hex digits of the SHA-256 of the canonical main root). A second one ends `lane_present`. Probes take the lock for an instant and write nothing.
+    - The worker takes the same lock for the length of its own closed and cleaned laps and skips both when it cannot (counter `checkout_retirement_laps_left_to_lane_process`; `closed_stop` `not_reached_lane_process`), so the kernel lock makes the worker's laps and the lane process exclusive and the lap cursors have one writer. The strip passes still run. A starting lane process waits up to 5 minutes for the lock while the worker's laps hold it, then ends `lane_present`.
+    - One judgement at a time per volume, host-wide: each judgement holds `checkout-retirement-volume-<device>.lock` for its whole length, waited for until the slice's deadline. So one Git inspection at a time runs on a volume across every repository's lane process.
+    - A judgement that never gets the turn is no verdict. It is kept as `volume_turn_unavailable` (counters `checkout_retirement_volume_turn_unavailable`, `checkout_retirement_kept_volume_turn_unavailable`, not remembered). The lap stops there and leaves its cursor before that checkout (`closed_stop` `volume_turn_unavailable`), instead of passing over it and every checkout after it.
+    - Turns are shared fairly between repositories' lanes. A waiter keeps a note beside the lock (`checkout-retirement-volume-<device>.waiting`: `pid <n> at <ms>`, rewritten every 250 ms poll), and a process about to take the turn while another process's note is under 1 s old first lets 500 ms go by (counter `checkout_retirement_volume_turn_yielded`).
+    - Pacing: before each 5-minute slice it reads host pressure. It waits 5 s while the host is loaded or memory is at warning (`paced_slices`), and ends at critical memory pressure (`pressure`). Each process runs at most 60 minutes (`cap`); the next worker starts another while closed checkouts wait.
+  - Work. Each slice takes the open sessions' paths and the open-file observation once, then runs the closed lap, then (when that lap reached its end) the cleaned lap. These are the worker's laps (`retirement_lap`) with the same judgement, keeps, remembered-keep back-off and 60 s inspection allowance, and the cursors are shared with the worker. The process ends `backlog_done` once both laps reached their end in one slice: every checkout not remembered as kept was judged. Other endings are `process_use_unknown`, `open_paths_unresolved`, `no_pool` and `error`; counters `checkout_retirement_lane_end_<reason>`.
+  - Telemetry. Each process writes its own command-metric row (`gc.__retire-lane`, no outcome event) with spans `checkout_retirement_lane`, `checkout_retirement_lane_pressure` and `checkout_retirement_lane_paced`. The attachment `checkout_retirement_lane` has `examined`, `retired`, `kept` (by reason), `inspections_started`, `inspections_succeeded`, `inspections_failed`, `inspections_cut_by_deadline`, `median_inspection_ms`, `slices`, `paced_slices`, `end_reason` and `elapsed_ms`.
+Covered by `broker/retire.rs`, `gc/background_priority.rs` and `cli/telemetry.rs` tests.
+
+- Changed 2026-11-20 (retirement observations and inspections that fit). On 0.8.143 on the busiest repository, six worker passes each judged one closed checkout and retired none.
+  - Three ended `process_use_unknown`. Their open-file observation took 10.4, 10.6 and 10.9 s against `lsof`'s 10 s limit, under a load of 24 to 74 at the worker's throttled disk priority. In the same runs the trash drain's observation completed in 2.0 to 4.7 s and the landed share's in 1.8 s, so those workers were not sandboxed: `lsof` ran out of time. A sandbox refusal ends within a fraction of the budget.
+  - Three ended `deadline`, each with one inspection started and cut by the lap's deadline.
+
+  Now:
+  - An incomplete observation is judged by how long it took, never by its words. One that used at least 90 % of its budget ran out of time and is retried once with up to 30 s when the run has room (`RETIRE_PROCESS_USE_RETRY_LIMIT`; `lsof`'s limit is a parameter, `open_file_snapshot_under_with_limit`). Counters `checkout_retirement_process_snapshot_retried`, `_retry_recovered`; span `checkout_retirement_process_snapshot_retry`. One that ended early was refused (counter `checkout_retirement_process_listing_refused`).
+  - Before starting the lane process, the worker probes the process listing once (one bounded `lsof`, span `checkout_retirement_listing_probe`). A refused listing means a worker inherited from a sandboxed agent command, so it starts no lane, which would inherit the sandbox and judge nothing. It records `checkout_retirement.listing_refused_at_ms` and counts `checkout_retirement_lane_listing_refused`. A probe that only ran out of time still starts the lane, which runs at normal disk priority. The lane process probes once at its start too, and ends `process_listing_refused` before spending a slice.
+  - Unsandboxed runners. The lane is started only by a worker that can list processes. Of the existing launchers, the managed GC sweep LaunchAgent (`gc service`) runs unsandboxed. The shared broker service accepts only `gc_plan` jobs and routes nothing. A sandboxed command reaches neither. So until the managed sweep is installed for a repository, its lane starts from the next worker an unsandboxed command (or the managed sweep) opens.
+  - A lap does not start an inspection it cannot give its whole 60 s allowance. With less time left before the plan (whose context capture counts toward it), the checkout is kept as `inspection_deferred` (counter `checkout_retirement_kept_inspection_deferred`, not remembered), and the lap stops there with its cursor before that checkout (`closed_stop` `inspection_deferred`). With 50 or more closed checkouts waiting, the worker's closed-lap floor is now 75 s instead of 45 s, so one inspection with its allowance always fits. The lane process's 5-minute slices give each inspection its allowance except near a slice's end, where the same rule defers it to the next slice.
+Covered by `broker/retire.rs` tests.
+
+- Changed 2026-11-21 (retirement lane at an ordinary process's disk priority). On 0.8.144 on the busiest repository the first lane run (1,319 s, 5 slices) examined 24 closed checkouts and retired none.
+  - All 16 inspections it started stopped in the eligibility `git status` at the 60 s allowance: 12 failed on the allowance and 4 were cut by the slice's deadline. The 15 `git_timeout_not_started` are each failure's follow-up `rev-parse --is-shallow-repository` for its message, which runs under the same expired deadline. A deadline reused from earlier is not the cause.
+  - Timed once in an ordinary shell under a load of 25 to 28, the same read-only command took 0.14 s on one of those checkouts and 0.36 s on another closed checkout.
+  - A sample of the lane process showed every thread blocked in single `stat` and `read` calls on the checkouts' volume.
+  - Cause: at `IOPOL_STANDARD` (tier 1), the lane's I/O, and its Git children's (they inherit it), waited behind the agents' builds (tier 0) on the same volume.
+
+  Now:
+  - The lane process sets `IOPOL_IMPORTANT`, an ordinary process's policy (attachment `checkout_retirement_lane_priority` `io_policy` `important`), keeping CPU niceness 10. It stays bounded by one judgement at a time per volume and by host-pressure pacing.
+  - Each lane run records its outcome (meta key `checkout_retirement.lane`: `runs_without_retirement`, and the last run's `examined`, inspections started, succeeded, failed and cut, end reason, time). A run that retires one resets the count; a run that ran no slice leaves it.
+  - From 3 runs in a row that retired nothing while closed checkouts wait, `broker status` shows the Warning `cleanup.retirement-lane-idle` with the last run's counts, and the lane counts `checkout_retirement_lane_idle_runs`.
+Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
+
+- Changed 2026-11-21 (fast finish). On 0.8.144 on the busiest repository three of four finishes took 60 s, two of them failing on the lifecycle-claim wait. The finish that retired spent 2.2 s in `finish_retire_move`. The rest was `finish_size_walk_unlocked` (14.7 to 45.0 s) and `lifecycle_lock_wait` (13.3 to 34.8 s, `waited_behind` `broker gc __continue-artifacts`). The overlapping worker run held the claim 3 times for 80 s in all: the checkout strip pass's proofs, whose `git status` ran under the claim to the pass's deadline (`proof_git_stopped_at_deadline` 3, 23.7 s each). Now:
+  - `finish` walks the checkout for its reported `reclaimed_bytes` for at most 2 s (`FINISH_SIZE_WALK_BUDGET`, `directory_usage_bounded`, never following links). A walk that runs out records no size, reported as 0 exactly like a failed walk (counter `finish_size_walk_budget_stopped`); eligibility never reads the size.
+  - A background strip's proofs run under the lifecycle claim for at most 5 s (`STRIP_PROOF_UNDER_CLAIM_BUDGET`, with the Git deadline set to match). A proof that runs out is a transient refusal, tried again by the next pass (counter `checkout_strip_proof_claim_budget_stopped`). What a strip proves is unchanged.
+  - A background lifecycle hold of 5 s or more is counted with its time (`lifecycle_lock_held_background_long`), so a slow foreground command can be traced to its holder.
+
+- Changed 2026-11-21 (retirement keeps that never leave). On 0.8.146 the lane's second and third runs on the busiest repository examined 39 and 31 closed checkouts, retired 5 and 3, and judged the same kept ones again each run:
+  - `operation_state_unknown` 16 and 18: the 18 closed checkouts whose Git registration is gone. The `.git` file names a missing `.git/worktrees/<name>`, so Git cannot read their state. These are full checkouts left by removals that stopped after Git dropped the registration; one has a recorded interrupted finish-cleanup proof.
+  - `ownership_unknown` 2 and 3: the 3 closed folders with no `.git` at all (one holding only `.DS_Store`, two partial). They are remains of interrupted removals, and nothing proves whose they are.
+  - `lease_held` 1: 15 implicit leases recorded 24 s after that session's `finish` had released its leases and closed it.
+  - `operation_unresolved` 1: a recorded broker operation not resolved since boot.
+  - `plan_refused` 10 and 3: 14 of the 16 remembered ones were the recovery patch's `git diff --binary` exceeding its output limit, and 2 were ignored directories over the file cap.
+  - `archive_cleanup_failed` 2: unresolved artifact-use markers (`gc artifact-use reconcile`).
+  - `changed` 2.
+
+  Now:
+  - A closed session's implicit (diff-derived) leases are released when the lane finds them (store `release_implicit_leases_of_closed_session`, recorded as `lease.released` with reason `closed_session_implicit_lease`; counter `checkout_retirement_released_closed_session_implicit_leases`). Explicit claims still keep the checkout.
+  - A positively identified orphan of this repository (registration gone, `.git` naming this repository's `worktrees` directory) is resumed only when its recorded interrupted finish-cleanup proof validates as the cleanup that acts on it judges it (`Finish` lane). Otherwise it is kept as `orphan_cleanup_refused` without calling any removal.
+  - The resume runs `Broker::cleanup` without force inside `OrphanResumeOnlyScope`. In that scope the recursive orphan removal (`remove_proven_orphan_worktree`) refuses (counter `checkout_retirement_orphan_recursive_removal_refused`), so only the content-verified interrupted-cleanup removal can act. That removal keeps every path changed or added after the proof. Any refusal keeps the orphan as `orphan_cleanup_refused` with the refusal as detail. The operator's `finish cleanup <id>` is unchanged.
+  - Span `checkout_retirement_phase_orphan_cleanup`; counters `checkout_retirement_orphan_cleanup_attempted` and `_completed`.
+  - `operation_state_unknown`, `ownership_unknown`, `lease_held`, `operation_unresolved` and `orphan_cleanup_refused` are remembered with the keep back-off (1 h, 6 h, then 24 h, or at once when the checkout changes) instead of being judged every run. A folder with no usable registration is keyed by its own modification time (`unregistered:<ns>`). A remembered `lease_held` keep ends as soon as the session holds no unexpired lease, and a remembered `operation_unresolved` keep ends once its operation is resolved (one database read when the lap reaches it; counter `checkout_retirement_keep_condition_cleared`).
+  - `broker status` shows the Notice `cleanup.retirement-kept`: the remembered keeps by reason, with up to 8 session ids and one detail each.
+Covered by `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
@@ -4030,3 +4236,27 @@ Command metrics include `submit_batch_admission`, `submit_batch_compose`,
 `submit_batch_revalidate`. The `batch_verification` attachment contains the
 outcome, member count, executed and cached gate counts, and executed gate
 milliseconds. It contains no path, branch, commit or task information.
+
+### Opportunistic queued batch verification
+
+`broker submit queued <coordinator-id> --session <id> [--no-cache] --json`
+opts a single submission into sharing the exact group gate when the ordinary
+verification pool is already saturated. Only requests already waiting at slot
+admission may join. The coordinator must be a member and every member names
+that coordinator. Standalone submissions use the existing JSON shape.
+
+A successful group reply carries `queued_batch` (`coordinator`, `verifier`,
+`base`, `members`, `candidate`, `tree`, and `gates`), `landed: false`,
+`next_action`, and `collaboration_capture`. The individual queue entries
+record `superseded` with the combined candidate ID. This receipt does not
+satisfy single-session verification or any provider check. Gate and input
+details in command output are scoped to the opted-in group.
+
+Command metrics include `submit_queued_batch_register`,
+`submit_queued_batch_claim`, `submit_queued_batch_handoff`, and
+`submit_queued_batch_follow`. Waiters retain the last immutable snapshot and
+reload only when the state file changes, timed by
+`submit_queued_batch_read_snapshot`. The `queued_batch` attachment counts admitted
+members when known and records `role` (`leader`, `follower`, or `single`) and
+`outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
+on the verifier's `batch_verification` attachment.
