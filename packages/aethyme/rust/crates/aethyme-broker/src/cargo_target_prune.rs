@@ -158,7 +158,7 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
         if units.len() < 2 {
             continue;
         }
-        units.sort_by(|left, right| left.built_at.cmp(&right.built_at));
+        units.sort_by_key(|unit| unit.built_at);
         let newest_built_at = units.last().map(|unit| unit.built_at);
         let Some(newest_built_at) = newest_built_at else {
             continue;
