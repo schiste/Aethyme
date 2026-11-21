@@ -2948,6 +2948,8 @@ nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
 
 Changed 2026-11-21 (worker census and activity waits). The checkout backlog census remembers the folders it found to be retired checkouts' tombstones in meta key `checkout_strip.backlog_tombstones` (JSON: path to `[device, inode, modification time in ns]`) and judges a folder whose identity is unchanged from one `lstat` (count `checkout_strip_backlog_tombstone_remembered`); a census that could list every pool replaces the memory, one that could not keeps what it did not see. Counts are unchanged. The changed-file activity probe remembers, for the rest of the process (one command or one worker run), a checkout whose `git status` ran out of its 2 s, and answers the next probe of it as that timeout did without running Git (count `worktree_status_activity_unavailable_remembered`); a failed call is not remembered.
 
+Changed 2026-11-21 (transcripts cadence). The detached worker's transcripts lane (every repository's worker runs it; its work is host-wide) records each pass in `<host state>/transcripts/last-worker-pass.json` (`at_ms`, `idle`: nothing eligible, within budget, first-run gate open). After an idle pass the next worker pass on the host waits 15 minutes (count `transcripts_worker_pass_not_due` on the skipping worker's line); a pass that found work or ran out of budget, an unreadable record, or a clock that went back runs it at once. Manual `transcripts` commands are unaffected.
+
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
 where the work happens rather than by each command: `subprocess_git` and
