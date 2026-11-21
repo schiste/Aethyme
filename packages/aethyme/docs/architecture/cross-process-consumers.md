@@ -2946,6 +2946,8 @@ closed checkout group is judged in full again); and `checkout_strip_backlog`
 nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
 `checkout_strip_backlog_regenerable` (the per-folder catalogue `lstat`s).
 
+Changed 2026-11-21 (worker census and activity waits). The checkout backlog census remembers the folders it found to be retired checkouts' tombstones in meta key `checkout_strip.backlog_tombstones` (JSON: path to `[device, inode, modification time in ns]`) and judges a folder whose identity is unchanged from one `lstat` (count `checkout_strip_backlog_tombstone_remembered`); a census that could list every pool replaces the memory, one that could not keeps what it did not see. Counts are unchanged. The changed-file activity probe remembers, for the rest of the process (one command or one worker run), a checkout whose `git status` ran out of its 2 s, and answers the next probe of it as that timeout did without running Git (count `worktree_status_activity_unavailable_remembered`); a failed call is not remembered.
+
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
 where the work happens rather than by each command: `subprocess_git` and
