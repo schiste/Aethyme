@@ -2637,7 +2637,7 @@ fn preflight_managed_gc_tick(
             "managed GC service accepts only the fixed `broker gc sweep --json` invocation".into(),
         ));
     }
-    let preflight = (|| {
+    let preflight = (|| -> Result<Option<crate::gc_sweep_service::ManagedTick>, UsageError> {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
         let snapshot = Broker::open_snapshot(&cwd)?;
