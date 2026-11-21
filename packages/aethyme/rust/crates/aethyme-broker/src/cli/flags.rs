@@ -713,6 +713,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("gc service plan", &[]),
     ("gc service install", &["--confirm"]),
     ("gc service status", &[]),
+    ("gc service refresh", &[]),
     ("gc service activate", &["--confirm"]),
     ("gc service deactivate", &["--confirm"]),
     ("gc service uninstall", &["--confirm"]),
