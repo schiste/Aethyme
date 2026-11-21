@@ -130,6 +130,23 @@ pub(crate) fn raise_for_retirement_lane() -> DeleterPriority {
     platform::raise_for_retirement_lane()
 }
 
+/// In a child process between `fork` and `exec` (a Git child of a
+/// throttled worker): leave the macOS background band and set the child's
+/// process-scope disk policy to `IOPOL_IMPORTANT`, an ordinary process's.
+/// Two integer-only system calls on the child itself, safe after `fork`;
+/// failures leave the inherited policy. Nothing elsewhere.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn raise_child_before_exec() {
+    platform::raise_child_before_exec();
+}
+
+/// Whether a child Git process of this one should run at an ordinary disk
+/// priority: only a read on behalf of a throttled process (macOS
+/// `throttle`), never a Git deletion (`keeps_inherited`).
+pub(crate) fn git_child_wants_ordinary_io(io_policy: &str, keeps_inherited: bool) -> bool {
+    io_policy == "throttle" && !keeps_inherited
+}
+
 /// The disk I/O policy of this process, as a label for telemetry:
 /// macOS `throttle`, `utility`, `standard`, `important`, `passive` or
 /// `default`; Linux `idle`, `best_effort`, `realtime` or `none`;
@@ -169,6 +186,19 @@ mod platform {
             // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
             |nice| unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } == 0,
         )
+    }
+
+    pub(super) fn raise_child_before_exec() {
+        // SAFETY: integer-only system calls on the calling (child) process,
+        // async-signal-safe between fork and exec.
+        unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, super::TRASH_DELETER_DARWIN_BG);
+            setiopolicy_np(
+                IOPOL_TYPE_DISK,
+                super::TRASH_DELETER_IOPOL_SCOPE_PROCESS,
+                super::TRASH_DELETER_IOPOL_IMPORTANT,
+            );
+        }
     }
 
     pub(super) fn current_io_policy() -> &'static str {
@@ -236,6 +266,9 @@ mod platform {
         raise_for_trash_deleter()
     }
 
+    /// Linux keeps the inherited class (the throttle measured was macOS's).
+    pub(super) fn raise_child_before_exec() {}
+
     pub(super) fn current_io_policy() -> &'static str {
         // SAFETY: `ioprio_get` takes two integers and touches no memory.
         let value =
@@ -302,6 +335,9 @@ mod platform {
         "unknown"
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn raise_child_before_exec() {}
+
     /// No qualified call on this platform (Windows included): the worker runs
     /// at normal priority and relies on the rate limit and host lock.
     pub(super) fn lower_current_process() -> BackgroundPriority {
@@ -344,6 +380,46 @@ mod tests {
         let refused = raise_for_trash_deleter_with(|_| false, |_, _| false, |_| false);
         assert_eq!(refused.io_policy, "unchanged");
         assert!(!current_io_policy().is_empty());
+    }
+
+    /// Only a Git read is known read-only; a write, a deletion, an unknown
+    /// subcommand and a bare option list keep the throttle.
+    #[test]
+    fn git_subcommands_are_classified_read_only_conservatively() {
+        use crate::git::git_subcommand_is_read_only as read_only;
+        assert!(read_only(&[
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "-z"
+        ]));
+        assert!(read_only(&["-C", "/w", "rev-parse", "HEAD"]));
+        assert!(read_only(&["diff", "--binary"]));
+        assert!(read_only(&["worktree", "list", "--porcelain"]));
+        assert!(read_only(&["config", "--get", "user.name"]));
+        assert!(!read_only(&["worktree", "remove", "--force", "/w"]));
+        assert!(!read_only(&["worktree", "prune"]));
+        assert!(!read_only(&["commit", "-m", "x"]));
+        assert!(!read_only(&["gc", "--auto"]));
+        assert!(!read_only(&["config", "user.name", "x"]));
+        assert!(!read_only(&["update-ref", "--stdin"]));
+        assert!(!read_only(&["bundle", "create", "-", "HEAD"]));
+        assert!(!read_only(&["some-new-command"]));
+        assert!(!read_only(&["-c", "a=b"]));
+    }
+
+    /// A Git child runs at an ordinary disk priority only for a throttled
+    /// process and never for a Git deletion.
+    #[test]
+    fn only_a_throttled_processes_git_reads_get_ordinary_io() {
+        assert!(git_child_wants_ordinary_io("throttle", false));
+        assert!(
+            !git_child_wants_ordinary_io("throttle", true),
+            "a deletion keeps its pace"
+        );
+        assert!(!git_child_wants_ordinary_io("important", false));
+        assert!(!git_child_wants_ordinary_io("idle", false));
     }
 
     /// The retirement lane leaves the background band, asks for an ordinary

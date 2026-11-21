@@ -3757,6 +3757,21 @@ Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
   - `broker status` shows the Notice `cleanup.retirement-kept`: the remembered keeps by reason, with up to 8 session ids and one detail each.
 Covered by `broker/retire.rs` tests.
 
+- Changed 2026-11-21 (worker Git reads at an ordinary disk priority). In 23 worker runs on 0.8.146 on the busiest repository the removal lane's status proofs took 16.1 s each (`proof_uncommitted_check`, 70) and its cleanup status checks 9.9 s (`auto_cleanup_check_status`, 114). Capacity selection took 57.7 s a run and selected nothing. Meanwhile the retirement lane's same status took a median 0.87 s at an ordinary priority.
+  - The worker sets process-scope `IOPOL_THROTTLE` and the background band (`lower_current_process`) to pace its deletions, as its drain's `io_policy` `throttle` shows. Every Git child inherits that policy, so the gap is I/O wait, not a longer walk.
+
+  Now:
+  - Before the Git runners spawn a child of a throttled process (macOS `throttle`), `prepare_git_child_io` classifies its subcommand from the arguments (`git_subcommand_is_read_only`).
+    - Only a known read runs at an ordinary process's disk priority: `status`, `diff`, `diff-index`, `diff-files`, `diff-tree`, `ls-files`, `ls-tree`, `rev-parse`, `rev-list`, `merge-base`, `for-each-ref`, `show-ref`, `cat-file`, `log`, `show`, `name-rev`, `describe`, `check-ignore`, `check-attr`, `count-objects`, `var`, `grep`, `blame`, `worktree list`, `stash list`, `bundle verify`/`list-heads`, and `config` with `--get`/`--get-all`/`--get-regexp`/`-l`/`--list`. A `pre_exec` hook in the child leaves the background band and sets process-scope `IOPOL_IMPORTANT` before `exec` (counter `git_child_ordinary_io`).
+    - Every other Git child keeps the inherited throttle (counter `git_child_kept_throttle`): any write, any deletion (`worktree remove`, `worktree prune`), and anything not known to be a read.
+    - Every Git child of a throttled process also gets `gc.auto=0` and `maintenance.auto=false` through Git's environment configuration (`GIT_CONFIG_COUNT`, unless the command already sets it), so none starts automatic maintenance.
+    - The runners covered are `run_git_process_output`, `_in_owned_group`, `_limited` and the removal proofs' `run_proof_git`; any other spawn keeps the throttle.
+    - Linux keeps the inherited class.
+  - The worker's own file deletions, the trash drain and the strip's renames are in-process and unchanged.
+  - Overlap with the retirement lane is measured. A capacity-removal pass that ran while this repository's retirement lane process was alive counts `artifact_worker_capacity_removal_pass_while_retirement_lane_live` with the pass's time.
+  - The removal lane no longer proves a closed checkout the retirement lane owns (a remembered keep, or already in its trash): removal refused it at its last step anyway. It is kept as `retirement_lane_owns` without a Git call (counter `auto_cleanup_skipped_retirement_lane_owns`).
+  - Unchanged: the strip pass's backlog census (33.4 s a run) is the worker's own `lstat` of checkout folders and stays throttled.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
