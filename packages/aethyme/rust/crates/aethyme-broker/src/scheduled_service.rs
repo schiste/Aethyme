@@ -156,24 +156,55 @@ pub(crate) mod launchd {
         Unknown,
     }
 
-    /// Ask launchd whether `gui/<uid>/<label>` is loaded.
+    /// What one `launchctl print <domain>/<label>` answered: exit 0 is
+    /// loaded, exit 113 ("could not find service") is not loaded, and any
+    /// other exit, or no exit at all (`None`: a timeout or output limit),
+    /// proves nothing.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn print_exit_state(exit: Option<i32>) -> LabelState {
+        match exit {
+            Some(0) => LabelState::Loaded,
+            Some(113) => LabelState::NotLoaded,
+            _ => LabelState::Unknown,
+        }
+    }
+
+    /// One label's state from its answers in both per-user domains: loaded
+    /// in either is loaded, not loaded needs both to say not found, and
+    /// anything else is unknown.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn combine_domains(gui: LabelState, user: LabelState) -> LabelState {
+        match (gui, user) {
+            (LabelState::Loaded, _) | (_, LabelState::Loaded) => LabelState::Loaded,
+            (LabelState::NotLoaded, LabelState::NotLoaded) => LabelState::NotLoaded,
+            _ => LabelState::Unknown,
+        }
+    }
+
+    /// Ask launchd whether `<label>` is loaded in `gui/<uid>` or
+    /// `user/<uid>`: a job bootstrapped into either domain runs.
     #[cfg(target_os = "macos")]
     pub(crate) fn label_state(uid: u32, label: &str) -> io::Result<LabelState> {
         use crate::bounded_output::{LimitedOutput, output_limited};
         use std::process::Command;
         use std::time::Duration;
-        let output = output_limited(
-            Command::new("/bin/launchctl").args(["print", &format!("gui/{uid}/{label}")]),
-            Duration::from_secs(10),
-            64 * 1024,
-        )?;
-        Ok(match output {
-            LimitedOutput::Completed(output) if output.status.success() => LabelState::Loaded,
-            LimitedOutput::Completed(output) if output.status.code() == Some(113) => {
-                LabelState::NotLoaded
-            }
-            _ => LabelState::Unknown,
-        })
+        let _span = crate::phase_telemetry::span("launchd_label_state");
+        let ask = |domain: &str| -> io::Result<LabelState> {
+            let output = output_limited(
+                Command::new("/bin/launchctl").args(["print", &format!("{domain}/{uid}/{label}")]),
+                Duration::from_secs(10),
+                64 * 1024,
+            )?;
+            Ok(print_exit_state(match output {
+                LimitedOutput::Completed(output) => output.status.code(),
+                _ => None,
+            }))
+        };
+        let gui = ask("gui")?;
+        if gui == LabelState::Loaded {
+            return Ok(gui);
+        }
+        Ok(combine_domains(gui, ask("user")?))
     }
 
     #[cfg(target_os = "macos")]

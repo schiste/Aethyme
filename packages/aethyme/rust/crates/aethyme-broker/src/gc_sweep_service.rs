@@ -515,6 +515,7 @@ pub(crate) fn install(plan: &Plan, confirmation: &str) -> io::Result<Vec<PathBuf
     install_replacing_dead_record(plan, state).map(|(created, _)| created)
 }
 
+#[cfg(test)]
 fn install_exact_plan_files(plan: &Plan) -> io::Result<Vec<PathBuf>> {
     let bytes = serde_json::to_vec(plan).map_err(io::Error::other)?;
     let files = [("plan.json", bytes.as_slice())];
@@ -943,6 +944,9 @@ pub(crate) struct InstallationRecord {
     pub(crate) runtime_version: Option<String>,
     pub(crate) router: Option<PathBuf>,
     pub(crate) unit_present: bool,
+    /// SHA-256 of the unit file when it is a readable private owned file:
+    /// what `uninstall` takes as confirmation when no plan is recorded.
+    pub(crate) unit_digest: Option<String>,
 }
 
 impl InstallationRecord {
@@ -969,10 +973,23 @@ impl InstallationRecord {
         if !self.unit_present {
             return Some("unit_file_missing_and_label_not_loaded");
         }
+        if self.plan_bytes.is_none() {
+            return Some("plan_missing_and_label_not_loaded");
+        }
         if self.runtime_present() == Some(false) {
             return Some("recorded_runtime_missing_and_label_not_loaded");
         }
         None
+    }
+
+    /// The digest `uninstall` must be confirmed with: the recorded plan's,
+    /// or the unit file's when no plan is recorded.
+    fn confirmation_digest(&self) -> Option<&str> {
+        if self.plan_bytes.is_some() {
+            self.plan_digest.as_deref()
+        } else {
+            self.unit_digest.as_deref()
+        }
     }
 
     fn describe(&self, label: crate::scheduled_service::launchd::LabelState) -> Value {
@@ -980,7 +997,9 @@ impl InstallationRecord {
             "recorded_plan_digest": self.plan_digest,
             "recorded_runtime_version": self.runtime_version,
             "recorded_runtime_present": self.runtime_present(),
+            "plan_file": if self.plan_bytes.is_some() { "present" } else { "missing" },
             "unit_file": if self.unit_present { "present" } else { "missing" },
+            "recorded_unit_digest": self.unit_digest,
             "scheduler_state": label_state_name(label),
             "replaceable": self.dead_reason(label).is_some(),
             "replaceable_because": self.dead_reason(label),
@@ -1026,6 +1045,14 @@ pub(crate) fn read_record(home: &Path, uuid: &str, uid: u32) -> io::Result<Insta
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
     };
+    let unit_digest = if unit_present {
+        crate::pr_watch_service_install::existing(&unit_path, uid)
+            .ok()
+            .flatten()
+            .map(|(bytes, _)| digest(&bytes))
+    } else {
+        None
+    };
     Ok(InstallationRecord {
         directory,
         unit_path,
@@ -1036,13 +1063,18 @@ pub(crate) fn read_record(home: &Path, uuid: &str, uid: u32) -> io::Result<Insta
         router: field("router").map(PathBuf::from),
         plan_bytes,
         unit_present,
+        unit_digest,
     })
 }
 
-/// Move a dead record's files (its plan, receipts and, when present, its
-/// unit) into `archive/<ms>/` inside the service directory, keeping the
-/// newest [`RECORD_ARCHIVES_KEPT`] archives. Renames only; nothing of the
-/// record is deleted here.
+/// Move a dead record's files (its unit when present, then its plan and
+/// receipts) into `archive/<ms>/` inside the service directory, keeping the
+/// newest [`RECORD_ARCHIVES_KEPT`] archives. Moves only; nothing of the
+/// record is deleted here. The caller holds the directory's installer claim.
+///
+/// The unit goes first: a crash part-way leaves a plan without its unit,
+/// which `status`, `install` and `uninstall` already treat as a stale record,
+/// rather than a unit without its plan.
 fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt as _;
     let _span = crate::phase_telemetry::span("gc_service_record_archive");
@@ -1055,8 +1087,24 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
     if !fs::symlink_metadata(&archives)?.is_dir() {
         return Err(invalid("GC service archive path is not a directory"));
     }
-    let target = archives.join(now_unix_ms()?.to_string());
-    fs::DirBuilder::new().mode(0o700).create(&target)?;
+    if record.unit_present && !fs::symlink_metadata(&record.unit_path)?.is_file() {
+        return Err(invalid("GC service unit path is not a file"));
+    }
+    let mut stamp = now_unix_ms()?;
+    let target = loop {
+        let candidate = archives.join(stamp.to_string());
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => stamp += 1,
+            Err(error) => return Err(error),
+        }
+    };
+    if record.unit_present {
+        move_file(&record.unit_path, &target.join("unit.plist"))?;
+        if let Some(parent) = record.unit_path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
     for name in ["plan.json", "control.json", "last-pass.json"] {
         let source = record.directory.join(name);
         match fs::symlink_metadata(&source) {
@@ -1068,19 +1116,20 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     }
-    if record.unit_present {
-        let metadata = fs::symlink_metadata(&record.unit_path)?;
-        if !metadata.is_file() {
-            return Err(invalid("GC service unit path is not a file"));
-        }
-        fs::rename(&record.unit_path, target.join("unit.plist"))?;
-        if let Some(parent) = record.unit_path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
-    }
     fs::File::open(&target)?.sync_all()?;
     fs::File::open(&record.directory)?.sync_all()?;
-    let mut kept: Vec<(u64, PathBuf)> = fs::read_dir(&archives)?
+    prune_archives(&archives);
+    crate::phase_telemetry::add("gc_service_record_archived", Duration::ZERO);
+    Ok(target)
+}
+
+/// Keep the newest [`RECORD_ARCHIVES_KEPT`] archives; only numeric names are
+/// archives, anything else is left alone.
+fn prune_archives(archives: &Path) {
+    let Ok(entries) = fs::read_dir(archives) else {
+        return;
+    };
+    let mut kept: Vec<(u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let stamp = entry.file_name().to_str()?.parse::<u64>().ok()?;
@@ -1094,8 +1143,44 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
             fs::remove_dir_all(old),
         );
     }
-    crate::phase_telemetry::add("gc_service_record_archived", Duration::ZERO);
-    Ok(target)
+}
+
+/// Move one owned file. `LaunchAgents` and the service directory can sit on
+/// different volumes, where a rename fails with `EXDEV`: then copy, sync and
+/// only then remove the source.
+fn move_file(source: &Path, destination: &Path) -> io::Result<()> {
+    move_file_with(source, destination, |from, to| fs::rename(from, to))
+}
+
+fn move_file_with(
+    source: &Path,
+    destination: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {}
+        Err(error) => return Err(error),
+    }
+    let mut from = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(source)?;
+    if !from.metadata()?.is_file() {
+        return Err(invalid("GC service record holds a non-file path"));
+    }
+    let mut to = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)?;
+    io::copy(&mut from, &mut to)?;
+    to.sync_all()?;
+    if let Some(parent) = destination.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    fs::remove_file(source)
 }
 
 /// Install `plan`, first archiving a different recorded installation when
@@ -1105,6 +1190,13 @@ fn install_replacing_dead_record(
     mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
 ) -> io::Result<(Vec<PathBuf>, Option<PathBuf>)> {
     let new_bytes = serde_json::to_vec(plan).map_err(io::Error::other)?;
+    // Decide under the installer claim, so a concurrent install cannot
+    // judge this record dead and archive what this one just published.
+    let claim = crate::pr_watch_service_install::claim_service_directory(
+        &plan.home,
+        &plan.directory,
+        plan.uid,
+    )?;
     let record = read_record(&plan.home, &plan.repository_uuid, plan.uid)?;
     let differs = record
         .plan_bytes
@@ -1133,7 +1225,17 @@ fn install_replacing_dead_record(
     } else {
         None
     };
-    Ok((install_exact_plan_files(plan)?, archived))
+    let bytes = serde_json::to_vec(plan).map_err(io::Error::other)?;
+    let created = crate::pr_watch_service_install::install_exact_files_claimed(
+        &plan.home,
+        &plan.directory,
+        &plan.unit_path,
+        plan.uid,
+        &[("plan.json", bytes.as_slice())],
+        plan.unit.as_bytes(),
+        &claim,
+    )?;
+    Ok((created, archived))
 }
 
 /// `service status` and `uninstall` for a record whose unit file is gone:
@@ -1149,8 +1251,11 @@ fn control_dead_record(
     // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
     let uid = unsafe { libc::geteuid() };
     let record = read_record(home, uuid, uid)?;
-    if record.unit_present || record.plan_bytes.is_none() {
+    if !record.exists() || (record.unit_present && record.plan_bytes.is_some()) {
         return Ok(None);
+    }
+    if action == "uninstall" {
+        return uninstall_dead_record(home, uuid, uid, confirmation, label_state).map(Some);
     }
     let state = label_state(uid, &record.label)?;
     match action {
@@ -1162,31 +1267,49 @@ fn control_dead_record(
             "record": record.describe(state),
             "delivery_proven": false
         }))),
-        "uninstall" => {
-            if confirmation.is_none() || confirmation != record.plan_digest.as_deref() {
-                return Err(invalid(
-                    "GC service uninstall requires the exact recorded plan digest",
-                ));
-            }
-            if record.dead_reason(state).is_none() {
-                return Err(invalid(
-                    "GC service record has no unit file but launchd did not confirm the label is unloaded; refusing to remove it",
-                ));
-            }
-            let _claim = crate::pr_watch_service_install::claim_installer(&record.directory, uid)?;
-            let archive = archive_record(&record)?;
-            Ok(Some(json!({
-                "schema": CONTROL_SCHEMA,
-                "action": "uninstall",
-                "plan_digest": record.plan_digest,
-                "scheduler_state": "not_loaded",
-                "installed_files_removed": true,
-                "stale_record_archived_to": archive,
-                "delivery_proven": false
-            })))
-        }
         _ => Ok(None),
     }
+}
+
+/// Finish removing a record that has its plan or its unit but not both,
+/// deciding under the installer claim on a record read under it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn uninstall_dead_record(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    confirmation: Option<&str>,
+    mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
+) -> io::Result<Value> {
+    let directory = expected_directory(home, uuid);
+    let _claim = crate::pr_watch_service_install::claim_service_directory(home, &directory, uid)?;
+    let record = read_record(home, uuid, uid)?;
+    if !record.exists() || (record.unit_present && record.plan_bytes.is_some()) {
+        return Err(invalid(
+            "GC service record changed while claiming uninstall; run status again",
+        ));
+    }
+    if confirmation.is_none() || confirmation != record.confirmation_digest() {
+        return Err(invalid(
+            "GC service uninstall requires the exact recorded plan digest (or, with no plan, the unit file's digest)",
+        ));
+    }
+    let state = label_state(uid, &record.label)?;
+    if record.dead_reason(state).is_none() {
+        return Err(invalid(
+            "GC service record is incomplete but launchd did not confirm the label is unloaded; refusing to remove it",
+        ));
+    }
+    let archive = archive_record(&record)?;
+    Ok(json!({
+        "schema": CONTROL_SCHEMA,
+        "action": "uninstall",
+        "plan_digest": record.plan_digest,
+        "scheduler_state": "not_loaded",
+        "installed_files_removed": true,
+        "stale_record_archived_to": archive,
+        "delivery_proven": false
+    }))
 }
 
 /// What `service plan` reports about an existing installation record.
@@ -1560,6 +1683,194 @@ mod tests {
             .unwrap();
         assert_eq!(existing["replaceable"], true);
         assert_eq!(existing["recorded_plan_digest"], "0".repeat(64));
+    }
+
+    #[test]
+    fn label_state_maps_print_exits_and_needs_both_domains_for_not_loaded() {
+        use crate::scheduled_service::launchd::{combine_domains, print_exit_state};
+        assert_eq!(print_exit_state(Some(0)), LabelState::Loaded);
+        assert_eq!(print_exit_state(Some(113)), LabelState::NotLoaded);
+        assert_eq!(print_exit_state(Some(1)), LabelState::Unknown);
+        assert_eq!(print_exit_state(Some(5)), LabelState::Unknown);
+        assert_eq!(print_exit_state(None), LabelState::Unknown);
+        let states = [
+            LabelState::Loaded,
+            LabelState::NotLoaded,
+            LabelState::Unknown,
+        ];
+        for gui in states {
+            for user in states {
+                let expected = if gui == LabelState::Loaded || user == LabelState::Loaded {
+                    LabelState::Loaded
+                } else if gui == LabelState::NotLoaded && user == LabelState::NotLoaded {
+                    LabelState::NotLoaded
+                } else {
+                    LabelState::Unknown
+                };
+                assert_eq!(combine_domains(gui, user), expected, "{gui:?} {user:?}");
+            }
+        }
+    }
+
+    /// The wedge a crash between the unit and plan moves used to leave: a
+    /// unit with no plan. Status reports it, install replaces it, and
+    /// uninstall removes it with the unit's digest, once launchd says the
+    /// label is not loaded.
+    #[test]
+    fn a_unit_without_its_plan_is_a_recoverable_stale_record() {
+        let (_temp, plan) = fixture();
+        stale_record(&plan, &plan.router, true);
+        fs::remove_file(plan.directory.join("plan.json")).unwrap();
+        let result =
+            control_dead_record(&plan.home, &plan.repository_uuid, "status", None, |_, _| {
+                Ok(LabelState::NotLoaded)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["installation_state"], "stale_record");
+        assert_eq!(result["record"]["plan_file"], "missing");
+        assert_eq!(
+            result["record"]["replaceable_because"],
+            "plan_missing_and_label_not_loaded"
+        );
+        let unit_digest = digest(b"<plist>old</plist>");
+        assert_eq!(result["record"]["recorded_unit_digest"], unit_digest);
+        // Unknown: nothing moves.
+        assert!(
+            control_dead_record(
+                &plan.home,
+                &plan.repository_uuid,
+                "uninstall",
+                Some(&unit_digest),
+                |_, _| Ok(LabelState::Unknown),
+            )
+            .is_err()
+        );
+        assert!(plan.unit_path.is_file());
+        // Install replaces it once launchd confirms the label is unloaded.
+        let (created, archive) =
+            install_replacing_dead_record(&plan, |_, _| Ok(LabelState::NotLoaded)).unwrap();
+        assert!(archive.unwrap().join("unit.plist").is_file());
+        assert!(created.contains(&plan.unit_path), "{created:?}");
+
+        // Uninstall finishes removing the same wedge, confirmed by unit digest.
+        let (_temp, plan) = fixture();
+        stale_record(&plan, &plan.router, true);
+        fs::remove_file(plan.directory.join("plan.json")).unwrap();
+        assert!(
+            control_dead_record(
+                &plan.home,
+                &plan.repository_uuid,
+                "uninstall",
+                Some(&"0".repeat(64)),
+                |_, _| Ok(LabelState::NotLoaded),
+            )
+            .is_err()
+        );
+        let result = control_dead_record(
+            &plan.home,
+            &plan.repository_uuid,
+            "uninstall",
+            Some(&unit_digest),
+            |_, _| Ok(LabelState::NotLoaded),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["installed_files_removed"], true);
+        assert!(!plan.unit_path.exists());
+    }
+
+    #[test]
+    fn install_decides_under_the_installer_claim() {
+        let (temp, plan) = fixture();
+        stale_record(&plan, &temp.path().join("gone/aethyme"), false);
+        let held =
+            crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid).unwrap();
+        let mut asked = false;
+        let error = install_replacing_dead_record(&plan, |_, _| {
+            asked = true;
+            Ok(LabelState::NotLoaded)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(!asked, "launchd must not be asked before the claim is held");
+        assert!(archived_plans(&plan).is_empty());
+        drop(held);
+        install_replacing_dead_record(&plan, |_, _| Ok(LabelState::NotLoaded)).unwrap();
+        assert_eq!(archived_plans(&plan).len(), 1);
+    }
+
+    #[test]
+    fn archives_are_pruned_to_the_newest_five_numeric_names() {
+        let (temp, plan) = fixture();
+        let archives = plan.directory.join(RECORD_ARCHIVE_DIRECTORY);
+        install_fixture(&plan);
+        fs::create_dir(&archives).unwrap();
+        for stamp in [10_u64, 20, 30, 40, 50] {
+            fs::create_dir(archives.join(stamp.to_string())).unwrap();
+        }
+        fs::create_dir(archives.join("notes")).unwrap();
+        stale_record(&plan, &temp.path().join("gone/aethyme"), false);
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let newest = archive_record(&record).unwrap();
+        let mut names: Vec<String> = fs::read_dir(&archives)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let newest = newest.file_name().unwrap().to_string_lossy().into_owned();
+        let mut expected = vec!["20", "30", "40", "50", "notes", newest.as_str()];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn archiving_refuses_a_symlinked_archive_directory_or_unit() {
+        use std::os::unix::fs::symlink;
+        let (temp, plan) = fixture();
+        stale_record(&plan, &temp.path().join("gone/aethyme"), false);
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, plan.directory.join(RECORD_ARCHIVE_DIRECTORY)).unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert!(archive_record(&record).is_err());
+        assert!(plan.directory.join("plan.json").is_file());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        let (temp, plan) = fixture();
+        stale_record(&plan, &temp.path().join("gone/aethyme"), false);
+        let target = temp.path().join("foreign.plist");
+        fs::write(&target, b"foreign").unwrap();
+        symlink(&target, &plan.unit_path).unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert!(record.unit_present);
+        assert!(archive_record(&record).is_err());
+        assert!(plan.directory.join("plan.json").is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn a_cross_volume_unit_move_copies_syncs_then_removes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unit.plist");
+        let destination = temp.path().join("archived.plist");
+        fs::write(&source, b"unit bytes").unwrap();
+        move_file_with(&source, &destination, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        })
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"unit bytes");
+        // Any other rename failure leaves the source where it was.
+        fs::write(&source, b"unit bytes").unwrap();
+        assert!(
+            move_file_with(&source, &temp.path().join("other"), |_, _| {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            })
+            .is_err()
+        );
+        assert!(source.is_file());
     }
 
     #[test]
