@@ -1087,7 +1087,7 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
             Some((stamp, entry.path()))
         })
         .collect();
-    kept.sort_by(|left, right| right.0.cmp(&left.0));
+    kept.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
     for (_, old) in kept.into_iter().skip(RECORD_ARCHIVES_KEPT) {
         crate::warn_unrecorded(
             "prune an old GC service record archive",
@@ -1190,6 +1190,7 @@ fn control_dead_record(
 }
 
 /// What `service plan` reports about an existing installation record.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn existing_installation_for(plan: &Plan) -> io::Result<Option<Value>> {
     #[cfg(target_os = "macos")]
     let state = crate::scheduled_service::launchd::label_state;

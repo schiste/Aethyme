@@ -149,6 +149,7 @@ pub(crate) mod launchd {
     /// exit 0 is loaded, exit 113 ("could not find service") is not loaded,
     /// and anything else (another exit, a timeout) proves nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) enum LabelState {
         Loaded,
         NotLoaded,
