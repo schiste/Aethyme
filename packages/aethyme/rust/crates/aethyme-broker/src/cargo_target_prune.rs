@@ -9,52 +9,78 @@
 //! the new ones. On 2026-11-21 the busiest shared target held 14.6 GiB, of
 //! which 10.2 GiB were such superseded generations.
 //!
-//! A cargo unit is `.fingerprint/<package>-<hash>/` plus the `deps/` files
-//! and `build/<package>-<hash>/` directory carrying the same hash. Units of
-//! one package with the same unit kinds (the hash files in the fingerprint
-//! directory: `lib-x`, `test-lib-x`, `bin-y`, `build-script-build-script-build`
+//! A cargo unit is `.fingerprint/<package>-<hash>/` plus the `deps/` and
+//! `examples/` files and the `build/<package>-<hash>/` directory carrying the
+//! same hash. Units of one package with the same unit kinds (the hash files
+//! in the fingerprint directory: `lib-x`, `test-lib-x`, `bin-y`,
+//! `build-script-build-script-build`, `run-build-script-build-script-build`
 //! ...) are generations of each other. An older generation is a candidate
 //! only when nothing has read its fingerprint since the newest generation
 //! was built: every cargo build that considers a unit reads its fingerprint
-//! to decide freshness, so a generation a live build still alternates with
-//! (two feature sets of one dependency, say) shows a later access time and
-//! is kept. Candidates go oldest first, only until the requested number of
-//! bytes is freed.
+//! to decide freshness (and, for a unit's dependencies, theirs too), so a
+//! generation a live build still uses -- one dependency in two feature sets,
+//! or a build-script run whose `out` directory a kept unit compiles against
+//! -- shows a later access time and is kept. Candidates go oldest first, only
+//! until the requested number of bytes is staged or the deadline passes.
 //!
-//! The caller holds the cache's exclusive lease, so no build is using the
-//! tree. The fingerprint directory goes first: a prune interrupted after that
+//! Nothing is deleted here. Each pruned unit is renamed into one staging
+//! directory on the same volume, fingerprint first, so an interrupted prune
 //! leaves a unit cargo rebuilds, never one cargo trusts without its outputs.
-//! Anything unexpected (an unreadable entry, a name that is not a cargo unit)
-//! is left alone; the caller still rotates the tree when pruning did not
-//! bring it under its ceiling.
+//! The caller hands the staging directory to a deferred deleter. The caller
+//! holds the cache's exclusive lease, so no build is using the tree.
+//! Anything unexpected (an unreadable entry, a name that is not a cargo unit,
+//! a rename that fails) is left in place; the caller still rotates the tree
+//! when pruning did not bring it under its ceiling.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-/// What one prune removed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What one prune staged.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PruneOutcome {
-    /// Superseded units removed.
+    /// Superseded units moved into the staging directory.
     pub(crate) units: u64,
-    /// Logical bytes of the regular files removed, the measure `max_bytes`
-    /// is compared with.
+    /// Logical bytes of the regular files staged, the measure `max_bytes`
+    /// is compared with. A unit's `build/` directory is not walked to size
+    /// it and counts zero.
     pub(crate) bytes: u64,
-    /// Superseded units found, removed or not.
+    /// Superseded units found, staged or not.
     pub(crate) candidates: u64,
+    /// The deadline passed before enough bytes were staged.
+    pub(crate) deadline_stopped: bool,
+    /// The staged units as `<profile>/.fingerprint/<package>-<hash>`
+    /// relative to the target, to tell later whether cargo rebuilt one.
+    pub(crate) staged: Vec<String>,
 }
 
 struct Unit {
     profile: PathBuf,
+    profile_name: String,
     directory_name: String,
     hash: String,
     built_at: SystemTime,
     read_at: SystemTime,
+    /// Logical bytes of the fingerprint directory's files.
+    bytes: u64,
 }
 
-/// Remove superseded units under `target`, oldest first, until at least
-/// `wanted_bytes` logical bytes are freed or no candidate remains.
-pub(crate) fn prune_superseded_units(target: &Path, wanted_bytes: u64) -> PruneOutcome {
+/// A `deps/` or `examples/` entry of one unit and its logical size, from
+/// the listing's own metadata.
+struct Output {
+    path: PathBuf,
+    bytes: u64,
+}
+
+/// Move superseded units under `target` into `staging` (created on first
+/// use, on the target's volume), oldest first, until at least `wanted_bytes`
+/// logical bytes are staged, no candidate remains, or `deadline` passes.
+pub(crate) fn prune_superseded_units(
+    target: &Path,
+    staging: &Path,
+    wanted_bytes: u64,
+    deadline: Instant,
+) -> PruneOutcome {
     let mut outcome = PruneOutcome::default();
     if wanted_bytes == 0 {
         return outcome;
@@ -69,32 +95,80 @@ pub(crate) fn prune_superseded_units(target: &Path, wanted_bytes: u64) -> PruneO
             .cmp(&right.built_at)
             .then_with(|| left.directory_name.cmp(&right.directory_name))
     });
-    let mut deps_by_profile: BTreeMap<PathBuf, BTreeMap<String, Vec<PathBuf>>> = BTreeMap::new();
+    let mut outputs_by_profile: BTreeMap<PathBuf, BTreeMap<String, Vec<Output>>> = BTreeMap::new();
+    let mut staging_ready = false;
+    let mut sequence = 0_u64;
     for unit in candidates {
         if outcome.bytes >= wanted_bytes {
             break;
         }
-        let deps = deps_by_profile
+        if Instant::now() >= deadline {
+            outcome.deadline_stopped = true;
+            break;
+        }
+        if !staging_ready {
+            if std::fs::create_dir(staging).is_err() || !is_real_directory(staging) {
+                break;
+            }
+            staging_ready = true;
+        }
+        let outputs = outputs_by_profile
             .entry(unit.profile.clone())
-            .or_insert_with(|| deps_by_hash(&unit.profile.join("deps")));
+            .or_insert_with(|| {
+                let mut found = outputs_by_hash(&unit.profile.join("deps"));
+                for (hash, mut more) in outputs_by_hash(&unit.profile.join("examples")) {
+                    found.entry(hash).or_default().append(&mut more);
+                }
+                found
+            });
+        let mut stage = |source: &Path| -> bool {
+            sequence += 1;
+            let Some(name) = source.file_name() else {
+                return false;
+            };
+            let destination = staging.join(format!("{sequence:06}-{}", name.to_string_lossy()));
+            std::fs::rename(source, destination).is_ok()
+        };
         let fingerprint = unit.profile.join(".fingerprint").join(&unit.directory_name);
-        let Some(fingerprint_bytes) = remove_tree(&fingerprint) else {
+        if !stage(&fingerprint) {
             // Cannot prove the unit gone without its fingerprint going
             // first; leave the rest of it.
             continue;
-        };
-        let mut freed = fingerprint_bytes;
-        for path in deps.remove(&unit.hash).unwrap_or_default() {
-            freed = freed.saturating_add(remove_tree(&path).unwrap_or(0));
+        }
+        let mut staged_bytes = unit.bytes;
+        for output in outputs.remove(&unit.hash).unwrap_or_default() {
+            if stage(&output.path) {
+                staged_bytes = staged_bytes.saturating_add(output.bytes);
+            }
         }
         let build = unit.profile.join("build").join(&unit.directory_name);
         if std::fs::symlink_metadata(&build).is_ok() {
-            freed = freed.saturating_add(remove_tree(&build).unwrap_or(0));
+            stage(&build);
         }
         outcome.units += 1;
-        outcome.bytes = outcome.bytes.saturating_add(freed);
+        outcome.bytes = outcome.bytes.saturating_add(staged_bytes);
+        outcome.staged.push(format!(
+            "{}/.fingerprint/{}",
+            unit.profile_name, unit.directory_name
+        ));
     }
     outcome
+}
+
+/// How many of `staged` (as [`PruneOutcome::staged`] names them) exist again
+/// under `target`: units cargo rebuilt with the very hash a prune removed,
+/// which means the prune misjudged them as unused.
+pub(crate) fn rebuilt_units(target: &Path, staged: &[String]) -> u64 {
+    staged
+        .iter()
+        .filter(|relative| {
+            let relative = Path::new(relative.as_str());
+            relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && is_real_directory(&target.join(relative))
+        })
+        .count() as u64
 }
 
 /// Profile directories directly under the target (`debug`, `release`, a
@@ -129,6 +203,10 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
     let Ok(entries) = std::fs::read_dir(profile.join(".fingerprint")) else {
         return Vec::new();
     };
+    let profile_name = profile
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut generations: BTreeMap<(String, Vec<String>), Vec<Unit>> = BTreeMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -139,18 +217,20 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
         if !is_real_directory(&path) {
             continue;
         }
-        let Some((kinds, built_at, read_at)) = fingerprint_facts(&path) else {
+        let Some(facts) = fingerprint_facts(&path) else {
             continue;
         };
         generations
-            .entry((package.to_string(), kinds))
+            .entry((package.to_string(), facts.kinds))
             .or_default()
             .push(Unit {
                 profile: profile.to_path_buf(),
+                profile_name: profile_name.clone(),
                 directory_name: name.clone(),
                 hash: hash.to_string(),
-                built_at,
-                read_at,
+                built_at: facts.built_at,
+                read_at: facts.read_at,
+                bytes: facts.bytes,
             });
     }
     let mut superseded = Vec::new();
@@ -173,14 +253,25 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
     superseded
 }
 
-/// The unit kinds (its hash files), when it was last built (newest file
-/// modification) and last read (newest file access) from one fingerprint
-/// directory. `None` when it holds no recognisable hash file or a file
-/// cannot be inspected: such a unit is never a candidate.
-fn fingerprint_facts(directory: &Path) -> Option<(Vec<String>, SystemTime, SystemTime)> {
-    let mut kinds = Vec::new();
-    let mut built_at = SystemTime::UNIX_EPOCH;
-    let mut read_at = SystemTime::UNIX_EPOCH;
+struct FingerprintFacts {
+    /// The unit kinds: its hash files.
+    kinds: Vec<String>,
+    /// Newest file modification: when the unit was last built.
+    built_at: SystemTime,
+    /// Newest file access: when a build last considered the unit.
+    read_at: SystemTime,
+    bytes: u64,
+}
+
+/// Facts of one fingerprint directory. `None` when it holds no recognisable
+/// hash file or a file cannot be inspected: such a unit is never a candidate.
+fn fingerprint_facts(directory: &Path) -> Option<FingerprintFacts> {
+    let mut facts = FingerprintFacts {
+        kinds: Vec::new(),
+        built_at: SystemTime::UNIX_EPOCH,
+        read_at: SystemTime::UNIX_EPOCH,
+        bytes: 0,
+    };
     for entry in std::fs::read_dir(directory).ok()? {
         let entry = entry.ok()?;
         let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
@@ -189,62 +280,50 @@ fn fingerprint_facts(directory: &Path) -> Option<(Vec<String>, SystemTime, Syste
         }
         let modified = metadata.modified().ok()?;
         let accessed = metadata.accessed().ok()?;
-        built_at = built_at.max(modified);
-        read_at = read_at.max(accessed).max(modified);
+        facts.built_at = facts.built_at.max(modified);
+        facts.read_at = facts.read_at.max(accessed).max(modified);
+        facts.bytes = facts.bytes.saturating_add(metadata.len());
         let name = entry.file_name().to_string_lossy().into_owned();
         if !(name.ends_with(".json")
             || name.starts_with("dep-")
             || name.starts_with("output-")
             || name == "invoked.timestamp")
         {
-            kinds.push(name);
+            facts.kinds.push(name);
         }
     }
-    if kinds.is_empty() {
+    if facts.kinds.is_empty() {
         return None;
     }
-    kinds.sort();
-    Some((kinds, built_at, read_at))
+    facts.kinds.sort();
+    Some(facts)
 }
 
-/// `deps/` entries by the unit hash in their name: `<stem>-<hash>` with an
-/// optional extension (`.rlib`, `.rmeta`, `.d`, `.dSYM`, ...).
-fn deps_by_hash(deps: &Path) -> BTreeMap<String, Vec<PathBuf>> {
-    let mut found: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(deps) else {
+/// Entries of `deps/` or `examples/` by the unit hash in their name:
+/// `<stem>-<hash>` with an optional extension (`.rlib`, `.rmeta`, `.d`,
+/// `.dSYM`, ...). Sizes come from this listing; a directory counts zero.
+fn outputs_by_hash(directory: &Path) -> BTreeMap<String, Vec<Output>> {
+    let mut found: BTreeMap<String, Vec<Output>> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return found;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let stem = name.split_once('.').map_or(name.as_str(), |(stem, _)| stem);
-        if let Some((_, hash)) = unit_name(stem) {
-            found
-                .entry(hash.to_string())
-                .or_default()
-                .push(entry.path());
-        }
+        let Some((_, hash)) = unit_name(stem) else {
+            continue;
+        };
+        let bytes = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |metadata| metadata.len());
+        found.entry(hash.to_string()).or_default().push(Output {
+            path: entry.path(),
+            bytes,
+        });
     }
     found
-}
-
-/// Remove a file or a directory tree without following links, returning the
-/// logical bytes of the regular files it held. `None` when nothing could be
-/// removed.
-fn remove_tree(path: &Path) -> Option<u64> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if metadata.is_dir() {
-        let bytes = crate::disk_headroom::directory_usage_best_effort(path).bytes;
-        std::fs::remove_dir_all(path).ok()?;
-        Some(bytes)
-    } else {
-        let bytes = if metadata.is_file() {
-            metadata.len()
-        } else {
-            0
-        };
-        std::fs::remove_file(path).ok()?;
-        Some(bytes)
-    }
 }
 
 #[cfg(test)]
@@ -261,6 +340,10 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + seconds)
     }
 
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     fn file(path: &Path, bytes: usize, modified: SystemTime, accessed: SystemTime) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![0_u8; bytes]).unwrap();
@@ -274,8 +357,8 @@ mod tests {
             .unwrap();
     }
 
-    /// One unit: its fingerprint (built at `built`, last read at `read`) and
-    /// a `bytes`-long rlib.
+    /// One library unit: its fingerprint (built at `built`, last read at
+    /// `read`), a `bytes`-long rlib and a dep-info file.
     fn unit(profile: &Path, package: &str, hash: &str, built: u64, read: u64, bytes: usize) {
         let fingerprint = profile
             .join(".fingerprint")
@@ -304,10 +387,43 @@ mod tests {
         );
     }
 
+    /// One build-script run unit: its fingerprint and its `out` directory.
+    fn run_unit(profile: &Path, package: &str, hash: &str, built: u64, read: u64) {
+        let name = format!("{package}-{hash}");
+        let fingerprint = profile.join(".fingerprint").join(&name);
+        for kind in [
+            "run-build-script-build-script-build",
+            "run-build-script-build-script-build.json",
+        ] {
+            file(&fingerprint.join(kind), 8, at(built), at(read));
+        }
+        file(
+            &profile.join("build").join(&name).join("out/generated.rs"),
+            32,
+            at(built),
+            at(read),
+        );
+    }
+
+    fn staged_names(staging: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(staging)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn prunes_only_generations_nobody_read_since_their_successor_was_built() {
+    fn stages_only_generations_nobody_read_since_their_successor_was_built() {
         let tmp = tempfile::tempdir().unwrap();
-        let profile = tmp.path().join("debug");
+        let target = tmp.path().join("target");
+        let staging = tmp.path().join("staging");
+        let profile = target.join("debug");
         // A workspace crate, superseded by a version bump and never read again.
         unit(&profile, "work-crate", OLD, 10, 20, 1_000);
         unit(&profile, "work-crate", NEW, 100, 110, 1_000);
@@ -325,23 +441,31 @@ mod tests {
             at(10),
         );
 
-        let outcome = prune_superseded_units(tmp.path(), u64::MAX);
+        let outcome = prune_superseded_units(&target, &staging, u64::MAX, later());
 
         assert_eq!(outcome.candidates, 1);
         assert_eq!(outcome.units, 1);
-        assert_eq!(outcome.bytes, 3 * 8 + 1_000 + 4 + 50);
-        assert!(
-            !profile
-                .join(format!(".fingerprint/work-crate-{OLD}"))
-                .exists()
+        assert!(!outcome.deadline_stopped);
+        // The fingerprint and both deps files; the build directory is moved
+        // but not walked to size it.
+        assert_eq!(outcome.bytes, 3 * 8 + 1_000 + 4);
+        assert_eq!(
+            outcome.staged,
+            vec![format!("debug/.fingerprint/work-crate-{OLD}")]
         );
-        assert!(
-            !profile
-                .join(format!("deps/libwork_crate-{OLD}.rlib"))
-                .exists()
-        );
-        assert!(!profile.join(format!("deps/work_crate-{OLD}.d")).exists());
-        assert!(!profile.join(format!("build/work-crate-{OLD}")).exists());
+        // Moved, not deleted: the fingerprint first.
+        let staged = staged_names(&staging);
+        assert_eq!(staged.len(), 4, "{staged:?}");
+        assert_eq!(staged[0], format!("000001-work-crate-{OLD}"));
+        assert!(staged.contains(&format!("000004-work-crate-{OLD}")));
+        for gone in [
+            format!(".fingerprint/work-crate-{OLD}"),
+            format!("deps/libwork_crate-{OLD}.rlib"),
+            format!("deps/work_crate-{OLD}.d"),
+            format!("build/work-crate-{OLD}"),
+        ] {
+            assert!(!profile.join(&gone).exists(), "{gone} must be staged");
+        }
         for kept in [
             format!(".fingerprint/work-crate-{NEW}"),
             format!("deps/libwork_crate-{NEW}.rlib"),
@@ -353,47 +477,96 @@ mod tests {
         ] {
             assert!(profile.join(&kept).exists(), "{kept} must be kept");
         }
+        assert_eq!(rebuilt_units(&target, &outcome.staged), 0);
+        // Cargo rebuilding the very unit is what the rebuild count reports.
+        unit(&profile, "work-crate", OLD, 200, 200, 1_000);
+        assert_eq!(rebuilt_units(&target, &outcome.staged), 1);
+        assert_eq!(rebuilt_units(&target, &["../escape".to_string()]), 0);
+    }
+
+    /// A build-script run whose `out` directory a kept unit compiles against
+    /// is read by every build of that unit, so it is kept even though a newer
+    /// run generation exists.
+    #[test]
+    fn keeps_a_build_script_run_a_kept_unit_still_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let staging = tmp.path().join("staging");
+        let profile = target.join("debug");
+        run_unit(&profile, "native-sys", OLD, 10, 150);
+        run_unit(&profile, "native-sys", NEW, 100, 110);
+        unit(&profile, "native-user", SOLE, 10, 150, 100);
+
+        let outcome = prune_superseded_units(&target, &staging, u64::MAX, later());
+
+        assert_eq!(outcome.candidates, 0);
+        assert_eq!(outcome.units, 0);
+        assert!(
+            profile
+                .join(format!("build/native-sys-{OLD}/out/generated.rs"))
+                .is_file()
+        );
+        assert!(!staging.exists(), "nothing staged, nothing created");
     }
 
     #[test]
-    fn stops_once_enough_bytes_are_freed_oldest_generation_first() {
+    fn stops_once_enough_bytes_are_staged_oldest_generation_first() {
         let tmp = tempfile::tempdir().unwrap();
-        let profile = tmp.path().join("debug");
+        let target = tmp.path().join("target");
+        let profile = target.join("debug");
         unit(&profile, "first", OLD, 10, 10, 1_000);
         unit(&profile, "first", NEW, 100, 100, 1_000);
         unit(&profile, "second", OLD, 20, 20, 1_000);
         unit(&profile, "second", NEW, 100, 100, 1_000);
 
-        let outcome = prune_superseded_units(tmp.path(), 500);
+        let outcome = prune_superseded_units(&target, &tmp.path().join("staging"), 500, later());
 
         assert_eq!(outcome.candidates, 2);
         assert_eq!(outcome.units, 1);
         assert!(!profile.join(format!(".fingerprint/first-{OLD}")).exists());
         assert!(profile.join(format!(".fingerprint/second-{OLD}")).exists());
         assert_eq!(
-            prune_superseded_units(tmp.path(), 0),
+            prune_superseded_units(&target, &tmp.path().join("unused"), 0, later()),
             PruneOutcome::default()
         );
     }
 
     #[test]
+    fn a_passed_deadline_stages_nothing_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let profile = target.join("debug");
+        unit(&profile, "first", OLD, 10, 10, 1_000);
+        unit(&profile, "first", NEW, 100, 100, 1_000);
+
+        let outcome = prune_superseded_units(
+            &target,
+            &tmp.path().join("staging"),
+            u64::MAX,
+            Instant::now(),
+        );
+
+        assert_eq!(outcome.candidates, 1);
+        assert_eq!(outcome.units, 0);
+        assert!(outcome.deadline_stopped);
+        assert!(profile.join(format!(".fingerprint/first-{OLD}")).exists());
+    }
+
+    #[test]
     fn leaves_a_tree_that_is_not_a_cargo_target_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("large"), b"1234").unwrap();
-        std::fs::create_dir_all(tmp.path().join("debug/deps")).unwrap();
-        std::fs::write(
-            tmp.path().join("debug/deps/libx-aaaaaaaaaaaaaaaa.rlib"),
-            b"1",
-        )
-        .unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(target.join("large"), b"1234").unwrap();
+        std::fs::write(target.join("debug/deps/libx-aaaaaaaaaaaaaaaa.rlib"), b"1").unwrap();
 
         assert_eq!(
-            prune_superseded_units(tmp.path(), u64::MAX),
+            prune_superseded_units(&target, &tmp.path().join("staging"), u64::MAX, later()),
             PruneOutcome::default()
         );
-        assert!(tmp.path().join("large").exists());
+        assert!(target.join("large").exists());
         assert!(
-            tmp.path()
+            target
                 .join("debug/deps/libx-aaaaaaaaaaaaaaaa.rlib")
                 .exists()
         );
