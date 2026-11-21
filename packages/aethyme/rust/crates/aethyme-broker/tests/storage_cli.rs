@@ -811,6 +811,17 @@ fn an_empty_bound_root_is_retained_and_reused_after_apply() {
         !removed_worktree.exists(),
         "finish removes the session worktree"
     );
+    // `finish` moves the checkout into the pool's checkout trash, and the
+    // deleter removes it later; until then the root holds those bytes and
+    // is rightly not empty. Stand in for the deleter so the root is as it
+    // is once drained.
+    let trash = removed_worktree
+        .parent()
+        .unwrap()
+        .join(".aethyme-checkout-trash");
+    if trash.exists() {
+        std::fs::remove_dir_all(&trash).unwrap();
+    }
 
     let plan = json(run(
         repo.path(),

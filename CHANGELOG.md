@@ -4,6 +4,134 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.147] - 2026-11-21
+
+### Fixed
+
+- A managed gate cache over its `max_bytes` no longer loses the whole tree. The gate first moves aside superseded cargo unit generations (an older generation of the same package and unit kinds whose fingerprint nothing has read since the newest was built), oldest first, down to three quarters of the cap, with a 5 s limit; the storage worker deletes them off the command path. The whole-tree rotation remains the fallback. On this repository's largest target 10.2 of 14.6 GiB was superseded generations left by version bumps (#1909).
+- The retirement lane releases a closed session's implicit leases, in the same transaction that checks the session is not open, so a checkout held only by them can retire. Explicit claims still keep it (#1910).
+- An orphaned checkout (its Git registration is gone) with a recorded interrupted finish-cleanup proof is resumed through the content-verified removal: tracked files are compared with the pinned commit and anything modified or new refuses the removal. Without the proof it is kept as `orphan_cleanup_refused`. The lane cannot reach the recursive orphan removal (#1910).
+- Keeps that cannot resolve by themselves (`operation_state_unknown`, `ownership_unknown`, `lease_held`, `operation_unresolved`, `orphan_cleanup_refused`) are remembered with the existing back-off instead of being judged on every run. `lease_held` and `operation_unresolved` clear as soon as the lease is released or the operation resolved (#1910).
+
+### Added
+
+- `broker status` notice `cleanup.retirement-kept`: remembered keeps by reason, with up to eight session ids and one detail each (#1910).
+- Span and attachment `managed_cache_prune` (`candidates`, `units`, `bytes`, `deadline_stopped`, `deletion_deferred`, `rebuilt_after_previous_prune`); counters `managed_cache_prune_staged_unit`, `managed_cache_prune_deadline_stop`, `managed_cache_prune_rebuilt_unit` (#1909).
+- Counters `checkout_retirement_keep_condition_cleared` and `checkout_retirement_orphan_recursive_removal_refused`; event `lease.released` with reason `closed_session_implicit_lease` (#1910).
+
+### Known issues
+
+- Orphaned checkouts without a recorded proof, folders with no Git data, and checkouts whose changes are too large for the recovery archive stay on disk. They are now listed in `broker status`.
+
+## [0.8.146] - 2026-11-21
+
+### Fixed
+
+- The retirement lane's inspections no longer starve. The lane ran at a disk priority one tier below ordinary processes, so its reads, and those of its Git children, waited behind every build on the same volume. On the busiest repository one run of 1,319 s examined 24 checkouts, started 16 inspections, finished none and retired nothing; each status timed out at 60 s, while the same command took 0.14 s and 0.36 s from an ordinary shell under the same load. The lane now runs at an ordinary process's disk priority. It keeps its low CPU priority, one inspection per volume and host-pressure pacing. Which checkouts may be retired is unchanged (#1905).
+- `finish` no longer spends its budget on a size walk. The walk only feeds the reported reclaimed bytes and took 14 to 45 s; it is now bounded at 2 s, and a walk that runs out reports no size (#1906).
+- A background strip pass may hold the lifecycle claim for at most 5 s per proof, with its Git deadline matched. On the busiest repository a worker held the claim three times for 80 s in total, and two of three finishes timed out waiting behind it. A proof that runs out is a transient refusal retried on the next pass; what is proven is unchanged (#1906).
+
+### Added
+
+- Each lane run is recorded in meta `checkout_retirement.lane`. After three consecutive runs retire nothing while closed checkouts wait, `broker status` warns with `cleanup.retirement-lane-idle` (#1905).
+- Counter `lifecycle_lock_held_background_long` for background lifecycle holds of 5 s or more (#1906).
+
+### Upgrade notes
+
+- `finish` may report 0 reclaimed bytes for a large checkout: the size is no longer measured past 2 s.
+
+## [0.8.145] - 2026-11-21
+
+### Added
+
+- Abandoned sessions can close early when nothing can be lost. Before its class window, a session idle past `session_abandoned_after_hours` now closes only if a fresh check finds: no merge, rebase, cherry-pick, revert or bisect in progress; no stash on the branch; every tip of HEAD and the branch contained in the upstream default branch, in the remote branch as the remote reports it now, or in a merged pull-request head; no staged or unstaged change; no untracked file Git does not ignore; and no index entry flagged skip-worktree or assume-unchanged. Anything that cannot be read keeps the session. The check runs on the first look and again under both claims immediately before the close; a rule that first holds under the claims keeps the session for that pass. An early close also requires the open-file check with no holder exemption. Sessions that fail the rule keep the existing path: a closing-soon note, then the archive-verified close at the class window (#1900).
+- A reading agent counts as active: the PreToolUse hook records activity at most once a minute (#1900).
+- Each early close records the checks it passed on its `session.abandoned` event. `broker status` attaches `session_abandonment_early_close_24h {closed, resumed_within_24h}` and warns with `sessions.early-close-resumed` when a session closed early was reused within 24 hours (#1900).
+- `broker status` advice `sessions.abandonment-held` ("N held by <reason>"), `sessions.abandonment-lane-idle` and `retention.invalid`; attachment `abandonment_lane_last_judged_age_ms`; a per-session record of the last keep reason (#1898).
+
+### Fixed
+
+- The abandonment lane no longer stops for good when a pass is refused the process listing. On the busiest repository it had judged no session for about 16 hours. The lane now stops only when the pass could judge nothing else; sessions whose verdict needs the listing wait for a worker that can take it (#1898).
+- Landed proofs can no longer use a whole page's time: a third of each page is reserved for abandonment judgements (#1898).
+- A working-tree status that could not finish is recorded as not examined (`working_tree_not_examined`) and is no longer remembered as a dirty verdict (#1898).
+- A fractional or invalid `session_abandoned_after_hours` is reported in status instead of silently disabling the lane. Nothing closes while it is invalid (#1898).
+- An adopted session whose base carries unpushed commits is classed by those commits instead of as landed (#1900).
+- A retirement run whose open-file observation ran out of time retries it once with up to 30 s instead of ending the pass. On the busiest repository three of six passes ended that way under load, at 10.4 to 10.9 s against a 10 s limit. A refused listing is told apart from a timed-out one; the worker probes once before starting the retirement lane, and the lane probes once at its own start (#1902).
+- A retirement lap no longer starts an inspection it cannot give its full allowance; the checkout is kept as `inspection_deferred` with the cursor before it. The worker's closed-lap floor with a large backlog goes from 45 s to 75 s (#1902).
+
+### Upgrade notes
+
+- The early close applies wherever `session_abandoned_after_hours` is shorter than a session's class window. The value is whole hours in `.aethyme/broker.toml` under `[retention]`.
+- A session closed under an agent refuses the next command with the reason and the exact `start --reuse` command; reuse recreates the checkout from its branch.
+- The untracked check is strict: a stray file the repository does not ignore, such as a desktop metadata file, keeps a session until its class window.
+
+## [0.8.144] - 2026-11-20
+
+### Changed
+
+- `finish` retires the checkout with one rename. When `finish` has proven the checkout clean and delivered, it now moves it into the checkout trash under the lifecycle claim instead of removing it file by file with `git worktree remove`. On the busiest repository 45% of finishes removed the checkout, at a median 48 s under the repository-wide claim, so every other start and finish waited. The Git registration is removed and reflog-only commits are pinned first, the clean check is repeated immediately before the move, and anything the move refuses falls back to `git worktree remove` as before. The trash deleter removes the entry later, and only once no process uses it (#1895).
+- Closed checkouts are judged by a dedicated process. The worker starts `broker gc __retire-lane` when closed checkouts wait: one per repository, normal disk priority and reduced CPU priority, one Git inspection at a time per volume, in 5-minute slices paced by host pressure, ending when the backlog is done, at critical memory pressure or after 60 minutes. It calls the worker's own judgement with the same keeps, back-off and inspection allowance, and which checkouts may be retired is unchanged. The worker's own laps and the lane are exclusive through one kernel lock (#1897).
+
+### Added
+
+- When `finish` keeps a checkout it records why on the session: `keep_worktree`, `dirty`, `not_proven_safe`, `not_broker_owned`, `policy_disabled`, `cleanup_plan_unsafe` or `removal_failed` (#1895).
+- Span `finish_retire_move`; counters `finish_retire_trashed`, `finish_retire_git_fallback`, `finish_retire_kept_<reason>`, `finish_retire_holder_check_deferred_to_deleter` and `checkout_retirement_judged_after_finish_keep` (#1895).
+- Metric row `gc.__retire-lane` with `examined`, `retired`, `kept` by reason, inspection counts, `median_inspection_ms`, `slices`, `paced_slices`, `end_reason` and `elapsed_ms`; stop reasons `not_reached_lane_process` and `volume_turn_unavailable`; counter `checkout_retirement_volume_turn_yielded` (#1897).
+
+### Upgrade notes
+
+- Right after `finish`, the finished checkout's bytes are still on disk in the pool's trash until the deleter removes them, so storage reports that root as not yet empty for a short time.
+- A process whose working directory is a finished checkout sees the directory renamed, not its files deleted.
+
+## [0.8.143] - 2026-11-20
+
+### Fixed
+
+- Retirement inspections no longer time out just short of finishing. The eligibility check's `git status` had a fixed 15 s limit, and the first, cold walk of a large checkout on a contended volume lands just past it. On the busiest repository 13 of 19 inspections in four passes timed out, and in two passes 79 to 81 s of an 81 to 84 s lap produced nothing. Inside the retirement laps each plan's cleanup listings may now take up to 60 s, still bounded by the lap's deadline. The commands and what they prove are unchanged, and outside the laps the limit stays 15 s (#1892).
+- A plan in the cleaned lap ran its Git calls under the closed lap's deadline, already past, so they were never started and could be remembered as failed inspections. The planning context now takes each lap's deadline before every plan (#1892).
+
+### Added
+
+- The `checkout_retirement` attachment adds `inspections` with `started`, `succeeded`, `failed`, `cut_by_deadline`, `refused` and `median_succeeded_ms` (#1892).
+
+## [0.8.142] - 2026-11-20
+
+### Fixed
+
+- The retirement run reaches the closed checkouts on every pass. Before it may retire anything the run resolves the paths of every open session, with a fixed limit of a third of its window. On the busiest repository that took 63 to 80 s against 60 s, and a run that went over discarded the work and retired nothing: two passes in three. The step may now use the window less the closed lap's floor, never less than a third (#1886).
+- With 50 or more closed checkouts waiting, the closed lap runs before the strip passes, with the rest of the sweep window. The strip passes follow with their floors. Below 50 the order is unchanged. Which checkouts may be retired is unchanged (#1886).
+- The recovery-archive bound no longer spends minutes per pass. It checked each archive-root entry and each earlier recorded size one at a time without looking at the deadline: 105 to 339 s per pass on the busiest repository, with nothing to evict. It now runs at most every 30 minutes while the last record was within the bound, and every time when that record was over the bound, partial, missing or unreadable, or when the current run archived anything. The listing takes entry types from the directory read, and sizes the pass already holds are not looked up again (#1886).
+
+### Added
+
+- `closed_stop` is `not_reached_open_paths` when the closed lap never starts. The `checkout_retirement` attachment adds `closed_lap_first`, `open_sessions` and `open_paths_ms` (#1886).
+- Spans `checkout_retirement_setup`, `checkout_retirement_archive_bound`, `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`; counters `checkout_retirement_closed_lap_first` and `checkout_retirement_archive_bound_not_due` (#1886).
+
+### Known issues
+
+- Each retirement plan still costs one `git status`, about 13 s per checkout on a slow volume, so a pass judges only a few closed checkouts.
+
+## [0.8.141] - 2026-11-20
+
+### Fixed
+
+- The retirement lap no longer spends its time on checkouts it cannot retire. On the busiest repository a lap judged a median of 4 checkouts per run: about two thirds of its time went to `git status` plans that timed out at about 14.5 s each, and in some runs a single operation-state Git call took the whole 45 s. The run's open-file observation is now consulted before any Git call, so a checkout held open by a process is kept at no cost and the lap moves on (#1874).
+- A checkout whose `git status` failed or timed out on its own is remembered with the existing keep back-off (1 h, 6 h, then 24 h, or at once when HEAD or the index changes) instead of being inspected again on the next run. A Git call cut short by the lap's own deadline is kept as `deadline` and not remembered. Which checkouts may be retired is unchanged (#1874).
+- Gates that declare no graph authority skip graph hashing (#1878).
+- Lint errors in the content-gate code that kept main's lint job red (#1880).
+
+### Added
+
+- Per-run fields on the `checkout_retirement` attachment: `closed_examined`, `closed_stop` (`deadline`, `lap_complete`, `process_use_unknown` or `archive_deferred`) and `failed_inspection_ms`; counters `checkout_retirement_closed_lap_stop_<reason>` (#1874).
+
+### Upgrade notes
+
+- The counter `checkout_retirement_inspection_retried` is removed. It only ever meant "inspected again on a later run".
+
+### Known issues
+
+- A checkout held open by another process, for example a file browser window showing the pool, still cannot be retired. On the busiest repository that is the largest remaining reason checkouts are kept.
+
 ## [0.8.140] - 2026-11-19
 
 ### Fixed

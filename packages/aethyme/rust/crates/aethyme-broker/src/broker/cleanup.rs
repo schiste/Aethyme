@@ -132,7 +132,10 @@ impl CleanupStatusLimits {
         output_bytes: usize,
         path_fields: usize,
     ) -> Self {
-        let per_call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // 15 s, or the allowance of the retirement inspection running on
+        // this thread (`InspectionAllowanceScope`).
+        let per_call_deadline =
+            std::time::Instant::now() + crate::cleanup_resolve::cleanup_listing_allowance();
         Self {
             deadline: overall_deadline.map_or(per_call_deadline, |deadline| {
                 deadline.min(per_call_deadline)
@@ -560,6 +563,35 @@ fn orphan_object_volume_matches(
         }
         Some(_) => refuse(crate::events::IDENTITY_VOLUME_UUID_DIFFERS),
         None => refuse(crate::events::IDENTITY_VOLUME_UUID_UNAVAILABLE),
+    }
+}
+
+thread_local! {
+    /// Set while the retirement lane resumes an orphan's interrupted
+    /// cleanup: only the content-verified removal may act.
+    static ORPHAN_RESUME_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an orphan may be removed by the recursive
+/// [`Broker::remove_proven_orphan_worktree`] on this thread: not while an
+/// [`OrphanResumeOnlyScope`] is held.
+pub(super) fn orphan_tree_removal_allowed() -> bool {
+    !ORPHAN_RESUME_ONLY.with(std::cell::Cell::get)
+}
+
+/// Limits orphan removal on this thread to the content-verified
+/// interrupted-cleanup path until dropped.
+pub(super) struct OrphanResumeOnlyScope(bool);
+
+impl OrphanResumeOnlyScope {
+    pub(super) fn enter() -> Self {
+        Self(ORPHAN_RESUME_ONLY.with(|cell| cell.replace(true)))
+    }
+}
+
+impl Drop for OrphanResumeOnlyScope {
+    fn drop(&mut self) {
+        ORPHAN_RESUME_ONLY.with(|cell| cell.set(self.0));
     }
 }
 
@@ -4598,6 +4630,19 @@ impl Broker {
         Ok(())
     }
 
+    /// The interrupted finish-cleanup proof of an orphaned checkout, as the
+    /// cleanup that acts on it judges it (`Finish` lane), for the retirement
+    /// lane's decision to resume it.
+    pub(super) fn interrupted_finish_orphan_cleanup_proof_for_retirement(
+        &self,
+        session: &Session,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        self.interrupted_finish_orphan_cleanup_proof_in_lane(
+            session,
+            crate::auto_cleanup::OwnershipReproofLane::Finish,
+        )
+    }
+
     fn resume_interrupted_finish_orphan_cleanup(
         &mut self,
         session: &Session,
@@ -4722,6 +4767,19 @@ impl Broker {
         worktree_path: &Path,
         force: bool,
     ) -> Result<(String, String), BrokerOpError> {
+        // The retirement lane resumes an orphan only through the
+        // content-verified interrupted-cleanup removal, never this
+        // recursive one.
+        if !orphan_tree_removal_allowed() {
+            crate::phase_telemetry::add(
+                "checkout_retirement_orphan_recursive_removal_refused",
+                std::time::Duration::ZERO,
+            );
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the retirement lane removes an orphan only through its content-verified interrupted cleanup; preserved the checkout".into(),
+            });
+        }
         let current = self.store.session(session.id)?;
         let Some(item) = item else {
             return Err(BrokerOpError::DirtyWorktree {
@@ -4963,7 +5021,11 @@ impl Broker {
         worktree: &Path,
         force: bool,
     ) -> Result<(), BrokerOpError> {
-        let in_lane = super::retire::in_retirement_lane();
+        // The retirement lane keeps what the move refuses, and `finish`
+        // falls back to Git's removal itself (counted once there): neither
+        // gets a fallback here.
+        let no_fallback =
+            super::retire::in_retirement_lane() || super::retire::in_finish_retirement(session.id);
         let refuse = |reason: String| BrokerOpError::DirtyWorktree {
             id: session.id,
             reason,
@@ -4986,7 +5048,7 @@ impl Broker {
                     "checkout_trash_declined_unclean",
                     std::time::Duration::ZERO,
                 );
-                if in_lane {
+                if no_fallback {
                     return Err(refuse("the checkout changed since it was judged".into()));
                 }
                 self.repo.worktree_remove_registered(worktree, false)?;
@@ -4995,7 +5057,7 @@ impl Broker {
         }
         let Some(pool) = self.trash_pool_for(session, worktree) else {
             crate::phase_telemetry::add("checkout_trash_outside_pool", std::time::Duration::ZERO);
-            if in_lane {
+            if no_fallback {
                 return Err(refuse(
                     "the checkout is not inside a broker-owned pool".into(),
                 ));
@@ -5024,11 +5086,14 @@ impl Broker {
         match moved {
             Ok(trashed) => {
                 self.note_checkout_trashed(&trashed);
+                if super::retire::in_finish_retirement(session.id) {
+                    crate::phase_telemetry::add("finish_retire_trashed", std::time::Duration::ZERO);
+                }
                 Ok(())
             }
             Err(reason) => {
                 crate::phase_telemetry::add("checkout_trash_refused", std::time::Duration::ZERO);
-                if in_lane {
+                if no_fallback {
                     return Err(refuse(reason));
                 }
                 crate::phase_telemetry::add(
@@ -5549,6 +5614,29 @@ impl Broker {
                             .collect(),
                     );
                     self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                } else if super::retire::in_finish_retirement(session_id) {
+                    // `finish` just proved this checkout clean and delivered
+                    // under this claim: one rename into the trash instead of
+                    // `git worktree remove` deleting it here (a median 48 s
+                    // with every start and finish waiting on this claim).
+                    // Whatever the move refuses falls back to Git's removal,
+                    // exactly as before.
+                    let moved = {
+                        let _span = crate::phase_telemetry::span("finish_retire_move");
+                        self.remove_checkout_through_trash(session, &worktree_path, force)
+                    };
+                    if let Err(error) = moved {
+                        crate::phase_telemetry::add(
+                            "finish_retire_git_fallback",
+                            std::time::Duration::ZERO,
+                        );
+                        crate::warn_unrecorded::<(), _>(
+                            "move a finished checkout into the trash",
+                            Err(error),
+                        );
+                        self.repo
+                            .worktree_remove_registered(&worktree_path, force)?;
+                    }
                 } else {
                     self.repo
                         .worktree_remove_registered(&worktree_path, force)?;

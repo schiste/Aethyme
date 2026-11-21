@@ -1636,3 +1636,55 @@ project = "proj-7k2m"
 > `advisory` and `off` never touch the floor.
 
 Details: `architecture/local-v3-l2-optin.md`.
+
+### Verify a ready group together
+
+An integration coordinator can verify two to sixteen independent sessions in
+one checkout. Supply the exact fetched default commit and the published
+branch heads in the intended order. The sessions must already be based on
+that default commit and each must own its exclusive pending history. A
+stacked, stale or ambiguous member can use ordinary single-session submit.
+
+```sh
+aethyme broker submit batch "$BASE" "21=$FIRST_HEAD" "34=$SECOND_HEAD" \
+  --session "$COORDINATOR" --json
+```
+
+The broker returns the verified candidate commit, tree, ordered members,
+and exact gate results. A textual conflict identifies the member and paths
+before running a gate. A moved base or member invalidates the group. If a
+gate fails, the receipt identifies the gate and its outcome. The coordinator
+can repair or regroup the members and capture a fresh set of exact heads.
+
+A verified batch applies to the whole candidate. Land that candidate as one
+group through your repository's authorized merge workflow, with the expected
+base and the required provider checks. The candidate has the base as first
+parent and the participating heads as subsequent parents. Individual pull
+requests and prefixes still require verification on their own candidate.
+A repeated batch can reuse cacheable gate verdicts for the same tree,
+definition and execution profile. Use `--no-cache` for fresh gate execution.
+
+### Share verification when the ordinary queue is busy
+
+When your repository provides an authorized way to land one combined candidate,
+each participating session can opt in by naming the same coordinator session:
+
+```sh
+aethyme broker submit queued "$COORDINATOR" --session "$OWN_SESSION" --json
+```
+
+The coordinator must also run this command for its own session. Publish
+the member heads first. If the ordinary verification pool is saturated, each
+compatible submit joins the waiting queue. When a submit acquires a slot, it
+can take up to sixteen already waiting participants. The group needs the same
+fetched base and cache mode, with distinct heads and disjoint changed paths.
+The broker preserves their order in the waiting queue and runs the exact
+combined candidate through the normal graph and gate policy.
+
+Each participant receives the same combined candidate and gate verdict.
+The named coordinator may use the repository's authorized group merge
+workflow, subject to its merge permissions and required provider checks.
+Other participants can wait for that result. If a slot opens with only one
+eligible submit, that submit starts immediately. An incompatible, stale,
+or failed group falls back to ordinary verification. Use ordinary
+`broker submit` for repositories that land each pull request separately.

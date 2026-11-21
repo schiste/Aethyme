@@ -95,6 +95,41 @@ pub(crate) fn raise_for_trash_deleter() -> DeleterPriority {
     platform::raise_for_trash_deleter()
 }
 
+/// Apply the retirement lane's priority through the three setters (the
+/// platform calls, or recorders in tests): leave the background band, set
+/// the process-scope disk policy to `IOPOL_IMPORTANT` (the policy an
+/// ordinary process has), and lower CPU niceness to 10.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn raise_for_retirement_lane_with(
+    set_darwin_bg: impl FnOnce(libc::c_int) -> bool,
+    set_io_policy: impl FnOnce(libc::c_int, libc::c_int) -> bool,
+    set_nice: impl FnOnce(libc::c_int) -> bool,
+) -> DeleterPriority {
+    let darwin_bg_cleared = set_darwin_bg(TRASH_DELETER_DARWIN_BG);
+    let io_raised = set_io_policy(
+        TRASH_DELETER_IOPOL_SCOPE_PROCESS,
+        TRASH_DELETER_IOPOL_IMPORTANT,
+    );
+    let cpu_niced = set_nice(TRASH_DELETER_NICE);
+    DeleterPriority {
+        io_policy: if io_raised { "important" } else { "unchanged" },
+        darwin_bg_cleared,
+        cpu_niced,
+    }
+}
+
+/// Set the checkout retirement lane process to an ordinary process's disk
+/// priority (`IOPOL_IMPORTANT`) with reduced CPU priority on macOS. Its Git
+/// children inherit the policy. Under `IOPOL_STANDARD` (tier 1) every one
+/// of 16 eligibility `git status` runs hit its 60 s limit on the busiest
+/// repository while agents' builds (tier 0) used the same volume, and the
+/// same command in an ordinary shell finished in 0.14 s and 0.36 s on two
+/// of those checkouts. One Git inspection at a time per volume and the
+/// host pressure pacing bound it instead. Linux keeps the inherited class.
+pub(crate) fn raise_for_retirement_lane() -> DeleterPriority {
+    platform::raise_for_retirement_lane()
+}
+
 /// The disk I/O policy of this process, as a label for telemetry:
 /// macOS `throttle`, `utility`, `standard`, `important`, `passive` or
 /// `default`; Linux `idle`, `best_effort`, `realtime` or `none`;
@@ -116,6 +151,17 @@ mod platform {
 
     pub(super) fn raise_for_trash_deleter() -> DeleterPriority {
         super::raise_for_trash_deleter_with(
+            // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
+            |band| unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, band) } == 0,
+            // SAFETY: integer-only wrapper changing only this process's policy.
+            |scope, policy| unsafe { setiopolicy_np(IOPOL_TYPE_DISK, scope, policy) } == 0,
+            // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
+            |nice| unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } == 0,
+        )
+    }
+
+    pub(super) fn raise_for_retirement_lane() -> DeleterPriority {
+        super::raise_for_retirement_lane_with(
             // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
             |band| unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, band) } == 0,
             // SAFETY: integer-only wrapper changing only this process's policy.
@@ -185,6 +231,11 @@ mod platform {
         }
     }
 
+    /// As for the trash deleter: the inherited class.
+    pub(super) fn raise_for_retirement_lane() -> DeleterPriority {
+        raise_for_trash_deleter()
+    }
+
     pub(super) fn current_io_policy() -> &'static str {
         // SAFETY: `ioprio_get` takes two integers and touches no memory.
         let value =
@@ -243,6 +294,10 @@ mod platform {
         }
     }
 
+    pub(super) fn raise_for_retirement_lane() -> DeleterPriority {
+        raise_for_trash_deleter()
+    }
+
     pub(super) fn current_io_policy() -> &'static str {
         "unknown"
     }
@@ -289,5 +344,35 @@ mod tests {
         let refused = raise_for_trash_deleter_with(|_| false, |_, _| false, |_| false);
         assert_eq!(refused.io_policy, "unchanged");
         assert!(!current_io_policy().is_empty());
+    }
+
+    /// The retirement lane leaves the background band, asks for an ordinary
+    /// process's disk policy (`IOPOL_IMPORTANT`) and lowers CPU niceness.
+    #[test]
+    fn the_retirement_lane_asks_for_ordinary_process_io() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let priority = raise_for_retirement_lane_with(
+            |band| {
+                calls.borrow_mut().push(format!("darwin_bg {band}"));
+                true
+            },
+            |scope, policy| {
+                calls
+                    .borrow_mut()
+                    .push(format!("iopolicy scope {scope} policy {policy}"));
+                true
+            },
+            |nice| {
+                calls.borrow_mut().push(format!("nice {nice}"));
+                true
+            },
+        );
+        assert_eq!(
+            calls.into_inner(),
+            vec!["darwin_bg 0", "iopolicy scope 0 policy 1", "nice 10"]
+        );
+        assert_eq!(priority.io_policy, "important");
+        let refused = raise_for_retirement_lane_with(|_| false, |_, _| false, |_| false);
+        assert_eq!(refused.io_policy, "unchanged");
     }
 }

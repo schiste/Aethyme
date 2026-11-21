@@ -515,6 +515,17 @@ impl ExactTreeVerificationSlot {
         )
     }
 
+    pub(crate) fn try_acquire_with_worktree_root_plan(
+        main_root: &Path,
+        namespace: &str,
+        root_plan: &crate::WorktreeRootPlan,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        Self::try_acquire_at(
+            main_root,
+            plan_slot_placement_with_worktree_root_plan(main_root, namespace, root_plan),
+        )
+    }
+
     /// Acquire the exact placement that the caller capacity-checked before
     /// snapshot materialization. Replanning here could silently select a
     /// different volume after that preflight.
@@ -585,6 +596,33 @@ impl ExactTreeVerificationSlot {
         report_every: Duration,
         on_wait: &mut dyn FnMut(Duration),
     ) -> Result<Self, BrokerOpError> {
+        Self::acquire_pooled_until(
+            main_root,
+            namespace,
+            size,
+            root_plan,
+            report_every,
+            &mut |waited, report| {
+                if report {
+                    on_wait(waited);
+                }
+                false
+            },
+        )
+        .map(|slot| slot.expect("this slot acquisition never redirects"))
+    }
+
+    /// Let a caller leave the wait upon discovering that its pending work
+    /// has been claimed elsewhere. The observer first runs only when every
+    /// slot is busy. Reporting remains on the original heartbeat cadence.
+    pub(crate) fn acquire_pooled_until(
+        main_root: &Path,
+        namespace: &str,
+        size: usize,
+        root_plan: &crate::WorktreeRootPlan,
+        report_every: Duration,
+        on_busy: &mut dyn FnMut(Duration, bool) -> bool,
+    ) -> Result<Option<Self>, BrokerOpError> {
         let placements = (0..size.max(1))
             .map(|index| {
                 let name = if index == 0 {
@@ -600,13 +638,16 @@ impl ExactTreeVerificationSlot {
         loop {
             for placement in &placements {
                 if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
-                    return Ok(slot);
+                    return Ok(Some(slot));
                 }
             }
             let waited = started.elapsed();
-            if waited >= next_report {
-                on_wait(waited);
+            let report = waited >= next_report;
+            if report {
                 next_report = waited.saturating_add(report_every);
+            }
+            if on_busy(waited, report) {
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(250));
         }

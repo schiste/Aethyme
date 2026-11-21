@@ -742,12 +742,23 @@ Usage:
       advance, push, sync, finish, close, git, gh and adopt --reuse refuse
       another live agent; --take-over moves the session to the caller and
       records a session.holder_bound event. Unidentified callers are not refused.
-  aethyme broker advance [--session <id>] [--pr] [--take-over] [--json]
+  aethyme broker submit queued <coordinator-id> --session <id> [--no-cache] [--json]
+      Opt into whole-group verification with published sessions already waiting
+      for a verification slot and naming the same coordinator. Start ordinary
+      verification immediately when a slot is free. A group verdict applies
+      only to the combined candidate and authorizes no ref or provider writes.
+  aethyme broker submit preverify <head> <base> --session <id> [--json]
+      Warm reusable gates on the pinned candidate. A regular submit still verifies it.
+  aethyme broker submit batch <base> <session=head>... --session <id> [--no-cache] [--json]
+      Verify one candidate from two to sixteen ready published sessions on the exact
+      fetched base. Reports the candidate and gates without updating any ref.
+  aethyme broker advance [--session <id>] [--pr] [--preverify] [--take-over] [--json]
       Prepare the current worktree when authorized, check its state and
       publish its committed head under the session push policy. --pr also
       requests a pull request under repository policy. Use --take-over for
       an explicit handoff from a live holder. Prints the next safe action.
-      Ambiguous writes stop for inspection and reconciliation.
+      Ambiguous writes stop for inspection and reconciliation. --preverify
+      starts bounded early verification of an exact published candidate.
   aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
@@ -1556,6 +1567,7 @@ struct Parsed {
     ai_provider: Option<String>,
     pr_number: Option<i64>,
     open_pr: bool,
+    preverify: bool,
     /// `push --plan`: describe the push and do not push.
     push_plan: bool,
     session: Option<i64>,
@@ -1753,6 +1765,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         ai_provider: None,
         pr_number: None,
         open_pr: false,
+        preverify: false,
         push_plan: false,
         session: None,
         to_session: None,
@@ -1986,6 +1999,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--keep-worktree" => parsed.keep_worktree = true,
             "--open-pr" => parsed.open_pr = true,
+            "--preverify" => parsed.preverify = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
             "--with-gate" => parsed.with_gate = true,
@@ -2693,9 +2707,9 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
-    // Everywhere else `--pr` takes a pull-request number; for `push` it is a
-    // switch. Translate it before parsing.
-    let rest: Vec<String> = if subcommand == "push" {
+    // Publication commands use `--pr` as a switch. Other commands use a
+    // pull-request number. Normalize the switch before shared parsing.
+    let rest: Vec<String> = if matches!(subcommand.as_str(), "push" | "advance") {
         let separator = args
             .iter()
             .position(|arg| arg == "--")
@@ -2740,17 +2754,54 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "start" if parsed.cmd.is_some() => "start-agent".to_string(),
         other => other.to_string(),
     };
-    // `submit` has no positional subcommands. Refuse them before advisories or
-    // holder admission can touch broker state; otherwise a typo such as
-    // `submit status` falls through to the stateful submit handler.
-    if subcommand == "submit"
-        && let Some(unknown) = parsed.positional.first()
-    {
-        return Err(UsageError::Exit {
-            message: surface::unsupported_submit_subcommand(unknown),
-            code: crate::exit_status::USAGE,
-        });
-    }
+    // Validate submit's optional exact-candidate requests before
+    // advisory delivery or session admission touches broker state.
+    let (early_verification, batch_verification, queued_coordinator) = if subcommand == "submit" {
+        match parsed.positional.as_slice() {
+            [] => (false, None, None),
+            [action, base, members @ ..] if action == "batch" => (
+                false,
+                Some(crate::merge::BatchRequest::parse(base, members).ok_or_else(|| {
+                    UsageError::Exit {
+                        message: "submit batch requires an exact fetched base and two to sixteen distinct session=head pairs".into(),
+                        code: crate::exit_status::USAGE,
+                    }
+                })?),
+                None,
+            ),
+            [action, id] if action == "queued" => (
+                false,
+                None,
+                Some(id.parse::<i64>().ok().filter(|id| *id > 0).ok_or_else(|| UsageError::Exit {
+                    message: "submit queued requires a positive coordinator session ID".into(),
+                    code: crate::exit_status::USAGE,
+                })?),
+            ),
+            [action, head, base]
+                if action == "preverify"
+                    && [head, base].iter().all(|oid| {
+                        matches!(oid.len(), 40 | 64)
+                            && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }) =>
+            {
+                (true, None, None)
+            }
+            [unknown, ..] => {
+                return Err(UsageError::Exit {
+                    message: if unknown == "preverify" {
+                        "submit preverify requires an exact published head and fetched base object ID".into()
+                    } else if unknown == "queued" {
+                        "submit queued requires a coordinator session ID".into()
+                    } else {
+                        surface::unsupported_submit_subcommand(unknown)
+                    },
+                    code: crate::exit_status::USAGE,
+                });
+            }
+        }
+    } else {
+        (false, None, None)
+    };
     if subcommand == "advance" && !parsed.positional.is_empty() {
         return Err(UsageError::Exit {
             message: "advance takes no positional arguments".into(),
@@ -2903,7 +2954,11 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "watch" => run_pull_request_watch(parsed)?,
         "pr" => run_pr(parsed)?,
         "hooks" => run_hooks(parsed)?,
-        "submit" => run_submit(parsed)?,
+        "submit" if early_verification => advance::run_preverify(parsed)?,
+        "submit" if batch_verification.is_some() => {
+            submit::run_submit_batch(parsed, batch_verification.expect("validated batch request"))?
+        }
+        "submit" => run_submit(parsed, queued_coordinator)?,
         "advance" => advance::run_advance(parsed)?,
         "push" => run_push(parsed)?,
         "sync" => run_sync(parsed)?,

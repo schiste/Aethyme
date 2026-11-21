@@ -3867,8 +3867,28 @@ pub(crate) enum LiveOverlapEvidence {
     Unknown,
 }
 
+/// One page's time is split so landed proofs use at most all but
+/// `1 / ABANDONMENT_RESERVE_DIVISOR` of it; the rest is kept for the
+/// abandonment judgements of the sessions after them.
+const ABANDONMENT_RESERVE_DIVISOR: u32 = 3;
+
 fn deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// Bound the initial, read-only Git reference snapshot to the retirement lane.
+/// An incomplete snapshot never advances retirement after the deadline.
+fn retirement_refs_with_deadline<T>(
+    deadline: Option<Instant>,
+    read: impl FnOnce() -> T,
+) -> Option<T> {
+    let _git_deadline = deadline.map(crate::git::limit_git_until);
+    let effective = crate::git::active_git_deadline();
+    if deadline_expired(effective) {
+        return None;
+    }
+    let result = read();
+    (!deadline_expired(effective)).then_some(result)
 }
 
 /// Resolve every live path once, retaining the store's order so a candidate
@@ -4173,7 +4193,7 @@ fn run_proof_git(
             ))
         }
         Ok(OwnedGroupEnd::Output(LimitedOutput::Deadline) | OwnedGroupEnd::Stopped) => {
-            crate::phase_telemetry::add("proof_git_stopped_at_deadline", budget);
+            crate::phase_telemetry::value("proof_git_stopped_at_deadline", budget);
             Err(format!(
                 "git {}: stopped at its time budget",
                 args.join(" ")
@@ -7838,8 +7858,21 @@ impl Broker {
 
         let landed_window_ms =
             i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
-        let mut decline_memo = LandedDeclineMemo::load(self);
-        let upstream_tip = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+        let Some((mut decline_memo, upstream_tip)) =
+            retirement_refs_with_deadline(deadline, || {
+                let memo = LandedDeclineMemo::load(self);
+                let upstream = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+                (memo, upstream)
+            })
+        else {
+            summary.deferred += 1;
+            summary
+                .reasons
+                .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                    after_session_id: cursor.after_session_id,
+                });
+            return Ok(summary);
+        };
         // Sessions that already show landing evidence go first, ahead of
         // the oldest-first cursor whose head is full of sessions that will
         // never close. Same proof, same re-checks: only the order changes.
@@ -7925,6 +7958,16 @@ impl Broker {
         // landed proofs this pass, the cursor stays put, and the cheap
         // abandonment judgements go on.
         let mut cursor_pinned = false;
+        // The share of this page's time no landed proof may use: the
+        // abandonment judgements of the sessions after it need no Git and
+        // run in it. One landed proof took 13 s of a 30 s pass on the busiest
+        // repository and left the rest of the page unjudged.
+        let mut landed_reserve_reached = false;
+        // The lane's "last judged" stamp is written once per pass.
+        let mut judged_stamped = false;
+        let abandonment_reserve = deadline.map(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) / ABANDONMENT_RESERVE_DIVISOR
+        });
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -7959,11 +8002,31 @@ impl Broker {
             let landed_backed_off = landed_backoff
                 .get(&session.id)
                 .is_some_and(|(_, until)| *until > now);
+            // A landed proof starts only while more than the abandonment
+            // reserve is left, and must finish before the reserve begins.
+            let landed_deadline = match (deadline, abandonment_reserve) {
+                (Some(deadline), Some(reserve)) => {
+                    Some(deadline.checked_sub(reserve).unwrap_or(deadline))
+                }
+                (deadline, _) => deadline,
+            };
+            if !landed_reserve_reached && deadline_expired(landed_deadline) {
+                // No more landed proofs this pass. The cursor is not held for
+                // them: the sessions after this one are judged for
+                // abandonment, and their landed proofs come in a later lap
+                // (or the likely-landed queue).
+                crate::phase_telemetry::add(
+                    "landed_proof_stopped_for_abandonment_reserve",
+                    Duration::ZERO,
+                );
+                landed_reserve_reached = true;
+            }
             if landed_backed_off {
                 crate::phase_telemetry::add("landed_proof_budget_backed_off", Duration::ZERO);
             }
             let idle_enough_for_landed = landed_window_ms > 0
                 && !cursor_pinned
+                && !landed_reserve_reached
                 && !landed_backed_off
                 && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
@@ -8030,6 +8093,11 @@ impl Broker {
                 }
                 if closed {
                     summary.abandonment_closed += 1;
+                    crate::stale_session_policy::remember_keep(self.store(), session.id, None);
+                    if !judged_stamped {
+                        crate::stale_session_policy::record_abandonment_judged(self.store(), now);
+                        judged_stamped = true;
+                    }
                 } else {
                     // The close path counted `session_abandonment_kept_<reason>`
                     // already; the summary carries the same breakdown to
@@ -8037,6 +8105,20 @@ impl Broker {
                     let reason = holder_process_table
                         .keep_reason()
                         .unwrap_or(crate::broker::AbandonmentKeepReason::Unrecorded);
+                    crate::stale_session_policy::remember_keep(
+                        self.store(),
+                        session.id,
+                        Some(crate::stale_session_policy::KeepRecord {
+                            reason: reason.code().to_string(),
+                            at_ms: now,
+                        }),
+                    );
+                    if reason != crate::broker::AbandonmentKeepReason::HolderProcessTableDenied
+                        && !judged_stamped
+                    {
+                        crate::stale_session_policy::record_abandonment_judged(self.store(), now);
+                        judged_stamped = true;
+                    }
                     if reason == crate::broker::AbandonmentKeepReason::HolderProcessTableDenied {
                         // A pass refused the process listing (a worker started
                         // from a sandboxed caller) is no evidence about the
@@ -8093,7 +8175,7 @@ impl Broker {
                         landed_window_ms,
                         &mut holder_process_table,
                         allow_snapshot,
-                        deadline,
+                        landed_deadline,
                     )?
                 };
                 let elapsed = started.elapsed();
@@ -9322,6 +9404,22 @@ impl Broker {
                             })
                             .map(|entry| fast_judging::remembered_kept(&worktree_key, entry))
                     });
+                    if remembered.is_none() {
+                        // Why this group is judged in full again: never kept
+                        // (or forgotten), or a remembered verdict that no
+                        // longer holds because something it depended on
+                        // changed. Read together with the status checks
+                        // that follow, these say which full judgments repeat
+                        // a verdict.
+                        crate::phase_telemetry::add(
+                            if memo.entries.contains_key(&worktree_key) {
+                                "auto_cleanup_memo_miss_changed"
+                            } else {
+                                "auto_cleanup_memo_miss_absent"
+                            },
+                            Duration::ZERO,
+                        );
+                    }
                     if let Some(kept) = remembered {
                         // Nothing the verdict depended on changed: keep it
                         // without judging it again.
@@ -10373,6 +10471,48 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_reference_reads_honor_and_restore_git_deadlines() {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let entered = std::cell::Cell::new(false);
+        let result = super::retirement_refs_with_deadline(Some(deadline), || {
+            entered.set(true);
+            assert_eq!(crate::git::active_git_deadline(), Some(deadline));
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(2),
+            );
+            42
+        });
+        assert!(entered.get(), "the read must run before its deadline");
+        assert_eq!(result, None);
+        assert_eq!(crate::git::active_git_deadline(), None);
+
+        let already_expired = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            super::retirement_refs_with_deadline(Some(already_expired), || panic!(
+                "expired reads must not start"
+            )),
+            None::<()>
+        );
+
+        crate::git::with_git_deadline(Duration::from_secs(5), || {
+            let outer = crate::git::active_git_deadline();
+            assert_eq!(
+                super::retirement_refs_with_deadline(
+                    Some(Instant::now() + Duration::from_secs(10)),
+                    || {
+                        assert_eq!(crate::git::active_git_deadline(), outer);
+                        42
+                    }
+                ),
+                Some(42)
+            );
+            assert_eq!(crate::git::active_git_deadline(), outer);
+        });
+    }
+
     use super::{
         AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupGroupInspection, AutoCleanupPolicy,
         LiveOverlapEvidence, ResolvedWorktreePath, SESSION_RETIREMENT_CURSOR_VERSION,

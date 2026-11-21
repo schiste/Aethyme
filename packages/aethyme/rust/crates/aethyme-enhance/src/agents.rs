@@ -723,6 +723,13 @@ blocked.
    pinned installs the repository declares), with lockfiles unchanged -- no
    dependency upgrades, additions or lockfile edits. Anything else still needs
    the owner. When the key is `false`, ask the owner before preparing.
+   When staging a disposable Playground, run its broker commands, including
+   trust setup, with the Playground as their working directory. Clear inherited
+   broker and Git routing before setting fixture-owned state and worktree paths.
+   Passing the fixture to `--repo` alone can still bind the command to the
+   session in the caller's current checkout.
+   Stage fixtures that use noninteractive test trust under the OS temporary
+   directory. The broker checks the resolved directory before recording trust.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
@@ -1231,6 +1238,9 @@ blocked.
    aethyme broker advanced gh --session <your-session-id> \
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
+
+   Supply the repository only to the coordinator before `--`; do not pass
+   a second `--repo` or `-R` in the inner `gh` arguments, which it rejects.
 
    The broker classifies known commands and fails closed on ambiguity. For an
    authorized PR merge, use the broker's exact supported form:

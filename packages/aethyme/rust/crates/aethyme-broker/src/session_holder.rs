@@ -516,7 +516,8 @@ fn local_epoch_seconds(
 }
 
 /// A process's command line, read natively for a row a native listing
-/// produced; `(name)` like `ps` when it cannot be read.
+/// produced; `(name)` when arguments cannot be read. This fallback can differ
+/// from `ps`, which may expose an executable path for the same process.
 #[cfg(target_os = "macos")]
 fn native_process_args(pid: i64, comm: &str) -> String {
     native_process_table::args(pid).unwrap_or_else(|| format!("({comm})"))
@@ -1124,6 +1125,15 @@ pub(crate) fn set_process_use_snapshot_for_tests(
 pub(crate) fn retirement_run_process_use_snapshot(
     budget: Duration,
 ) -> crate::reclaim::OpenFileSnapshot {
+    retirement_run_process_use_snapshot_with_limit(budget, budget)
+}
+
+/// [`retirement_run_process_use_snapshot`] allowing `lsof` up to `limit`
+/// (within `budget`), for the retry of an observation that ran out of time.
+pub(crate) fn retirement_run_process_use_snapshot_with_limit(
+    budget: Duration,
+    limit: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
     #[cfg(test)]
     if let Some(snapshot) = TEST_PROCESS_USE_QUEUE
         .with(|queue| queue.borrow_mut().pop_front())
@@ -1131,7 +1141,10 @@ pub(crate) fn retirement_run_process_use_snapshot(
     {
         return snapshot;
     }
-    crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget)
+    if limit <= Duration::from_secs(10) {
+        return crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget);
+    }
+    crate::reclaim::open_file_snapshot_under_with_limit(Path::new("/"), budget, limit)
 }
 
 /// One host-wide open-file observation for a checkout trash deleter run,
@@ -1213,6 +1226,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// When the last session kept for recent activity can first be due: its
     /// newest activity plus the window it was judged against.
     not_due_before_ms: std::cell::Cell<Option<i64>>,
+    /// The session being judged passed the early-close safety rule
+    /// (`abandonment_safety`) before its class window.
+    early_safe_close: std::cell::Cell<bool>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -1396,6 +1412,18 @@ impl RecordedHolderProcessTable {
     pub(crate) fn clear_keep_reason(&self) {
         self.keep_reason.set(None);
         self.not_due_before_ms.set(None);
+        self.early_safe_close.set(false);
+    }
+
+    /// Record whether the session being judged passed the early-close safety
+    /// rule in its latest look.
+    pub(crate) fn note_early_safe_close(&self, safe: bool) {
+        self.early_safe_close.set(safe);
+    }
+
+    /// Whether the session being judged passed the early-close safety rule.
+    pub(crate) fn early_safe_close(&self) -> bool {
+        self.early_safe_close.get()
     }
 
     /// Record that the session being judged cannot be due before `at_ms`
@@ -2792,9 +2820,9 @@ mod tests {
         assert_eq!(table.snapshots_taken_for_test(), 1);
     }
 
-    /// The native listing reports this process and pid 1 (another user's
-    /// process) exactly as `ps` does, so a holder recorded from either
-    /// source matches the other.
+    /// Both listings agree on identity and parent for this process and pid 1.
+    /// Protected processes may deny native arguments even when `ps` shows a path;
+    /// the fallback must stay explicit and must not alter liveness identity.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_native_process_table_agrees_with_ps_for_this_process() {
@@ -2812,7 +2840,17 @@ mod tests {
         for pid in [i64::from(std::process::id()), 1] {
             let from_ps = ps.process(pid).expect("ps lists the process");
             let from_native = native.process(pid).expect("sysctl lists the process");
-            assert_eq!(from_native, from_ps, "pid {pid}");
+            assert_eq!(from_native.pid, from_ps.pid, "pid {pid}");
+            assert_eq!(from_native.started, from_ps.started, "pid {pid}");
+            if pid == i64::from(std::process::id()) || native_process_table::args(pid).is_some() {
+                assert_eq!(from_native.command, from_ps.command, "pid {pid}");
+            } else {
+                assert_eq!(
+                    from_native.command,
+                    format!("({})", native.rows[&pid].comm),
+                    "pid {pid}"
+                );
+            }
             assert_eq!(native.rows[&pid].ppid, ps.rows[&pid].ppid, "pid {pid}");
             assert!(native.is_alive(&from_ps), "pid {pid}");
             assert!(ps.is_alive(&from_native), "pid {pid}");

@@ -128,6 +128,8 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     // `gc __trash-catchup` (the worker's trash catch-up lane process) and
     // `gc trash drain`.
     "__trash-catchup",
+    // `gc __retire-lane` (the worker's checkout retirement lane process).
+    "__retire-lane",
     "trash",
     "storage",
     // `gc reclaim` resolves to `reclaim`. A plan attaches its phase timings
@@ -387,6 +389,9 @@ pub(super) fn record_command_metric(
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
     let mut details = with_spans(details.unwrap_or_default(), spans);
+    if let Some(cpu) = process_cpu_ms() {
+        details.entry("cpu_ms").or_insert(cpu);
+    }
     let Ok(cwd) = repository.map_or_else(std::env::current_dir, Ok) else {
         return;
     };
@@ -405,8 +410,31 @@ pub(super) fn record_command_metric(
     if args.first().is_some_and(|command| command == "hook") && session_id.is_none() {
         return;
     }
+    append_command_metric(
+        &main_root,
+        &label,
+        duration_ms,
+        exit,
+        output_bytes,
+        session_id,
+        spans.attribution(started, ended),
+        details,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_command_metric(
+    main_root: &std::path::Path,
+    label: &str,
+    duration_ms: i64,
+    exit: u8,
+    output_bytes: u64,
+    session_id: Option<i64>,
+    attribution: serde_json::Value,
+    mut details: serde_json::Map<String, serde_json::Value>,
+) {
     details.insert("session_id".into(), serde_json::json!(session_id));
-    details.insert("attribution".into(), spans.attribution(started, ended));
+    details.insert("attribution".into(), attribution);
     details.insert(
         "outcome".into(),
         serde_json::json!(match exit {
@@ -430,11 +458,11 @@ pub(super) fn record_command_metric(
         .map(|json| json[1..json.len().saturating_sub(1)].to_string())
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
-    let line = metric_line(ts, &label, duration_ms, exit, output_bytes, &extra_fields);
+    let line = metric_line(ts, label, duration_ms, exit, output_bytes, &extra_fields);
     // Under the shared append lock, so a GC trim replacing this log can never
     // drop the row with the inode it replaces.
     crate::gc::metrics_trim::append_command_metric_line(
-        &main_root,
+        main_root,
         &dir.join("command-metrics.jsonl"),
         line.as_bytes(),
     );
@@ -449,19 +477,72 @@ pub(crate) fn record_hook_metric(
     delivery: &'static str,
     spans: &crate::phase_telemetry::Recorder,
 ) {
+    let args = ["hook".into(), event.as_str().into()];
+    let cwd = repo.map_or_else(std::env::current_dir, |path| Ok(path.into()));
+    if matches!(
+        event,
+        crate::agent_hook::HookEvent::PreToolUse | crate::agent_hook::HookEvent::PostToolUse
+    ) && let Ok(cwd) = &cwd
+        && let Some((main, _, session)) = crate::agent_hook::registered_hook_session(cwd)
+        && let Some(label) = safe_command_surface(&args)
+    {
+        let ended = std::time::Instant::now();
+        append_command_metric(
+            &main,
+            &label,
+            (ended - started).as_millis() as i64,
+            0,
+            output_bytes,
+            Some(session.id),
+            spans.attribution(started, ended),
+            with_spans(
+                serde_json::Map::from_iter([("hook_delivery".into(), delivery.into())]),
+                spans,
+            ),
+        );
+        return;
+    }
     let ended = std::time::Instant::now();
     if let Some(repo) = repo {
         set_metric_repository(std::path::Path::new(repo));
     }
     set_command_metric_details(serde_json::json!({ "hook_delivery": delivery }));
-    record_command_metric(
-        &["hook".into(), event.as_str().into()],
-        0,
-        started,
-        ended,
-        output_bytes,
-        spans,
-    );
+    record_command_metric(&args, 0, started, ended, output_bytes, spans);
+}
+
+/// CPU time this process and its reaped children used, in milliseconds:
+/// `{"user", "system", "children_user", "children_system"}`. A command that
+/// runs for minutes on a shared machine (the detached worker) shows here
+/// whether it computed or waited.
+#[cfg(unix)]
+fn process_cpu_ms() -> Option<serde_json::Value> {
+    fn usage(who: libc::c_int) -> Option<(u64, u64)> {
+        // SAFETY: `rusage` is plain data that `getrusage` fully initialises
+        // on success; it is read only then.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid pointer to a local `rusage` and a valid `who`.
+        if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+            return None;
+        }
+        let millis = |time: libc::timeval| {
+            u64::try_from(time.tv_sec).unwrap_or(0) * 1_000
+                + u64::try_from(time.tv_usec).unwrap_or(0) / 1_000
+        };
+        Some((millis(usage.ru_utime), millis(usage.ru_stime)))
+    }
+    let (user, system) = usage(libc::RUSAGE_SELF)?;
+    let (children_user, children_system) = usage(libc::RUSAGE_CHILDREN).unwrap_or((0, 0));
+    Some(serde_json::json!({
+        "user": user,
+        "system": system,
+        "children_user": children_user,
+        "children_system": children_system,
+    }))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_ms() -> Option<serde_json::Value> {
+    None
 }
 
 /// Fold the spans recorded anywhere during the command into its metric
@@ -572,7 +653,9 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // The trash catch-up lane process and the operator's `gc trash
         // drain` record their lane (`checkout_trash_catchup`) and drains.
         Some("gc") => match args.get(1).map(String::as_str) {
-            Some("apply" | "sweep" | "__continue-artifacts" | "__trash-catchup") => true,
+            Some(
+                "apply" | "sweep" | "__continue-artifacts" | "__trash-catchup" | "__retire-lane",
+            ) => true,
             Some("trash") => args.get(2).map(String::as_str) == Some("drain"),
             _ => false,
         },
@@ -675,7 +758,10 @@ fn command_records_outcome(args: &[String]) -> bool {
             args.get(1).map(String::as_str)
         ),
         (Some("gates"), Some("affected"))
-            | (Some("gc"), Some("__continue-artifacts" | "__trash-catchup"))
+            | (
+                Some("gc"),
+                Some("__continue-artifacts" | "__trash-catchup" | "__retire-lane")
+            )
     ) && command_records_metric(args)
 }
 
@@ -705,6 +791,15 @@ mod tests {
         command_metric_enabled, command_records_metric, command_records_outcome, metric_line,
         safe_command_surface, with_spans,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn metric_lines_carry_the_process_cpu_time() {
+        let cpu = super::process_cpu_ms().expect("getrusage works on unix");
+        for field in ["user", "system", "children_user", "children_system"] {
+            assert!(cpu[field].is_u64(), "{field}: {cpu}");
+        }
+    }
 
     #[test]
     fn caller_hints_keep_only_the_executable_name() {
@@ -865,6 +960,19 @@ mod tests {
         assert_eq!(safe_command_surface(&drain).as_deref(), Some("gc.trash"));
         let other = ["gc", "trash", "list"].map(str::to_string);
         assert!(!command_records_metric(&other));
+    }
+
+    /// The checkout retirement lane process writes its own row (labelled,
+    /// no outcome event, like the trash catch-up lane).
+    #[test]
+    fn the_checkout_retirement_lane_writes_a_metric_row() {
+        let lane = ["gc", "__retire-lane", "/repository"].map(str::to_string);
+        assert!(command_records_metric(&lane));
+        assert!(!command_records_outcome(&lane));
+        assert_eq!(
+            safe_command_surface(&lane).as_deref(),
+            Some("gc.__retire-lane")
+        );
     }
 
     #[test]

@@ -331,6 +331,46 @@ impl BrokerStore {
     pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
         let repository_root = canonical_main_root(repo_root)?;
         let path = crate::broker_db_path(&repository_root)?;
+        Self::open_current_read_only(path, |path| {
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, path)
+        })
+    }
+
+    /// For the hook's advisory path only. The caller supplies a conventional
+    /// main checkout and Git common directory proven by the linked checkout's
+    /// bidirectional registration. An unbound or different database falls
+    /// back to ordinary Git discovery.
+    pub(crate) fn open_hook_snapshot(main_root: &Path, common: &Path) -> Result<Self, BrokerError> {
+        let path = crate::broker_db_path(main_root)?;
+        let scope = super::repository_identity::RepositoryBindingScope::from_resolved(
+            main_root.to_path_buf(),
+            common.to_path_buf(),
+            &path,
+            false,
+        )?;
+        let store = Self::open_current_read_only(path, |_| Ok(scope.clone()))?;
+        let binding = store.repository_worktree_binding()?;
+        if binding.repository_root.as_deref() != Some(main_root)
+            || binding.git_common_dir.as_deref() != Some(common)
+            || binding.broker_db_path.as_deref() != Some(scope.broker_db_path.as_path())
+            || binding.repository_key.as_deref() != Some(scope.repository_key.as_str())
+            || scope.repository_uuid.is_none()
+            || binding.repository_uuid != scope.repository_uuid
+        {
+            return Err(BrokerError::InvalidRepositoryWorktreeBinding(
+                "hook snapshot does not match a bound repository".into(),
+            ));
+        }
+        Ok(store)
+    }
+
+    fn open_current_read_only(
+        path: PathBuf,
+        scope: impl FnOnce(
+            &Path,
+        )
+            -> Result<super::repository_identity::RepositoryBindingScope, BrokerError>,
+    ) -> Result<Self, BrokerError> {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -347,10 +387,7 @@ impl BrokerStore {
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn,
-            binding_scope: Some(super::repository_identity::RepositoryBindingScope::capture(
-                &repository_root,
-                &path,
-            )?),
+            binding_scope: Some(scope(&path)?),
             path,
             _snapshot_dir: None,
         })
@@ -2064,6 +2101,46 @@ impl BrokerStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Release every unreleased implicit (diff-derived) lease of the closed
+    /// session `session_id`, recording each release with `reason`; explicit
+    /// claims are left as they are. Returns how many were released. A
+    /// closed session edits nothing, so its diff-derived leases describe no
+    /// intent (`finish` releases them in the transaction that closes it).
+    pub(crate) fn release_implicit_leases_of_closed_session(
+        &mut self,
+        session_id: i64,
+        reason: &str,
+    ) -> Result<usize, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let closed: bool = tx.query_row(
+            "SELECT cleanup_state != 'open' FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !closed {
+            return Ok(0);
+        }
+        let ids = record_lease_releases_in_tx(
+            &tx,
+            session_id,
+            None,
+            Some("implicit"),
+            now,
+            reason,
+            true,
+        )?;
+        tx.execute(
+            "UPDATE leases SET released_at = ?2
+             WHERE session_id = ?1 AND kind = 'implicit' AND released_at IS NULL",
+            params![session_id, now],
+        )?;
+        tx.commit()?;
+        Ok(ids.len())
     }
 
     /// Release only `session_id`'s explicit claim on exactly `path`.

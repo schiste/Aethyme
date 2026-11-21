@@ -21,6 +21,11 @@ use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
 use crate::types::{MergeQueueEntry, MergeStatus, VerificationCandidate};
 
+#[path = "merge_batch.rs"]
+mod batch;
+pub(crate) use batch::BatchRequest;
+pub use batch::{BatchMember, QueuedBatchReceipt};
+
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
@@ -52,6 +57,20 @@ fn mint_verification_candidate(
         tree: tree.to_string(),
         commit,
     })
+}
+
+fn append_verification_contract(message: &mut String, pending_messages: &str) {
+    if let Some(decision) = crate::contract_check::parse_contract_decision(pending_messages) {
+        message.push_str("\n\nContract decision: ");
+        message.push_str(decision.label());
+        // The contract gate reads this commit, not the session's. Dropping
+        // the justification made a justified `none` unpassable here.
+        if let Some(reason) = crate::contract_check::parse_contract_justification(pending_messages)
+        {
+            message.push_str("\nContract justification: ");
+            message.push_str(&reason);
+        }
+    }
 }
 
 pub(crate) fn require_session_checkout_identity(
@@ -485,6 +504,10 @@ pub struct SubmitOutcome {
     /// The commit this submission was simulated and gated against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_against: Option<VerificationBase>,
+    /// An exact group-only result from explicit queued submission. No
+    /// individual verdict or authorization is carried by this receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_batch: Option<QueuedBatchReceipt>,
 }
 
 /// What a submission is simulated and gated against.
@@ -1056,6 +1079,47 @@ impl SubmissionReplay {
     }
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct EarlyVerification {
+    state: &'static str,
+    gates: Vec<GateRunOutcome>,
+}
+
+impl EarlyVerification {
+    pub(crate) fn state(&self) -> &'static str {
+        self.state
+    }
+
+    pub(crate) fn metric_details(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "executed_gates": self.gates.iter().filter(|gate| !gate.cached && gate.duration_ms.is_some_and(|ms| ms > 0)).count(),
+            "cached_gates": self.gates.iter().filter(|gate| gate.cached).count(),
+            "cancelled_gates": self.gates.iter().filter(|gate| gate.status == crate::GateStatus::Cancelled).count(),
+            "executed_gate_ms": self.gates.iter().filter(|gate| !gate.cached).filter_map(|gate| gate.duration_ms).sum::<i64>(),
+        })
+    }
+
+    fn skipped(state: &'static str) -> Self {
+        Self {
+            state,
+            gates: Vec::new(),
+        }
+    }
+}
+
+struct EarlyGateProgress(std::sync::atomic::AtomicBool);
+
+impl crate::gates::GateProgressSink for EarlyGateProgress {
+    fn report(&self, line: &str) {
+        eprintln!("{line}");
+    }
+
+    fn early_verification_cancelled(&self) -> Option<bool> {
+        Some(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
 impl Broker {
     #[cfg(test)]
     fn observe_submission_plan_test_phase(&self, phase: crate::broker::SubmissionPlanTestPhase) {
@@ -1253,6 +1317,182 @@ impl Broker {
         })
     }
 
+    /// Run only reusable gates on the exact replay of a pinned published
+    /// head. A later submit still performs its usual ownership, base, tree,
+    /// policy and cache identity checks. This warms the existing verdict
+    /// store and does not create or update a submission queue entry.
+    pub(crate) fn preverify_published_head(
+        &mut self,
+        session_id: i64,
+        head: &str,
+        base: &str,
+    ) -> Result<EarlyVerification, BrokerOpError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let admission = crate::phase_telemetry::span("gate_preverify_admission");
+        if crate::git::graph_verification_environment_refusal().is_some() {
+            return Ok(EarlyVerification::skipped("git_routing_unknown"));
+        }
+        self.check_submission_root_before_planning()?;
+        let main_root = self.main_root_path();
+        let repo = GitRepo::discover(&main_root)?;
+        let session = self.store().session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        if checkout.root() == main_root || checkout.main_root()? != main_root {
+            return Ok(EarlyVerification::skipped("not_an_isolated_session"));
+        }
+        let current = || {
+            require_session_checkout_identity(&session, &checkout, Some(head)).is_ok()
+                && repo
+                    .upstream_default_checked()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, commit)| commit == base)
+        };
+        if !current() {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        let pushed = self.session_push_state(session_id)?;
+        if pushed.remote_oid.as_deref() != Some(head) {
+            return Ok(EarlyVerification::skipped("head_unpublished"));
+        }
+        let root_plan = self.worktree_root_plan()?;
+        let Some(mut slot) =
+            crate::verification::ExactTreeVerificationSlot::try_acquire_with_worktree_root_plan(
+                &main_root,
+                "merge-preverify",
+                &root_plan,
+            )?
+        else {
+            return Ok(EarlyVerification::skipped("busy"));
+        };
+        drop(admission);
+
+        let replay = crate::phase_telemetry::span("gate_preverify_replay");
+        let ownership = self.audit_submit_ownership(session_id)?;
+        if !ownership.ok {
+            return Ok(EarlyVerification::skipped("ownership_refused"));
+        }
+        self.require_trusted_policy_at_commit(base, Some(session_id))?;
+        let gates = self
+            .load_and_sync_gates_at_commit(base)?
+            .unwrap_or_default();
+        let gates: Vec<_> = gates
+            .into_iter()
+            .filter(|gate| gate.cache && !gate.content_gate_v1)
+            .collect();
+        if gates.is_empty() {
+            return Ok(EarlyVerification::skipped("no_reusable_gates"));
+        }
+        let Some(history_view) =
+            capture_submission_plan_history_view(&main_root, self.repo_handle(), self.store_ref())
+        else {
+            return Ok(EarlyVerification::skipped("history_unknown"));
+        };
+        let plan = self.build_submission_plan(&session, head, base)?;
+        let simulation = self.replay_submission_plan(&plan)?;
+        if !simulation.conflicts.is_empty() {
+            return Ok(EarlyVerification::skipped("candidate_conflict"));
+        }
+        if simulation.tree == repo.commit_tree_id(base)? {
+            return Ok(EarlyVerification::skipped("no_candidate_changes"));
+        }
+        if validate_submission_history_view(
+            &main_root,
+            self.repo_handle(),
+            self.store_ref(),
+            &history_view,
+        )
+        .is_err()
+            || !current()
+        {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(EarlyVerification::skipped("budget_exhausted"));
+        }
+        let candidate = mint_verification_candidate(
+            &repo,
+            base,
+            plan.pending_owned_commit_ids(),
+            &simulation.tree,
+            "chore(broker): prepare exact early verification candidate",
+            &crate::attribution::Attribution::broker_only(),
+            simulation.history_parent.as_deref(),
+        )?;
+        let changed = repo.gate_scope_changed_between(base, &candidate.commit)?;
+        let selections = crate::gates::select_gates(&gates, &changed);
+        let selected = selections.len();
+        if selected == 0 {
+            return Ok(EarlyVerification::skipped("no_gates_triggered"));
+        }
+        drop(replay);
+        let slot_checkout = {
+            let _span = crate::phase_telemetry::span("gate_preverify_checkout");
+            slot.materialize(&repo, &candidate.commit)?
+        };
+        if !current() {
+            return Ok(EarlyVerification::skipped("superseded"));
+        }
+        let storage = self.storage_context().gate_storage_locations();
+        if let Some(path) = self.session_scratch_dir(session_id) {
+            crate::session_scratch::remember_for_commands(session_id, &path);
+        }
+        let progress = EarlyGateProgress(std::sync::atomic::AtomicBool::new(false));
+        let gate_results = {
+            let _span = crate::phase_telemetry::span("gate_preverify_execution");
+            std::thread::scope(|scope| {
+                let (finished, completion) = std::sync::mpsc::channel::<()>();
+                let progress = &progress;
+                scope.spawn(move || {
+                    while matches!(
+                        completion.recv_timeout(Duration::from_millis(500)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        if !crate::git::with_git_deadline(Duration::from_secs(2), current) {
+                            progress.0.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                });
+                let gates = crate::gates::run_early_verification(
+                    self.store(),
+                    &main_root,
+                    &slot_checkout,
+                    selections,
+                    session_id,
+                    base,
+                    deadline,
+                    progress,
+                    storage,
+                );
+                drop(finished);
+                gates
+            })?
+        };
+        slot.cleanup();
+        let state = if progress.0.load(Ordering::Acquire) {
+            "superseded"
+        } else if gate_results.is_empty() {
+            "no_verdict"
+        } else if gate_results.len() != selected
+            || gate_results
+                .iter()
+                .any(|gate| gate.status != crate::GateStatus::Pass)
+        {
+            "incomplete"
+        } else {
+            "ready"
+        };
+        Ok(EarlyVerification {
+            state,
+            gates: gate_results,
+        })
+    }
+
     /// Submit a session's committed head for verification: queue (idempotent
     /// per head), simulate, and gate on the merged tree. Nothing is promoted;
     /// the work lands through the session's pull request. Uncommitted changes
@@ -1273,7 +1513,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         expected_head: &str,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, Some(expected_head))
+        self.submit_inner(session_id, cache_policy, Some(expected_head), None)
     }
 
     /// Submit with an explicit policy for merged-tree gate cache lookup.
@@ -1282,7 +1522,17 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, None)
+        self.submit_inner(session_id, cache_policy, None, None)
+    }
+
+    pub(crate) fn submit_for_queue(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        expected_head: Option<&str>,
+        coordinator: Option<i64>,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_inner(session_id, cache_policy, expected_head, coordinator)
     }
 
     fn submit_inner(
@@ -1290,6 +1540,7 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
         expected_head: Option<&str>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // Refuse legacy and incomplete bindings before submission planning.
         // A fresh database may proceed, but its root is not created until the
@@ -1409,6 +1660,7 @@ impl Broker {
             pre_refresh,
             Some(&progress),
             prepared_plan,
+            coordinator,
         )?;
         outcome.lease_warnings = ownership.warned_leases;
         self.attach_overlap_changes(
@@ -1568,6 +1820,7 @@ impl Broker {
             no_changes: true,
             lease_warnings: Vec::new(),
             verified_against: None,
+            queued_batch: None,
             promoted: false,
             promotion_suppressed: None,
         })
@@ -1584,6 +1837,7 @@ impl Broker {
             pre_refresh,
             None,
             None,
+            None,
         )
     }
 
@@ -1594,6 +1848,7 @@ impl Broker {
         pre_refresh: Option<String>,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: `pre_refresh` is where the integration branch stood BEFORE the
         // follows-main refresh, read by the caller before its first refresh.
@@ -1617,6 +1872,7 @@ impl Broker {
             SimulationBase { base, pre_refresh },
             progress,
             prepared_plan,
+            coordinator.filter(|_| verification.source == VERIFIED_AGAINST_UPSTREAM),
         )?;
         outcome.verified_against = Some(verification);
         Ok(outcome)
@@ -1726,6 +1982,7 @@ impl Broker {
         simulation_base: SimulationBase,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
+        coordinator: Option<i64>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         let SimulationBase { base, pre_refresh } = simulation_base;
         let entry = self
@@ -1856,6 +2113,7 @@ impl Broker {
                 no_changes: false,
                 lease_warnings: Vec::new(),
                 verified_against: None,
+                queued_batch: None,
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -1912,18 +2170,7 @@ impl Broker {
             .map(|commit| self.repo_handle().commit_message(commit))
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
-        if let Some(decision) = crate::contract_check::parse_contract_decision(&pending_messages) {
-            verification_message.push_str("\n\nContract decision: ");
-            verification_message.push_str(decision.label());
-            // The contract gate reads this commit, not the session's. Dropping
-            // the justification made a justified `none` unpassable here.
-            if let Some(reason) =
-                crate::contract_check::parse_contract_justification(&pending_messages)
-            {
-                verification_message.push_str("\nContract justification: ");
-                verification_message.push_str(&reason);
-            }
-        }
+        append_verification_contract(&mut verification_message, &pending_messages);
         let candidate = mint_verification_candidate(
             self.repo_handle(),
             &base,
@@ -1953,19 +2200,50 @@ impl Broker {
         }
         let main_root = self.main_root_path();
         let worktree_root_plan = self.worktree_root_plan()?;
-        let mut verification_slot =
-            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
-                &main_root,
-                "merge-sim",
-                MERGE_VERIFICATION_SLOTS,
-                &worktree_root_plan,
-                crate::gates::heartbeat_interval(),
-                &mut |waited| {
-                    if let Some(progress) = progress {
-                        progress.report_slot_wait(&main_root, waited);
-                    }
-                },
-            )?;
+        let coordinator = coordinator.filter(|_| {
+            entry.status == MergeStatus::Submitted
+                && entry.details_json.is_none()
+                && entry.base_commit == base
+                && !main_checkout_session
+        });
+        let mut verification_slot = match self.admit_queued_verification(
+            &main_root,
+            &worktree_root_plan,
+            &entry,
+            &base,
+            &submission_plan.merged_tree_paths,
+            coordinator,
+            cache_policy,
+            progress,
+        )? {
+            batch::QueuedAdmission::Single(slot) => slot,
+            batch::QueuedAdmission::Verified(receipt) => {
+                let details = serde_json::json!({
+                    "reason": "a waiting group was verified as a whole",
+                    "queued_batch_candidate": receipt.candidate,
+                });
+                self.store().record_queued_batch_supersession(
+                    entry.id,
+                    entry.session_id,
+                    &details.to_string(),
+                )?;
+                return Ok(SubmitOutcome {
+                    entry: self.queue_entry(entry.id)?,
+                    submission_plan,
+                    conflicts: Vec::new(),
+                    conflict_details: Vec::new(),
+                    gate_outcomes: Vec::new(),
+                    graph_integrity: None,
+                    gate_verification: SubmissionGateVerification::not_run(),
+                    no_changes: false,
+                    lease_warnings: Vec::new(),
+                    verified_against: None,
+                    queued_batch: Some(receipt),
+                    promoted: false,
+                    promotion_suppressed: None,
+                });
+            }
+        };
         if let Some(progress) = progress {
             progress.phase(crate::submit_progress::PHASE_VERIFYING);
         }
@@ -2183,6 +2461,7 @@ impl Broker {
             no_changes: false,
             lease_warnings: Vec::new(),
             verified_against: None,
+            queued_batch: None,
             promoted: false,
             promotion_suppressed,
         })
@@ -2238,10 +2517,27 @@ impl Broker {
             });
         }
         let mut current = plan.integration_head.clone();
+        let mut plain_history = None;
         for commit in &plan.commits {
             if commit.ownership != SubmissionCommitOwnership::SessionOwned
                 || commit.integration_state != SubmissionIntegrationState::Pending
             {
+                continue;
+            }
+            // When this owned linear commit is already on the exact replay
+            // tip, applying its delta produces its existing tree. The replay
+            // tip is private: only the final tree and the original provenance
+            // reach candidate minting.
+            if let [parent] = commit.parents.as_slice()
+                && *parent == current
+                && *plain_history
+                    .get_or_insert_with(|| repo.has_complete_unmodified_history().unwrap_or(false))
+            {
+                current.clone_from(&commit.commit);
+                crate::phase_telemetry::add(
+                    "submit_replay_exact_parent",
+                    std::time::Duration::ZERO,
+                );
                 continue;
             }
             // A sync merge can be replayed as its first-parent delta when

@@ -99,7 +99,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Maintainer Notes
 
-- `packages/aethyme/scripts/test-like-ci.sh` defaults to changed crates with the bounded local profile (one Cargo build job, two nextest workers, no retries); `--full` selects the full workspace and CI profile, including retries. Investigate contention when failures appear only under concurrency, and rerun the failing test in isolation before attributing cause; a passing isolated run does not rule out a race. Report interrupted test runs accurately.
+- `packages/aethyme/scripts/test-like-ci.sh` defaults to changed crates with the bounded local profile (one Cargo build job, two nextest workers, no retries); `--full` selects the full workspace and CI profile, including retries. Investigate contention when failures appear only under concurrency, and rerun the failing test in isolation before attributing cause; a passing isolated run does not rule out a race. Report interrupted test runs accurately. For macOS MCP HTTP failures with `listener_unverifiable:listener_listing_empty`, inspect `/usr/sbin/netstat -an -p tcp` in the same environment and rerun the exact failed test. A sandbox can hide listeners; use an environment with a visible listing to validate. Never weaken ownership checks, skip the test, or infer a full gate pass from an isolated result.
 - `packages/aethyme` is 100% Rust; `python -m src.cli` has no shim, and `packages/aethyme-eval` remains Python by design. Do not add Python build files under `packages/aethyme`. `rust-toolchain.toml` pins local, gate, and CI builds; it wins over an action's `toolchain: stable`, so install targets and components on the pinned toolchain separately.
 - Keep gate triggers aligned with the paths they cover; stale globs can silently disable a gate, so add triggers when adding packages, manifests, or workflow directories. Treat `.aethyme/gates.toml` and `.aethyme/config.toml` as security-sensitive. Graph authority `disabled` is the intended default; a missing fragment store is healthy in that posture, though graph-dependent commands fail until local refresh.
 - Tests that parse Git output should export `CHAU7_CTO_OPTIM_ACTIVE=1` because the host wrapper can compress `git log`/`git status`. Tests touching a shared database or external namespace must use `$AETHYME_TEST_DB_SUFFIX` and `$AETHYME_GATE_WORKER_ID` where relevant.
@@ -110,7 +110,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `974a0f0bf895913dde67f698a999c54af3d8721f69a5cc3ef88bf0c9e78b1ea6`
-- Tracked source files: `4023`
+- Source digest: `3f4c17b31a51553f954f80a8a6c877a148cb465bcae858e6a3aaf6ae240552d2`
+- Tracked source files: `4043`
 - Overrides applied: `True`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`
