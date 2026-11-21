@@ -1720,8 +1720,15 @@ fn restore_record(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    // The emptied archive directory goes; anything left in it stays.
-    let _ = fs::remove_dir(archive);
+    // The emptied archive directory goes; one still holding anything stays.
+    if let Err(error) = fs::remove_dir(archive)
+        && error.kind() != io::ErrorKind::DirectoryNotEmpty
+    {
+        crate::warn_unrecorded(
+            "remove an emptied GC service record archive",
+            Err::<(), _>(error),
+        );
+    }
     crate::phase_telemetry::add("gc_service_record_restored", Duration::ZERO);
     Ok(())
 }
