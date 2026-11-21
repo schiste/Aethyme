@@ -65,7 +65,7 @@ walkdir = "2"
 zstd = { version = "0.13", default-features = false }
 
 [workspace.package]
-version = "0.8.148"
+version = "0.8.149"
 
 # Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
 #
