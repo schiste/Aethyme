@@ -3233,6 +3233,60 @@ fn push_checkout_retirement_advice(
 
 /// The retirement lane retiring nothing for several runs in a row while
 /// closed checkouts wait: a lane that examines and retires none says so.
+/// The closed checkouts the retirement lane keeps on purpose and no longer
+/// judges every run (remembered with the keep back-off), by reason, so the
+/// owner sees what is stuck and why.
+fn push_retirement_keeps_advice(
+    view: &mut StatusView,
+    keeps: &std::collections::BTreeMap<i64, retire::RetireKeep>,
+) {
+    if keeps.is_empty() {
+        return;
+    }
+    let mut by_reason: std::collections::BTreeMap<&str, Vec<(i64, Option<&str>)>> =
+        std::collections::BTreeMap::new();
+    for (session_id, keep) in keeps {
+        by_reason
+            .entry(keep.reason.as_str())
+            .or_default()
+            .push((*session_id, keep.detail.as_deref()));
+    }
+    let evidence = by_reason
+        .iter()
+        .map(|(reason, sessions)| {
+            let ids = sessions
+                .iter()
+                .take(8)
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = sessions
+                .iter()
+                .find_map(|(_, detail)| *detail)
+                .map(|detail| format!(" (e.g. {detail})"))
+                .unwrap_or_default();
+            format!(
+                "{reason}: {} checkout(s), sessions {ids}{}{detail}",
+                sessions.len(),
+                if sessions.len() > 8 { ", ..." } else { "" }
+            )
+        })
+        .collect();
+    view.advice.push(StatusAdvice {
+        id: "cleanup.retirement-kept",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "closed checkouts the retirement lane keeps on purpose are judged again only after a back-off (1 h, 6 h, then 24 h) or once the checkout changes; each reason says what would let it retire",
+        summary: format!(
+            "{} closed checkout(s) kept by the retirement lane",
+            keeps.len()
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: Vec::new(),
+    });
+}
+
 fn push_retirement_lane_advice(
     view: &mut StatusView,
     lane: &retire::RetirementLaneRecord,

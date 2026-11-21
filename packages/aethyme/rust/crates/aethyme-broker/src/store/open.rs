@@ -2103,6 +2103,46 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Release every unreleased implicit (diff-derived) lease of the closed
+    /// session `session_id`, recording each release with `reason`; explicit
+    /// claims are left as they are. Returns how many were released. A
+    /// closed session edits nothing, so its diff-derived leases describe no
+    /// intent (`finish` releases them in the transaction that closes it).
+    pub(crate) fn release_implicit_leases_of_closed_session(
+        &mut self,
+        session_id: i64,
+        reason: &str,
+    ) -> Result<usize, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let closed: bool = tx.query_row(
+            "SELECT cleanup_state != 'open' FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !closed {
+            return Ok(0);
+        }
+        let ids = record_lease_releases_in_tx(
+            &tx,
+            session_id,
+            None,
+            Some("implicit"),
+            now,
+            reason,
+            true,
+        )?;
+        tx.execute(
+            "UPDATE leases SET released_at = ?2
+             WHERE session_id = ?1 AND kind = 'implicit' AND released_at IS NULL",
+            params![session_id, now],
+        )?;
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
     /// Release only `session_id`'s explicit claim on exactly `path`.
     /// Implicit diff-derived lease rows are left unchanged.
     pub(crate) fn release_explicit_lease(

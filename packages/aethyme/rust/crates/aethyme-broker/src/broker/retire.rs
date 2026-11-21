@@ -863,6 +863,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "operations_unknown" => "checkout_retirement_kept_operations_unknown",
         "operation_in_progress" => "checkout_retirement_kept_operation_in_progress",
         "operation_state_unknown" => "checkout_retirement_kept_operation_state_unknown",
+        "orphan_cleanup_refused" => "checkout_retirement_kept_orphan_cleanup_refused",
         "process_using_checkout" => "checkout_retirement_kept_process_using_checkout",
         "process_use_unknown" => "checkout_retirement_kept_process_use_unknown",
         "plan_context_unavailable" => "checkout_retirement_kept_plan_context_unavailable",
@@ -943,7 +944,17 @@ impl ArchiveDenialBackoff {
 fn remembered_keep(code: &str) -> bool {
     matches!(
         code,
-        "plan_refused"
+        // Conditions that hold run after run until the checkout or its
+        // records change (0.8.146 on the busiest repository re-examined 16
+        // to 18 `operation_state_unknown`, 2 to 3 `ownership_unknown`, one
+        // `lease_held` and one `operation_unresolved` every run), shown by
+        // `broker status` while remembered.
+        "operation_state_unknown"
+            | "ownership_unknown"
+            | "lease_held"
+            | "operation_unresolved"
+            | "orphan_cleanup_refused"
+            | "plan_refused"
             | "inspection_failed"
             | "archive_too_large"
             | "archive_failed"
@@ -1482,9 +1493,21 @@ fn run_git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// The key a remembered keep is bound to: the checkout's HEAD and index
 /// modification time, read from its files.
 fn checkout_keep_key(worktree: &Path) -> Option<String> {
-    let git_dir = crate::git::checked_worktree_git_dir(worktree)
+    let Some(git_dir) = crate::git::checked_worktree_git_dir(worktree)
         .ok()
-        .flatten()?;
+        .flatten()
+    else {
+        // A folder with no usable Git registration (its `.git` file is gone
+        // or names a missing directory): its own modification time, which
+        // changes when an entry is added or removed at its top.
+        let modified = std::fs::symlink_metadata(worktree)
+            .and_then(|metadata| metadata.modified())
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        return Some(format!("unregistered:{modified}"));
+    };
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let index_mtime = std::fs::metadata(git_dir.join("index"))
         .and_then(|metadata| metadata.modified())
@@ -2542,6 +2565,41 @@ impl Broker {
         }
     }
 
+    /// Retire an orphaned checkout of this repository (its Git registration
+    /// is gone) through the same path as `aethyme broker finish cleanup
+    /// <id>`: non-forced, so it acts only with the recorded interrupted
+    /// finish-cleanup proof and every check that command makes; any refusal
+    /// keeps it (`orphan_cleanup_refused`, remembered with its reason).
+    fn resume_orphan_cleanup(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        run: &mut RetireRun,
+    ) -> Result<RetireOutcome, BrokerOpError> {
+        let _phase = crate::phase_telemetry::span("checkout_retirement_phase_orphan_cleanup");
+        crate::phase_telemetry::add(
+            "checkout_retirement_orphan_cleanup_attempted",
+            std::time::Duration::ZERO,
+        );
+        match self.cleanup(session_id, false) {
+            Ok(()) if std::fs::symlink_metadata(worktree).is_err() => {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_orphan_cleanup_completed",
+                    std::time::Duration::ZERO,
+                );
+                Ok(RetireOutcome::RetiredClean)
+            }
+            Ok(()) => {
+                run.keep_detail = Some("the orphan cleanup left the folder in place".into());
+                Ok(RetireOutcome::Kept("orphan_cleanup_refused"))
+            }
+            Err(error) => {
+                run.keep_detail = Some(error.to_string());
+                Ok(RetireOutcome::Kept("orphan_cleanup_refused"))
+            }
+        }
+    }
+
     fn retire_closed_checkout_inner(
         &mut self,
         session_id: i64,
@@ -2606,7 +2664,34 @@ impl Broker {
             .unreleased_unexpired_leases_for_sessions_at(&[session_id], crate::clock::epoch_ms())
         {
             Ok(leases) if leases.is_empty() => {}
-            Ok(_) => return Ok(Kept("lease_held")),
+            Ok(_) => {
+                // A closed session's implicit (diff-derived) leases describe
+                // no intent: `finish` releases them as it closes, and one
+                // recorded after the close (15 on the busiest repository,
+                // 24 s after a finish) is stale. They are released here;
+                // an explicit claim still keeps the checkout.
+                match self.store().release_implicit_leases_of_closed_session(
+                    session_id,
+                    "closed_session_implicit_lease",
+                ) {
+                    Ok(released) if released > 0 => crate::phase_telemetry::add(
+                        "checkout_retirement_released_closed_session_implicit_leases",
+                        std::time::Duration::ZERO,
+                    ),
+                    Ok(_) => {}
+                    Err(_) => return Ok(Kept("lease_unknown")),
+                }
+                match self
+                    .store_ref()
+                    .unreleased_unexpired_leases_for_sessions_at(
+                        &[session_id],
+                        crate::clock::epoch_ms(),
+                    ) {
+                    Ok(leases) if leases.is_empty() => {}
+                    Ok(_) => return Ok(Kept("lease_held")),
+                    Err(_) => return Ok(Kept("lease_unknown")),
+                }
+            }
             Err(_) => return Ok(Kept("lease_unknown")),
         }
         let deadline = run.deadline;
@@ -2683,6 +2768,20 @@ impl Broker {
                 }
                 // The lap's deadline cut the Git call short: no verdict.
                 Err(_) if Instant::now() >= run.deadline => return Ok(Kept("deadline")),
+                // A positively identified orphan of this repository (its Git
+                // registration is gone; 18 closed checkouts on the busiest
+                // repository): what `finish cleanup <id>` does for it, with
+                // every proof that command requires (the recorded
+                // interrupted finish-cleanup proof among them); without that
+                // proof nothing is removed and the keep is remembered.
+                Err(_)
+                    if !run.inline
+                        && self
+                            .is_orphaned_worktree_of_this_repository_checked(&worktree)
+                            .unwrap_or(false) =>
+                {
+                    return self.resume_orphan_cleanup(session_id, &worktree, run);
+                }
                 Err(_) => return Ok(Kept("operation_state_unknown")),
             }
         };
@@ -7726,6 +7825,87 @@ mod tests {
         let stored = broker.checkout_retirement_lane_record();
         assert_eq!(stored.last_end_reason, lane.end_reason);
         assert!(stored.last_at_ms > 0);
+    }
+
+    /// Implicit (diff-derived) leases left on a closed session do not keep
+    /// its checkout: they are released and the checkout retires.
+    #[test]
+    fn a_closed_sessions_implicit_leases_do_not_keep_its_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "stale implicit lease", |_| {});
+        broker
+            .store()
+            .set_implicit_leases(session.id, &["base.txt".to_string()])
+            .unwrap();
+        assert!(
+            !broker
+                .store_ref()
+                .unreleased_unexpired_leases_for_sessions_at(
+                    &[session.id],
+                    crate::clock::epoch_ms()
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(retired_away(&worktree));
+        assert!(
+            broker
+                .store_ref()
+                .unreleased_unexpired_leases_for_sessions_at(
+                    &[session.id],
+                    crate::clock::epoch_ms()
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An orphaned checkout (its Git registration gone) with no recorded
+    /// interrupted finish-cleanup proof is never removed: it is kept as
+    /// `orphan_cleanup_refused`, remembered, and not judged again next run.
+    #[test]
+    fn an_unproven_orphan_is_kept_remembered_and_not_judged_every_run() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "orphaned checkout", |_| {});
+        let pointer = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        let admin = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        std::fs::remove_dir_all(&admin).unwrap();
+
+        let first = run(&mut broker);
+
+        assert_eq!(
+            first.kept.get("orphan_cleanup_refused"),
+            Some(&1),
+            "{first:#?}"
+        );
+        assert!(worktree.join("base.txt").exists(), "nothing was removed");
+        assert_eq!(
+            broker
+                .checkout_retirement_keeps()
+                .get(&session.id)
+                .map(|keep| keep.reason.clone()),
+            Some("orphan_cleanup_refused".to_string())
+        );
+        let second = run(&mut broker);
+        assert_eq!(
+            second.kept.get("orphan_cleanup_refused"),
+            None,
+            "{second:#?}"
+        );
+        assert!(worktree.join("base.txt").exists());
+    }
+
+    /// A folder with no usable Git registration still gets a keep key (its
+    /// own modification time), so its keep can be remembered.
+    #[test]
+    fn an_unregistered_folder_has_a_keep_key() {
+        let folder = tempfile::tempdir().unwrap();
+        let key = super::checkout_keep_key(folder.path()).expect("a key");
+        assert!(key.starts_with("unregistered:"), "{key}");
     }
 
     /// One judgement at a time per volume: a turn held elsewhere is waited

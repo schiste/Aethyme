@@ -3718,6 +3718,22 @@ Covered by `broker/retire.rs` and `gc/background_priority.rs` tests.
   - A background strip's proofs run under the lifecycle claim for at most 5 s (`STRIP_PROOF_UNDER_CLAIM_BUDGET`, with the Git deadline set to match). A proof that runs out is a transient refusal, tried again by the next pass (counter `checkout_strip_proof_claim_budget_stopped`). What a strip proves is unchanged.
   - A background lifecycle hold of 5 s or more is counted with its time (`lifecycle_lock_held_background_long`), so a slow foreground command can be traced to its holder.
 
+- Changed 2026-11-21 (retirement keeps that never leave). On 0.8.146 the lane's second and third runs on the busiest repository examined 39 and 31 closed checkouts, retired 5 and 3, and judged the same kept ones again each run:
+  - `operation_state_unknown` 16 and 18: the 18 closed checkouts whose Git registration is gone. The `.git` file names a missing `.git/worktrees/<name>`, so Git cannot read their state. These are full checkouts left by removals that stopped after Git dropped the registration; one has a recorded interrupted finish-cleanup proof.
+  - `ownership_unknown` 2 and 3: the 3 closed folders with no `.git` at all (one holding only `.DS_Store`, two partial). They are remains of interrupted removals, and nothing proves whose they are.
+  - `lease_held` 1: 15 implicit leases recorded 24 s after that session's `finish` had released its leases and closed it.
+  - `operation_unresolved` 1: a recorded broker operation not resolved since boot.
+  - `plan_refused` 10 and 3: 14 of the 16 remembered ones were the recovery patch's `git diff --binary` exceeding its output limit, and 2 were ignored directories over the file cap.
+  - `archive_cleanup_failed` 2: unresolved artifact-use markers (`gc artifact-use reconcile`).
+  - `changed` 2.
+
+  Now:
+  - A closed session's implicit (diff-derived) leases are released when the lane finds them (store `release_implicit_leases_of_closed_session`, recorded as `lease.released` with reason `closed_session_implicit_lease`; counter `checkout_retirement_released_closed_session_implicit_leases`). Explicit claims still keep the checkout.
+  - A positively identified orphan of this repository (registration gone, `.git` naming this repository's `worktrees` directory) goes through `finish cleanup <id>`'s own non-forced path, `Broker::cleanup`. It is removed only with the recorded interrupted finish-cleanup proof and every check that command makes. Otherwise it is kept as `orphan_cleanup_refused` with that command's refusal as detail. Span `checkout_retirement_phase_orphan_cleanup`; counters `checkout_retirement_orphan_cleanup_attempted` and `_completed`.
+  - `operation_state_unknown`, `ownership_unknown`, `lease_held`, `operation_unresolved` and `orphan_cleanup_refused` are remembered with the keep back-off (1 h, 6 h, then 24 h, or at once when the checkout changes) instead of being judged every run. A folder with no usable registration is keyed by its own modification time (`unregistered:<ns>`).
+  - `broker status` shows the Notice `cleanup.retirement-kept`: the remembered keeps by reason, with up to 8 session ids and one detail each.
+Covered by `broker/retire.rs` tests.
+
 ## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
 
 `.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
