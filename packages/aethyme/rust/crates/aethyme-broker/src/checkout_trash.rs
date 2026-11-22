@@ -277,30 +277,104 @@ pub(crate) fn new_entry_name(session_id: i64) -> String {
     )
 }
 
+/// Why a failed system call failed, as a counter-safe cause name: the
+/// process ran out of descriptors, the volume is full or read-only, the
+/// filesystem does not support the call, permission was denied, and so on.
+/// Never a path or an id, so it can name a metric key.
+pub(crate) fn errno_cause(error: &std::io::Error) -> &'static str {
+    let Some(errno) = error.raw_os_error() else {
+        return if error.kind() == std::io::ErrorKind::Unsupported {
+            "unsupported"
+        } else {
+            "unknown"
+        };
+    };
+    // Comparisons, not a `match`: several of these share a value on one
+    // platform (`ENOTSUP` and `EOPNOTSUPP` on Linux) and differ on another.
+    if errno == libc::EMFILE || errno == libc::ENFILE {
+        "too_many_open_files"
+    } else if errno == libc::ENOSPC || errno == libc::EDQUOT {
+        "no_space"
+    } else if errno == libc::ENOTSUP
+        || errno == libc::EOPNOTSUPP
+        || errno == libc::ENOSYS
+        || errno == libc::EINVAL
+    {
+        "unsupported"
+    } else if errno == libc::EACCES || errno == libc::EPERM {
+        "denied"
+    } else if errno == libc::EROFS {
+        "read_only"
+    } else if errno == libc::ENOENT {
+        "not_found"
+    } else if errno == libc::EEXIST || errno == libc::ENOTEMPTY {
+        "exists"
+    } else if errno == libc::EBUSY {
+        "busy"
+    } else if errno == libc::EIO {
+        "io"
+    } else if errno == libc::EXDEV {
+        "crosses_device"
+    } else if errno == libc::ENOTDIR || errno == libc::ELOOP {
+        "not_a_directory"
+    } else if errno == libc::EINTR {
+        "interrupted"
+    } else {
+        "other"
+    }
+}
+
+/// Why [`open_trash_classified`] refused: the message, and its cause as a
+/// counter-safe name ([`errno_cause`], or `not_private` / `foreign_marker`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrashOpenError {
+    pub(crate) message: String,
+    pub(crate) cause: &'static str,
+}
+
+impl TrashOpenError {
+    fn io(context: &str, error: &std::io::Error) -> Self {
+        Self {
+            message: format!("{context}: {error}"),
+            cause: errno_cause(error),
+        }
+    }
+}
+
 /// Open the trash of `pool`, creating it fresh (mode 0700, with the marker)
 /// when it does not exist. An existing one is used only when it is a real
 /// directory (no symlink is followed), owned by this user, closed to group
 /// and others, and holds the broker's marker.
 pub(crate) fn open_trash(pool: &Path) -> Result<TrashDir, String> {
-    let pool_fd = open_dir_nofollow(pool)
-        .map_err(|error| format!("cannot open the pool {}: {error}", pool.display()))?;
-    let name = c_name(TRASH_DIR).map_err(|error| error.to_string())?;
+    open_trash_classified(pool).map_err(|error| error.message)
+}
+
+/// [`open_trash`], keeping why it refused as a cause.
+pub(crate) fn open_trash_classified(pool: &Path) -> Result<TrashDir, TrashOpenError> {
+    let pool_fd = open_dir_nofollow(pool).map_err(|error| {
+        TrashOpenError::io(&format!("cannot open the pool {}", pool.display()), &error)
+    })?;
+    let name = c_name(TRASH_DIR).map_err(|error| TrashOpenError::io("bad name", &error))?;
     // SAFETY: `name` is NUL-terminated and `pool_fd` is open.
     let created = match checked(unsafe { libc::mkdirat(pool_fd.as_raw_fd(), name.as_ptr(), 0o700) })
     {
         Ok(_) => true,
         Err(error) if error.raw_os_error() == Some(libc::EEXIST) => false,
-        Err(error) => return Err(format!("cannot create the trash: {error}")),
+        Err(error) => return Err(TrashOpenError::io("cannot create the trash", &error)),
     };
     let trash_fd = openat_dir_nofollow(pool_fd.as_raw_fd(), TRASH_DIR)
-        .map_err(|error| format!("the trash is not a real directory: {error}"))?;
-    let stat = fstat(trash_fd.as_raw_fd()).map_err(|error| error.to_string())?;
+        .map_err(|error| TrashOpenError::io("the trash is not a real directory", &error))?;
+    let stat = fstat(trash_fd.as_raw_fd())
+        .map_err(|error| TrashOpenError::io("cannot inspect the trash", &error))?;
     // SAFETY: `geteuid` has no preconditions.
     let uid = unsafe { libc::geteuid() };
     if !is_directory(&stat) || stat.st_uid != uid || stat.st_mode & 0o077 != 0 {
-        return Err("the trash is not a private directory owned by this user".into());
+        return Err(TrashOpenError {
+            message: "the trash is not a private directory owned by this user".into(),
+            cause: "not_private",
+        });
     }
-    let marker = c_name(TRASH_MARKER).map_err(|error| error.to_string())?;
+    let marker = c_name(TRASH_MARKER).map_err(|error| TrashOpenError::io("bad name", &error))?;
     if created {
         // SAFETY: `marker` is NUL-terminated and `trash_fd` is open.
         let fd = checked(unsafe {
@@ -311,11 +385,11 @@ pub(crate) fn open_trash(pool: &Path) -> Result<TrashDir, String> {
                 0o600 as libc::c_uint,
             )
         })
-        .map_err(|error| format!("cannot mark the trash: {error}"))?;
+        .map_err(|error| TrashOpenError::io("cannot mark the trash", &error))?;
         // SAFETY: `fd` was just opened and is owned here.
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         std::io::Write::write_all(&mut file, TRASH_MARKER_CONTENT.as_bytes())
-            .map_err(|error| format!("cannot mark the trash: {error}"))?;
+            .map_err(|error| TrashOpenError::io("cannot mark the trash", &error))?;
     } else {
         // SAFETY: as above, read-only.
         let fd = checked(unsafe {
@@ -325,14 +399,24 @@ pub(crate) fn open_trash(pool: &Path) -> Result<TrashDir, String> {
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         })
-        .map_err(|_| "the trash directory lacks the broker's marker".to_string())?;
+        .map_err(|error| TrashOpenError {
+            message: "the trash directory lacks the broker's marker".to_string(),
+            cause: if error.raw_os_error() == Some(libc::ENOENT) {
+                "foreign_marker"
+            } else {
+                errno_cause(&error)
+            },
+        })?;
         // SAFETY: `fd` was just opened and is owned here.
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut content = String::new();
         std::io::Read::read_to_string(&mut file, &mut content)
-            .map_err(|error| format!("cannot read the trash marker: {error}"))?;
+            .map_err(|error| TrashOpenError::io("cannot read the trash marker", &error))?;
         if content != TRASH_MARKER_CONTENT {
-            return Err("the trash directory's marker is not the broker's".into());
+            return Err(TrashOpenError {
+                message: "the trash directory's marker is not the broker's".into(),
+                cause: "foreign_marker",
+            });
         }
     }
     Ok(TrashDir {

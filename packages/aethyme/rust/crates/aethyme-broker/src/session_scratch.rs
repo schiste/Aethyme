@@ -112,8 +112,70 @@ pub(crate) enum Refusal {
     IdentityChanged,
     /// The container or the entry is on another device than the pool.
     CrossesDevice,
-    /// The trash, the record or the rename failed; nothing moved.
-    Failed,
+    /// A system call, the trash, its record or the rename failed; nothing
+    /// moved. Which step and why are kept ([`MoveFailure`]) and counted.
+    Failed(MoveFailure),
+}
+
+/// The step of a move that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveStep {
+    /// Opening or inspecting a directory on the recorded path.
+    Open,
+    /// Inspecting the entry itself (its identity).
+    Inspect,
+    /// Opening (or creating) the pool's checkout trash.
+    TrashOpen,
+    /// Recording the pending trash row in the broker's store.
+    TrashRecord,
+    /// The exclusive rename into the trash.
+    Rename,
+}
+
+impl MoveStep {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Inspect => "inspect",
+            Self::TrashOpen => "trash_open",
+            Self::TrashRecord => "trash_record",
+            Self::Rename => "rename",
+        }
+    }
+}
+
+/// Where a move failed and why: the step, and the cause as a counter-safe
+/// name ([`crate::checkout_trash::errno_cause`], or `store` for the record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MoveFailure {
+    pub(crate) step: MoveStep,
+    pub(crate) cause: &'static str,
+}
+
+impl MoveFailure {
+    pub(crate) fn io(step: MoveStep, error: &std::io::Error) -> Self {
+        Self {
+            step,
+            cause: crate::checkout_trash::errno_cause(error),
+        }
+    }
+
+    /// `<step>.<cause>`, the key it is counted under.
+    pub(crate) fn key(self) -> String {
+        format!("{}.{}", self.step.code(), self.cause)
+    }
+
+    /// Whether the next move would fail the same way whatever it moves: the
+    /// process is out of descriptors, the volume is full or read-only, the
+    /// trash cannot be opened, or the store refuses the record. A pass stops
+    /// on these instead of failing every entry in turn.
+    pub(crate) fn systemic(self) -> bool {
+        matches!(self.step, MoveStep::TrashOpen | MoveStep::TrashRecord)
+            || matches!(
+                self.cause,
+                "too_many_open_files" | "no_space" | "read_only" | "unsupported"
+            )
+    }
 }
 
 impl Refusal {
@@ -125,7 +187,7 @@ impl Refusal {
             Self::ForeignContainer => "foreign_container",
             Self::IdentityChanged => "identity_changed",
             Self::CrossesDevice => "crosses_device",
-            Self::Failed => "move_failed",
+            Self::Failed(_) => "move_failed",
         }
     }
 
@@ -137,7 +199,7 @@ impl Refusal {
             Self::ForeignContainer => "session_scratch_refused_foreign_container",
             Self::IdentityChanged => "session_scratch_refused_identity_changed",
             Self::CrossesDevice => "session_scratch_refused_crosses_device",
-            Self::Failed => "session_scratch_refused_move_failed",
+            Self::Failed(_) => "session_scratch_refused_move_failed",
         }
     }
 }
@@ -197,21 +259,47 @@ fn open_path_without_links(path: &Path) -> Result<OwnedFd, Refusal> {
     if !plain_absolute(path) {
         return Err(Refusal::NotARecordedScratch);
     }
-    let mut current = open_dir_nofollow(Path::new("/")).map_err(|_| Refusal::Failed)?;
+    let mut current = open_dir_nofollow(Path::new("/"))
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?;
     for component in path.components() {
         let Component::Normal(name) = component else {
             continue;
         };
         let name = name.to_str().ok_or(Refusal::NotARecordedScratch)?;
-        current = openat_dir_nofollow(current.as_raw_fd(), name).map_err(|error| {
-            if error.raw_os_error() == Some(libc::ENOENT) {
-                Refusal::Missing
-            } else {
-                Refusal::NotARealDirectory
-            }
-        })?;
+        current =
+            openat_dir_nofollow(current.as_raw_fd(), name).map_err(|error| open_refusal(&error))?;
     }
     Ok(current)
+}
+
+/// Why opening a directory on a recorded path without following links
+/// failed: gone (`ENOENT`), not a real directory (a link, `ELOOP`, or not a
+/// directory, `ENOTDIR`), or a failed call whose cause is counted (out of
+/// descriptors, denied, I/O, ...). Only the first two are judgements about
+/// the path; the rest say nothing about it and stop or retry like any
+/// failed move.
+pub(crate) fn open_refusal(error: &std::io::Error) -> Refusal {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Refusal::Missing,
+        Some(libc::ELOOP | libc::ENOTDIR) => Refusal::NotARealDirectory,
+        _ => Refusal::Failed(MoveFailure::io(MoveStep::Open, error)),
+    }
+}
+
+/// Whether the pool holding `record` is not there to judge: its root is
+/// missing or not a directory (a volume that is not mounted), or it is on
+/// another device than recorded without the broker's scratch container (an
+/// empty mount-point directory standing in for the volume). A scratch
+/// directory that looks missing then is kept, never forgotten.
+pub(crate) fn pool_unavailable(record: &ScratchRecord) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(&record.pool) {
+        Err(_) => true,
+        Ok(metadata) if !metadata.is_dir() => true,
+        Ok(metadata) => {
+            metadata.dev() != record.device && !record.pool.join(SCRATCH_CONTAINER).is_dir()
+        }
+    }
 }
 
 fn uid() -> libc::uid_t {
@@ -268,14 +356,10 @@ fn private_directory(stat: &libc::stat) -> bool {
 /// The container inside the pool `pool_fd`, verified: a real, private,
 /// marked directory owned by this user, on the pool's device.
 fn open_container(pool_fd: RawFd, pool_device: u64) -> Result<OwnedFd, Refusal> {
-    let container = openat_dir_nofollow(pool_fd, SCRATCH_CONTAINER).map_err(|error| {
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            Refusal::Missing
-        } else {
-            Refusal::NotARealDirectory
-        }
-    })?;
-    let stat = fstat(container.as_raw_fd()).map_err(|_| Refusal::Failed)?;
+    let container =
+        openat_dir_nofollow(pool_fd, SCRATCH_CONTAINER).map_err(|error| open_refusal(&error))?;
+    let stat = fstat(container.as_raw_fd())
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?;
     if !private_directory(&stat) || !marker_matches(container.as_raw_fd()) {
         return Err(Refusal::ForeignContainer);
     }
@@ -376,14 +460,14 @@ pub(crate) fn verify(record: &ScratchRecord) -> Result<Verified, Refusal> {
     let pool_fd = open_path_without_links(&record.pool)?;
     #[allow(clippy::unnecessary_cast)]
     let pool_device = fstat(pool_fd.as_raw_fd())
-        .map_err(|_| Refusal::Failed)?
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?
         .st_dev as u64;
     let container = open_container(pool_fd.as_raw_fd(), pool_device)?;
     let stat = fstatat_nofollow(container.as_raw_fd(), &record.entry).map_err(|error| {
         if error.raw_os_error() == Some(libc::ENOENT) {
             Refusal::Missing
         } else {
-            Refusal::Failed
+            Refusal::Failed(MoveFailure::io(MoveStep::Inspect, &error))
         }
     })?;
     if !is_directory(&stat) {
@@ -415,7 +499,7 @@ pub(crate) fn reidentify(record: &ScratchRecord) -> Result<ScratchRecord, Refusa
     let pool_fd = open_path_without_links(&record.pool)?;
     #[allow(clippy::unnecessary_cast)]
     let pool_device = fstat(pool_fd.as_raw_fd())
-        .map_err(|_| Refusal::Failed)?
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?
         .st_dev as u64;
     if pool_device == record.device {
         // Same device: a different inode is another directory, not a remount.
@@ -426,7 +510,7 @@ pub(crate) fn reidentify(record: &ScratchRecord) -> Result<ScratchRecord, Refusa
         if error.raw_os_error() == Some(libc::ENOENT) {
             Refusal::Missing
         } else {
-            Refusal::Failed
+            Refusal::Failed(MoveFailure::io(MoveStep::Inspect, &error))
         }
     })?;
     if !is_directory(&stat) {
@@ -472,13 +556,14 @@ pub(crate) fn move_to_trash(
     let verified = verify(record).inspect_err(|refusal| {
         crate::phase_telemetry::add(refusal.counter(), Duration::ZERO);
     })?;
-    let trash = crate::checkout_trash::open_trash(&record.pool).map_err(|_| Refusal::Failed)?;
-    #[allow(clippy::unnecessary_cast)]
-    let trash_device = fstat(trash.trash_fd()).map_err(|_| Refusal::Failed)?.st_dev as u64;
-    if trash_device != record.device {
+    let trash = open_trash_for_move(&record.pool).inspect_err(|refusal| {
+        crate::phase_telemetry::add(refusal.counter(), Duration::ZERO);
+    })?;
+    if trash.device != record.device {
         crate::phase_telemetry::add(Refusal::CrossesDevice.counter(), Duration::ZERO);
         return Err(Refusal::CrossesDevice);
     }
+    let trash = trash.trash;
     let entry = crate::checkout_trash::new_entry_name(record.session_id);
     let (creator_pid, creator_started_ms) = crate::checkout_trash::this_process_identity();
     let mut row = crate::checkout_trash::TrashRow {
@@ -493,7 +578,11 @@ pub(crate) fn move_to_trash(
         scratch: true,
         verification: false,
     };
-    record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
+    record_pending(trash.path(), &entry, row).map_err(|_| {
+        let refusal = Refusal::Failed(STORE_FAILURE);
+        crate::phase_telemetry::add(refusal.counter(), Duration::ZERO);
+        refusal
+    })?;
     // The identity once more, on the pinned container, right before the
     // rename: a directory swapped in since `verify` is never moved. A swap
     // between this check and the rename (microseconds, by a process of this
@@ -510,20 +599,14 @@ pub(crate) fn move_to_trash(
         crate::phase_telemetry::add(Refusal::IdentityChanged.counter(), Duration::ZERO);
         return Err(Refusal::IdentityChanged);
     }
-    crate::checkout_trash::rename_noreplace(
+    exclusive_rename(
         verified.container.as_raw_fd(),
         &record.entry,
         trash.trash_fd(),
         &entry,
     )
-    .map_err(|error| {
-        let refusal = if error.raw_os_error() == Some(libc::EXDEV) {
-            Refusal::CrossesDevice
-        } else {
-            Refusal::Failed
-        };
+    .inspect_err(|refusal| {
         crate::phase_telemetry::add(refusal.counter(), Duration::ZERO);
-        refusal
     })?;
     row.pending = false;
     remove_container_if_empty(&record.pool, verified.container.as_raw_fd());
@@ -532,6 +615,79 @@ pub(crate) fn move_to_trash(
         entry,
         row,
     })
+}
+
+/// The store refused the pending trash row.
+const STORE_FAILURE: MoveFailure = MoveFailure {
+    step: MoveStep::TrashRecord,
+    cause: "store",
+};
+
+/// The pool's trash, opened for a move, and its device.
+struct TrashForMove {
+    trash: crate::checkout_trash::TrashDir,
+    device: u64,
+}
+
+fn open_trash_for_move(pool: &Path) -> Result<TrashForMove, Refusal> {
+    let trash = crate::checkout_trash::open_trash_classified(pool).map_err(|error| {
+        Refusal::Failed(MoveFailure {
+            step: MoveStep::TrashOpen,
+            cause: error.cause,
+        })
+    })?;
+    #[allow(clippy::unnecessary_cast)]
+    let device = fstat(trash.trash_fd())
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::TrashOpen, &error)))?
+        .st_dev as u64;
+    Ok(TrashForMove { trash, device })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// An errno the next exclusive renames of this thread fail with, as a
+    /// filesystem without an exclusive rename would (`ENOTSUP`, `EINVAL`).
+    /// With the names of the entries it applies to (empty: every entry).
+    static RENAME_ERRNO_FOR_TEST: std::cell::RefCell<Option<(i32, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make this thread's exclusive renames fail with `errno` (`None` clears).
+#[cfg(test)]
+pub(crate) fn fail_renames_for_test(errno: Option<i32>) {
+    RENAME_ERRNO_FOR_TEST.with(|cell| *cell.borrow_mut() = errno.map(|errno| (errno, Vec::new())));
+}
+
+/// Make this thread's exclusive renames of the entries named `names` fail
+/// with `errno`; other entries rename normally.
+#[cfg(test)]
+pub(crate) fn fail_renames_of_for_test(errno: i32, names: Vec<String>) {
+    RENAME_ERRNO_FOR_TEST.with(|cell| *cell.borrow_mut() = Some((errno, names)));
+}
+
+/// The exclusive rename into the trash, its failure classified. There is no
+/// fallback to a plain rename: a filesystem without an exclusive rename
+/// (`ENOTSUP`, `EINVAL`) keeps the entry, counted as `rename.unsupported`.
+fn exclusive_rename(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> Result<(), Refusal> {
+    #[cfg(test)]
+    if let Some(errno) = RENAME_ERRNO_FOR_TEST.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(_, names)| names.is_empty() || names.iter().any(|name| name == from))
+            .map(|(errno, _)| *errno)
+    }) {
+        return Err(rename_refusal(&std::io::Error::from_raw_os_error(errno)));
+    }
+    crate::checkout_trash::rename_noreplace(from_dir, from, to_dir, to)
+        .map_err(|error| rename_refusal(&error))
+}
+
+fn rename_refusal(error: &std::io::Error) -> Refusal {
+    if error.raw_os_error() == Some(libc::EXDEV) {
+        Refusal::CrossesDevice
+    } else {
+        Refusal::Failed(MoveFailure::io(MoveStep::Rename, error))
+    }
 }
 
 /// One finished command run ([`crate::command_temp`]) of a recorded scratch
@@ -558,15 +714,11 @@ impl FinishedRun {
 fn open_run_container(record: &ScratchRecord, name: &str) -> Result<OwnedFd, Refusal> {
     let verified = verify(record)?;
     let entry = openat_dir_nofollow(verified.container.as_raw_fd(), &record.entry)
-        .map_err(|_| Refusal::NotARealDirectory)?;
-    let container = openat_dir_nofollow(entry.as_raw_fd(), name).map_err(|error| {
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            Refusal::Missing
-        } else {
-            Refusal::NotARealDirectory
-        }
-    })?;
-    let stat = fstat(container.as_raw_fd()).map_err(|_| Refusal::Failed)?;
+        .map_err(|error| open_refusal(&error))?;
+    let container =
+        openat_dir_nofollow(entry.as_raw_fd(), name).map_err(|error| open_refusal(&error))?;
+    let stat = fstat(container.as_raw_fd())
+        .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?;
     if !private_directory(&stat) {
         return Err(Refusal::ForeignContainer);
     }
@@ -628,6 +780,25 @@ pub(crate) fn finished_runs(record: &ScratchRecord, limit: usize) -> Vec<Finishe
         .collect()
 }
 
+/// Whether `record`'s done container lists a finished-run marker. A hint
+/// read by path, never acted on: it only decides whether the verified
+/// [`finished_runs`] (a descriptor walk from `/`) is worth its cost for an
+/// open session, most of which have no finished run.
+pub(crate) fn may_have_finished_runs(record: &ScratchRecord) -> bool {
+    std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER)).is_ok_and(
+        |mut listing| {
+            listing.any(|entry| {
+                entry.ok().is_some_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(crate::command_temp::is_run_name)
+                })
+            })
+        },
+    )
+}
+
 /// Remove `run`'s marker from `record`'s done container (only a regular
 /// file: `unlinkat` without flags never removes a directory).
 pub(crate) fn forget_finished_run(record: &ScratchRecord, run: &FinishedRun) {
@@ -669,7 +840,7 @@ pub(crate) fn move_finished_run_to_trash(
     let identity = (run.marker.device, run.marker.inode);
     let check = |live: RawFd| match fstatat_nofollow(live, &run.name) {
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Err(Refusal::Missing),
-        Err(_) => Err(Refusal::Failed),
+        Err(error) => Err(Refusal::Failed(MoveFailure::io(MoveStep::Inspect, &error))),
         Ok(stat) if !is_directory(&stat) => Err(Refusal::NotARealDirectory),
         Ok(stat) => {
             #[allow(clippy::unnecessary_cast)]
@@ -685,12 +856,11 @@ pub(crate) fn move_finished_run_to_trash(
     if run.marker.device != record.device {
         return Err(Refusal::CrossesDevice);
     }
-    let trash = crate::checkout_trash::open_trash(&record.pool).map_err(|_| Refusal::Failed)?;
-    #[allow(clippy::unnecessary_cast)]
-    let trash_device = fstat(trash.trash_fd()).map_err(|_| Refusal::Failed)?.st_dev as u64;
-    if trash_device != record.device {
+    let trash = open_trash_for_move(&record.pool)?;
+    if trash.device != record.device {
         return Err(Refusal::CrossesDevice);
     }
+    let trash = trash.trash;
     let entry = crate::checkout_trash::new_entry_name(record.session_id);
     let (creator_pid, creator_started_ms) = crate::checkout_trash::this_process_identity();
     let mut row = crate::checkout_trash::TrashRow {
@@ -705,16 +875,9 @@ pub(crate) fn move_finished_run_to_trash(
         scratch: true,
         verification: false,
     };
-    record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
+    record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed(STORE_FAILURE))?;
     check(live.as_raw_fd())?;
-    crate::checkout_trash::rename_noreplace(live.as_raw_fd(), &run.name, trash.trash_fd(), &entry)
-        .map_err(|error| {
-            if error.raw_os_error() == Some(libc::EXDEV) {
-                Refusal::CrossesDevice
-            } else {
-                Refusal::Failed
-            }
-        })?;
+    exclusive_rename(live.as_raw_fd(), &run.name, trash.trash_fd(), &entry)?;
     row.pending = false;
     Ok(TrashedScratch {
         trash_dir: trash.path().to_path_buf(),

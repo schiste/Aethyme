@@ -3383,18 +3383,28 @@ impl Broker {
             if !report.closed_lap_first {
                 strip_passes(self, &mut run, &mut report);
             }
-            // Session scratch directories of closed (or replaced) sessions:
-            // O(1) renames into the trash with a small fixed budget, before
-            // the laps, so build output left there never waits behind them.
-            // The run's open-file observation, when this pass is the first
-            // to need it, keeps its full budget: the later laps reuse it.
-            let scratch_deadline =
-                (Instant::now() + super::scratch::SCRATCH_RETIRE_BUDGET).min(deadline);
+            // Session scratch directories of closed (or replaced) sessions,
+            // and the finished command runs of open ones: O(1) renames into
+            // the trash with a small fixed budget, before the laps, so build
+            // output left there never waits behind them. The run's
+            // open-file observation, when this pass is the first to need it,
+            // keeps its full budget outside that one: the later laps reuse
+            // it. Neither is cut short by what the phases before used of the
+            // lane's window (a floor, as for the other phases), but neither
+            // starts new work later than `SCRATCH_OVERRUN_MAX` past the
+            // lane's deadline: with one item in flight (a replaced
+            // directory's fresh observation, 10 s, and a rename) the run
+            // ends at most that plus 10 s plus one move past it.
+            let scratch_latest = deadline + super::scratch::SCRATCH_OVERRUN_MAX;
             run.deadline = (Instant::now()
                 + RETIRE_PROCESS_USE_BUDGET
                 + super::scratch::SCRATCH_RETIRE_BUDGET)
-                .min(deadline);
-            report.scratch = self.retire_session_scratch(&mut run, scratch_deadline);
+                .min(scratch_latest);
+            report.scratch = self.retire_session_scratch(
+                &mut run,
+                super::scratch::SCRATCH_RETIRE_BUDGET,
+                scratch_latest,
+            );
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other. Before the strip
