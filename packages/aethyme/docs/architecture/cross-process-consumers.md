@@ -4376,6 +4376,7 @@ failed moves in a row, or at once when the cause is systemic (the trash or
 its record, `too_many_open_files`, `no_space`, `read_only`, `unsupported`),
 and the next run retries: a failing move is tried at most once per run.
 Counters `session_scratch_retire_cursor_resumed`,
+`session_scratch_retire_process_use_unknown`,
 `session_scratch_retire_stopped_after_failures`,
 `command_temp_retire_stopped_after_failures`; span
 `session_scratch_retire_classify`; attachment `scratch_move_failures`,

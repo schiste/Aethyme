@@ -627,7 +627,14 @@ impl Broker {
             // The run's open-file observation, when this pass is the first
             // to need it, before the budget starts: `lsof` alone can take
             // 10 s on the busiest machine.
-            let _ = run.process_use();
+            // A failed observation is not lost: each item asks again and
+            // keeps itself as `process_use_unknown`.
+            if run.process_use().is_err() {
+                crate::phase_telemetry::add(
+                    "session_scratch_retire_process_use_unknown",
+                    Duration::ZERO,
+                );
+            }
         }
         let started = Instant::now();
         let deadline = started + budget;
