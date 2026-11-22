@@ -10,11 +10,13 @@
 //! Only the storage worker measures them, after its pass and at most every
 //! [`REFRESH_EVERY`]: a one-level listing (at most [`ENTRY_LIMIT`] entries)
 //! and a walk of each entry with one deadline for the whole reading
-//! ([`MEASURE_BUDGET`]), never following a symbolic link nor leaving the
-//! root's device. Sizes persist per entry (keyed by a hash of its name, so no
-//! name is stored), unmeasured entries first and then the oldest measured, so
-//! a large folder converges over a few passes. `broker status` reads only the
-//! small reading file.
+//! ([`MEASURE_BUDGET`]), checked every [`CHECK_EVERY`] children, with at most
+//! [`PENDING_LIMIT`] queued directories, never following a symbolic link nor
+//! leaving the root's device. Only this user's entries are walked; the
+//! broker's own alias directory is left out. Sizes persist per entry (keyed
+//! by a salted hash of its name, so no name is stored), unmeasured entries
+//! first and then the oldest measured, so a large folder converges over a
+//! few passes. `broker status` reads only the small reading file.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Budgets, GIB, HOUR, Usage, check::human, now_ms, walk_until, write_atomically};
+use super::{Budgets, GIB, HOUR, check::human, now_ms, write_atomically};
 
 /// `<host state>/storage-ledger-host-temp/`: the reading and the size cache.
 pub const HOST_TEMP_DIRECTORY: &str = "storage-ledger-host-temp";
@@ -32,12 +34,18 @@ pub const HOST_TEMP_DIRECTORY: &str = "storage-ledger-host-temp";
 const READING_FILE: &str = "reading.json";
 /// Per-entry sizes the next reading resumes from (worker only).
 const SIZES_FILE: &str = "sizes.json";
+/// The per-host salt of the entry keys (worker only, mode 0600).
+const SALT_FILE: &str = "salt";
 /// Wall time one reading may spend walking, across all roots.
 pub const MEASURE_BUDGET: Duration = Duration::from_secs(10);
 /// A reading younger than this is not taken again.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Top-level entries listed per root, at most.
 pub const ENTRY_LIMIT: usize = 100_000;
+/// Directories queued in one entry's walk, at most.
+pub const PENDING_LIMIT: usize = 4_096;
+/// Children read between deadline and heartbeat checks.
+const CHECK_EVERY: usize = 256;
 /// A reading older than this advises nothing (the worker has not run).
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// One trend sample per root per hour, three days of them.
@@ -81,6 +89,14 @@ pub struct RootReading {
     /// Top-level entries (at most [`ENTRY_LIMIT`]; `entries_capped` beyond).
     pub entries: u64,
     pub entries_capped: bool,
+    /// Top-level entries owned by another user: counted, never walked nor
+    /// sized.
+    #[serde(default)]
+    pub other_users_entries: u64,
+    /// The broker's own command-temp alias directory (`ae<uid>`), left out
+    /// of these totals: it is Aethyme's.
+    #[serde(default)]
+    pub aethyme_entries_excluded: u64,
     /// Allocated bytes of the measured entries: a lower bound when
     /// `partial`.
     pub bytes: u64,
@@ -211,85 +227,242 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn name_key(name: &std::ffi::OsStr) -> String {
+/// The per-host salt of the entry keys, created once (mode 0600) beside the
+/// reading, so a key cannot be matched against the hash of a common name.
+fn salt(directory: &Path) -> io::Result<Vec<u8>> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = directory.join(SALT_FILE);
+    if let Ok(bytes) = fs::read(&path)
+        && !bytes.is_empty()
+    {
+        return Ok(bytes);
+    }
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            Ok(bytes.to_vec())
+        }
+        // Another worker created it first: use that one.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::read(&path),
+        Err(error) => Err(error),
+    }
+}
+
+fn name_key(salt: &[u8], name: &std::ffi::OsStr) -> String {
     use sha2::Digest as _;
     use std::os::unix::ffi::OsStrExt as _;
-    let mut key = format!("{:x}", sha2::Sha256::digest(name.as_bytes()));
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(salt);
+    hasher.update(name.as_bytes());
+    let mut key = format!("{:x}", hasher.finalize());
     key.truncate(16);
     key
 }
 
+/// The worker's heartbeat, called at most every [`super::BEAT_EVERY`]; once
+/// it reports the lock lost, every walk stops.
+struct Beat<'a> {
+    beat: &'a mut dyn FnMut() -> bool,
+    last: Option<Instant>,
+    lost: bool,
+}
+
+impl Beat<'_> {
+    /// False once the worker lock is lost.
+    fn tick(&mut self) -> bool {
+        if !self.lost
+            && self
+                .last
+                .is_none_or(|last| last.elapsed() >= super::BEAT_EVERY)
+        {
+            self.last = Some(Instant::now());
+            self.lost = !(self.beat)();
+        }
+        !self.lost
+    }
+}
+
+/// What one entry's walk found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryWalk {
+    bytes: u64,
+    complete: bool,
+}
+
+/// One top-level entry, as the listing saw it.
+struct Listed {
+    key: String,
+    path: PathBuf,
+    bytes: u64,
+    is_dir: bool,
+    same_device: bool,
+}
+
+/// Walk one directory entry until `deadline`. Directories are read lazily,
+/// one open listing at a time; the deadline and the heartbeat are checked
+/// every [`CHECK_EVERY`] children; at most [`PENDING_LIMIT`] directories
+/// wait in the queue, and past it the entry is measured only in part rather
+/// than holding more paths. Never follows a link nor leaves `device`.
+fn walk_entry(
+    path: &Path,
+    bytes: u64,
+    device: u64,
+    deadline: Instant,
+    beat: &mut Beat<'_>,
+) -> EntryWalk {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut walk = EntryWalk {
+        bytes,
+        complete: true,
+    };
+    let mut pending = vec![path.to_path_buf()];
+    let mut children = 0usize;
+    while let Some(directory) = pending.pop() {
+        if Instant::now() >= deadline || !beat.tick() {
+            walk.complete = false;
+            return walk;
+        }
+        let Ok(listing) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for child in listing {
+            children += 1;
+            if children.is_multiple_of(CHECK_EVERY) && (Instant::now() >= deadline || !beat.tick())
+            {
+                walk.complete = false;
+                return walk;
+            }
+            let Ok(child) = child else {
+                continue;
+            };
+            // `DirEntry::metadata` does not follow a symbolic link.
+            let Ok(metadata) = child.metadata() else {
+                continue;
+            };
+            if metadata.dev() != device {
+                continue;
+            }
+            walk.bytes = walk.bytes.saturating_add(super::allocated(&metadata));
+            if metadata.is_dir() {
+                if pending.len() < PENDING_LIMIT {
+                    pending.push(child.path());
+                } else {
+                    walk.complete = false;
+                }
+            }
+        }
+    }
+    walk
+}
+
 /// Measure one root until `deadline`, resuming from and updating `sizes`.
-/// `None` when the root does not exist.
+/// Entries owned by another user than `uid` are counted, never walked;
+/// the broker's own alias directory (`ae<uid>`) is left out. `None` when the
+/// root does not exist or the worker lock was lost.
 fn measure_root(
     root: &TempRoot,
     deadline: Instant,
     sizes: &mut BTreeMap<String, EntrySize>,
-    beat: &mut dyn FnMut(),
+    beat: &mut Beat<'_>,
+    salt: &[u8],
+    uid: u32,
 ) -> Option<RootReading> {
     use std::os::unix::fs::MetadataExt as _;
     let started = Instant::now();
+    if !beat.tick() {
+        return None;
+    }
     let metadata = fs::symlink_metadata(&root.path).ok()?;
     if !metadata.is_dir() {
         return None;
     }
     let device = metadata.dev();
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    let mut capped = false;
+    let alias = std::ffi::OsString::from(format!("ae{uid}"));
+    let mut entries: Vec<Listed> = Vec::new();
+    let (mut capped, mut other_users, mut excluded, mut seen) = (false, 0u64, 0u64, 0usize);
     if let Ok(listing) = fs::read_dir(&root.path) {
         for entry in listing.flatten() {
+            seen += 1;
+            if seen.is_multiple_of(CHECK_EVERY) && !beat.tick() {
+                return None;
+            }
             if entries.len() >= ENTRY_LIMIT {
                 capped = true;
                 break;
             }
-            entries.push((name_key(&entry.file_name()), entry.path()));
+            let name = entry.file_name();
+            if name == alias {
+                excluded += 1;
+                continue;
+            }
+            let Ok(entry_metadata) = entry.metadata() else {
+                continue;
+            };
+            if entry_metadata.uid() != uid {
+                other_users += 1;
+                continue;
+            }
+            entries.push(Listed {
+                key: name_key(salt, &name),
+                path: entry.path(),
+                bytes: super::allocated(&entry_metadata),
+                is_dir: entry_metadata.is_dir(),
+                same_device: entry_metadata.dev() == device,
+            });
         }
     }
-    let present: BTreeSet<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
+    let present: BTreeSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
     sizes.retain(|key, _| present.contains(key.as_str()));
     // Unmeasured first, then the oldest complete size, and entries the
     // deadline cut short last, so one huge entry cannot starve the rest.
-    entries.sort_by_key(|(key, _)| match sizes.get(key) {
+    entries.sort_by_key(|entry| match sizes.get(&entry.key) {
         None => (0, 0),
         Some(size) if size.complete => (1, size.measured_at_ms),
         Some(size) => (2, size.measured_at_ms),
     });
     let now = now_ms();
     let mut walked = 0u64;
-    for (key, path) in &entries {
+    for entry in &entries {
         if Instant::now() >= deadline {
             break;
         }
-        let mut pending = vec![path.clone()];
-        let mut usage = Usage::default();
-        let complete = walk_until(
-            &mut pending,
-            &mut usage,
-            device,
-            deadline,
-            super::BEAT_EVERY,
-            beat,
-        );
+        // A mount point at the top level: its own size only.
+        let walk = if entry.is_dir && entry.same_device {
+            walk_entry(&entry.path, entry.bytes, device, deadline, beat)
+        } else {
+            EntryWalk {
+                bytes: entry.bytes,
+                complete: true,
+            }
+        };
+        if beat.lost {
+            return None;
+        }
         walked += 1;
-        let previous = sizes.get(key).copied();
-        let keep_previous = !complete && previous.is_some_and(|size| size.bytes >= usage.bytes);
+        let previous = sizes.get(&entry.key).copied();
+        let keep_previous = !walk.complete && previous.is_some_and(|size| size.bytes >= walk.bytes);
         if !keep_previous {
             sizes.insert(
-                key.clone(),
+                entry.key.clone(),
                 EntrySize {
-                    bytes: usage.bytes,
+                    bytes: walk.bytes,
                     measured_at_ms: now,
-                    complete,
+                    complete: walk.complete,
                 },
             );
-        } else if let Some(size) = sizes.get_mut(key) {
+        } else if let Some(size) = sizes.get_mut(&entry.key) {
             // Tried now: it goes to the back of its group.
             size.measured_at_ms = now;
         }
     }
     let unmeasured = entries
         .iter()
-        .filter(|(key, _)| !sizes.contains_key(key))
+        .filter(|entry| !sizes.contains_key(&entry.key))
         .count() as u64;
     let incomplete = sizes.values().any(|size| !size.complete);
     let volume = super::check::statvfs(&root.path);
@@ -302,6 +475,8 @@ fn measure_root(
         path: root.path.clone(),
         entries: entries.len() as u64,
         entries_capped: capped,
+        other_users_entries: other_users,
+        aethyme_entries_excluded: excluded,
         bytes: sizes.values().map(|size| size.bytes).sum(),
         unmeasured_entries: unmeasured,
         partial: capped || unmeasured > 0 || incomplete,
@@ -313,29 +488,52 @@ fn measure_root(
 }
 
 /// Take a reading of `roots` within `budget` and persist it, unless the last
-/// one is younger than [`REFRESH_EVERY`] and `force` is off. Worker only.
+/// one is younger than [`REFRESH_EVERY`] and `force` is off. `beat` is the
+/// worker's heartbeat: when it reports the lock lost, the reading stops and
+/// nothing is written. Worker only.
 pub fn refresh(
     host_state: &Path,
     roots: &[TempRoot],
     budget: Duration,
     force: bool,
-    beat: &mut dyn FnMut(),
+    beat: &mut dyn FnMut() -> bool,
+) -> io::Result<Reading> {
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    refresh_as(host_state, roots, budget, force, beat, uid)
+}
+
+fn refresh_as(
+    host_state: &Path,
+    roots: &[TempRoot],
+    budget: Duration,
+    force: bool,
+    beat: &mut dyn FnMut() -> bool,
+    uid: u32,
 ) -> io::Result<Reading> {
     let _span = crate::phase_telemetry::span("storage_host_temp_measure");
     let previous = Reading::load(host_state);
     let now = now_ms();
+    // A reading stamped in the future (a clock that went back) is stale.
     if !force
         && previous.updated_at_ms > 0
-        && now.saturating_sub(previous.updated_at_ms) < duration_ms(REFRESH_EVERY)
+        && previous.updated_at_ms <= now
+        && now - previous.updated_at_ms < duration_ms(REFRESH_EVERY)
     {
         return Ok(previous);
     }
     let directory = host_state.join(HOST_TEMP_DIRECTORY);
     fs::create_dir_all(&directory)?;
+    let salt = salt(&directory)?;
     let mut sizes: Sizes = fs::read(directory.join(SIZES_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
+    let mut beat = Beat {
+        beat,
+        last: None,
+        lost: false,
+    };
     let started = Instant::now();
     let mut readings = Vec::new();
     for (index, root) in roots.iter().enumerate() {
@@ -344,9 +542,19 @@ pub fn refresh(
         let share = left / u32::try_from(roots.len() - index).unwrap_or(1);
         let key = root.path.to_string_lossy().into_owned();
         let entry_sizes = sizes.entry(key).or_default();
-        if let Some(reading) = measure_root(root, Instant::now() + share, entry_sizes, beat) {
-            readings.push(reading);
+        let reading = measure_root(
+            root,
+            Instant::now() + share,
+            entry_sizes,
+            &mut beat,
+            &salt,
+            uid,
+        );
+        if beat.lost {
+            crate::phase_telemetry::add("storage_host_temp_lock_lost", Duration::ZERO);
+            return Ok(previous);
         }
+        readings.extend(reading);
     }
     let measured: BTreeSet<String> = readings
         .iter()
@@ -402,6 +610,7 @@ pub fn refresh(
 /// below its free-space floor. Reads only; nothing here deletes.
 pub fn advice(reading: &Reading, budgets: &Budgets, now: u64) -> Option<crate::StatusAdvice> {
     if reading.updated_at_ms == 0
+        || reading.updated_at_ms > now.saturating_add(duration_ms(REFRESH_EVERY))
         || now.saturating_sub(reading.updated_at_ms) > duration_ms(STALE_AFTER)
     {
         return None;
@@ -480,6 +689,8 @@ mod tests {
                 path: PathBuf::from("/tmp"),
                 entries,
                 entries_capped: false,
+                other_users_entries: 0,
+                aethyme_entries_excluded: 0,
                 bytes,
                 unmeasured_entries: 0,
                 partial: false,
@@ -555,7 +766,7 @@ mod tests {
             &roots,
             Duration::from_secs(30),
             true,
-            &mut || {},
+            &mut || true,
         )
         .unwrap();
         let measured = &reading.roots[0];
@@ -575,7 +786,7 @@ mod tests {
             &roots,
             Duration::from_secs(30),
             false,
-            &mut || {},
+            &mut || true,
         )
         .unwrap();
         assert_eq!(again, reading);
@@ -585,7 +796,7 @@ mod tests {
             &[root(&temp.path().join("missing"))],
             Duration::from_secs(1),
             true,
-            &mut || {},
+            &mut || true,
         )
         .unwrap();
         assert!(gone.roots.is_empty());
@@ -607,7 +818,7 @@ mod tests {
         }
         let roots = [root(temp.path())];
         let started = Instant::now();
-        let cut = refresh(host.path(), &roots, Duration::ZERO, true, &mut || {}).unwrap();
+        let cut = refresh(host.path(), &roots, Duration::ZERO, true, &mut || true).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         let measured = &cut.roots[0];
         assert_eq!(measured.entries, 50, "listing is counted regardless");
@@ -619,7 +830,7 @@ mod tests {
             &roots,
             Duration::from_secs(30),
             true,
-            &mut || {},
+            &mut || true,
         )
         .unwrap();
         assert!(!full.roots[0].partial, "{:?}", full.roots[0]);
@@ -637,7 +848,7 @@ mod tests {
             &[root(temp.path())],
             Duration::from_secs(5),
             true,
-            &mut || {},
+            &mut || true,
         )
         .unwrap();
         fs::write(
@@ -671,5 +882,142 @@ mod tests {
             before,
             "status wrote under host state"
         );
+    }
+
+    fn always() -> impl FnMut() -> bool {
+        || true
+    }
+
+    fn uid() -> u32 {
+        // SAFETY: `geteuid` has no preconditions.
+        unsafe { libc::geteuid() }
+    }
+
+    /// One huge directory cannot hold the walk past its deadline: a zero
+    /// budget stops it at the first check, and a directory with more
+    /// subdirectories than the queue cap is measured in part, not queued
+    /// in full.
+    #[test]
+    fn one_huge_directory_is_bounded_by_the_deadline_and_the_queue_cap() {
+        use std::os::unix::fs::MetadataExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let huge = temp.path().join("huge");
+        for index in 0..PENDING_LIMIT + 8 {
+            fs::create_dir_all(huge.join(format!("d{index}"))).unwrap();
+        }
+        let metadata = fs::symlink_metadata(&huge).unwrap();
+        let mut beat_fn = always();
+        let mut beat = Beat {
+            beat: &mut beat_fn,
+            last: None,
+            lost: false,
+        };
+        let started = Instant::now();
+        let cut = walk_entry(&huge, 0, metadata.dev(), Instant::now(), &mut beat);
+        assert!(!cut.complete, "{cut:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let capped = walk_entry(&huge, 0, metadata.dev(), deadline, &mut beat);
+        assert!(
+            !capped.complete,
+            "over the queue cap is partial: {capped:?}"
+        );
+        // Under the cap the same walk completes.
+        let small = temp.path().join("small");
+        for index in 0..8 {
+            fs::create_dir_all(small.join(format!("d{index}"))).unwrap();
+        }
+        let done = walk_entry(&small, 0, metadata.dev(), deadline, &mut beat);
+        assert!(done.complete, "{done:?}");
+    }
+
+    /// Another user's entries are counted, never sized; the broker's alias
+    /// directory is left out; the keys are salted per host (0600 salt).
+    #[test]
+    fn only_this_users_entries_are_sized_and_keys_are_salted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let host = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("mine"), vec![1u8; 4096]).unwrap();
+        fs::create_dir_all(temp.path().join(format!("ae{}", uid()))).unwrap();
+        let roots = [root(temp.path())];
+        let mine = refresh_as(
+            host.path(),
+            &roots,
+            Duration::from_secs(5),
+            true,
+            &mut always(),
+            uid(),
+        )
+        .unwrap();
+        assert_eq!(mine.roots[0].entries, 1, "{:?}", mine.roots[0]);
+        assert_eq!(mine.roots[0].aethyme_entries_excluded, 1);
+        assert_eq!(mine.roots[0].other_users_entries, 0);
+        let other = refresh_as(
+            host.path(),
+            &roots,
+            Duration::from_secs(5),
+            true,
+            &mut always(),
+            uid().wrapping_add(1),
+        )
+        .unwrap();
+        assert_eq!(other.roots[0].entries, 0, "{:?}", other.roots[0]);
+        assert_eq!(other.roots[0].other_users_entries, 2);
+        assert_eq!(other.roots[0].bytes, 0);
+        let salt_path = host.path().join(HOST_TEMP_DIRECTORY).join(SALT_FILE);
+        let mode = fs::metadata(&salt_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let salt = fs::read(&salt_path).unwrap();
+        assert_ne!(
+            name_key(&salt, std::ffi::OsStr::new("mine")),
+            name_key(&[], std::ffi::OsStr::new("mine"))
+        );
+    }
+
+    /// A lost worker lock stops the reading and writes nothing; a reading
+    /// stamped in the future does not block the next one.
+    #[test]
+    fn a_lost_lock_stops_the_reading_and_a_future_stamp_does_not_block() {
+        let host = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a"), b"x").unwrap();
+        let roots = [root(temp.path())];
+        let lost = refresh(
+            host.path(),
+            &roots,
+            Duration::from_secs(5),
+            true,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(lost, Reading::default());
+        assert!(
+            !host
+                .path()
+                .join(HOST_TEMP_DIRECTORY)
+                .join(READING_FILE)
+                .exists()
+        );
+        let directory = host.path().join(HOST_TEMP_DIRECTORY);
+        let future = Reading {
+            updated_at_ms: now_ms() + duration_ms(HOUR),
+            ..Reading::default()
+        };
+        fs::write(
+            directory.join(READING_FILE),
+            serde_json::to_vec(&future).unwrap(),
+        )
+        .unwrap();
+        let fresh = refresh(
+            host.path(),
+            &roots,
+            Duration::from_secs(5),
+            false,
+            &mut always(),
+        )
+        .unwrap();
+        assert_eq!(fresh.roots.len(), 1, "a future stamp was taken as fresh");
+        assert!(advice(&future, &Budgets::default(), now_ms()).is_none());
     }
 }

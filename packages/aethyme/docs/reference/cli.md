@@ -394,13 +394,20 @@ ledger when the worker measured it within the hour instead of walking it.
 Host temp folders (the per-user temp folder on macOS and `/tmp`) are not
 Aethyme's roots: they are read, never deleted. After its pass, at most every
 10 minutes, the worker counts their top-level entries (at most 100,000) and
-sizes them within a 10-second deadline, resuming next pass where the deadline
-stopped it. `aethyme storage status` shows each folder's bytes, entries, free
+sizes this user's entries within a 10-second deadline, resuming next pass
+where the deadline stopped it. Entries owned by another user are counted,
+never sized; the broker's own alias directory (`/tmp/ae<uid>`) is left out. `aethyme storage status` shows each folder's bytes, entries, free
 space and growth over the last day; `broker status` adds advice
 `storage.host-temp-large` when one holds 8 GiB or 5,000 entries, or holds
 1 GiB or more on a volume with less than 10 GiB free (a warning). `[budget]`
 keys `host_temp_advice_bytes`, `host_temp_advice_entries` and
-`host_temp_free_floor_bytes` change those thresholds.
+`host_temp_free_floor_bytes` change those thresholds. An older binary on the
+same host (a pinned GC service runtime included) rejects a `storage.toml`
+holding keys it does not know and runs with the default budgets, so set
+these keys only once every Aethyme binary on the host is at least this
+version. Known limit: the one-level listing calls `lstat` on each entry, and
+a dead network or automount mount inside a temp folder can block that call
+with no timeout.
 
 ## Broker Commands
 

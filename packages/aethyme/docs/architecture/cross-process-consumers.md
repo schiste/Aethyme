@@ -307,21 +307,34 @@ temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
 `/tmp`, at most every 10 minutes, into
 `<host state>/storage-ledger-host-temp/reading.json` (`updated_at_ms`,
 `roots[]` with `kind` `user_temp`|`system_tmp`, `path`, `entries`,
-`entries_capped`, `bytes`, `unmeasured_entries`, `partial`, `free_bytes`,
+`entries_capped`, `other_users_entries` (counted, never sized),
+`aethyme_entries_excluded` (the broker's `ae<uid>` alias directory),
+`bytes`, `unmeasured_entries`, `partial`, `free_bytes`,
 `total_bytes`, `walked_entries`, `measure_ms`; `history[]` hourly samples,
-72 per root) and `sizes.json` (per-entry sizes keyed by a 16-hex-digit hash
-of the name; no names stored), classified `coordination`. The walk lists at
-most 100,000 entries per root and shares a 10-second deadline across roots;
-it never follows a link or leaves the root's device and deletes nothing.
+72 per root), `sizes.json` (per-entry sizes keyed by a 16-hex-digit
+SHA-256 of a per-host salt and the name; no names stored) and `salt` (32
+random bytes, created once, mode 0600), classified `coordination`. The walk
+lists at most 100,000 entries per root, sizes only entries owned by the
+worker's user, shares a 10-second deadline across roots, reads directories
+lazily, checks the deadline and the worker heartbeat every 256 children,
+queues at most 4,096 directories per entry (beyond that the entry is
+partial), never follows a link or leaves the root's device, stops without
+writing when the worker lock is lost, and deletes nothing. A reading stamped
+in the future does not block the next one and advises nothing. Known limit:
+each top-level entry is `lstat`ed, which a dead network or automount mount
+can block with no timeout.
 `aethyme storage status --json` adds `host_temp` (the reading); `broker
 status` adds advice `storage.host-temp-large` (notice; warning when the volume
 is below `host_temp_free_floor_bytes`) from the reading only, skipped when the
 reading is over a day old. `storage.toml` `[budget]` adds
 `host_temp_advice_bytes` (8 GiB), `host_temp_advice_entries` (5,000) and
-`host_temp_free_floor_bytes` (10 GiB); an older binary rejects a file that
-sets them and keeps its defaults. Span `storage_host_temp_measure` times the
+`host_temp_free_floor_bytes` (10 GiB); an older binary on the same host (a
+pinned GC service runtime included) rejects a file that sets them and runs
+with default budgets, so set them only once every binary on the host is at
+least this version. Span `storage_host_temp_measure` times the
 reading; counters `storage_host_temp_root_measured` (one per root, with its
-time) and `storage_host_temp_partial` (a root left partial by the deadline).
+time), `storage_host_temp_partial` (a root left partial by the deadline) and
+`storage_host_temp_lock_lost` (a reading stopped by a lost worker lock).
 
 ## Build output of kept worktrees
 

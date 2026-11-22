@@ -1282,6 +1282,7 @@ pub fn run_worker_pass() -> Result<Ledger, String> {
             false,
             &mut || {
                 lock.beat();
+                !lock.lost()
             },
         ),
     );
