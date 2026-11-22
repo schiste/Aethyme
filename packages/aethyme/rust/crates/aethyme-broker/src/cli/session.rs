@@ -84,7 +84,7 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     scratch_dir: Option<Option<&'a std::path::Path>>,
     /// What to put there, or why there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    scratch_dir_note: Option<&'a str>,
+    scratch_dir_note: Option<std::borrow::Cow<'a, str>>,
     /// Other sessions that look like the same work; omitted when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     duplicate_work: &'a [crate::DuplicateWork],
@@ -194,7 +194,7 @@ fn session_action_json<T: serde::Serialize>(
             lines: guidance.authorizations.agreement_lines(),
         }),
         scratch_dir: scratch.map(|scratch| scratch.path.as_deref()),
-        scratch_dir_note: scratch.map(|scratch| scratch.note.as_str()),
+        scratch_dir_note: scratch.map(scratch_note),
         duplicate_work,
         scopes,
         planned_path_pr_overlaps,
@@ -202,12 +202,26 @@ fn session_action_json<T: serde::Serialize>(
     })
 }
 
+/// Appended to the scratch instruction when the session has a directory:
+/// `/tmp` by name is the one temp path no variable redirects, and nothing
+/// records or removes what lands there.
+const SCRATCH_NOT_TMP: &str = "Logs and throwaway checkouts go there too; never write to /tmp by name (no variable redirects it and nothing removes it).";
+
+/// What to put in the scratch directory, or why there is none.
+fn scratch_note(scratch: &crate::broker::SessionScratch) -> std::borrow::Cow<'_, str> {
+    if scratch.path.is_some() {
+        format!("{} {SCRATCH_NOT_TMP}", scratch.note).into()
+    } else {
+        scratch.note.as_str().into()
+    }
+}
+
 /// The session's scratch directory, under the working agreement.
 fn render_scratch(scratch: &crate::broker::SessionScratch) {
     match &scratch.path {
         Some(path) => {
             out!("Scratch directory: {}", path.display());
-            out!("  {}", scratch.note);
+            out!("  {}", scratch_note(scratch));
         }
         None => out!(
             "note: no scratch directory for this session: {}",
@@ -3124,6 +3138,13 @@ mod scratch_output_tests {
                 .as_str()
                 .unwrap()
                 .contains("AETHYME_SESSION_SCRATCH_DIR")
+        );
+        assert!(
+            value["scratch_dir_note"]
+                .as_str()
+                .unwrap()
+                .ends_with(super::SCRATCH_NOT_TMP),
+            "the note steers away from /tmp by name"
         );
 
         let none = crate::broker::SessionScratch {
