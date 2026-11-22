@@ -1133,7 +1133,7 @@ fn control_with(
         let binding = runtime_binding(&plan.router, &plan.managed_root);
         let (last_error_at, last_pass_at) = tick_timestamps(&plan.directory, plan.uid);
         let now = now_unix_ms()?;
-        let tick = unanswered_tick(&plan.directory, plan.uid, now, tick_process_alive)
+        let tick = unanswered_tick(&plan.directory, plan.uid, now, tick_process)
             .map(|tick| tick.describe(now));
         // Until the service runs a verified current pair again, say how.
         let next_action = (runtime_state != "verified"
@@ -2430,9 +2430,61 @@ fn tick_timestamps(directory: &Path, uid: u32) -> (Option<u64>, Option<u64>) {
 struct UnansweredTick {
     started_at_unix_ms: u64,
     pid: Option<u32>,
-    /// Whether the process that wrote the receipt still runs: same pid and,
-    /// when its start was recorded, the same start (`None` with no pid).
-    process_alive: Option<bool>,
+    /// Whether the process that wrote the receipt still runs, as far as this
+    /// process can tell (`None` with no recorded pid: unverified).
+    process: Option<TickProcess>,
+}
+
+/// What this process can tell about a tick's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickProcess {
+    /// It still runs (and, when its start was recorded and a table could be
+    /// read, under the same start).
+    Alive,
+    /// No such process, or the pid provably belongs to another process.
+    Gone,
+    /// Neither the signal probe nor the native process listing could answer
+    /// from this process (for example inside a sandbox).
+    Unverified,
+}
+
+impl TickProcess {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Gone => "gone",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// What a signal-0 probe said about a pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAnswer {
+    Exists,
+    /// `ESRCH`: no process has the pid.
+    NoSuchProcess,
+    /// `EPERM` or anything else: proves nothing either way.
+    Unanswered,
+}
+
+/// Decide from the signal probe and, when asked, the native process table
+/// (`table_proves_gone(start)`; `None` when the table cannot be read or the
+/// start is unknown) what is known about the tick's process.
+fn decide_tick_process(
+    signal: SignalAnswer,
+    process_started_ms: Option<i64>,
+    table_proves_gone: impl FnOnce(i64) -> Option<bool>,
+) -> TickProcess {
+    if signal == SignalAnswer::NoSuchProcess {
+        return TickProcess::Gone;
+    }
+    match process_started_ms.and_then(table_proves_gone) {
+        Some(true) => TickProcess::Gone,
+        Some(false) => TickProcess::Alive,
+        None if signal == SignalAnswer::Exists => TickProcess::Alive,
+        None => TickProcess::Unverified,
+    }
 }
 
 /// The cause hint and the person's action for a blocked tick. On macOS the
@@ -2441,23 +2493,41 @@ struct UnansweredTick {
 /// waits on the request without showing anyone a dialog.
 const TICK_BLOCKED_CAUSE: &str = "the tick has written neither a pass nor an error since it started and its process still exists; on macOS this is most often a pending privacy consent for the service's runtime binary (a new code identity with each version) to read a removable or protected volume, which a launchd job waits on without showing anyone a dialog";
 const TICK_BLOCKED_ACTION: &str = "answer the pending privacy prompt, or allow the service's runtime in System Settings > Privacy & Security (Files and Folders > Removable Volumes, or Full Disk Access); launchd starts no further tick while this one runs, so scheduled sweeps stay stopped until then";
+const TICK_UNVERIFIED_CAUSE: &str = "the tick has written neither a pass nor an error since it started, and its process could not be checked from this process (the signal probe and the native process listing gave no answer, as inside a sandbox)";
+const TICK_UNVERIFIED_ACTION: &str = "run `aethyme broker gc service status --json` from a terminal outside any sandbox to see whether the tick is blocked";
 const TICK_ENDED_CAUSE: &str = "the tick process is gone and wrote neither a pass nor an error (killed or crashed); the next interval starts a new tick";
 
 impl UnansweredTick {
-    /// Blocked unless its process is known to be gone.
-    fn blocked(&self) -> bool {
-        self.process_alive != Some(false)
+    fn process(&self) -> TickProcess {
+        self.process.unwrap_or(TickProcess::Unverified)
+    }
+
+    fn state(&self) -> &'static str {
+        match self.process() {
+            TickProcess::Alive => "tick_blocked",
+            TickProcess::Gone => "tick_ended_without_receipt",
+            TickProcess::Unverified => "tick_unverified",
+        }
     }
 
     fn describe(&self, now_unix_ms: u64) -> Value {
+        let process = self.process();
         json!({
-            "state": if self.blocked() { "tick_blocked" } else { "tick_ended_without_receipt" },
+            "state": self.state(),
             "started_at_unix_ms": self.started_at_unix_ms,
             "minutes_since_start": now_unix_ms.saturating_sub(self.started_at_unix_ms) / 60_000,
             "pid": self.pid,
-            "process_alive": self.process_alive,
-            "cause_hint": if self.blocked() { TICK_BLOCKED_CAUSE } else { TICK_ENDED_CAUSE },
-            "person_action": self.blocked().then_some(TICK_BLOCKED_ACTION),
+            "process": process.as_str(),
+            "cause_hint": match process {
+                TickProcess::Alive => TICK_BLOCKED_CAUSE,
+                TickProcess::Gone => TICK_ENDED_CAUSE,
+                TickProcess::Unverified => TICK_UNVERIFIED_CAUSE,
+            },
+            "person_action": match process {
+                TickProcess::Alive => Some(TICK_BLOCKED_ACTION),
+                TickProcess::Gone => None,
+                TickProcess::Unverified => Some(TICK_UNVERIFIED_ACTION),
+            },
         })
     }
 }
@@ -2482,7 +2552,7 @@ fn unanswered_tick(
     directory: &Path,
     uid: u32,
     now_unix_ms: u64,
-    alive: impl Fn(u32, Option<i64>) -> bool,
+    alive: impl Fn(u32, Option<i64>) -> TickProcess,
 ) -> Option<UnansweredTick> {
     let started = read_bounded_json(&directory.join(TICK_STARTED_RECEIPT), uid)?;
     let started_at_unix_ms = started.get("started_at_unix_ms")?.as_u64()?;
@@ -2500,25 +2570,31 @@ fn unanswered_tick(
     Some(UnansweredTick {
         started_at_unix_ms,
         pid,
-        process_alive: pid.map(|pid| alive(pid, process_started)),
+        process: pid.map(|pid| alive(pid, process_started)),
     })
 }
 
-/// Whether the tick's process still runs: signal 0 says the pid exists, and
-/// when its start was recorded a process-table snapshot does not prove the
-/// pid now belongs to another process (a reused pid). Only called for a tick
-/// already unanswered for a full interval, never on the common path.
-fn tick_process_alive(pid: u32, process_started_ms: Option<i64>) -> bool {
-    if !process_alive(pid) {
-        return false;
-    }
-    match (
-        process_started_ms,
-        crate::session_holder::ProcessTable::snapshot(),
-    ) {
-        (Some(started), Some(table)) => !table.proves_gone(i64::from(pid), started),
-        _ => true,
-    }
+/// Set once the native process listing failed or was refused in this
+/// process: later checks answer from the signal probe alone.
+static NATIVE_TABLE_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What this process can tell about the tick's process: signal 0, then,
+/// when its start was recorded, the native process listing (never a `ps`
+/// child, never a timeout; a failure is latched for the process). Only
+/// called for a tick already unanswered for a full interval.
+fn tick_process(pid: u32, process_started_ms: Option<i64>) -> TickProcess {
+    use std::sync::atomic::Ordering;
+    decide_tick_process(signal_probe(pid), process_started_ms, |started| {
+        if NATIVE_TABLE_UNAVAILABLE.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(table) = crate::session_holder::ProcessTable::observe_native() else {
+            NATIVE_TABLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+            return None;
+        };
+        Some(table.proves_gone(i64::from(pid), started))
+    })
 }
 
 /// Whether the service's last control receipt is an acknowledged
@@ -2530,17 +2606,24 @@ fn service_deactivated(directory: &Path, uid: u32) -> bool {
     })
 }
 
-/// Whether a process with this pid exists (signal 0 delivers nothing).
-fn process_alive(pid: u32) -> bool {
+/// Signal 0 to `pid` (delivers nothing): exists, no such process, or no
+/// answer (`EPERM`, or a pid that cannot be a process).
+fn signal_probe(pid: u32) -> SignalAnswer {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
+        return SignalAnswer::Unanswered;
     };
     if pid <= 0 {
-        return false;
+        return SignalAnswer::Unanswered;
     }
     // SAFETY: kill with signal 0 sends no signal; it only reports whether
     // the pid exists and may be signalled by this user.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return SignalAnswer::Exists;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => SignalAnswer::NoSuchProcess,
+        _ => SignalAnswer::Unanswered,
+    }
 }
 
 /// The `broker status` advice for a blocked tick (files and one signal-0
@@ -2549,15 +2632,34 @@ fn blocked_tick_advice(
     record: &InstallationRecord,
     uid: u32,
     now_unix_ms: u64,
-    alive: impl Fn(u32, Option<i64>) -> bool,
+    alive: impl Fn(u32, Option<i64>) -> TickProcess,
 ) -> Option<RepairAdvice> {
     record.plan_bytes.as_ref()?;
     if service_deactivated(&record.directory, uid) {
         return None;
     }
     let tick = unanswered_tick(&record.directory, uid, now_unix_ms, alive)?;
-    if !tick.blocked() {
-        return None;
+    match tick.process() {
+        TickProcess::Gone => return None,
+        TickProcess::Unverified => {
+            return Some(RepairAdvice {
+                id: "storage.gc-service-tick-unverified",
+                reason: TICK_UNVERIFIED_CAUSE,
+                summary: "this repository's scheduled GC sweep tick has no receipt since it started, and its process could not be checked from here",
+                evidence: vec![
+                    format!(
+                        "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                        tick.started_at_unix_ms,
+                        now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
+                        tick.pid
+                            .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+                    ),
+                    format!("what to do: {TICK_UNVERIFIED_ACTION}"),
+                ],
+                commands: vec!["aethyme broker gc service status --json".into()],
+            });
+        }
+        TickProcess::Alive => {}
     }
     Some(RepairAdvice {
         id: "storage.gc-service-tick-blocked",
@@ -2627,6 +2729,9 @@ pub(crate) enum ScheduledRefresh {
     BackingOff,
     /// Another `broker status` holds the service's claim and decides.
     Contended,
+    /// The claim's lock file could not be opened at all (for example a
+    /// sandbox that denies writes): nothing was started.
+    LockUnavailable,
     /// The scheduling receipt could not be written: nothing was started.
     ReceiptUnwritable,
     /// The background refresh could not be started.
@@ -2644,6 +2749,9 @@ impl ScheduledRefresh {
                 "an automatic refresh was attempted recently; the next waits for its backoff (15 minutes, doubling to 6 hours while attempts fail)"
             }
             Self::Contended => "another command is deciding the automatic refresh right now",
+            Self::LockUnavailable => {
+                "the automatic refresh could not open the service's lock file from this process, so none was started"
+            }
             Self::ReceiptUnwritable => {
                 "the automatic refresh could not record its attempt, so none was started"
             }
@@ -2706,15 +2814,23 @@ fn schedule_refresh_with(
     if !running_is_current_selection(&running, managed_root) {
         return None;
     }
-    let Ok(_claim) = crate::pr_watch_service_install::claim_installer(&record.directory, uid)
-    else {
-        return Some(ScheduledRefresh::Contended);
+    let claim = match crate::pr_watch_service_install::claim_installer(&record.directory, uid) {
+        Ok(claim) => claim,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Some(ScheduledRefresh::Contended);
+        }
+        Err(_) => {
+            crate::phase_telemetry::add("gc_service_refresh_lock_unavailable", Duration::ZERO);
+            return Some(ScheduledRefresh::LockUnavailable);
+        }
     };
     let bundle = current_bundle(managed_root);
     let previous = read_bounded_json(&record.directory.join(SCHEDULED_REFRESH_RECEIPT), uid);
+    // A receipt from the future (a clock that moved back) has expired.
     let previous_at = previous
         .as_ref()
-        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64));
+        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64))
+        .filter(|at| *at <= now_unix_ms);
     let same_bundle = previous
         .as_ref()
         .and_then(|value| value.get("current_bundle").and_then(Value::as_str))
@@ -2725,7 +2841,8 @@ fn schedule_refresh_with(
         _ => 0,
     };
     let refreshed_at = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
-        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64));
+        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64))
+        .filter(|at| *at <= now_unix_ms);
     let last = if same_bundle { previous_at } else { None }.max(refreshed_at);
     let wait = scheduled_refresh_backoff_ms(failed_attempts.saturating_sub(1));
     if last.is_some_and(|at| now_unix_ms.saturating_sub(at) < wait) {
@@ -2744,6 +2861,8 @@ fn schedule_refresh_with(
         .and_then(|bytes| {
             write_bounded_receipt(&record.directory, SCHEDULED_REFRESH_RECEIPT, &bytes)
         });
+    // The receipt bounds the next start; the child takes the claim itself.
+    drop(claim);
     if written.is_err() {
         crate::phase_telemetry::add("gc_service_refresh_receipt_unwritable", Duration::ZERO);
         return Some(ScheduledRefresh::ReceiptUnwritable);
@@ -2760,8 +2879,9 @@ fn schedule_refresh_with(
     }
 }
 
-/// Set once a scheduling receipt could not be written in this process, so
-/// later `broker status` calls in it neither retry the write nor spawn.
+/// Set once a scheduling receipt could not be written, or the service's lock
+/// file could not be opened, in this process: later `broker status` calls in
+/// it neither retry nor spawn.
 #[cfg(target_os = "macos")]
 static SCHEDULE_RECEIPT_UNWRITABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2819,10 +2939,19 @@ pub(crate) fn status_service_advice(
                 Ok(())
             },
         );
-        if outcome == Some(ScheduledRefresh::ReceiptUnwritable) {
-            SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
+        match outcome {
+            Some(ScheduledRefresh::ReceiptUnwritable) => {
+                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
+                outcome
+            }
+            // Latched, and said nowhere: a denied lock is this process's
+            // sandbox, not news for every status call.
+            Some(ScheduledRefresh::LockUnavailable) => {
+                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
+                None
+            }
+            other => other,
         }
-        outcome
     };
     let mut advice =
         repair_advice_for(&record, home, uuid, uid).or_else(|| reclaim_advice(home, uuid))?;
@@ -2920,8 +3049,7 @@ fn repair_advice_for(
             ],
         });
     }
-    if let Some(advice) =
-        blocked_tick_advice(record, uid, now_unix_ms().unwrap_or(0), tick_process_alive)
+    if let Some(advice) = blocked_tick_advice(record, uid, now_unix_ms().unwrap_or(0), tick_process)
     {
         return Some(advice);
     }
@@ -5230,9 +5358,10 @@ mod tests {
         .unwrap();
         let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
         let later = now_unix_ms().unwrap() + TICK_BLOCKED_AFTER_MS + 60_000;
-        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| true).is_none());
-        // A pid reused by another process reads as gone.
-        assert!(!tick_process_alive(0, Some(1)));
+        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Alive).is_none());
+        // A pid that cannot be signalled, with no native listing here, is
+        // unverified: never blocked, never ended.
+        assert_eq!(tick_process(0, Some(1)), TickProcess::Unverified);
     }
 
     #[test]
@@ -5266,12 +5395,15 @@ mod tests {
         let started = receipt["started_at_unix_ms"].as_u64().unwrap();
         let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
         // Young, it is a running tick: nothing to say.
-        assert!(blocked_tick_advice(&record, plan.uid, started + 1, |_, _| true).is_none());
+        assert!(
+            blocked_tick_advice(&record, plan.uid, started + 1, |_, _| TickProcess::Alive)
+                .is_none()
+        );
         let later = started + interval + 60_000;
         let advice = blocked_tick_advice(&record, plan.uid, later, |pid, process_started| {
             assert_eq!(process_started, Some(77_000));
             assert_eq!(pid, 4242);
-            true
+            TickProcess::Alive
         })
         .unwrap();
         assert_eq!(advice.id, "storage.gc-service-tick-blocked");
@@ -5283,11 +5415,13 @@ mod tests {
                 .any(|line| line.contains("Privacy & Security"))
         );
         // A process known to be gone is not blocked, and not advised.
-        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| false).is_none());
-        let ended = unanswered_tick(&plan.directory, plan.uid, later, |_, _| false).unwrap();
+        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Gone).is_none());
+        let ended =
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Gone).unwrap();
         assert_eq!(ended.describe(later)["state"], "tick_ended_without_receipt");
         assert!(ended.describe(later)["person_action"].is_null());
-        let blocked = unanswered_tick(&plan.directory, plan.uid, later, |_, _| true).unwrap();
+        let blocked =
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Alive).unwrap();
         let described = blocked.describe(later);
         assert_eq!(described["state"], "tick_blocked");
         assert_eq!(
@@ -5305,11 +5439,17 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert!(unanswered_tick(&plan.directory, plan.uid, later, |_, _| true).is_none());
+        assert!(
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Alive).is_none()
+        );
         // This process exists; a pid that cannot exist does not.
-        assert!(process_alive(std::process::id()));
-        assert!(!process_alive(0));
-        assert!(!process_alive(u32::MAX));
+        assert_eq!(signal_probe(std::process::id()), SignalAnswer::Exists);
+        assert_eq!(signal_probe(0), SignalAnswer::Unanswered);
+        assert_eq!(signal_probe(u32::MAX), SignalAnswer::Unanswered);
+        assert_eq!(
+            signal_probe(u32::try_from(i32::MAX).unwrap()),
+            SignalAnswer::NoSuchProcess
+        );
     }
 
     #[test]
@@ -5356,6 +5496,99 @@ mod tests {
                 .is_file()
         );
         assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    #[test]
+    fn an_unanswered_signal_lets_the_native_table_decide_or_reports_unverified() {
+        use SignalAnswer::*;
+        let never = |_: i64| -> Option<bool> { panic!("the table is not needed") };
+        assert_eq!(
+            decide_tick_process(NoSuchProcess, Some(1), never),
+            TickProcess::Gone
+        );
+        // EPERM: the table decides.
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| Some(false)),
+            TickProcess::Alive
+        );
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| Some(true)),
+            TickProcess::Gone
+        );
+        // Neither can answer: unverified, never blocked or ended.
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| None),
+            TickProcess::Unverified
+        );
+        assert_eq!(
+            decide_tick_process(Unanswered, None, never),
+            TickProcess::Unverified
+        );
+        // The pid exists: a reused pid is caught by the table, else alive.
+        assert_eq!(
+            decide_tick_process(Exists, Some(1), |_| Some(true)),
+            TickProcess::Gone
+        );
+        assert_eq!(
+            decide_tick_process(Exists, Some(1), |_| None),
+            TickProcess::Alive
+        );
+        assert_eq!(decide_tick_process(Exists, None, never), TickProcess::Alive);
+        // The native-only listing never falls back to a child: off macOS it
+        // has no source at all.
+        #[cfg(not(target_os = "macos"))]
+        assert!(crate::session_holder::ProcessTable::observe_native().is_none());
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_tick_started(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            None,
+            4242,
+            Some(1),
+        )
+        .unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let later = now_unix_ms().unwrap() + TICK_BLOCKED_AFTER_MS + 60_000;
+        let advice =
+            blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Unverified).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-unverified");
+        assert!(advice.reason.contains("could not be checked"));
+        let tick = unanswered_tick(&plan.directory, plan.uid, later, |_, _| {
+            TickProcess::Unverified
+        })
+        .unwrap();
+        let described = tick.describe(later);
+        assert_eq!(described["state"], "tick_unverified");
+        assert_eq!(described["process"], "unverified");
+        assert_eq!(described["person_action"], TICK_UNVERIFIED_ACTION);
+    }
+
+    #[test]
+    fn a_scheduled_refresh_receipt_from_the_future_has_expired() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        let record = || read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let router = || Some(runtime.router.clone());
+        let now = 10_000_000;
+        for name in [SCHEDULED_REFRESH_RECEIPT, "last-refresh.json"] {
+            write_private(
+                &plan.directory.join(name),
+                &serde_json::to_vec(&json!({
+                    "observed_at_unix_ms": now + 3_600_000,
+                    "current_bundle": "v0.8.51-test",
+                    "attempts": 1,
+                }))
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, now, |_| Ok(())),
+            Some(ScheduledRefresh::Started)
+        );
     }
 
     #[test]
