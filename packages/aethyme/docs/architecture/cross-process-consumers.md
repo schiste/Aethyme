@@ -4353,6 +4353,47 @@ attachment gains `command_temps_retired` and `command_temps_kept`; the
 `session_scratch_usage` attachment gains `finished_runs` and
 `finished_run_bytes`.
 
+**Scratch pass order, cursor and failure causes.** The scratch pass first
+classifies every record (one store lookup each; for an open session, one
+listing of its `tmp-done` container by path, a hint that only decides
+whether the verified walk is worth its cost), then takes the run's
+open-file observation outside its 5 s budget, then judges the closed (or
+replaced) directories with half the budget while finished runs wait (all of
+it otherwise) and the finished runs of open sessions with the rest. Each
+phase resumes after the record where the previous pass stopped (broker
+metadata key `session_scratch.retire_cursor`, JSON `closed` and
+`command_temps`, each the last record key judged, absent once a phase went
+round), and attempts at most 256 moves. The pass is not cut short by what
+the strip passes or the open-path resolution used of the lane's window. A
+failed move names its step (`open`, `inspect`, `trash_open`,
+`trash_record`, `rename`) and cause (`too_many_open_files`, `no_space`,
+`unsupported` for `ENOTSUP`/`EOPNOTSUPP`/`ENOSYS`/`EINVAL`, `denied`,
+`read_only`, `not_found`, `exists`, `busy`, `io`, `crosses_device`,
+`not_a_directory`, `interrupted`, `other`, `unknown`; `not_private` or
+`foreign_marker` for a refused trash; `store` for a refused trash row).
+There is no fallback to a non-exclusive rename. A phase stops after three
+failed moves in a row, or at once when the cause is systemic (the trash or
+its record, `too_many_open_files`, `no_space`, `read_only`, `unsupported`),
+and the next run retries: a failing move is tried at most once per run.
+Counters `session_scratch_retire_cursor_resumed`,
+`session_scratch_retire_stopped_after_failures`,
+`command_temp_retire_stopped_after_failures`; span
+`session_scratch_retire_classify`; attachment `scratch_move_failures`,
+keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
+`total_ms`, `max_ms`). The `session_scratch_retire` attachment gains
+`records`, `sessions_with_finished_runs`, `kept_causes` (directories kept
+by `<step>.<cause>`), `stopped_after_failures` and
+`command_temps_kept_by_reason` (`in_use`, `process_use_unknown`, a refusal
+code, or `move_failed.<step>.<cause>`).
+
+A command that keeps the inherited temp folder because a directory or link
+could not be made (`command_temp_create_failed`) is also counted in the
+attachment `command_temp_create_failures`, keyed `<step>.<cause>`: step
+`live_container`, `run_dir`, `inspect` or `alias`; cause as above, or
+`not_private`, `no_name`, `no_base`. Commands of one session creating the
+containers at once never fail on that account (the `mkdir` that loses sees
+`EEXIST` and checks the winner's directory).
+
 **Session stacks and remote session-branch cleanup (schema v66).** All fields
 below are additive and absent when they do not apply. `broker start --stack-on
 <id> --json` adds `stack` (`session_id`, `parent_session_id`, `parent_branch`,

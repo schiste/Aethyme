@@ -223,19 +223,19 @@ fn uid() -> u32 {
 
 /// Create `path` as a private directory when absent, then require it to be
 /// a real directory (not a link) owned by this user and closed to others.
-fn private_directory(path: &Path) -> Result<(), String> {
+/// A refusal is its cause ([`crate::checkout_trash::errno_cause`], or
+/// `not_private`). Two commands creating it at once both succeed: the one
+/// that loses the `mkdir` sees `EEXIST` and checks the winner's directory.
+fn private_directory(path: &Path) -> Result<(), &'static str> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
+        Err(error) => return Err(crate::checkout_trash::errno_cause(&error)),
     }
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        .map_err(|error| crate::checkout_trash::errno_cause(&error))?;
     if !metadata.is_dir() || metadata.uid() != uid() || metadata.mode() & 0o077 != 0 {
-        return Err(format!(
-            "{} is not a private directory owned by this user",
-            path.display()
-        ));
+        return Err("not_private");
     }
     Ok(())
 }
@@ -281,8 +281,31 @@ pub(crate) enum Unavailable {
     Inherited,
     /// Neither the run directory nor an alias fits [`TMPDIR_PATH_MAX`].
     PathTooLong,
-    /// A directory or link could not be made.
-    Failed,
+    /// A directory or link could not be made: which, and why.
+    Failed(CreateFailure),
+}
+
+/// Where creating a run failed and why, counted under `<step>.<cause>` in
+/// the `command_temp_create_failures` attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreateFailure {
+    /// `live_container`, `run_dir`, `inspect` or `alias`.
+    pub(crate) step: &'static str,
+    /// [`crate::checkout_trash::errno_cause`], `not_private` or `no_name`.
+    pub(crate) cause: &'static str,
+}
+
+impl CreateFailure {
+    fn io(step: &'static str, error: &std::io::Error) -> Self {
+        Self {
+            step,
+            cause: crate::checkout_trash::errno_cause(error),
+        }
+    }
+
+    pub(crate) fn key(self) -> String {
+        format!("{}.{}", self.step, self.cause)
+    }
 }
 
 impl Unavailable {
@@ -290,7 +313,19 @@ impl Unavailable {
         match self {
             Self::Inherited => "command_temp_inherited",
             Self::PathTooLong => "command_temp_path_too_long",
-            Self::Failed => "command_temp_create_failed",
+            Self::Failed(_) => "command_temp_create_failed",
+        }
+    }
+
+    /// Count it, with the cause of a failure.
+    fn record(&self) {
+        crate::phase_telemetry::add(self.counter(), Duration::ZERO);
+        if let Self::Failed(failure) = self {
+            crate::phase_telemetry::add_keyed(
+                "command_temp_create_failures",
+                &failure.key(),
+                Duration::ZERO,
+            );
         }
     }
 }
@@ -325,9 +360,7 @@ impl CommandTemp {
             std::env::var_os("TMPDIR").as_deref(),
         );
         Self::create_in(scratch, &alias_bases(), inherited)
-            .inspect_err(|unavailable| {
-                crate::phase_telemetry::add(unavailable.counter(), Duration::ZERO);
-            })
+            .inspect_err(Unavailable::record)
             .ok()
     }
 
@@ -342,7 +375,12 @@ impl CommandTemp {
             return Err(Unavailable::Inherited);
         }
         let live = scratch.join(LIVE_CONTAINER);
-        private_directory(&live).map_err(|_| Unavailable::Failed)?;
+        private_directory(&live).map_err(|cause| {
+            Unavailable::Failed(CreateFailure {
+                step: "live_container",
+                cause,
+            })
+        })?;
         let pid = std::process::id();
         let created_ms = u64::try_from(crate::clock::epoch_ms().max(0)).unwrap_or(0);
         let mut made = None;
@@ -358,12 +396,18 @@ impl CommandTemp {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err(Unavailable::Failed),
+                Err(error) => {
+                    return Err(Unavailable::Failed(CreateFailure::io("run_dir", &error)));
+                }
             }
         }
-        let name = made.ok_or(Unavailable::Failed)?;
+        let name = made.ok_or(Unavailable::Failed(CreateFailure {
+            step: "run_dir",
+            cause: "no_name",
+        }))?;
         let run = live.join(&name);
-        let metadata = std::fs::symlink_metadata(&run).map_err(|_| Unavailable::Failed)?;
+        let metadata = std::fs::symlink_metadata(&run)
+            .map_err(|error| Unavailable::Failed(CreateFailure::io("inspect", &error)))?;
         let mut temp = Self {
             scratch: scratch.to_path_buf(),
             name,
@@ -462,7 +506,7 @@ impl Drop for CommandTemp {
 /// private directory, never over an existing entry.
 fn write_marker(scratch: &Path, name: &str, marker: &FinishedMarker) -> Result<(), String> {
     let done = scratch.join(DONE_CONTAINER);
-    private_directory(&done)?;
+    private_directory(&done).map_err(|cause| format!("the done container: {cause}"))?;
     let text = serde_json::to_vec(marker).map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -512,6 +556,8 @@ fn alias_name() -> String {
 /// [`TMPDIR_PATH_MAX`], pruning dangling links of the broker's naming first.
 fn make_alias(bases: &[PathBuf], run: &Path) -> Result<PathBuf, Unavailable> {
     let mut too_long = false;
+    // Why the last usable base failed, for the count.
+    let mut cause = "no_base";
     for base in bases {
         let container = base.join(format!("ae{}", uid()));
         let name = alias_name();
@@ -519,12 +565,14 @@ fn make_alias(bases: &[PathBuf], run: &Path) -> Result<PathBuf, Unavailable> {
             too_long = true;
             continue;
         }
-        if private_directory(&container).is_err() {
+        if let Err(refused) = private_directory(&container) {
             crate::phase_telemetry::add("command_temp_alias_base_refused", Duration::ZERO);
+            cause = refused;
             continue;
         }
         prune_dangling_aliases(&container);
         let mut name = name;
+        cause = "no_name";
         for _ in 0..CREATE_ATTEMPTS {
             let alias = container.join(&name);
             match std::os::unix::fs::symlink(run, &alias) {
@@ -532,14 +580,20 @@ fn make_alias(bases: &[PathBuf], run: &Path) -> Result<PathBuf, Unavailable> {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     name = alias_name();
                 }
-                Err(_) => break,
+                Err(error) => {
+                    cause = crate::checkout_trash::errno_cause(&error);
+                    break;
+                }
             }
         }
     }
     Err(if too_long {
         Unavailable::PathTooLong
     } else {
-        Unavailable::Failed
+        Unavailable::Failed(CreateFailure {
+            step: "alias",
+            cause,
+        })
     })
 }
 
@@ -732,7 +786,10 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, linked.join(format!("ae{}", uid()))).unwrap();
         assert_eq!(
             CommandTemp::create_in(&deep, std::slice::from_ref(&linked), false).err(),
-            Some(Unavailable::Failed)
+            Some(Unavailable::Failed(CreateFailure {
+                step: "alias",
+                cause: "not_private"
+            }))
         );
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
         let fallback = base.path().join("fallback");
@@ -751,7 +808,10 @@ mod tests {
         std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(
             CommandTemp::create_in(&deep, &[base.path().to_path_buf()], false).err(),
-            Some(Unavailable::Failed)
+            Some(Unavailable::Failed(CreateFailure {
+                step: "alias",
+                cause: "not_private"
+            }))
         );
     }
 
@@ -815,6 +875,64 @@ mod tests {
             Some(marker.as_ref()).filter(|marker: &&std::ffi::OsStr| !marker.is_empty()),
             Some(tmpdir.as_ref())
         ));
+    }
+
+    /// A live container that is not private refuses, and the failure names
+    /// its step and cause instead of a bare "failed".
+    #[test]
+    fn a_failed_create_names_its_step_and_cause() {
+        let (_owner, scratch) = scratch();
+        let live = scratch.join(LIVE_CONTAINER);
+        std::fs::create_dir(&live).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = CommandTemp::create_in(&scratch, &[PathBuf::from("/tmp")], false).err();
+        assert_eq!(
+            refused,
+            Some(Unavailable::Failed(CreateFailure {
+                step: "live_container",
+                cause: "not_private"
+            }))
+        );
+        let Some(Unavailable::Failed(failure)) = refused else {
+            unreachable!()
+        };
+        assert_eq!(failure.key(), "live_container.not_private");
+        // A missing scratch directory fails at the same step, by errno.
+        let gone = scratch.join("gone");
+        assert_eq!(
+            CommandTemp::create_in(&gone, &[PathBuf::from("/tmp")], false).err(),
+            Some(Unavailable::Failed(CreateFailure {
+                step: "live_container",
+                cause: "not_found"
+            }))
+        );
+    }
+
+    /// Concurrent commands of one session creating the containers at once
+    /// never fail: the `mkdir` that loses sees `EEXIST` and checks the
+    /// winner's directory.
+    #[test]
+    fn concurrent_creates_share_the_containers() {
+        let (_owner, deep) = long_scratch();
+        let base = short_base();
+        let bases = vec![base.path().to_path_buf()];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let deep = deep.clone();
+                let bases = bases.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    CommandTemp::create_in(&deep, &bases, false).map(|temp| temp.run_dir())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let run = handle.join().unwrap();
+            assert!(run.is_ok(), "{run:?}");
+        }
     }
 
     #[test]
