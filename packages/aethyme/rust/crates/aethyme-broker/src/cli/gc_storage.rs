@@ -1966,7 +1966,15 @@ fn gc_trash_drain(
     for (_, _, cause) in &identity_changed {
         *identity_changed_by_cause.entry(cause.as_str()).or_default() += 1;
     }
+    // Rows rebound to their trash's new device number after a remount, and
+    // rows refused a rebind by cause, over every lap.
+    let mut rebind = crate::checkout_trash::RebindTally::default();
+    for lap in &laps {
+        rebind.merge(&lap.rebind);
+    }
     Ok(serde_json::json!({
+        "rebound": rebind.rebound,
+        "rebind_refused": rebind.refused,
         "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
         "laps": laps.len(),
         "slices": laps.iter().map(|lap| u64::from(lap.slices)).sum::<u64>(),
@@ -2839,6 +2847,14 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
             trash.stale_pending,
             trash.confirmed_this_pass,
             trash.identity_changed
+        );
+    }
+    if trash.rebound_this_pass > 0 || trash.rebind_refused_this_pass > 0 {
+        out!(
+            "  checkout trash after a remount: {} entr(y/ies) rebound to the volume's new device number (deleted later with the usual checks); {} refused ({} because the trash's rows record more than one old device)",
+            trash.rebound_this_pass,
+            trash.rebind_refused_this_pass,
+            trash.rebind_refused_mixed_old_devices_this_pass
         );
     }
     out!(

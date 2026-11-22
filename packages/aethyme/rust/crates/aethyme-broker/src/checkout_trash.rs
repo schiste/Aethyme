@@ -119,9 +119,12 @@ pub(crate) struct TrashRow {
     pub(crate) verification: bool,
     /// Set while a confirmed entry is present but no longer has the
     /// recorded identity (and why), by the deleter's look or the sweep's
-    /// reconcile; cleared once it matches again. Such an entry is never
-    /// deleted and is not part of the deletable backlog
-    /// ([`TrashBacklog::deletable`]).
+    /// reconcile; cleared once it matches again, or when a remount rebind
+    /// ([`RemountRebind`]) records the device it is on now. Also set on a
+    /// pending row whose creator is gone and whose entry has the recorded
+    /// inode on another device but cannot be rebound: kept, not dropped.
+    /// Such an entry is never deleted and is not part of the deletable
+    /// backlog ([`TrashBacklog::deletable`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) identity_mismatch: Option<IdentityMismatch>,
 }
@@ -615,6 +618,262 @@ pub(crate) fn trash_entry_state(trash_dir: &Path, name: &str, row: &TrashRow) ->
         }
         Err(_) => TrashEntryState::TrashUnavailable,
     }
+}
+
+/// Why a trash row recorded on another device than its trash's current one
+/// was not rebound to it ([`RemountRebind`]). Each names a counter
+/// (`checkout_trash_rebind_refused_<cause>`) and never a path or an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RebindRefusal {
+    /// The row's directory is not named as the trash, or the trash is not a
+    /// real directory (a link is never followed), not owned by this user,
+    /// open to group or others, or without the broker's marker.
+    TrashUnverified,
+    /// The rows of this trash that record another device than its current
+    /// one record more than one such device: not one remount.
+    MixedOldDevices,
+    /// The entry name is not a broker entry name for the row's session.
+    NameNotForSession,
+    /// No entry by that name.
+    EntryMissing,
+    /// The entry could not be looked at.
+    EntryUnreadable,
+    /// The entry is not a real directory.
+    NotADirectory,
+    /// The entry is on another device than the trash (a mount point).
+    EntryOnOtherDevice,
+    /// The entry has another inode than recorded: another directory.
+    InodeChanged,
+}
+
+impl RebindRefusal {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrashUnverified => "trash_unverified",
+            Self::MixedOldDevices => "mixed_old_devices",
+            Self::NameNotForSession => "name_not_for_session",
+            Self::EntryMissing => "entry_missing",
+            Self::EntryUnreadable => "entry_unreadable",
+            Self::NotADirectory => "not_a_directory",
+            Self::EntryOnOtherDevice => "entry_on_other_device",
+            Self::InodeChanged => "inode_changed",
+        }
+    }
+
+    const fn counter(self) -> &'static str {
+        match self {
+            Self::TrashUnverified => "checkout_trash_rebind_refused_trash_unverified",
+            Self::MixedOldDevices => "checkout_trash_rebind_refused_mixed_old_devices",
+            Self::NameNotForSession => "checkout_trash_rebind_refused_name_not_for_session",
+            Self::EntryMissing => "checkout_trash_rebind_refused_entry_missing",
+            Self::EntryUnreadable => "checkout_trash_rebind_refused_entry_unreadable",
+            Self::NotADirectory => "checkout_trash_rebind_refused_not_a_directory",
+            Self::EntryOnOtherDevice => "checkout_trash_rebind_refused_entry_on_other_device",
+            Self::InodeChanged => "checkout_trash_rebind_refused_inode_changed",
+        }
+    }
+
+    /// Count one refusal (`checkout_trash_rebind_refused_<cause>`).
+    pub(crate) fn record(self) {
+        crate::phase_telemetry::add(self.counter(), Duration::ZERO);
+    }
+}
+
+/// What rebinding found over a set of trash rows: how many were rebound and
+/// how many refused, by cause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RebindTally {
+    pub(crate) rebound: usize,
+    pub(crate) refused: BTreeMap<&'static str, usize>,
+}
+
+impl RebindTally {
+    pub(crate) fn refused_total(&self) -> usize {
+        self.refused.values().sum()
+    }
+
+    pub(crate) fn refuse(&mut self, cause: RebindRefusal) {
+        *self.refused.entry(cause.as_str()).or_default() += 1;
+        cause.record();
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.rebound += other.rebound;
+        for (cause, count) in &other.refused {
+            *self.refused.entry(cause).or_default() += count;
+        }
+    }
+}
+
+/// One trash read for rebinding its rows after a remount. A remount gives
+/// every directory on the volume a new device number and keeps inode
+/// numbers, so a row whose entry is found again on the trash's current
+/// device, with its recorded inode and under a name the broker made for its
+/// session, is the same directory: only its recorded device is stale.
+///
+/// The trash is opened by name under its pool without following a link and
+/// must be the broker's (a real directory, owned by this user, closed to
+/// group and others, holding the broker's marker). Every row in it that
+/// records another device than the current one must record the same single
+/// old device; rows showing two old devices are not one remount and none is
+/// rebound. A row on the current device is never a remount: another inode
+/// there is another directory.
+pub(crate) struct RemountRebind {
+    trash: OwnedFd,
+    current_device: u64,
+    old_devices: std::collections::BTreeSet<u64>,
+}
+
+impl RemountRebind {
+    /// Read `trash_dir` for its rows `rows` (every row recorded under it).
+    /// `Ok(None)`: nothing to rebind, because every row records the trash's
+    /// current device, or no pool or trash exists by that path (an
+    /// unmounted volume: nothing is concluded, nothing refused). The trash
+    /// is never created.
+    pub(crate) fn read(
+        trash_dir: &Path,
+        rows: &BTreeMap<String, TrashRow>,
+    ) -> Result<Option<Self>, RebindRefusal> {
+        if trash_dir.file_name().and_then(|name| name.to_str()) != Some(TRASH_DIR) {
+            return Err(RebindRefusal::TrashUnverified);
+        }
+        let pool = trash_dir.parent().ok_or(RebindRefusal::TrashUnverified)?;
+        let pool_fd = match open_dir_nofollow(pool) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(RebindRefusal::TrashUnverified),
+        };
+        let trash = match openat_dir_nofollow(pool_fd.as_raw_fd(), TRASH_DIR) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(RebindRefusal::TrashUnverified),
+        };
+        let stat = fstat(trash.as_raw_fd()).map_err(|_| RebindRefusal::TrashUnverified)?;
+        // SAFETY: `geteuid` has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !is_directory(&stat)
+            || stat.st_uid != uid
+            || stat.st_mode & 0o077 != 0
+            || !holds_broker_marker(trash.as_raw_fd())
+        {
+            return Err(RebindRefusal::TrashUnverified);
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let current_device = stat.st_dev as u64;
+        let old_devices = rows
+            .values()
+            .map(|row| row.device)
+            .filter(|device| *device != current_device)
+            .collect::<std::collections::BTreeSet<_>>();
+        if old_devices.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            trash,
+            current_device,
+            old_devices,
+        }))
+    }
+
+    /// The trash's current device.
+    #[cfg(test)]
+    pub(crate) fn current_device(&self) -> u64 {
+        self.current_device
+    }
+
+    /// Whether `row` records another device than the trash's current one.
+    pub(crate) fn applies(&self, row: &TrashRow) -> bool {
+        row.device != self.current_device
+    }
+
+    /// The device to rebind `row` (recorded as `name`) to, or why not.
+    /// Only for a row that [`Self::applies`].
+    pub(crate) fn check(&self, name: &str, row: &TrashRow) -> Result<u64, RebindRefusal> {
+        if self.old_devices.len() != 1 {
+            return Err(RebindRefusal::MixedOldDevices);
+        }
+        if !is_broker_entry_name_for(name, row.session_id) {
+            return Err(RebindRefusal::NameNotForSession);
+        }
+        let stat = fstatat_nofollow(self.trash.as_raw_fd(), name).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                RebindRefusal::EntryMissing
+            } else {
+                RebindRefusal::EntryUnreadable
+            }
+        })?;
+        if !is_directory(&stat) {
+            return Err(RebindRefusal::NotADirectory);
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let (device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
+        if device != self.current_device {
+            return Err(RebindRefusal::EntryOnOtherDevice);
+        }
+        if inode != row.inode {
+            return Err(RebindRefusal::InodeChanged);
+        }
+        Ok(device)
+    }
+}
+
+/// Whether the trash open as `trash_fd` holds the broker's marker, a
+/// regular file (no link followed) with the broker's content.
+fn holds_broker_marker(trash_fd: RawFd) -> bool {
+    let Ok(marker) = c_name(TRASH_MARKER) else {
+        return false;
+    };
+    // SAFETY: `marker` is NUL-terminated and `trash_fd` is open.
+    let Ok(fd) = checked(unsafe {
+        libc::openat(
+            trash_fd,
+            marker.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    }) else {
+        return false;
+    };
+    // SAFETY: `fd` was just opened and is owned here.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content).is_ok()
+        && content == TRASH_MARKER_CONTENT
+}
+
+/// Rebind the stored row `name` of one trash's `entries` from `read` (the
+/// row [`RemountRebind::check`] looked at) to `device`, inside the caller's
+/// compare-and-set: only when the stored row is still exactly `read`, and
+/// every stored row of that trash records either `device` or `read`'s old
+/// device. Only the device changes and the identity mark is cleared; a
+/// pending row stays pending. True when rebound.
+pub(crate) fn apply_rebind(
+    entries: &mut BTreeMap<String, TrashRow>,
+    name: &str,
+    read: &TrashRow,
+    device: u64,
+) -> bool {
+    let one_old_device = entries
+        .values()
+        .all(|row| row.device == device || row.device == read.device);
+    match entries.get_mut(name) {
+        Some(stored) if one_old_device && stored == read => {
+            stored.device = device;
+            stored.identity_mismatch = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether `name` is a broker entry name ([`is_broker_entry_name`]) whose
+/// session field is `session_id`.
+pub(crate) fn is_broker_entry_name_for(name: &str, session_id: i64) -> bool {
+    is_broker_entry_name(name)
+        && name
+            .split('-')
+            .nth(1)
+            .and_then(|session| session.parse::<i64>().ok())
+            == Some(session_id)
 }
 
 /// Whether `name` has the shape of an entry the broker names:
@@ -1682,10 +1941,15 @@ pub(crate) struct TrashDrainReport {
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
     pub(crate) reported: Vec<String>,
-    /// Confirmed entries present with another identity than recorded
+    /// Entries present with another identity than recorded
     /// ([`TrashRow::identity_mismatch`]): never deleted, out of the
     /// deletable backlog.
     pub(crate) identity_changed: usize,
+    /// Rows rebound to the device their trash is on now after a remount
+    /// ([`RemountRebind`]), and rows that recorded another device but were
+    /// refused, by cause. A rebound row is deleted (or confirmed) by a
+    /// later run, from the stored row, never by the run that rebound it.
+    pub(crate) rebind: RebindTally,
     /// The first of those, as `<name> (<cause>)`.
     pub(crate) identity_changed_entries: Vec<String>,
     /// Names in a trash the broker did not record (left alone).
@@ -1810,11 +2074,12 @@ pub(crate) const TRASH_IN_USE_NAMES_MAX: usize = 256;
 const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Recorded entries the deleter still has to delete or confirm: every row
-/// but confirmed ones kept with a changed identity.
+/// but those kept with a changed identity (confirmed ones, and pending ones
+/// whose creator is gone and whose entry is on another device).
 pub(crate) fn rows_awaiting_deletion(rows: &TrashRows) -> usize {
     rows.values()
         .flat_map(BTreeMap::values)
-        .filter(|row| row.pending || row.identity_mismatch.is_none())
+        .filter(|row| row.identity_mismatch.is_none())
         .count()
 }
 
@@ -1828,6 +2093,14 @@ pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, afte
     for (dir, entries) in before {
         for (name, was) in entries {
             match after.get(dir).and_then(|after| after.get(name)) {
+                // A remount rebind: written only onto a stored row that is
+                // still exactly the one the drain read, under the same
+                // single-old-device rule (nothing else changed with it).
+                Some(now) if now.device != was.device => {
+                    if let Some(stored) = current.get_mut(dir) {
+                        apply_rebind(stored, name, was, now.device);
+                    }
+                }
                 Some(now) => {
                     if let Some(stored) =
                         current.get_mut(dir).and_then(|stored| stored.get_mut(name))
@@ -2026,15 +2299,51 @@ fn drain_trash_in(
                     crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
                 }
             }
+            // A remount gives the trash a new device number: a row found
+            // again on it by name, session and inode is rebound to it
+            // ([`RemountRebind`], judged over every row of this trash). The
+            // rebind is only written onto an unchanged stored row
+            // ([`apply_drain_rows`]); this run neither confirms nor deletes
+            // a row it rebound.
+            let mut rebound = std::collections::BTreeSet::new();
+            match RemountRebind::read(trash_path, known_here.unwrap_or(&*entries)) {
+                Ok(None) => {}
+                Ok(Some(view)) => {
+                    let _span = crate::phase_telemetry::span("checkout_trash_rebind");
+                    for (name, row) in entries.iter_mut().filter(|(_, row)| view.applies(row)) {
+                        match view.check(name, row) {
+                            Ok(device) => {
+                                row.device = device;
+                                row.identity_mismatch = None;
+                                rebound.insert(name.clone());
+                                report.rebind.rebound += 1;
+                                crate::phase_telemetry::add(
+                                    "checkout_trash_rebound",
+                                    Duration::ZERO,
+                                );
+                            }
+                            Err(cause) => report.rebind.refuse(cause),
+                        }
+                    }
+                }
+                Err(cause) if context.count_unrecognized => report.rebind.refuse(cause),
+                Err(_) => {}
+            }
             // A pending row is never deleted while its creator may still
             // run (the move may be mid-way). Once the creator is proven
             // gone, an entry that still matches the recorded identity is
-            // confirmed; a mismatch, or no entry, drops the row. A confirmed
-            // entry present with another identity is marked, never deleted,
-            // and left out of the deletable backlog until it matches again
-            // (a volume mounted back under its old device number).
+            // confirmed; one with the recorded inode on another device that
+            // could not be rebound is kept and marked (never deleted, never
+            // dropped while it exists); another mismatch, or no entry, drops
+            // the row. A confirmed entry present with another identity is
+            // marked, never deleted, and left out of the deletable backlog
+            // until it matches again (rebound, or a volume mounted back
+            // under its old device number).
             let mut dropped = Vec::new();
             for (name, row) in entries.iter_mut() {
+                if rebound.contains(name) {
+                    continue;
+                }
                 let present = listed.contains(name);
                 if !row.pending {
                     if !present {
@@ -2075,23 +2384,53 @@ fn drain_trash_in(
                 if !creator_gone(row, table.as_ref()) {
                     continue;
                 }
-                let matches = present
-                    && fstatat_nofollow(trash.trash.as_raw_fd(), name).is_ok_and(|stat| {
-                        #[allow(clippy::unnecessary_cast)]
-                        let identity = (stat.st_dev as u64, stat.st_ino as u64);
-                        is_directory(&stat) && identity == (row.device, row.inode)
-                    });
-                if matches {
-                    row.pending = false;
-                    crate::phase_telemetry::add("checkout_trash_pending_confirmed", Duration::ZERO);
+                let look = if present {
+                    fstatat_nofollow(trash.trash.as_raw_fd(), name)
+                        .map(|stat| identity_mismatch(&stat, row))
                 } else {
-                    dropped.push(name.clone());
+                    Err(std::io::ErrorKind::NotFound.into())
+                };
+                match look {
+                    Ok(None) => {
+                        row.pending = false;
+                        row.identity_mismatch = None;
+                        crate::phase_telemetry::add(
+                            "checkout_trash_pending_confirmed",
+                            Duration::ZERO,
+                        );
+                    }
+                    // The recorded inode on another device, not rebound:
+                    // kept and marked, never confirmed, deleted or dropped
+                    // while the entry exists.
+                    Ok(Some(IdentityMismatch::DeviceChanged)) => {
+                        row.identity_mismatch = Some(IdentityMismatch::DeviceChanged);
+                        report.identity_changed += 1;
+                        if report.identity_changed_entries.len() < 20 {
+                            report.identity_changed_entries.push(format!(
+                                "{name} ({})",
+                                IdentityMismatch::DeviceChanged.as_str()
+                            ));
+                        }
+                        crate::phase_telemetry::add(
+                            "checkout_trash_pending_identity_held",
+                            Duration::ZERO,
+                        );
+                    }
+                    Ok(Some(_)) => dropped.push(name.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        dropped.push(name.clone());
+                    }
+                    // A failed look concludes nothing.
+                    Err(_) => {}
                 }
             }
             for name in dropped {
                 entries.remove(&name);
             }
             for name in drain_order(entries) {
+                if rebound.contains(&name) {
+                    continue;
+                }
                 if Instant::now() >= deadline {
                     report.budget_stopped = true;
                     break 'dirs;
@@ -2353,6 +2692,7 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
         merged.reported.extend(part.reported);
         merged.unrecognized += part.unrecognized;
         merged.identity_changed += part.identity_changed;
+        merged.rebind.merge(&part.rebind);
         merged
             .identity_changed_entries
             .extend(part.identity_changed_entries);
@@ -3536,21 +3876,27 @@ mod tests {
         );
     }
 
-    /// A confirmed entry present with another identity than recorded (here
-    /// the volume's device number changed, as a remount does) is never
-    /// deleted, is reported with its cause, and leaves the deletable
-    /// backlog; once it matches again it is deleted as usual.
+    /// A confirmed entry present with another identity than recorded that
+    /// cannot be rebound (here every row of the trash records an old device
+    /// number, but two different ones: not one remount) is never deleted, is
+    /// reported with its cause, and leaves the deletable backlog; once it
+    /// matches again it is deleted as usual.
     #[test]
     fn a_confirmed_entry_with_another_identity_is_kept_out_of_the_backlog() {
         let fixture = Fixture::new();
-        let checkout = fixture.checkout("one");
-        let trashed = fixture.trash(&checkout, 7).unwrap();
-        let recorded = TrashRow {
-            device: trashed.row.device.wrapping_add(1),
-            ..trashed.row
-        };
-        let mut rows = rows_with(&trashed, recorded);
-        assert_eq!(TrashBacklog::of(&rows).entries, 1);
+        let one = fixture.trash(&fixture.checkout("one"), 7).unwrap();
+        let two = fixture.trash(&fixture.checkout("two"), 8).unwrap();
+        let mut rows = TrashRows::new();
+        for (offset, trashed) in [(1, &one), (2, &two)] {
+            rows.entry(trashed.trash_dir.clone()).or_default().insert(
+                trashed.entry.clone(),
+                TrashRow {
+                    device: trashed.row.device.wrapping_add(offset),
+                    ..trashed.row
+                },
+            );
+        }
+        assert_eq!(TrashBacklog::of(&rows).entries, 2);
         let before = rows.clone();
         let report = drain_trash(
             &mut rows,
@@ -3559,44 +3905,393 @@ mod tests {
         );
         assert_eq!(report.entries_removed, 0, "{report:?}");
         assert_eq!(report.unrecognized, 0, "{report:?}");
-        assert_eq!(report.identity_changed, 1, "{report:?}");
+        assert_eq!(report.identity_changed, 2, "{report:?}");
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(
+            report.rebind.refused.get("mixed_old_devices"),
+            Some(&2),
+            "{report:?}"
+        );
         assert_eq!(
             report.entries_pending, 0,
             "nothing left to delete: {report:?}"
         );
-        assert_eq!(
-            report.identity_changed_entries,
-            vec![format!("{} (device_changed)", trashed.entry)]
-        );
-        assert!(trashed.path().join("base.txt").exists(), "never deleted");
-        let kept = rows[&trashed.trash_dir][&trashed.entry];
-        assert_eq!(
-            kept.identity_mismatch,
-            Some(IdentityMismatch::DeviceChanged)
-        );
+        let mut expected = vec![
+            format!("{} (device_changed)", one.entry),
+            format!("{} (device_changed)", two.entry),
+        ];
+        expected.sort();
+        let mut named = report.identity_changed_entries.clone();
+        named.sort();
+        assert_eq!(named, expected);
+        for trashed in [&one, &two] {
+            assert!(trashed.path().join("base.txt").exists(), "never deleted");
+            assert_eq!(
+                rows[&trashed.trash_dir][&trashed.entry].identity_mismatch,
+                Some(IdentityMismatch::DeviceChanged)
+            );
+        }
         assert_eq!(TrashBacklog::of(&rows).entries, 0, "out of the backlog");
         let mut stored = before.clone();
         apply_drain_rows(&mut stored, &before, &rows);
         assert_eq!(
-            stored[&trashed.trash_dir][&trashed.entry].identity_mismatch,
+            stored[&one.trash_dir][&one.entry].identity_mismatch,
             Some(IdentityMismatch::DeviceChanged),
             "the mark is written back"
         );
+        assert_eq!(
+            stored[&one.trash_dir][&one.entry].device,
+            one.row.device.wrapping_add(1),
+            "nothing rebound"
+        );
 
         // The volume comes back under its recorded device number.
-        rows.get_mut(&trashed.trash_dir)
-            .unwrap()
-            .get_mut(&trashed.entry)
-            .unwrap()
-            .device = trashed.row.device;
+        for trashed in [&one, &two] {
+            rows.get_mut(&trashed.trash_dir)
+                .unwrap()
+                .get_mut(&trashed.entry)
+                .unwrap()
+                .device = trashed.row.device;
+        }
         let report = drain_trash(
             &mut rows,
             Instant::now() + Duration::from_secs(600),
             DeleterPace::Unpaced,
         );
         assert_eq!(report.identity_changed, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 2, "{report:?}");
+        assert!(!one.path().exists());
+        assert!(!two.path().exists());
+    }
+
+    /// A process id that no longer runs.
+    fn dead_pid() -> i64 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        i64::from(child.id())
+    }
+
+    /// A remount as the broker's rows see it: every directory on the volume
+    /// (pool, trash, entries) now has a new device number and the same
+    /// inodes, so every row recorded under `trash_dir` records the one old
+    /// device, `offset` away from the current one. The current device of
+    /// the real filesystem is the "new" one; nothing needs privileges.
+    fn remount(rows: &mut TrashRows, trash_dir: &Path, offset: u64) {
+        for row in rows.get_mut(trash_dir).unwrap().values_mut() {
+            row.device = row.device.wrapping_add(offset);
+        }
+    }
+
+    fn drain_all(rows: &mut TrashRows) -> TrashDrainReport {
+        drain_trash(
+            rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        )
+    }
+
+    /// After a remount, a confirmed row and pending rows are rebound to the
+    /// trash's new device: only the device changes, the run that rebinds
+    /// deletes and confirms nothing, the write-back applies only the rebind.
+    /// The next run deletes the confirmed entry through the usual pinned
+    /// checks and confirms the pending row whose creator is gone (then
+    /// deletes it); a pending row whose creator still runs is never deleted.
+    #[test]
+    fn a_remount_rebinds_confirmed_and_pending_rows_without_deleting_them() {
+        let fixture = Fixture::new();
+        let confirmed = fixture.trash(&fixture.checkout("one"), 7).unwrap();
+        let (gone, mut gone_row) = move_unconfirmed(&fixture, "two");
+        gone_row.creator_pid = dead_pid();
+        gone_row.creator_started_ms = 1;
+        let (alive, alive_row) = move_unconfirmed(&fixture, "three");
+        let device = confirmed.row.device;
+        let mut rows = rows_of(&confirmed);
+        let entries = rows.get_mut(&confirmed.trash_dir).unwrap();
+        entries.insert(gone.entry.clone(), gone_row);
+        entries.insert(alive.entry.clone(), alive_row);
+        remount(&mut rows, &confirmed.trash_dir, 1000);
+        let before = rows.clone();
+
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 3, "{report:?}");
+        assert_eq!(report.rebind.refused_total(), 0, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing deleted: {report:?}");
+        assert_eq!(report.unrecognized, 0, "{report:?}");
+        assert_eq!(report.identity_changed, 0, "{report:?}");
+        for trashed in [&confirmed, &gone, &alive] {
+            assert!(trashed.path().join("base.txt").exists());
+            let row = rows[&trashed.trash_dir][&trashed.entry];
+            let was = before[&trashed.trash_dir][&trashed.entry];
+            assert_eq!(
+                row,
+                TrashRow {
+                    device,
+                    identity_mismatch: None,
+                    ..was
+                },
+                "only the device changed"
+            );
+        }
+        assert!(rows[&gone.trash_dir][&gone.entry].pending, "still pending");
+
+        // The write-back rebinds the stored rows and changes nothing else.
+        let mut stored = before.clone();
+        apply_drain_rows(&mut stored, &before, &rows);
+        assert_eq!(stored, rows);
+
+        let report = drain_all(&mut stored);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 2, "{report:?}");
+        assert!(!confirmed.path().exists(), "deleted through the checks");
+        assert!(
+            !gone.path().exists(),
+            "confirmed by its own proofs, then deleted"
+        );
+        assert!(alive.path().join("base.txt").exists(), "its creator runs");
+        assert!(stored[&alive.trash_dir][&alive.entry].pending);
+    }
+
+    /// The write-back applies a rebind only onto a stored row that is still
+    /// the one the drain read, and only while the stored rows of that trash
+    /// show one old device.
+    #[test]
+    fn a_rebind_is_written_only_onto_an_unchanged_stored_row() {
+        let dir = PathBuf::from("/pool").join(TRASH_DIR);
+        let name = "0000000000001-7-1-1".to_string();
+        let was = TrashRow {
+            device: 5,
+            ..row_for_backlog(0, false)
+        };
+        let mut before = TrashRows::new();
+        before
+            .entry(dir.clone())
+            .or_default()
+            .insert(name.clone(), was);
+        let mut after = before.clone();
+        after.get_mut(&dir).unwrap().get_mut(&name).unwrap().device = 9;
+
+        let mut stored = before.clone();
+        apply_drain_rows(&mut stored, &before, &after);
+        assert_eq!(stored[&dir][&name].device, 9);
+
+        // Someone stored a change meanwhile: no rebind.
+        let mut stored = before.clone();
+        stored
+            .get_mut(&dir)
+            .unwrap()
+            .get_mut(&name)
+            .unwrap()
+            .failures = 2;
+        apply_drain_rows(&mut stored, &before, &after);
+        assert_eq!(stored[&dir][&name].device, 5);
+
+        // A row on a third device appeared meanwhile: no rebind.
+        let mut stored = before.clone();
+        stored
+            .get_mut(&dir)
+            .unwrap()
+            .insert("0000000000002-8-1-1".into(), TrashRow { device: 6, ..was });
+        apply_drain_rows(&mut stored, &before, &after);
+        assert_eq!(stored[&dir][&name].device, 5);
+    }
+
+    /// No rebind without every proof: another inode on the same device is
+    /// another directory (never a remount); after a remount, an entry with
+    /// another inode, a name whose session is not the row's, a trash open to
+    /// others, an unmarked trash or a trash reached through a symbolic link
+    /// are refused, and nothing is deleted.
+    #[test]
+    fn a_rebind_is_refused_unless_every_proof_holds() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let trashed = fixture.trash(&fixture.checkout("one"), 7).unwrap();
+        let trash = trashed.trash_dir.clone();
+
+        // Same device, another inode: not a remount; marked, not rebound.
+        let mut rows = rows_with(
+            &trashed,
+            TrashRow {
+                inode: trashed.row.inode.wrapping_add(1),
+                ..trashed.row
+            },
+        );
+        assert!(
+            RemountRebind::read(&trash, &rows[&trash])
+                .unwrap()
+                .is_none()
+        );
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind, RebindTally::default(), "{report:?}");
+        assert_eq!(
+            rows[&trash][&trashed.entry].identity_mismatch,
+            Some(IdentityMismatch::InodeChanged)
+        );
+
+        // After a remount, another inode: refused.
+        let mut rows = rows_with(
+            &trashed,
+            TrashRow {
+                inode: trashed.row.inode.wrapping_add(1),
+                ..trashed.row
+            },
+        );
+        remount(&mut rows, &trash, 1000);
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(report.rebind.refused.get("inode_changed"), Some(&1));
+
+        // After a remount, a name made for another session: refused.
+        let mut rows = rows_with(
+            &trashed,
+            TrashRow {
+                session_id: 8,
+                ..trashed.row
+            },
+        );
+        remount(&mut rows, &trash, 1000);
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(
+            report.rebind.refused.get("name_not_for_session"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            rows[&trash][&trashed.entry].identity_mismatch,
+            Some(IdentityMismatch::DeviceChanged),
+            "held, never deleted"
+        );
+
+        let mut remounted = rows_of(&trashed);
+        remount(&mut remounted, &trash, 1000);
+        let view = RemountRebind::read(&trash, &remounted[&trash])
+            .unwrap()
+            .expect("the rows record an old device");
+        assert_eq!(view.current_device(), trashed.row.device);
+        let old = remounted[&trash][&trashed.entry];
+        assert!(view.applies(&old));
+        assert_eq!(view.check(&trashed.entry, &old), Ok(trashed.row.device));
+        assert_eq!(
+            view.check("0000000000001-7-1-1", &old),
+            Err(RebindRefusal::EntryMissing)
+        );
+
+        // A trash open to others: refused.
+        std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            RemountRebind::read(&trash, &remounted[&trash]).err(),
+            Some(RebindRefusal::TrashUnverified)
+        );
+        let mut rows = remounted.clone();
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(rows, remounted, "nothing changed");
+        std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // An unmarked trash: refused.
+        let marker = trash.join(TRASH_MARKER);
+        std::fs::rename(&marker, fixture.pool.join("marker-aside")).unwrap();
+        assert_eq!(
+            RemountRebind::read(&trash, &remounted[&trash]).err(),
+            Some(RebindRefusal::TrashUnverified)
+        );
+        let mut rows = remounted.clone();
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(rows, remounted, "nothing changed");
+        // A marker with other content: refused.
+        std::fs::write(&marker, "not the broker's\n").unwrap();
+        assert_eq!(
+            RemountRebind::read(&trash, &remounted[&trash]).err(),
+            Some(RebindRefusal::TrashUnverified)
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::rename(fixture.pool.join("marker-aside"), &marker).unwrap();
+
+        // The trash reached through a symbolic link: refused.
+        let other_pool = fixture.pool.with_file_name("linked-pool");
+        std::fs::create_dir_all(&other_pool).unwrap();
+        std::os::unix::fs::symlink(&trash, other_pool.join(TRASH_DIR)).unwrap();
+        let linked = other_pool.join(TRASH_DIR);
+        let mut rows = TrashRows::new();
+        rows.insert(linked.clone(), remounted[&trash].clone());
+        assert_eq!(
+            RemountRebind::read(&linked, &rows[&linked]).err(),
+            Some(RebindRefusal::TrashUnverified)
+        );
+        let before = rows.clone();
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert_eq!(rows, before, "nothing changed");
+        assert!(trashed.path().join("base.txt").exists(), "never deleted");
+    }
+
+    /// A pending row whose creator is gone and whose entry has the recorded
+    /// inode on another device that cannot be rebound (two old devices in
+    /// the trash) is kept and marked, never dropped while the entry exists,
+    /// so the entry never turns unrecognized; the same row in a trash that
+    /// shows one old device is rebound instead.
+    #[test]
+    fn a_pending_row_on_another_device_is_never_dropped_while_its_entry_exists() {
+        let fixture = Fixture::new();
+        let dead = dead_pid();
+        let (one, mut one_row) = move_unconfirmed(&fixture, "one");
+        let (two, mut two_row) = move_unconfirmed(&fixture, "two");
+        for row in [&mut one_row, &mut two_row] {
+            row.creator_pid = dead;
+            row.creator_started_ms = 1;
+        }
+        let mut rows = rows_with(
+            &one,
+            TrashRow {
+                device: one_row.device.wrapping_add(1000),
+                ..one_row
+            },
+        );
+        rows.get_mut(&two.trash_dir).unwrap().insert(
+            two.entry.clone(),
+            TrashRow {
+                device: two_row.device.wrapping_add(2000),
+                ..two_row
+            },
+        );
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.refused.get("mixed_old_devices"), Some(&2));
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert_eq!(report.identity_changed, 2, "{report:?}");
+        assert_eq!(report.entries_pending, 0, "held: {report:?}");
+        for trashed in [&one, &two] {
+            assert!(trashed.path().join("base.txt").exists());
+            let row = rows[&trashed.trash_dir][&trashed.entry];
+            assert!(row.pending, "kept, not dropped or confirmed: {row:?}");
+            assert_eq!(row.identity_mismatch, Some(IdentityMismatch::DeviceChanged));
+        }
+        let report = drain_all(&mut rows);
+        assert_eq!(report.unrecognized, 0, "never stranded: {report:?}");
+        assert_eq!(rows.values().map(BTreeMap::len).sum::<usize>(), 2);
+
+        // The second entry's row is put right: one old device is left, and
+        // the first row is rebound (its mark cleared, still pending).
+        rows.get_mut(&two.trash_dir)
+            .unwrap()
+            .get_mut(&two.entry)
+            .unwrap()
+            .device = two_row.device;
+        let report = drain_all(&mut rows);
+        assert_eq!(report.rebind.rebound, 1, "{report:?}");
+        let rebound = rows[&one.trash_dir][&one.entry];
+        assert_eq!(
+            (rebound.device, rebound.pending, rebound.identity_mismatch),
+            (one_row.device, true, None)
+        );
+        assert!(
+            one.path().join("base.txt").exists(),
+            "not deleted by the rebind"
+        );
+        let report = drain_all(&mut rows);
         assert_eq!(report.entries_removed, 1, "{report:?}");
-        assert!(!trashed.path().exists());
+        assert!(!one.path().exists());
     }
 
     /// An identity mark survives a binary that does not know the field: an
