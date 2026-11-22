@@ -4366,7 +4366,23 @@ than half the budget after the closed phase. Each phase resumes after the
 record where the previous pass stopped (broker metadata key
 `session_scratch.retire_cursor`, JSON `classify`, `closed` and
 `command_temps`, each the last record key judged, absent once it went
-round); a record whose runs stopped the phase by failing counts as judged.
+round, and `command_temp_runs`, an object from record key to the name of
+the last finished run judged when that record's visit ended before it
+went through its runs). Classification judges at least one record per
+pass. When it stops at its budget, the pass judges only the records it
+classified, in classification order, and `classify` moves past the records
+every phase judged and no further (never when the observation failed);
+`closed` and `command_temps` then stay for the next complete
+classification. With R records holding N finished runs, every record is
+judged within R + N passes whose observation succeeds and whose moves do
+not fail systemically. An unfinished classification counts as more to do
+only when the pass retired or forgot something. Finished runs are taken in
+name order after the record's run cursor: a failed move that is not
+systemic goes on to the record's next run, three failed moves in a row in
+one record pass to the next record (the record is judged, its run cursor
+kept past them), and the phase stops after three records in a row ended on
+a failed move. A systemic failure, the deadline or the move cap leaves the
+record unjudged, so the next pass starts with it at its run cursor.
 Each phase attempts at most 256 moves. The pass is not cut short by what
 the strip passes or the open-path resolution used of the lane's window, but
 starts no new work later than 20 s past the lane's deadline: with one item
@@ -4376,7 +4392,15 @@ are written into `session_scratch.records` once per pass. A closed
 session's directory that looks missing while its pool root is absent (or is
 on another device without the scratch container: an unmounted volume) is
 kept as `pool_unavailable` (counter `session_scratch_kept_pool_unavailable`),
-never forgotten. Opening a directory on the recorded path refuses as
+never forgotten. An absent pool root counts as an unmounted volume only when
+the nearest existing ancestor (looked at without following a link, climbing
+only past `ENOENT`) is on another device than recorded; on the recorded
+device the volume is mounted, the directory is really gone and the record
+is forgotten (counters `session_scratch_pool_absent_volume_away` and
+`session_scratch_pool_absent_volume_mounted`). The same rule applies when a
+command asks for an open session's directory: on an unavailable volume the
+record is kept and no fresh directory is made (counter
+`session_scratch_unavailable_pool_unavailable`). Opening a directory on the recorded path refuses as
 `not_a_real_directory` only for `ELOOP` and `ENOTDIR`; any other errno but
 `ENOENT` is a failed move at step `open`. A failed move names its step (`open`, `inspect`, `trash_open`,
 `trash_record`, `rename`) and cause (`too_many_open_files`, `no_space`,
@@ -4385,7 +4409,8 @@ never forgotten. Opening a directory on the recorded path refuses as
 `not_a_directory`, `interrupted`, `other`, `unknown`; `not_private` or
 `foreign_marker` for a refused trash; `store` for a refused trash row).
 There is no fallback to a non-exclusive rename. A phase stops after three
-failed moves in a row, or at once when the cause is systemic (the trash or
+failed moves in a row (the finished-runs phase: three records in a row
+ending on one, as above), or at once when the cause is systemic (the trash or
 its record, `too_many_open_files`, `no_space`, `read_only`, `unsupported`),
 and the next run retries: a failing move is tried at most once per run. A
 stop after failures does not count as more to do, so it never keeps the
@@ -4394,7 +4419,12 @@ Counters `session_scratch_retire_cursor_resumed`,
 `session_scratch_retire_process_use_unknown`,
 `session_scratch_retire_classify_stopped`,
 `session_scratch_retire_stopped_after_failures`,
-`command_temp_retire_stopped_after_failures`; span
+`command_temp_retire_stopped_after_failures`,
+`session_scratch_retire_classify_held` (a partial classification's cursor
+held before a record a phase did not judge),
+`command_temp_record_passed_after_failures` (a record passed after three
+failed moves in a row), `command_temp_run_cursor_resumed` (a record's
+visit resumed after its run cursor); span
 `session_scratch_retire_classify`; attachment `scratch_move_failures`,
 keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
 `total_ms`, `max_ms`). The `session_scratch_retire` attachment gains

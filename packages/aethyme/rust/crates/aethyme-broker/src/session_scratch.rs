@@ -291,15 +291,50 @@ pub(crate) fn open_refusal(error: &std::io::Error) -> Refusal {
 /// another device than recorded without the broker's scratch container (an
 /// empty mount-point directory standing in for the volume). A scratch
 /// directory that looks missing then is kept, never forgotten.
+///
+/// A missing pool root alone does not prove the volume is away: when the
+/// nearest ancestor that exists (looked at without following a link) is on
+/// the recorded device, the volume is mounted and the pool was really
+/// removed, so the record may be forgotten. Any other answer (an ancestor
+/// on another device, as the empty mount point of a volume that is not
+/// mounted is, or an error other than `ENOENT` on the way up) keeps it.
 pub(crate) fn pool_unavailable(record: &ScratchRecord) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     match std::fs::symlink_metadata(&record.pool) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let unavailable = !nearest_existing_ancestor_on_device(&record.pool, record.device);
+            crate::phase_telemetry::add(
+                if unavailable {
+                    "session_scratch_pool_absent_volume_away"
+                } else {
+                    "session_scratch_pool_absent_volume_mounted"
+                },
+                Duration::ZERO,
+            );
+            unavailable
+        }
         Err(_) => true,
         Ok(metadata) if !metadata.is_dir() => true,
         Ok(metadata) => {
             metadata.dev() != record.device && !record.pool.join(SCRATCH_CONTAINER).is_dir()
         }
     }
+}
+
+/// Whether the nearest ancestor of `path` that exists is on `device`:
+/// ancestors are looked at without following a link (a link's own device
+/// is its parent's), climbing only past `ENOENT`. False on any other error
+/// or when no ancestor answers.
+fn nearest_existing_ancestor_on_device(path: &Path, device: u64) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => return metadata.is_dir() && metadata.dev() == device,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn uid() -> libc::uid_t {
@@ -761,23 +796,56 @@ fn read_marker(done: RawFd, name: &str) -> Option<crate::command_temp::FinishedM
 /// files with a run name the broker writes) in its verified done container.
 /// Anything else there is left alone. Read-only.
 pub(crate) fn finished_runs(record: &ScratchRecord, limit: usize) -> Vec<FinishedRun> {
+    finished_runs_after(record, None, limit).runs
+}
+
+/// Finished runs of one scratch directory, in name order from a cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FinishedRunsListing {
+    pub(crate) runs: Vec<FinishedRun>,
+    /// Every finished run of the directory is in `runs` (the listing was
+    /// not cut at its limit).
+    pub(crate) complete: bool,
+}
+
+/// [`finished_runs`] in name order, starting with the first run named after
+/// `after` and wrapping round, so a caller that stores the last run it
+/// judged reaches every run in turn, whatever stays behind (kept or
+/// failing) at the front of the order. Read-only.
+pub(crate) fn finished_runs_after(
+    record: &ScratchRecord,
+    after: Option<&str>,
+    limit: usize,
+) -> FinishedRunsListing {
     let Ok(done) = open_run_container(record, crate::command_temp::DONE_CONTAINER) else {
-        return Vec::new();
+        return FinishedRunsListing::default();
     };
     let Ok(listing) = std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER))
     else {
-        return Vec::new();
+        return FinishedRunsListing::default();
     };
-    listing
+    let mut names = listing
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .filter(|name| crate::command_temp::is_run_name(name))
-        .filter_map(|name| {
-            let marker = read_marker(done.as_raw_fd(), &name)?;
-            Some(FinishedRun { name, marker })
-        })
-        .take(limit)
-        .collect()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    if let Some(after) = after {
+        let split = names.partition_point(|name| name.as_str() <= after);
+        names.rotate_left(split);
+    }
+    let mut runs = Vec::new();
+    let mut complete = true;
+    for name in names {
+        if runs.len() >= limit {
+            complete = false;
+            break;
+        }
+        if let Some(marker) = read_marker(done.as_raw_fd(), &name) {
+            runs.push(FinishedRun { name, marker });
+        }
+    }
+    FinishedRunsListing { runs, complete }
 }
 
 /// Whether `record`'s done container lists a finished-run marker. A hint
@@ -1024,6 +1092,37 @@ mod tests {
         assert!(!is_entry_name_for("s12-1a-2-3", 12));
         assert!(is_entry_name("s7-ff"));
         assert!(!is_entry_name(".aethyme-scratch-marker"));
+    }
+
+    /// A missing pool is unavailable only when its nearest existing
+    /// ancestor is on another device than recorded (a volume that is not
+    /// mounted leaves its mount point on the parent volume); on the
+    /// recorded device the volume is mounted and the pool is really gone.
+    #[test]
+    fn a_missing_pool_is_unavailable_only_off_the_recorded_device() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (_owner, pool) = pool();
+        let mut record = create(&pool, 5).unwrap();
+        let device = std::fs::metadata(&pool).unwrap().dev();
+        assert_eq!(record.device, device);
+        assert!(!pool_unavailable(&record), "a present pool is available");
+
+        std::fs::remove_dir_all(&pool).unwrap();
+        assert!(
+            !pool_unavailable(&record),
+            "removed from a mounted volume: really gone"
+        );
+        record.pool = pool.join("deeper").join("still");
+        assert!(
+            !pool_unavailable(&record),
+            "the nearest existing ancestor decides, however far up"
+        );
+
+        record.device = device.wrapping_add(1000);
+        assert!(
+            pool_unavailable(&record),
+            "an ancestor on another volume: the recorded one is away"
+        );
     }
 
     #[test]
