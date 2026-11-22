@@ -20,6 +20,13 @@ const CONTROL_SCHEMA: &str = "aethyme.gc-sweep-service-control/v1";
 const RECEIPT_SCHEMA: &str = "aethyme.gc-sweep-service-last-pass/v1";
 const REFRESH_SCHEMA: &str = "aethyme.gc-sweep-service-refresh/v1";
 const ERROR_SCHEMA: &str = "aethyme.gc-sweep-service-last-error/v1";
+const STARTED_SCHEMA: &str = "aethyme.gc-sweep-service-tick-started/v1";
+/// Written by a managed tick before it touches the repository or its pools.
+const TICK_STARTED_RECEIPT: &str = "tick-started.json";
+/// A tick that started this long ago and wrote neither a pass nor an error
+/// is reported as blocked: one full service interval, after which launchd
+/// has already coalesced (skipped) the next tick behind it.
+const TICK_BLOCKED_AFTER_MS: u64 = SERVICE_INTERVAL_SECONDS * 1000;
 /// The command that rebinds this repository's service to the running runtime.
 pub(crate) const REFRESH_COMMAND: &str = "aethyme broker gc service refresh";
 const SERVICE_DIRECTORY: &str = "Library/Application Support/Aethyme/gc-sweep-services";
@@ -92,15 +99,243 @@ struct LastPassReceipt {
     disk_pressured: Option<bool>,
     legacy_unscoped_state: Option<String>,
     error: Option<String>,
+    // Per-lane fields, added within v1: absent from older receipts, and
+    // ignored by older readers (no `deny_unknown_fields`).
+    /// `ran`, or why the artifact cache lane returned at once
+    /// ([`crate::ArtifactSweepLane`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_lane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entries_reclaimed: Option<usize>,
+    /// Logical file bytes observed before unlink plus preparation-cache bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes_reclaimed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkouts_removed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkouts_kept: Option<usize>,
+    /// The trash as this pass found it (the last observation on a failed
+    /// pass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash: Option<crate::CheckoutTrashBacklog>,
+    /// Entries the paced deleter removed from the deletable backlog since
+    /// the previous pass (a floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash_entries_drained: Option<usize>,
+    /// Entries that left the deletable backlog since the previous pass
+    /// without being deleted: their identity changed, they reached the
+    /// failure cap, or a process uses them. Never counted as drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash_entries_held_back: Option<usize>,
+    /// Set when the pass reclaimed nothing: the one cause that explains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reclaimed_nothing_because: Option<String>,
+    /// Consecutive passes, this one included, that reclaimed nothing.
+    #[serde(default)]
+    passes_without_reclaim: u64,
+    /// When the first of those passes started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unreclaimed_since_unix_ms: Option<u64>,
 }
 
-/// Kept alive for the complete managed tick so uninstall and control cannot
-/// remove or change the generation while the sweep is running.
+/// Consecutive passes that reclaimed nothing before `broker status` says so
+/// (two hours at the fixed 900 s interval).
+const UNRECLAIMED_PASSES_ADVICE_THRESHOLD: u64 = 8;
+
+/// What the paced host deleter did to the confirmed trash between the
+/// previous pass and this one. It deletes the oldest entries first, so a
+/// backlog that shrank (net of this pass's confirmations, and of entries
+/// held back without being deleted) or whose oldest entry moved forward
+/// while nothing was held back is draining. `None` without a previous
+/// observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrashDrain {
+    /// Entries deleted from the deletable backlog since the previous pass
+    /// (a floor: entries trashed meanwhile hide some).
+    entries: usize,
+    /// Entries that left the deletable backlog without being deleted
+    /// (identity changed, failure cap, in use) since the previous pass.
+    held_back: usize,
+    draining: bool,
+}
+
+fn trash_drain_since(
+    previous: Option<&crate::CheckoutTrashBacklog>,
+    current: &crate::CheckoutTrashBacklog,
+) -> Option<TrashDrain> {
+    let previous = previous?;
+    // Entries newly held back left the deletable count too; they are not
+    // the deleter's work. (A floor: one released meanwhile hides one.)
+    let held_back = current.held_back().saturating_sub(previous.held_back());
+    let entries = previous
+        .deletable
+        .saturating_add(current.confirmed_this_pass)
+        .saturating_sub(current.deletable)
+        .saturating_sub(held_back);
+    let oldest_moved = match (
+        previous.oldest_deletable_created_ms,
+        current.oldest_deletable_created_ms,
+    ) {
+        (Some(before), Some(now)) => now > before,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    Some(TrashDrain {
+        entries,
+        held_back,
+        // The oldest entry may have moved only because it was held back.
+        draining: entries > 0 || (oldest_moved && held_back == 0),
+    })
+}
+
+/// Whether a pass reclaimed, confirmed or rebound anything, counting what
+/// the paced deleter removed from the trash since the previous pass.
+fn pass_reclaimed(report: &crate::ArtifactSweepReport, drain: Option<TrashDrain>) -> bool {
+    report.directories_reclaimed > 0
+        || report.entries_reclaimed > 0
+        || report.observed_logical_file_bytes > 0
+        || report.preparation_cache_bytes_reclaimed > 0
+        || report.checkout_trash.confirmed_this_pass > 0
+        || report.checkout_trash.rebound_this_pass > 0
+        || drain.is_some_and(|drain| drain.draining)
+        || report
+            .auto_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| !cleanup.removed.is_empty())
+}
+
+/// The one cause that explains a pass that reclaimed nothing: a stalled
+/// deleter first (actionable), then the lane that actually blocked, then
+/// trash rows no command can help. `None` when nothing reclaimable was in
+/// view, or a trash backlog had no previous observation to compare with.
+fn reclaimed_nothing_because(
+    report: &crate::ArtifactSweepReport,
+    drain: Option<TrashDrain>,
+) -> Option<&'static str> {
+    let trash = &report.checkout_trash;
+    if trash.deletable > 0 && drain.is_some_and(|drain| !drain.draining) {
+        Some("trash_not_draining")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::GcLockHeld {
+        Some("artifact_lane_yielded_to_worker")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::Disabled {
+        Some("artifact_lane_disabled")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::PausedByStrictCleanup {
+        Some("artifact_lane_paused_by_strict_cleanup")
+    } else if !report.complete {
+        Some("artifact_lane_budget_spent")
+    } else if trash.stale_pending > 0 {
+        // Kept by the proofs (identity changed, session in use, trash not
+        // readable as recorded): nothing to run, so never advised.
+        Some("trash_entries_kept_by_proofs")
+    } else if trash.identity_changed > 0 {
+        // Confirmed entries present with another identity: never deleted;
+        // `broker status` names them (`cleanup.trash-identity-changed`), and
+        // no sweep or drain can act on them, so never advised here.
+        Some("trash_entries_identity_changed")
+    } else if trash.pending > 0 {
+        Some("trash_entries_awaiting_mover")
+    } else {
+        None
+    }
+}
+
+/// Kept alive for the managed tick so uninstall and control cannot remove or
+/// change the generation while the sweep is running. The installer claim is
+/// released around the broker open (which may block on the pool volume,
+/// for instance on a privacy consent nobody can answer from a launchd job)
+/// and taken again, with the plan and runtime re-verified, before the sweep.
 #[cfg(target_os = "macos")]
 pub(crate) struct ManagedTick {
     plan: Plan,
+    bytes: Vec<u8>,
     started_at_unix_ms: u64,
-    _claim: crate::file_lock::ExclusiveFileLock,
+    _claim: Option<crate::file_lock::ExclusiveFileLock>,
+}
+
+#[cfg(target_os = "macos")]
+impl ManagedTick {
+    /// Let refresh, install and control proceed while the broker opens.
+    pub(crate) fn release_claim(&mut self) {
+        self._claim = None;
+    }
+
+    /// Take the installer claim again (waiting up to [`RECLAIM_WAIT`]) and
+    /// prove the generation this tick verified is still the installed one
+    /// with the same verified runtime.
+    pub(crate) fn reclaim(&mut self) -> io::Result<()> {
+        let claim = reverify_claim(&self.plan, &self.bytes, RECLAIM_WAIT, verify_runtime)?;
+        self._claim = Some(claim);
+        Ok(())
+    }
+
+    /// Record a failed broker open: as this generation's pass only when the
+    /// claim is retaken and the plan re-proven, else generation-free.
+    pub(crate) fn record_open_failure(&mut self, error: &str) -> io::Result<()> {
+        let (plan, bytes, started) = (&self.plan, &self.bytes, self.started_at_unix_ms);
+        let claim = record_open_failure_with(plan, started, error, || {
+            reverify_claim(plan, bytes, RECLAIM_WAIT, verify_runtime)
+        })?;
+        self._claim = claim;
+        Ok(())
+    }
+}
+
+/// How long a tick waits to retake the installer claim after the broker open.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const RECLAIM_WAIT: Duration = Duration::from_secs(2);
+
+/// Retake `plan`'s installer claim, retrying for up to `wait`, then prove the
+/// installed plan still has exactly `bytes` and `verify` accepts it.
+fn reverify_claim(
+    plan: &Plan,
+    bytes: &[u8],
+    wait: Duration,
+    verify: impl FnOnce(&Plan) -> io::Result<()>,
+) -> io::Result<crate::file_lock::ExclusiveFileLock> {
+    let deadline = std::time::Instant::now() + wait;
+    let claim = loop {
+        match crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid) {
+            Ok(claim) => break claim,
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    if load(&plan.home, &plan.repository_uuid)?.1 != bytes {
+        return Err(invalid(
+            "managed GC service plan changed while the broker opened",
+        ));
+    }
+    verify(plan)?;
+    Ok(claim)
+}
+
+/// Record a tick whose broker open failed. Under a claim `reverify` retook
+/// for the unchanged plan, as this generation's last pass; when the plan
+/// changed (a refresh published another generation meanwhile) or cannot be
+/// re-proven, as the generation-free `last-error.json`, never as a last-pass
+/// receipt bound to a plan the directory no longer serves.
+fn record_open_failure_with(
+    plan: &Plan,
+    started_at_unix_ms: u64,
+    error: &str,
+    reverify: impl FnOnce() -> io::Result<crate::file_lock::ExclusiveFileLock>,
+) -> io::Result<Option<crate::file_lock::ExclusiveFileLock>> {
+    match reverify() {
+        Ok(claim) => {
+            write_last_pass(plan, started_at_unix_ms, None, Some(error))?;
+            Ok(Some(claim))
+        }
+        Err(refused) => {
+            write_tick_failure(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                Some(&plan.generation),
+                &format!("{error}; the tick then refused: {refused}"),
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 impl Plan {
@@ -607,13 +842,17 @@ fn read_last_pass(plan: &Plan) -> io::Result<Option<LastPassReceipt>> {
         ));
     }
     let receipt: LastPassReceipt = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if receipt.schema != RECEIPT_SCHEMA
-        || receipt.repository_uuid != plan.repository_uuid
-        || receipt.generation != plan.generation
-    {
+    if receipt.schema != RECEIPT_SCHEMA || receipt.repository_uuid != plan.repository_uuid {
         return Err(invalid(
-            "GC service last-pass receipt belongs to another generation",
+            "GC service last-pass receipt belongs to another service",
         ));
+    }
+    // Another generation's pass is no pass of this one: reading it as an
+    // error would fail `status` and every later receipt write until a hand
+    // refresh. The next pass overwrites it.
+    if receipt.generation != plan.generation {
+        crate::phase_telemetry::add("gc_service_foreign_generation_receipt", Duration::ZERO);
+        return Ok(None);
     }
     Ok(Some(receipt))
 }
@@ -633,8 +872,28 @@ fn write_last_pass(
     error: Option<&str>,
 ) -> io::Result<()> {
     // Parse and bind any previous receipt before replacing it.
-    let _previous_pass = read_last_pass(plan)?;
+    let previous_pass = read_last_pass(plan)?;
     let finished_at_unix_ms = now_unix_ms()?;
+    let previous_trash = previous_pass.as_ref().and_then(|previous| previous.trash);
+    let drain = report
+        .and_then(|report| trash_drain_since(previous_trash.as_ref(), &report.checkout_trash));
+    // A failed pass neither extends nor resets the run of empty passes.
+    let reclaimed = report.map(|report| pass_reclaimed(report, drain));
+    let (passes_without_reclaim, unreclaimed_since_unix_ms) = match (reclaimed, &previous_pass) {
+        (Some(true), _) => (0, None),
+        (Some(false), Some(previous)) if previous.passes_without_reclaim > 0 => (
+            previous.passes_without_reclaim.saturating_add(1),
+            previous
+                .unreclaimed_since_unix_ms
+                .or(Some(started_at_unix_ms)),
+        ),
+        (Some(false), _) => (1, Some(started_at_unix_ms)),
+        (None, Some(previous)) => (
+            previous.passes_without_reclaim,
+            previous.unreclaimed_since_unix_ms,
+        ),
+        (None, None) => (0, None),
+    };
     let receipt = LastPassReceipt {
         schema: RECEIPT_SCHEMA.to_string(),
         repository_uuid: plan.repository_uuid.clone(),
@@ -657,6 +916,32 @@ fn write_last_pass(
             }
         }),
         error: error.map(bounded_error),
+        artifact_lane: report.map(|report| report.artifact_lane.as_str().to_string()),
+        entries_reclaimed: report.map(|report| report.entries_reclaimed),
+        bytes_reclaimed: report.map(|report| {
+            report
+                .observed_logical_file_bytes
+                .saturating_add(report.preparation_cache_bytes_reclaimed)
+        }),
+        checkouts_removed: report
+            .and_then(|report| report.auto_cleanup.as_ref())
+            .map(|cleanup| cleanup.removed.len()),
+        checkouts_kept: report
+            .and_then(|report| report.auto_cleanup.as_ref())
+            .map(|cleanup| cleanup.kept.len()),
+        // A failed pass keeps the last observation, so the next pass still
+        // measures the deleter against it.
+        trash: report
+            .map(|report| report.checkout_trash)
+            .or(previous_trash),
+        trash_entries_drained: drain.map(|drain| drain.entries),
+        trash_entries_held_back: drain.map(|drain| drain.held_back),
+        reclaimed_nothing_because: report
+            .filter(|report| !pass_reclaimed(report, drain))
+            .and_then(|report| reclaimed_nothing_because(report, drain))
+            .map(str::to_string),
+        passes_without_reclaim,
+        unreclaimed_since_unix_ms,
     };
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     if bytes.len() > MAX_RECEIPT_BYTES {
@@ -718,15 +1003,16 @@ pub(crate) fn preflight_managed_tick(snapshot: &crate::Broker) -> io::Result<Opt
         ));
     }
     verify_runtime(&plan)?;
-    let _claim = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)?;
+    let claim = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)?;
     if load(&home, &uuid)?.1 != bytes {
         return Err(invalid("managed GC service plan changed during preflight"));
     }
     verify_runtime(&plan)?;
     Ok(Some(ManagedTick {
         plan,
+        bytes,
         started_at_unix_ms: now_unix_ms()?,
-        _claim,
+        _claim: Some(claim),
     }))
 }
 
@@ -753,7 +1039,8 @@ pub(crate) fn control(
 ) -> io::Result<Value> {
     if action == "status"
         && let Ok((repository, marker_uuid)) = current_repository()
-        && automatic_refresh_proof(home, uuid, &marker_uuid, &repository).is_ok()
+        && let Ok(running) = std::env::current_exe()
+        && automatic_refresh_proof(home, uuid, &marker_uuid, &repository, &running).is_ok()
     {
         let refreshed = refresh_current(home, uuid);
         // A refresh that stopped part-way leaves no loadable plan: report
@@ -843,7 +1130,16 @@ fn control_with(
         let last_pass = read_last_pass(&plan)?;
         let last_error = read_bounded_json(&plan.directory.join("last-error.json"), plan.uid);
         let last_refresh = read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid);
-        let next_action = (!plan.router.exists()).then_some(REFRESH_COMMAND);
+        let binding = runtime_binding(&plan.router, &plan.managed_root);
+        let (last_error_at, last_pass_at) = tick_timestamps(&plan.directory, plan.uid);
+        let now = now_unix_ms()?;
+        let tick = unanswered_tick(&plan.directory, plan.uid, now, tick_process)
+            .map(|tick| tick.describe(now));
+        // Until the service runs a verified current pair again, say how.
+        let next_action = (runtime_state != "verified"
+            || binding.needs_refresh()
+            || tick_refusing(last_error_at, last_pass_at))
+        .then_some(REFRESH_COMMAND);
         return Ok(json!({
             "schema": CONTROL_SCHEMA,
             "action": "status",
@@ -852,6 +1148,9 @@ fn control_with(
             "scheduler_state": if observation == Observation::Success { "loaded" } else { "unknown" },
             "scheduler_observation": observation_name(&observation),
             "runtime_state": runtime_state,
+            "runtime_binding": binding.as_str(),
+            "tick_started": read_bounded_json(&plan.directory.join(TICK_STARTED_RECEIPT), plan.uid),
+            "unanswered_tick": tick,
             "control": control,
             "last_pass": last_pass,
             "last_error": last_error,
@@ -1001,6 +1300,9 @@ pub(crate) struct InstallationRecord {
     pub(crate) plan_digest: Option<String>,
     pub(crate) runtime_version: Option<String>,
     pub(crate) router: Option<PathBuf>,
+    /// The recorded installation root, whose `current` selector says
+    /// whether the recorded runtime is still the selected one.
+    pub(crate) managed_root: Option<PathBuf>,
     pub(crate) unit_present: bool,
     /// SHA-256 of the unit file when it is a readable private owned file:
     /// what `uninstall` takes as confirmation when no plan is recorded.
@@ -1119,6 +1421,7 @@ pub(crate) fn read_record(home: &Path, uuid: &str, uid: u32) -> io::Result<Insta
         plan_digest: field("digest"),
         runtime_version: field("runtime_version"),
         router: field("router").map(PathBuf::from),
+        managed_root: field("managed_root").map(PathBuf::from),
         plan_bytes,
         unit_present,
         unit_digest,
@@ -1168,6 +1471,7 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
         "control.json",
         "last-pass.json",
         "last-error.json",
+        TICK_STARTED_RECEIPT,
     ] {
         let source = record.directory.join(name);
         match fs::symlink_metadata(&source) {
@@ -1712,7 +2016,12 @@ fn restore_record(
             fs::File::open(parent)?.sync_all()?;
         }
     }
-    for name in ["control.json", "last-pass.json", "last-error.json"] {
+    for name in [
+        "control.json",
+        "last-pass.json",
+        "last-error.json",
+        TICK_STARTED_RECEIPT,
+    ] {
         let Some(source) = archived_file(name)? else {
             continue;
         };
@@ -1851,16 +2160,20 @@ pub(crate) struct UpdateRefresh {
 }
 
 /// Refresh every service whose recorded runtime lies in a bundle of
-/// `managed_root` that this update is about to remove (one not `selected`
-/// by `current` or `previous`) or that is already gone. Called after the
-/// selector switch and before cleanup; it never fails the update.
+/// `managed_root` other than the one this update or install just selected
+/// as `current` (the bundle of `new_router`), or that is already gone.
+///
+/// A bundle kept as `previous` counts: it still exists, but a managed tick
+/// verifies its runtime against the installation's current selection, so a
+/// service bound to it refuses every tick until something rebinds it.
+/// Called after the selector switch and before cleanup; it never fails the
+/// update.
 #[cfg(target_os = "macos")]
-pub(crate) fn refresh_for_update(
-    managed_root: &Path,
-    selected: &[std::ffi::OsString],
-    new_router: &Path,
-) -> UpdateRefresh {
+pub(crate) fn refresh_for_update(managed_root: &Path, new_router: &Path) -> UpdateRefresh {
     let _span = crate::phase_telemetry::span("gc_service_refresh_for_update");
+    let Some(active) = new_router.parent().and_then(Path::file_name) else {
+        return UpdateRefresh::default();
+    };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return UpdateRefresh::default();
     };
@@ -1876,7 +2189,7 @@ pub(crate) fn refresh_for_update(
         &home,
         uid,
         managed_root,
-        selected,
+        active,
         || runtime_pair(new_router),
         crate::scheduled_service::launchd::label_state,
         launchctl,
@@ -1891,7 +2204,7 @@ fn refresh_for_update_with(
     home: &Path,
     uid: u32,
     managed_root: &Path,
-    selected: &[std::ffi::OsString],
+    active: &std::ffi::OsStr,
     runtime: impl FnOnce() -> io::Result<RuntimePair>,
     label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
     run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
@@ -1900,7 +2213,7 @@ fn refresh_for_update_with(
         home,
         uid,
         managed_root,
-        selected,
+        active,
         std::time::Instant::now() + UPDATE_REFRESH_BUDGET,
         runtime,
         label_state,
@@ -1913,7 +2226,7 @@ fn refresh_for_update_within(
     home: &Path,
     uid: u32,
     managed_root: &Path,
-    selected: &[std::ffi::OsString],
+    active: &std::ffi::OsStr,
     deadline: std::time::Instant,
     runtime: impl FnOnce() -> io::Result<RuntimePair>,
     mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
@@ -1950,8 +2263,7 @@ fn refresh_for_update_within(
         let Some(bundle) = version_directory.file_name() else {
             continue;
         };
-        let doomed = !selected.iter().any(|name| name == bundle) || !router.exists();
-        if !doomed {
+        if !needs_update_refresh(bundle, active, router.exists()) {
             continue;
         }
         if std::time::Instant::now() >= deadline {
@@ -2011,16 +2323,379 @@ pub(crate) fn refresh_current(home: &Path, uuid: &str) -> RefreshOutcome {
     )
 }
 
+/// Whether an update that just selected bundle `active` must rebind a
+/// service whose recorded router lies in `bundle`: every other bundle,
+/// including the one kept as `previous`, and any bundle whose router is gone.
+fn needs_update_refresh(
+    bundle: &std::ffi::OsStr,
+    active: &std::ffi::OsStr,
+    router_present: bool,
+) -> bool {
+    bundle != active || !router_present
+}
+
+/// How a recorded service's runtime relates to its installation's current
+/// selection. A managed tick only runs the pair `current` selects (its
+/// preflight verifies the recorded router as the installer receipt's
+/// router), so a present runtime that is no longer current refuses every
+/// tick just as a removed one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBinding {
+    /// The recorded router is the one `current` selects.
+    Current,
+    /// The recorded router exists but `current` selects another one.
+    Stale,
+    /// The recorded router is gone.
+    Gone,
+    /// The installation's `current` selector cannot be read: proves nothing.
+    Unknown,
+}
+
+impl RuntimeBinding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Gone => "gone",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether a refresh to the current runtime is what this binding needs.
+    fn needs_refresh(self) -> bool {
+        matches!(self, Self::Stale | Self::Gone)
+    }
+}
+
+/// The router the installation rooted at `managed_root` currently selects,
+/// resolved through its `current` selector. A few `lstat`/`readlink` calls:
+/// no process, no launchd, no hashing.
+fn current_selection(managed_root: &Path) -> Option<PathBuf> {
+    fs::canonicalize(managed_root.join("current").join("aethyme")).ok()
+}
+
+/// Classify `router` against the selection of `managed_root`.
+fn runtime_binding(router: &Path, managed_root: &Path) -> RuntimeBinding {
+    if !router.exists() {
+        return RuntimeBinding::Gone;
+    }
+    let Ok(router) = fs::canonicalize(router) else {
+        return RuntimeBinding::Unknown;
+    };
+    match current_selection(managed_root) {
+        Some(current) if current == router => RuntimeBinding::Current,
+        Some(_) => RuntimeBinding::Stale,
+        None => RuntimeBinding::Unknown,
+    }
+}
+
+/// Whether `running` is the router `managed_root` currently selects: the
+/// only runtime a foreground command may rebind a service to by itself.
+fn running_is_current_selection(running: &Path, managed_root: &Path) -> bool {
+    match (fs::canonicalize(running), current_selection(managed_root)) {
+        (Ok(running), Some(current)) => running == current,
+        _ => false,
+    }
+}
+
+/// Whether the service's ticks are refusing: its last recorded tick error
+/// is newer than its last finished pass (or there is no pass at all).
+fn tick_refusing(
+    last_error_at_unix_ms: Option<u64>,
+    last_pass_finished_unix_ms: Option<u64>,
+) -> bool {
+    match (last_error_at_unix_ms, last_pass_finished_unix_ms) {
+        (Some(error), Some(pass)) => error > pass,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// When the service last recorded a tick error and finished a pass, read
+/// from its receipts without requiring the plan to verify.
+fn tick_timestamps(directory: &Path, uid: u32) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str, key: &str| {
+        read_bounded_json(&directory.join(name), uid)
+            .and_then(|value| value.get(key).and_then(Value::as_u64))
+    };
+    (
+        field("last-error.json", "observed_at_unix_ms"),
+        field("last-pass.json", "finished_at_unix_ms"),
+    )
+}
+
+/// A managed tick that recorded its start and, for at least
+/// [`TICK_BLOCKED_AFTER_MS`], neither a pass nor an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnansweredTick {
+    started_at_unix_ms: u64,
+    pid: Option<u32>,
+    /// Whether the process that wrote the receipt still runs, as far as this
+    /// process can tell (`None` with no recorded pid: unverified).
+    process: Option<TickProcess>,
+}
+
+/// What this process can tell about a tick's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickProcess {
+    /// It still runs (and, when its start was recorded and a table could be
+    /// read, under the same start).
+    Alive,
+    /// No such process, or the pid provably belongs to another process.
+    Gone,
+    /// Neither the signal probe nor the native process listing could answer
+    /// from this process (for example inside a sandbox).
+    Unverified,
+}
+
+impl TickProcess {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Gone => "gone",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// What a signal-0 probe said about a pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAnswer {
+    Exists,
+    /// `ESRCH`: no process has the pid.
+    NoSuchProcess,
+    /// `EPERM` or anything else: proves nothing either way.
+    Unanswered,
+}
+
+/// Decide from the signal probe and, when asked, the native process table
+/// (`table_proves_gone(start)`; `None` when the table cannot be read or the
+/// start is unknown) what is known about the tick's process.
+fn decide_tick_process(
+    signal: SignalAnswer,
+    process_started_ms: Option<i64>,
+    table_proves_gone: impl FnOnce(i64) -> Option<bool>,
+) -> TickProcess {
+    if signal == SignalAnswer::NoSuchProcess {
+        return TickProcess::Gone;
+    }
+    match process_started_ms.and_then(table_proves_gone) {
+        Some(true) => TickProcess::Gone,
+        Some(false) => TickProcess::Alive,
+        None if signal == SignalAnswer::Exists => TickProcess::Alive,
+        None => TickProcess::Unverified,
+    }
+}
+
+/// The cause hint and the person's action for a blocked tick. On macOS the
+/// usual cause is a privacy consent: consent is bound to the binary's code
+/// identity, which each managed runtime version changes, and a launchd job
+/// waits on the request without showing anyone a dialog.
+const TICK_BLOCKED_CAUSE: &str = "the tick has written neither a pass nor an error since it started and its process still exists; on macOS this is most often a pending privacy consent for the service's runtime binary (a new code identity with each version) to read a removable or protected volume, which a launchd job waits on without showing anyone a dialog";
+const TICK_BLOCKED_ACTION: &str = "answer the pending privacy prompt, or allow the service's runtime in System Settings > Privacy & Security (Files and Folders > Removable Volumes, or Full Disk Access); launchd starts no further tick while this one runs, so scheduled sweeps stay stopped until then";
+const TICK_UNVERIFIED_CAUSE: &str = "the tick has written neither a pass nor an error since it started, and its process could not be checked from this process (the signal probe and the native process listing gave no answer, as inside a sandbox)";
+const TICK_UNVERIFIED_ACTION: &str = "run `aethyme broker gc service status --json` from a terminal outside any sandbox to see whether the tick is blocked";
+const TICK_ENDED_CAUSE: &str = "the tick process is gone and wrote neither a pass nor an error (killed or crashed); the next interval starts a new tick";
+
+impl UnansweredTick {
+    fn process(&self) -> TickProcess {
+        self.process.unwrap_or(TickProcess::Unverified)
+    }
+
+    fn state(&self) -> &'static str {
+        match self.process() {
+            TickProcess::Alive => "tick_blocked",
+            TickProcess::Gone => "tick_ended_without_receipt",
+            TickProcess::Unverified => "tick_unverified",
+        }
+    }
+
+    fn describe(&self, now_unix_ms: u64) -> Value {
+        let process = self.process();
+        json!({
+            "state": self.state(),
+            "started_at_unix_ms": self.started_at_unix_ms,
+            "minutes_since_start": now_unix_ms.saturating_sub(self.started_at_unix_ms) / 60_000,
+            "pid": self.pid,
+            "process": process.as_str(),
+            "cause_hint": match process {
+                TickProcess::Alive => TICK_BLOCKED_CAUSE,
+                TickProcess::Gone => TICK_ENDED_CAUSE,
+                TickProcess::Unverified => TICK_UNVERIFIED_CAUSE,
+            },
+            "person_action": match process {
+                TickProcess::Alive => Some(TICK_BLOCKED_ACTION),
+                TickProcess::Gone => None,
+                TickProcess::Unverified => Some(TICK_UNVERIFIED_ACTION),
+            },
+        })
+    }
+}
+
+/// Whether a tick that started at `started` is still unanswered at `now`:
+/// no error and no finished pass at or after its start, and one full
+/// service interval gone.
+fn tick_unanswered(
+    started: u64,
+    last_error_at_unix_ms: Option<u64>,
+    last_pass_finished_unix_ms: Option<u64>,
+    now_unix_ms: u64,
+) -> bool {
+    started > last_error_at_unix_ms.unwrap_or(0)
+        && started > last_pass_finished_unix_ms.unwrap_or(0)
+        && now_unix_ms.saturating_sub(started) >= TICK_BLOCKED_AFTER_MS
+}
+
+/// Read the service's receipts for a tick that started and never answered.
+/// Files only, plus `alive` for the recorded pid and process start.
+fn unanswered_tick(
+    directory: &Path,
+    uid: u32,
+    now_unix_ms: u64,
+    alive: impl Fn(u32, Option<i64>) -> TickProcess,
+) -> Option<UnansweredTick> {
+    let started = read_bounded_json(&directory.join(TICK_STARTED_RECEIPT), uid)?;
+    let started_at_unix_ms = started.get("started_at_unix_ms")?.as_u64()?;
+    let (error_at, pass_at) = tick_timestamps(directory, uid);
+    if !tick_unanswered(started_at_unix_ms, error_at, pass_at, now_unix_ms) {
+        return None;
+    }
+    let pid = started
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let process_started = started
+        .get("process_started_at_unix_ms")
+        .and_then(Value::as_i64);
+    Some(UnansweredTick {
+        started_at_unix_ms,
+        pid,
+        process: pid.map(|pid| alive(pid, process_started)),
+    })
+}
+
+/// Set once the native process listing failed or was refused in this
+/// process: later checks answer from the signal probe alone.
+static NATIVE_TABLE_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What this process can tell about the tick's process: signal 0, then,
+/// when its start was recorded, the native process listing (never a `ps`
+/// child, never a timeout; a failure is latched for the process). Only
+/// called for a tick already unanswered for a full interval.
+fn tick_process(pid: u32, process_started_ms: Option<i64>) -> TickProcess {
+    use std::sync::atomic::Ordering;
+    decide_tick_process(signal_probe(pid), process_started_ms, |started| {
+        if NATIVE_TABLE_UNAVAILABLE.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(table) = crate::session_holder::ProcessTable::observe_native() else {
+            NATIVE_TABLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+            return None;
+        };
+        Some(table.proves_gone(i64::from(pid), started))
+    })
+}
+
+/// Whether the service's last control receipt is an acknowledged
+/// deactivation: an unloaded service runs no tick, so none is blocked.
+fn service_deactivated(directory: &Path, uid: u32) -> bool {
+    read_bounded_json(&directory.join("control.json"), uid).is_some_and(|control| {
+        control.get("action").and_then(Value::as_str) == Some("deactivate")
+            && control.get("operation_result").and_then(Value::as_str) == Some("acknowledged")
+    })
+}
+
+/// Signal 0 to `pid` (delivers nothing): exists, no such process, or no
+/// answer (`EPERM`, or a pid that cannot be a process).
+fn signal_probe(pid: u32) -> SignalAnswer {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return SignalAnswer::Unanswered;
+    };
+    if pid <= 0 {
+        return SignalAnswer::Unanswered;
+    }
+    // SAFETY: kill with signal 0 sends no signal; it only reports whether
+    // the pid exists and may be signalled by this user.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return SignalAnswer::Exists;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => SignalAnswer::NoSuchProcess,
+        _ => SignalAnswer::Unanswered,
+    }
+}
+
+/// The `broker status` advice for a blocked tick (files and one signal-0
+/// probe; no launchctl).
+fn blocked_tick_advice(
+    record: &InstallationRecord,
+    uid: u32,
+    now_unix_ms: u64,
+    alive: impl Fn(u32, Option<i64>) -> TickProcess,
+) -> Option<RepairAdvice> {
+    record.plan_bytes.as_ref()?;
+    if service_deactivated(&record.directory, uid) {
+        return None;
+    }
+    let tick = unanswered_tick(&record.directory, uid, now_unix_ms, alive)?;
+    match tick.process() {
+        TickProcess::Gone => return None,
+        TickProcess::Unverified => {
+            return Some(RepairAdvice {
+                id: "storage.gc-service-tick-unverified",
+                reason: TICK_UNVERIFIED_CAUSE,
+                summary: "this repository's scheduled GC sweep tick has no receipt since it started, and its process could not be checked from here",
+                evidence: vec![
+                    format!(
+                        "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                        tick.started_at_unix_ms,
+                        now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
+                        tick.pid
+                            .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+                    ),
+                    format!("what to do: {TICK_UNVERIFIED_ACTION}"),
+                ],
+                commands: vec!["aethyme broker gc service status --json".into()],
+            });
+        }
+        TickProcess::Alive => {}
+    }
+    Some(RepairAdvice {
+        id: "storage.gc-service-tick-blocked",
+        reason: TICK_BLOCKED_CAUSE,
+        summary: "this repository's scheduled GC sweep tick has been blocked since it started; a person must answer a prompt",
+        evidence: vec![
+            format!(
+                "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                tick.started_at_unix_ms,
+                now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
+                tick.pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+            ),
+            format!(
+                "runtime {}",
+                record.runtime_version.as_deref().unwrap_or("unknown")
+            ),
+            format!("what to do: {TICK_BLOCKED_ACTION}"),
+        ],
+        commands: vec!["aethyme broker gc service status --json".into()],
+    })
+}
+
 /// Whether a foreground command may refresh this repository's service by
-/// itself: the recorded runtime is gone, the uuid read from the
-/// repository's marker is the service's, the recorded plan verifies (its
-/// label is exactly `com.aethyme.gc-sweep.<uuid>` and the unit file's bytes
-/// equal its rendered unit), and it names this repository.
+/// itself: the recorded runtime is gone or no longer the installation's
+/// current selection, the command runs from exactly that current selection
+/// (the runtime the refresh binds), the uuid read from the repository's
+/// marker is the service's, the recorded plan verifies (its label is
+/// exactly `com.aethyme.gc-sweep.<uuid>` and the unit file's bytes equal
+/// its rendered unit), and it names this repository.
 fn automatic_refresh_proof(
     home: &Path,
     uuid: &str,
     marker_uuid: &str,
     repository: &Path,
+    running: &Path,
 ) -> Result<(), &'static str> {
     if uuid != marker_uuid {
         return Err("service_uuid_differs_from_repository_marker");
@@ -2032,10 +2707,258 @@ fn automatic_refresh_proof(
     if plan.repository != repository {
         return Err("plan_names_another_repository");
     }
-    if plan.router.exists() {
-        return Err("recorded_runtime_present");
+    match runtime_binding(&plan.router, &plan.managed_root) {
+        RuntimeBinding::Stale | RuntimeBinding::Gone => {}
+        RuntimeBinding::Current => return Err("recorded_runtime_current"),
+        RuntimeBinding::Unknown => return Err("installation_selection_unreadable"),
+    }
+    if !running_is_current_selection(running, &plan.managed_root) {
+        return Err("running_runtime_is_not_the_current_selection");
     }
     Ok(())
+}
+
+/// What `broker status` did about a stale or gone service binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledRefresh {
+    /// A detached `gc service status` was started to refresh the service.
+    Started,
+    /// An earlier attempt is recent: the next waits for its backoff, which
+    /// doubles from one service interval to six hours while attempts leave
+    /// the binding stale for the same current bundle.
+    BackingOff,
+    /// Another `broker status` holds the service's claim and decides.
+    Contended,
+    /// The claim's lock file could not be opened at all (for example a
+    /// sandbox that denies writes): nothing was started.
+    LockUnavailable,
+    /// The scheduling receipt could not be written: nothing was started.
+    ReceiptUnwritable,
+    /// The background refresh could not be started.
+    StartFailed,
+}
+
+impl ScheduledRefresh {
+    /// The evidence line `broker status` adds to the service's advice.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Started => {
+                "a background `aethyme broker gc service status --json` was started to rebind the service to the current runtime"
+            }
+            Self::BackingOff => {
+                "an automatic refresh was attempted recently; the next waits for its backoff (15 minutes, doubling to 6 hours while attempts fail)"
+            }
+            Self::Contended => "another command is deciding the automatic refresh right now",
+            Self::LockUnavailable => {
+                "the automatic refresh could not open the service's lock file from this process, so none was started"
+            }
+            Self::ReceiptUnwritable => {
+                "the automatic refresh could not record its attempt, so none was started"
+            }
+            Self::StartFailed => "the automatic refresh could not be started",
+        }
+    }
+}
+
+/// The receipt `broker status` writes, under the service's installer claim,
+/// before it starts a background refresh.
+const SCHEDULED_REFRESH_RECEIPT: &str = "refresh-scheduled.json";
+const SCHEDULED_REFRESH_SCHEMA: &str = "aethyme.gc-sweep-service-refresh-scheduled/v1";
+/// The longest wait between automatic refresh attempts that keep failing.
+const SCHEDULED_REFRESH_MAX_BACKOFF_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// How long to wait after an attempt before the next, given how many
+/// attempts in a row already left the binding stale: one service interval,
+/// doubling, capped at six hours.
+fn scheduled_refresh_backoff_ms(failed_attempts: u64) -> u64 {
+    let base = SERVICE_INTERVAL_SECONDS * 1000;
+    let doublings = u32::try_from(failed_attempts.min(16)).unwrap_or(16);
+    base.saturating_mul(1u64 << doublings)
+        .min(SCHEDULED_REFRESH_MAX_BACKOFF_MS)
+}
+
+/// The bundle `managed_root` currently selects, by name.
+fn current_bundle(managed_root: &Path) -> Option<String> {
+    current_selection(managed_root)?
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// `broker status` noticing a stale binding on `record`: when its recorded
+/// runtime is gone or no longer current and `running()` (asked only then)
+/// is the installation's current router, take the service's installer claim
+/// without waiting (so concurrent callers start at most one), re-read the
+/// receipt under it, honour the backoff, write the receipt and `start` one
+/// background refresh. Files, selector links and one lock; launchd is asked
+/// by the refresh, which repeats every proof under the claim. Prints
+/// nothing: failures are counted. `None` when the binding needs nothing.
+fn schedule_refresh_with(
+    record: &InstallationRecord,
+    uid: u32,
+    running: impl FnOnce() -> Option<PathBuf>,
+    now_unix_ms: u64,
+    start: impl FnOnce(&Path) -> io::Result<()>,
+) -> Option<ScheduledRefresh> {
+    let _span = crate::phase_telemetry::span("gc_service_refresh_schedule");
+    if record.plan_bytes.is_none() || !record.unit_present {
+        return None;
+    }
+    let router = record.router.as_deref()?;
+    let managed_root = record.managed_root.as_deref()?;
+    if !runtime_binding(router, managed_root).needs_refresh() {
+        return None;
+    }
+    let running = running()?;
+    if !running_is_current_selection(&running, managed_root) {
+        return None;
+    }
+    let claim = match crate::pr_watch_service_install::claim_installer(&record.directory, uid) {
+        Ok(claim) => claim,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Some(ScheduledRefresh::Contended);
+        }
+        Err(_) => {
+            crate::phase_telemetry::add("gc_service_refresh_lock_unavailable", Duration::ZERO);
+            return Some(ScheduledRefresh::LockUnavailable);
+        }
+    };
+    let bundle = current_bundle(managed_root);
+    let previous = read_bounded_json(&record.directory.join(SCHEDULED_REFRESH_RECEIPT), uid);
+    // A receipt from the future (a clock that moved back) has expired.
+    let previous_at = previous
+        .as_ref()
+        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64))
+        .filter(|at| *at <= now_unix_ms);
+    let same_bundle = previous
+        .as_ref()
+        .and_then(|value| value.get("current_bundle").and_then(Value::as_str))
+        == bundle.as_deref();
+    // Attempts so far that left the binding stale for this current bundle.
+    let failed_attempts = match (&previous, same_bundle) {
+        (Some(value), true) => value.get("attempts").and_then(Value::as_u64).unwrap_or(1),
+        _ => 0,
+    };
+    let refreshed_at = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
+        .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64))
+        .filter(|at| *at <= now_unix_ms);
+    let last = if same_bundle { previous_at } else { None }.max(refreshed_at);
+    let wait = scheduled_refresh_backoff_ms(failed_attempts.saturating_sub(1));
+    if last.is_some_and(|at| now_unix_ms.saturating_sub(at) < wait) {
+        return Some(ScheduledRefresh::BackingOff);
+    }
+    // The receipt goes first: without it nothing bounds the next start.
+    let receipt = json!({
+        "schema": SCHEDULED_REFRESH_SCHEMA,
+        "repository_uuid": record.directory.file_name().and_then(|name| name.to_str()),
+        "observed_at_unix_ms": now_unix_ms,
+        "current_bundle": bundle,
+        "attempts": failed_attempts.saturating_add(1),
+    });
+    let written = serde_json::to_vec(&receipt)
+        .map_err(io::Error::other)
+        .and_then(|bytes| {
+            write_bounded_receipt(&record.directory, SCHEDULED_REFRESH_RECEIPT, &bytes)
+        });
+    // The receipt bounds the next start; the child takes the claim itself.
+    drop(claim);
+    if written.is_err() {
+        crate::phase_telemetry::add("gc_service_refresh_receipt_unwritable", Duration::ZERO);
+        return Some(ScheduledRefresh::ReceiptUnwritable);
+    }
+    match start(running.as_path()) {
+        Ok(()) => {
+            crate::phase_telemetry::add("gc_service_refresh_scheduled", Duration::ZERO);
+            Some(ScheduledRefresh::Started)
+        }
+        Err(_) => {
+            crate::phase_telemetry::add("gc_service_refresh_start_failed", Duration::ZERO);
+            Some(ScheduledRefresh::StartFailed)
+        }
+    }
+}
+
+/// Set once a scheduling receipt could not be written, or the service's lock
+/// file could not be opened, in this process: later `broker status` calls in
+/// it neither retry nor spawn.
+#[cfg(target_os = "macos")]
+static SCHEDULE_RECEIPT_UNWRITABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `broker status` on macOS: read this repository's service record once,
+/// maybe start a background refresh ([`schedule_refresh_with`]), and return
+/// the advice for it. The background refresh is
+/// `<running> broker gc service status --json` in `repository`, in its own
+/// process group with no stdio and the tick variables removed. Not started
+/// from an App Sandbox process (`APP_SANDBOX_CONTAINER_ID` set), which could
+/// not reach launchd; other sandboxes are not cheaply knowable and are
+/// bounded by the backoff.
+#[cfg(target_os = "macos")]
+pub(crate) fn status_service_advice(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    repository: &Path,
+) -> Option<RepairAdvice> {
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::atomic::Ordering;
+    let record = read_record(home, uuid, uid).ok()?;
+    let scheduled = if SCHEDULE_RECEIPT_UNWRITABLE.load(Ordering::Relaxed)
+        || std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some()
+    {
+        None
+    } else {
+        let now = now_unix_ms().unwrap_or(0);
+        let outcome = schedule_refresh_with(
+            &record,
+            uid,
+            || std::env::current_exe().ok(),
+            now,
+            |running| {
+                let mut command = std::process::Command::new(running);
+                command
+                    .args(["broker", "gc", "service", "status", "--json"])
+                    .current_dir(repository)
+                    .env_remove(SERVICE_ENV_UUID)
+                    .env_remove(SERVICE_ENV_GENERATION)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0);
+                let mut child = command.spawn()?;
+                // Reap it whenever it ends; a short-lived caller exits first.
+                std::thread::spawn(move || {
+                    if child.wait().is_err() {
+                        crate::phase_telemetry::add(
+                            "gc_service_refresh_reap_failed",
+                            Duration::ZERO,
+                        );
+                    }
+                });
+                Ok(())
+            },
+        );
+        match outcome {
+            Some(ScheduledRefresh::ReceiptUnwritable) => {
+                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
+                outcome
+            }
+            // Latched, and said nowhere: a denied lock is this process's
+            // sandbox, not news for every status call.
+            Some(ScheduledRefresh::LockUnavailable) => {
+                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
+                None
+            }
+            other => other,
+        }
+    };
+    let mut advice =
+        repair_advice_for(&record, home, uuid, uid).or_else(|| reclaim_advice(home, uuid))?;
+    if let Some(scheduled) = scheduled {
+        advice.evidence.push(scheduled.describe().into());
+    }
+    Some(advice)
 }
 
 /// A `broker status` advice row about this repository's scheduled GC
@@ -2063,8 +2986,19 @@ fn load_unconfirmed(control: &ControlReceipt) -> bool {
 /// What `broker status` should say about this repository's service, from
 /// files only (no launchctl): the recorded runtime is gone; a refresh left
 /// the record in its archive; or a load was meant and never confirmed.
-pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairAdvice> {
+#[cfg(test)]
+fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairAdvice> {
     let record = read_record(home, uuid, uid).ok()?;
+    repair_advice_for(&record, home, uuid, uid)
+}
+
+/// [`repair_advice`] for a record already read.
+fn repair_advice_for(
+    record: &InstallationRecord,
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+) -> Option<RepairAdvice> {
     if !record.exists() {
         let archive = interrupted_refresh_archive(&record.directory, uid)?;
         return Some(RepairAdvice {
@@ -2115,6 +3049,13 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
             ],
         });
     }
+    if let Some(advice) = blocked_tick_advice(record, uid, now_unix_ms().unwrap_or(0), tick_process)
+    {
+        return Some(advice);
+    }
+    if let Some(advice) = refusing_or_stale_advice(record, uid) {
+        return Some(advice);
+    }
     let (plan, _) = load(home, uuid).ok()?;
     let control = read_control(&plan).ok().flatten()?;
     if !load_unconfirmed(&control) {
@@ -2134,6 +3075,143 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
                 "aethyme broker gc service activate --confirm {}",
                 plan.digest
             ),
+        ],
+    })
+}
+
+/// The advice for a recorded service whose runtime is present but no longer
+/// the installation's current selection, or whose ticks refuse (the last
+/// tick error is newer than the last finished pass). Files and selector
+/// links only.
+fn refusing_or_stale_advice(record: &InstallationRecord, uid: u32) -> Option<RepairAdvice> {
+    record.plan_bytes.as_ref()?;
+    let binding = match (record.router.as_deref(), record.managed_root.as_deref()) {
+        (Some(router), Some(root)) => runtime_binding(router, root),
+        _ => RuntimeBinding::Unknown,
+    };
+    let (last_error_at, last_pass_at) = tick_timestamps(&record.directory, uid);
+    let refusing = tick_refusing(last_error_at, last_pass_at);
+    if binding != RuntimeBinding::Stale && !refusing {
+        return None;
+    }
+    let mut evidence = Vec::new();
+    if binding == RuntimeBinding::Stale {
+        evidence.push(format!(
+            "the recorded runtime {} is installed but no longer the installation's current one; managed ticks refuse it",
+            record.runtime_version.as_deref().unwrap_or("unknown")
+        ));
+    }
+    if refusing
+        && let Some(error) = read_bounded_json(&record.directory.join("last-error.json"), uid)
+    {
+        evidence.push(format!(
+            "last tick refused at (ms since epoch) {}: {}",
+            last_error_at.unwrap_or(0),
+            error
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        evidence.push(match last_pass_at {
+            Some(at) => format!("last finished pass at (ms since epoch): {at}"),
+            None => "no finished pass is recorded for this plan".into(),
+        });
+    }
+    if let Some(refresh) = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
+        && let Some(outcome) = refresh.get("outcome").and_then(Value::as_str)
+    {
+        evidence.push(format!("last refresh attempt: {outcome}"));
+    }
+    Some(if binding == RuntimeBinding::Stale {
+        RepairAdvice {
+            id: "storage.gc-service-runtime-stale",
+            reason: "the scheduled GC sweep service is pinned to one exact runtime, and an update selected another one; each tick verifies its runtime as the installation's current one and refuses, so scheduled sweeps have stopped",
+            summary: "this repository's scheduled GC sweep service is bound to a runtime that is no longer the current one",
+            evidence,
+            commands: vec![
+                REFRESH_COMMAND.into(),
+                "aethyme broker gc service status --json".into(),
+            ],
+        }
+    } else {
+        RepairAdvice {
+            id: "storage.gc-service-ticks-refusing",
+            reason: "the scheduled GC sweep service's last tick refused before sweeping and no pass has finished since, so scheduled sweeps have stopped",
+            summary: "this repository's scheduled GC sweep service refuses its ticks",
+            evidence,
+            commands: vec![
+                REFRESH_COMMAND.into(),
+                "aethyme broker gc service status --json".into(),
+            ],
+        }
+    })
+}
+
+/// What `broker status` should say when the service runs but its passes
+/// have reclaimed nothing for [`UNRECLAIMED_PASSES_ADVICE_THRESHOLD`] passes
+/// while the last one saw reclaimable work: the cause it recorded and the
+/// command that acts on it. Files only (no launchctl).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn reclaim_advice(home: &Path, uuid: &str) -> Option<RepairAdvice> {
+    let (plan, _) = load(home, uuid).ok()?;
+    let receipt = read_last_pass(&plan).ok().flatten()?;
+    reclaim_advice_for(&receipt)
+}
+
+fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
+    if receipt.passes_without_reclaim < UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+        return None;
+    }
+    let cause = receipt.reclaimed_nothing_because.as_deref()?;
+    // Only causes a command can act on: a lane that yielded to the detached
+    // worker or was disabled on purpose, and trash rows the proofs keep, are
+    // explained in the receipt and need nobody.
+    let (reason, command): (&'static str, &str) = match cause {
+        "trash_not_draining" => (
+            "confirmed checkout trash entries are waiting and the backlog has not shrunk between passes: the paced host deleter is not getting to them",
+            "aethyme broker gc trash drain --json",
+        ),
+        "artifact_lane_budget_spent" => (
+            "the artifact cache lane keeps stopping at its budget with work left and reclaims nothing",
+            "aethyme broker gc sweep --json",
+        ),
+        _ => return None,
+    };
+    let mut evidence = vec![format!(
+        "{} consecutive passes reclaimed nothing; recorded cause: {cause}",
+        receipt.passes_without_reclaim
+    )];
+    if let Some(since) = receipt.unreclaimed_since_unix_ms {
+        evidence.push(format!(
+            "first empty pass started at (ms since epoch): {since}"
+        ));
+    }
+    if let Some(trash) = receipt.trash {
+        evidence.push(format!(
+            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use; after a remount: {} rebound, {} refused, {} trash(es) whose rebound rows spanned more than one old device",
+            trash.recorded,
+            trash.deletable,
+            trash.pending,
+            trash.stale_pending,
+            trash.identity_changed,
+            trash.failing,
+            trash.in_use,
+            trash.rebound_this_pass,
+            trash.rebind_refused_this_pass,
+            trash.rebind_proven_old_devices_mixed_this_pass
+        ));
+    }
+    if let Some(lane) = &receipt.artifact_lane {
+        evidence.push(format!("artifact cache lane: {lane}"));
+    }
+    Some(RepairAdvice {
+        id: "storage.gc-service-reclaiming-nothing",
+        reason,
+        summary: "this repository's scheduled GC sweep has reclaimed nothing for at least two hours while reclaimable storage remains",
+        evidence,
+        commands: vec![
+            command.to_string(),
+            "aethyme broker gc service status --json".into(),
         ],
     })
 }
@@ -2236,6 +3314,57 @@ pub(crate) fn record_tick_failure(error: &str) {
         "record the GC service tick failure",
         write_tick_failure(&home, &uuid, uid, generation.as_deref(), error),
     );
+}
+
+/// Record that a managed tick started, before it touches the repository or
+/// its pool volumes, so a tick that then blocks is visible (its output goes
+/// to /dev/null and it may never get to write a pass or an error).
+#[cfg(target_os = "macos")]
+pub(crate) fn record_tick_started() {
+    let Ok(uuid) = std::env::var(SERVICE_ENV_UUID) else {
+        return;
+    };
+    let generation = std::env::var(SERVICE_ENV_GENERATION).ok();
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    crate::warn_unrecorded(
+        "record the GC service tick start",
+        write_tick_started(
+            &home,
+            &uuid,
+            uid,
+            generation.as_deref(),
+            std::process::id(),
+            crate::session_holder::own_start_epoch_ms(),
+        ),
+    );
+}
+
+fn write_tick_started(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    generation: Option<&str>,
+    pid: u32,
+    process_started_at_unix_ms: Option<i64>,
+) -> io::Result<()> {
+    crate::store::repository_identity::validate_uuid_v4(uuid).map_err(io::Error::other)?;
+    let home = absolute_directory(home)?;
+    let directory = expected_directory(&home, uuid);
+    crate::pr_watch_service_install::lifecycle::check_directories(&home, &directory, uid, true)?;
+    let receipt = json!({
+        "schema": STARTED_SCHEMA,
+        "repository_uuid": uuid,
+        "generation": generation.filter(|value| valid_hex_digest(value)),
+        "pid": pid,
+        "process_started_at_unix_ms": process_started_at_unix_ms,
+        "started_at_unix_ms": now_unix_ms()?,
+    });
+    let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+    write_bounded_receipt(&directory, TICK_STARTED_RECEIPT, &bytes)
 }
 
 fn write_tick_failure(
@@ -2429,6 +3558,8 @@ mod tests {
             budget_ms: 250,
             disk_pressured: false,
             legacy_unscoped_state: crate::ArtifactSweepLegacyUnscopedState::UnknownPending,
+            artifact_lane: crate::ArtifactSweepLane::Ran,
+            checkout_trash: crate::CheckoutTrashBacklog::default(),
             auto_cleanup: None,
         };
         write_last_pass(&plan, 2, Some(&report), None).unwrap();
@@ -2438,6 +3569,332 @@ mod tests {
             Some("unknown_pending")
         );
         assert_eq!(receipt.outcome, "sweep_paused");
+    }
+
+    fn empty_pass(
+        lane: crate::ArtifactSweepLane,
+        trash: crate::CheckoutTrashBacklog,
+    ) -> crate::ArtifactSweepReport {
+        crate::ArtifactSweepReport {
+            at_ms: 1,
+            scope: "drain".into(),
+            directories_reclaimed: 0,
+            entries_reclaimed: 0,
+            observed_logical_file_bytes: 0,
+            preparation_cache_bytes_reclaimed: 0,
+            bytes_accounting_complete: true,
+            blockers: crate::ArtifactSweepBlockerSummary::default(),
+            headroom_threshold_bytes: crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            complete: false,
+            budget_ms: 5000,
+            disk_pressured: false,
+            legacy_unscoped_state: crate::ArtifactSweepLegacyUnscopedState::Clear,
+            artifact_lane: lane,
+            checkout_trash: trash,
+            auto_cleanup: None,
+        }
+    }
+
+    /// Entries that leave the deletable backlog by changing identity,
+    /// reaching the failure cap or being in use are held back, never counted
+    /// as drained: a backlog that only lost such entries is not draining,
+    /// even when its oldest entry moved forward.
+    #[test]
+    fn entries_held_back_are_not_counted_as_drained() {
+        let previous = trash(20, Some(5), 0);
+        let held = crate::CheckoutTrashBacklog {
+            identity_changed: 3,
+            identity_changed_device: 3,
+            failing: 2,
+            in_use: 1,
+            ..trash(14, Some(9), 0)
+        };
+        let drain = trash_drain_since(Some(&previous), &held).unwrap();
+        assert_eq!(drain.entries, 0, "{drain:?}");
+        assert_eq!(drain.held_back, 6, "{drain:?}");
+        assert!(!drain.draining, "{drain:?}");
+
+        let deleted_too = crate::CheckoutTrashBacklog {
+            deletable: 10,
+            ..held
+        };
+        let drain = trash_drain_since(Some(&previous), &deleted_too).unwrap();
+        assert_eq!(drain.entries, 4, "{drain:?}");
+        assert!(drain.draining);
+
+        // Entries already held back at the previous pass are not new.
+        let drain = trash_drain_since(Some(&held), &held).unwrap();
+        assert_eq!((drain.entries, drain.held_back), (0, 0));
+    }
+
+    /// Confirmed entries whose identity changed neither count as deletable
+    /// nor raise the stalled-deleter advice once everything else drained:
+    /// the receipt names them as the cause and stays silent.
+    #[test]
+    fn identity_changed_entries_are_explained_but_never_advised() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let kept = crate::CheckoutTrashBacklog {
+            recorded: 18,
+            identity_changed: 18,
+            identity_changed_device: 18,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        let mut finished = empty_pass(crate::ArtifactSweepLane::Ran, kept);
+        finished.complete = true;
+        for pass in 0..=UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            write_last_pass(&plan, 1 + pass, Some(&finished), None).unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert!(receipt.passes_without_reclaim > UNRECLAIMED_PASSES_ADVICE_THRESHOLD);
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_entries_identity_changed")
+        );
+        assert_eq!(receipt.trash.unwrap().identity_changed, 18);
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
+    }
+
+    /// Every pass says per lane what it found, and a pass that reclaimed
+    /// nothing records the one cause; the run of empty passes survives a
+    /// failed pass and ends at the first pass that reclaims.
+    #[test]
+    fn receipts_explain_empty_passes_and_count_them() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let yielded = empty_pass(
+            crate::ArtifactSweepLane::GcLockHeld,
+            crate::CheckoutTrashBacklog::default(),
+        );
+        write_last_pass(&plan, 10, Some(&yielded), None).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.artifact_lane.as_deref(), Some("gc_lock_held"));
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("artifact_lane_yielded_to_worker")
+        );
+        assert_eq!(receipt.passes_without_reclaim, 1);
+        assert_eq!(receipt.unreclaimed_since_unix_ms, Some(10));
+
+        let stuck = crate::CheckoutTrashBacklog {
+            recorded: 200,
+            pending: 180,
+            stale_pending: 180,
+            deletable: 20,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        write_last_pass(
+            &plan,
+            20,
+            Some(&empty_pass(crate::ArtifactSweepLane::Ran, stuck)),
+            None,
+        )
+        .unwrap();
+        write_last_pass(&plan, 30, None, Some("broker open failed")).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.outcome, "error");
+        assert_eq!(
+            receipt.passes_without_reclaim, 2,
+            "a failed pass keeps the run"
+        );
+        assert_eq!(receipt.unreclaimed_since_unix_ms, Some(10));
+
+        let confirming = crate::CheckoutTrashBacklog {
+            confirmed_this_pass: 180,
+            deletable: 200,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        write_last_pass(
+            &plan,
+            40,
+            Some(&empty_pass(crate::ArtifactSweepLane::Ran, confirming)),
+            None,
+        )
+        .unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.passes_without_reclaim, 0);
+        assert_eq!(receipt.unreclaimed_since_unix_ms, None);
+        assert_eq!(receipt.reclaimed_nothing_because, None);
+        assert_eq!(receipt.trash.unwrap().confirmed_this_pass, 180);
+        assert!(fs::metadata(&plan.receipt_path).unwrap().len() <= MAX_RECEIPT_BYTES as u64);
+    }
+
+    fn trash(deletable: usize, oldest: Option<i64>, stale: usize) -> crate::CheckoutTrashBacklog {
+        crate::CheckoutTrashBacklog {
+            recorded: deletable + stale,
+            deletable,
+            pending: stale,
+            stale_pending: stale,
+            oldest_deletable_created_ms: oldest,
+            ..crate::CheckoutTrashBacklog::default()
+        }
+    }
+
+    /// `broker status` speaks only after the threshold of empty passes, for
+    /// a deleter that is not getting through confirmed trash; that cause
+    /// wins over a lane that yielded to the detached worker.
+    #[test]
+    fn status_advice_names_a_stalled_deleter_after_two_hours_of_empty_passes() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let stalled = trash(20, Some(5), 0);
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            assert!(
+                reclaim_advice(&plan.home, &plan.repository_uuid).is_none(),
+                "no advice before the threshold (pass {pass})"
+            );
+            write_last_pass(
+                &plan,
+                100 + pass,
+                Some(&empty_pass(crate::ArtifactSweepLane::GcLockHeld, stalled)),
+                None,
+            )
+            .unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_not_draining")
+        );
+        assert_eq!(receipt.trash_entries_drained, Some(0));
+        let advice = reclaim_advice(&plan.home, &plan.repository_uuid).expect("advice");
+        assert_eq!(advice.id, "storage.gc-service-reclaiming-nothing");
+        assert_eq!(advice.commands[0], "aethyme broker gc trash drain --json");
+    }
+
+    /// Trash rows the proofs keep (identity changed, session in use) are
+    /// never advised, and do not hide the lane that actually blocked.
+    #[test]
+    fn rows_the_proofs_keep_are_explained_but_never_advised() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let kept = trash(0, None, 30);
+        write_last_pass(
+            &plan,
+            1,
+            Some(&empty_pass(crate::ArtifactSweepLane::GcLockHeld, kept)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .reclaimed_nothing_because
+                .as_deref(),
+            Some("artifact_lane_yielded_to_worker")
+        );
+        let mut finished = empty_pass(crate::ArtifactSweepLane::Ran, kept);
+        finished.complete = true;
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            write_last_pass(&plan, 2 + pass, Some(&finished), None).unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert!(receipt.passes_without_reclaim > UNRECLAIMED_PASSES_ADVICE_THRESHOLD);
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_entries_kept_by_proofs")
+        );
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
+    }
+
+    /// While the paced deleter works through the backlog (fewer deletable
+    /// entries, or the oldest one moving forward), passes count as
+    /// reclaiming and nothing says the deleter is stalled.
+    #[test]
+    fn a_shrinking_backlog_counts_as_reclaim() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let mut deletable = 200;
+        write_last_pass(
+            &plan,
+            1,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                trash(deletable, Some(10), 0),
+            )),
+            None,
+        )
+        .unwrap();
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            deletable -= 10;
+            write_last_pass(
+                &plan,
+                2 + pass,
+                Some(&empty_pass(
+                    crate::ArtifactSweepLane::GcLockHeld,
+                    trash(deletable, Some(10), 0),
+                )),
+                None,
+            )
+            .unwrap();
+            let receipt = read_last_pass(&plan).unwrap().unwrap();
+            assert_eq!(receipt.passes_without_reclaim, 0, "pass {pass}");
+            assert_eq!(receipt.trash_entries_drained, Some(10));
+            assert_eq!(receipt.reclaimed_nothing_because, None);
+        }
+        // Same count, but the oldest entry moved forward: still draining.
+        write_last_pass(
+            &plan,
+            50,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                trash(deletable, Some(11), 0),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .passes_without_reclaim,
+            0
+        );
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
+    }
+
+    /// A receipt an older binary wrote, without the per-lane fields, still
+    /// reads.
+    #[test]
+    fn receipts_without_per_lane_fields_still_read() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let old = json!({
+            "schema": RECEIPT_SCHEMA,
+            "repository_uuid": plan.repository_uuid,
+            "generation": plan.generation,
+            "started_at_unix_ms": 1,
+            "finished_at_unix_ms": 2,
+            "outcome": "sweep_paused",
+            "directories_reclaimed": 0,
+            "budget_ms": 5000,
+            "disk_pressured": false,
+            "legacy_unscoped_state": "unknown_pending",
+            "error": null
+        });
+        fs::write(&plan.receipt_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(&plan.receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.passes_without_reclaim, 0);
+        assert!(receipt.trash.is_none());
+        write_last_pass(
+            &plan,
+            3,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                crate::CheckoutTrashBacklog::default(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .passes_without_reclaim,
+            1
+        );
     }
 
     use crate::scheduled_service::launchd::LabelState;
@@ -2931,12 +4388,11 @@ mod tests {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
         let runtime = newer_runtime(&plan);
-        let selected = [std::ffi::OsString::from("v0.8.51-test")];
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            std::ffi::OsStr::new("v0.8.51-test"),
             || Ok(runtime.clone()),
             |_, _| Ok(LabelState::Unknown),
             |_| panic!("nothing is run without launchd's answer"),
@@ -2955,18 +4411,15 @@ mod tests {
     }
 
     #[test]
-    fn update_refresh_skips_services_whose_bundle_stays() {
+    fn update_refresh_skips_services_bound_to_the_bundle_it_selected() {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
-        let selected = [
-            std::ffi::OsString::from("v0.8.51-test"),
-            std::ffi::OsString::from("v0.8.50-test"),
-        ];
+        // Reinstalling the bundle the service already runs: nothing to do.
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            std::ffi::OsStr::new("v0.8.50-test"),
             || panic!("no runtime is resolved when no service needs it"),
             |_, _| panic!("launchd is not asked"),
             |_| panic!("launchctl is not run"),
@@ -2978,7 +4431,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.home.join("other-install/.aethyme-managed"),
-            &[],
+            std::ffi::OsStr::new("v0.8.51-test"),
             || panic!("no runtime is resolved for another installation"),
             |_, _| panic!("launchd is not asked"),
             |_| panic!("launchctl is not run"),
@@ -2991,14 +4444,14 @@ mod tests {
     fn a_refresh_failure_is_reported_and_never_fails_the_update() {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
-        let selected = [std::ffi::OsString::from("v0.8.51-test")];
+        let active = std::ffi::OsStr::new("v0.8.51-test");
         // The new pair cannot be verified and launchd says the job is loaded:
         // nothing changes, the error is reported, the old bundle is kept.
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Err(io::Error::other("new runtime pair is not verifiable")),
             |_, _| Ok(LabelState::Loaded),
             |_| panic!("launchctl is not run when the refresh failed"),
@@ -3021,7 +4474,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Err(io::Error::other("new runtime pair is not verifiable")),
             |_, _| Ok(LabelState::NotLoaded),
             |_| panic!("launchctl is not run"),
@@ -3034,7 +4487,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Ok(runtime.clone()),
             |_, _| Err(io::Error::other("launchctl unavailable")),
             |_| panic!("launchctl is not run"),
@@ -3060,7 +4513,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &[std::ffi::OsString::from("v0.8.51-test")],
+            std::ffi::OsStr::new("v0.8.51-test"),
             || Ok(runtime.clone()),
             |_, _| panic!("launchd is not asked without the claim"),
             |_| panic!("launchctl is not run without the claim"),
@@ -3319,7 +4772,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &[std::ffi::OsString::from("v0.8.51-test")],
+            std::ffi::OsStr::new("v0.8.51-test"),
             std::time::Instant::now(),
             || panic!("no runtime is resolved past the budget"),
             |_, _| panic!("launchd is not asked past the budget"),
@@ -3383,20 +4836,34 @@ mod tests {
         fs::remove_file(plan.directory.join("plan.json")).unwrap();
         fs::remove_file(&plan.unit_path).unwrap();
         install_fixture(&stale_plan);
+        select_current(&plan, "v0.8.51-test");
         automatic_refresh_proof(
             &plan.home,
             &plan.repository_uuid,
             &plan.repository_uuid,
             &plan.repository,
+            &runtime.router,
         )
         .unwrap();
+        // Only the current selection may rebind it by itself.
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("running_runtime_is_not_the_current_selection")
+        );
         // Another repository's marker, or another repository: advice only.
         assert!(
             automatic_refresh_proof(
                 &plan.home,
                 &plan.repository_uuid,
                 "00000000-0000-4000-8000-000000000000",
-                &plan.repository
+                &plan.repository,
+                &runtime.router,
             )
             .is_err()
         );
@@ -3405,7 +4872,8 @@ mod tests {
                 &plan.home,
                 &plan.repository_uuid,
                 &plan.repository_uuid,
-                &missing
+                &missing,
+                &runtime.router,
             )
             .is_err()
         );
@@ -3425,7 +4893,8 @@ mod tests {
                 &plan.home,
                 &plan.repository_uuid,
                 &plan.repository_uuid,
-                &plan.repository
+                &plan.repository,
+                &runtime.router,
             ),
             Err("recorded_plan_or_unit_not_verified")
         );
@@ -3443,6 +4912,683 @@ mod tests {
             b"<plist>edited</plist>"
         );
         assert!(archived_plans(&plan).is_empty());
+    }
+
+    /// Point the fixture installation's `current` selector at `bundle`.
+    fn select_current(plan: &Plan, bundle: &str) {
+        let link = plan.managed_root.join("current");
+        match fs::symlink_metadata(&link) {
+            Ok(_) => fs::remove_file(&link).unwrap(),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+        }
+        std::os::unix::fs::symlink(PathBuf::from("versions").join(bundle), &link).unwrap();
+    }
+
+    #[test]
+    fn update_refresh_rebinds_a_service_bound_to_the_bundle_kept_as_previous() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let fresh = refreshed_plan(&plan, &runtime);
+        // The update selected v0.8.51 as `current` and kept v0.8.50 as
+        // `previous`: the bundle stays, but ticks refuse a runtime that is
+        // not the current selection, so the service is rebound now.
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            std::ffi::OsStr::new("v0.8.51-test"),
+            || Ok(runtime.clone()),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].outcome, "refreshed_not_loaded");
+        assert!(report.protected_bundles.is_empty());
+        assert_eq!(
+            fs::read(plan.directory.join("plan.json")).unwrap(),
+            serde_json::to_vec(&fresh).unwrap()
+        );
+        assert!(
+            plan.router.exists(),
+            "the previous bundle itself is untouched"
+        );
+    }
+
+    #[test]
+    fn update_refresh_candidates_are_every_other_or_missing_bundle() {
+        let a = std::ffi::OsStr::new("v0.8.51-a");
+        let b = std::ffi::OsStr::new("v0.8.50-b");
+        assert!(!needs_update_refresh(a, a, true));
+        assert!(needs_update_refresh(a, a, false));
+        assert!(needs_update_refresh(b, a, true));
+        assert!(needs_update_refresh(b, a, false));
+    }
+
+    #[test]
+    fn runtime_binding_follows_the_current_selector() {
+        let (_temp, plan) = fixture();
+        // No selector: nothing is proven either way.
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Unknown
+        );
+        select_current(&plan, "v0.8.50-test");
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Current
+        );
+        assert!(running_is_current_selection(
+            &plan.router,
+            &plan.managed_root
+        ));
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Stale
+        );
+        assert!(!running_is_current_selection(
+            &plan.router,
+            &plan.managed_root
+        ));
+        assert!(running_is_current_selection(
+            &runtime.router,
+            &plan.managed_root
+        ));
+        fs::remove_file(&plan.router).unwrap();
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Gone
+        );
+        assert!(RuntimeBinding::Gone.needs_refresh());
+        assert!(RuntimeBinding::Stale.needs_refresh());
+        assert!(!RuntimeBinding::Current.needs_refresh());
+        assert!(!RuntimeBinding::Unknown.needs_refresh());
+    }
+
+    #[test]
+    fn a_stale_binding_is_advised_and_refreshed_only_from_the_current_runtime() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.50-test");
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("recorded_runtime_current")
+        );
+        // The update selected a newer pair; the bound one stays installed.
+        select_current(&plan, "v0.8.51-test");
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-runtime-stale");
+        assert_eq!(advice.commands[0], REFRESH_COMMAND);
+        assert!(advice.evidence[0].contains("0.8.50"));
+        automatic_refresh_proof(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+            &runtime.router,
+        )
+        .unwrap();
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("running_runtime_is_not_the_current_selection")
+        );
+        // `gc service status` names the refresh until it lands.
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Unknown)
+        })
+        .unwrap();
+        assert_eq!(status["runtime_binding"], "stale");
+        assert_eq!(status["next_action"], REFRESH_COMMAND);
+        // An unknown launchd answer changes nothing and the advice stays.
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Unknown),
+            |_| panic!("nothing is run without launchd's answer"),
+        );
+        assert_eq!(outcome.outcome, "label_state_unknown");
+        assert_unchanged(&plan);
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_some());
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Loaded),
+            |_| Ok(Observation::Success),
+        );
+        assert_eq!(outcome.outcome, "refreshed_and_reloaded");
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        let fresh = refreshed_plan(&plan, &runtime);
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["plan_digest"], fresh.digest);
+        assert_eq!(status["runtime_binding"], "current");
+    }
+
+    #[test]
+    fn refusing_ticks_are_advised_until_a_pass_finishes() {
+        assert!(tick_refusing(Some(2), Some(1)));
+        assert!(tick_refusing(Some(2), None));
+        assert!(!tick_refusing(Some(1), Some(1)));
+        assert!(!tick_refusing(Some(1), Some(2)));
+        assert!(!tick_refusing(None, Some(2)));
+        assert!(!tick_refusing(None, None));
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_private(
+            &plan.directory.join("last-error.json"),
+            &serde_json::to_vec(&json!({
+                "schema": ERROR_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "observed_at_unix_ms": 2_000,
+                "error": "managed GC tick preflight refused: fixture",
+            }))
+            .unwrap(),
+        );
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-ticks-refusing");
+        assert_eq!(advice.commands[0], REFRESH_COMMAND);
+        assert!(advice.evidence.iter().any(|line| line.contains("fixture")));
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["next_action"], REFRESH_COMMAND);
+        // A pass that finished after the error clears it.
+        write_private(
+            &plan.receipt_path,
+            &serde_json::to_vec(&json!({
+                "schema": RECEIPT_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "started_at_unix_ms": 2_500,
+                "finished_at_unix_ms": 3_000,
+                "outcome": "sweep_complete",
+                "directories_reclaimed": 0,
+                "budget_ms": 1,
+                "disk_pressured": false,
+                "legacy_unscoped_state": "clear",
+                "error": null,
+            }))
+            .unwrap(),
+        );
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    #[test]
+    fn status_starts_one_background_refresh_with_backoff_from_the_current_runtime() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let record = || read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let never = |_: &Path| -> io::Result<()> { panic!("no refresh is started") };
+        let router = || Some(runtime.router.clone());
+        // No selector, or a current binding: nothing, and the running
+        // executable is not even asked for.
+        let unasked = || -> Option<PathBuf> { panic!("current_exe is not needed") };
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
+            None
+        );
+        select_current(&plan, "v0.8.50-test");
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
+            None
+        );
+        select_current(&plan, "v0.8.51-test");
+        // Stale, but the caller is not the current runtime: nothing.
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, || Some(plan.router.clone()), 1, never),
+            None
+        );
+        // Another caller holding the claim decides: this one starts nothing.
+        let now = 10_000_000;
+        {
+            let _held = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)
+                .unwrap();
+            assert_eq!(
+                schedule_refresh_with(&record(), plan.uid, router, now, never),
+                Some(ScheduledRefresh::Contended)
+            );
+        }
+        let mut started = Vec::new();
+        let scheduled = schedule_refresh_with(&record(), plan.uid, router, now, |running| {
+            started.push(running.to_path_buf());
+            Ok(())
+        });
+        assert_eq!(scheduled, Some(ScheduledRefresh::Started));
+        assert_eq!(started, vec![runtime.router.clone()]);
+        let receipt =
+            read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["observed_at_unix_ms"], now);
+        assert_eq!(receipt["attempts"], 1);
+        assert_eq!(receipt["current_bundle"], "v0.8.51-test");
+        // The callers that lost the race see the receipt under the claim.
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, now + 1, never),
+            Some(ScheduledRefresh::BackingOff)
+        );
+        // The first attempt left it stale: the second waits 15 minutes, the
+        // third 30.
+        let interval = SERVICE_INTERVAL_SECONDS * 1000;
+        let ok = |_: &Path| -> io::Result<()> { Ok(()) };
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, now + interval - 1, never),
+            Some(ScheduledRefresh::BackingOff)
+        );
+        let second = now + interval;
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, second, ok),
+            Some(ScheduledRefresh::Started)
+        );
+        assert_eq!(
+            schedule_refresh_with(
+                &record(),
+                plan.uid,
+                router,
+                second + 2 * interval - 1,
+                never
+            ),
+            Some(ScheduledRefresh::BackingOff)
+        );
+        let third = second + 2 * interval;
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, third, ok),
+            Some(ScheduledRefresh::Started)
+        );
+        let receipt =
+            read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["attempts"], 3);
+        // A new current bundle resets the backoff.
+        let newest = plan.managed_root.join("versions/v0.8.52-test");
+        fs::create_dir_all(&newest).unwrap();
+        fs::write(newest.join("aethyme"), b"newest router fixture").unwrap();
+        select_current(&plan, "v0.8.52-test");
+        let newest_router = || Some(newest.join("aethyme"));
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, newest_router, third + 1, |_| Err(
+                io::Error::other("spawn refused")
+            )),
+            Some(ScheduledRefresh::StartFailed)
+        );
+        let receipt =
+            read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["attempts"], 1);
+        assert_eq!(receipt["current_bundle"], "v0.8.52-test");
+        for outcome in [
+            ScheduledRefresh::Started,
+            ScheduledRefresh::BackingOff,
+            ScheduledRefresh::Contended,
+            ScheduledRefresh::ReceiptUnwritable,
+            ScheduledRefresh::StartFailed,
+        ] {
+            assert!(!outcome.describe().is_empty());
+        }
+        assert_unchanged(&plan);
+    }
+
+    #[test]
+    fn scheduled_refresh_backoff_doubles_to_six_hours() {
+        let interval = SERVICE_INTERVAL_SECONDS * 1000;
+        assert_eq!(scheduled_refresh_backoff_ms(0), interval);
+        assert_eq!(scheduled_refresh_backoff_ms(1), 2 * interval);
+        assert_eq!(scheduled_refresh_backoff_ms(4), 16 * interval);
+        assert_eq!(
+            scheduled_refresh_backoff_ms(5),
+            SCHEDULED_REFRESH_MAX_BACKOFF_MS
+        );
+        assert_eq!(
+            scheduled_refresh_backoff_ms(u64::MAX),
+            SCHEDULED_REFRESH_MAX_BACKOFF_MS
+        );
+    }
+
+    #[test]
+    fn plan_replaced_during_a_failed_open_records_no_foreign_pass() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        // The tick released its claim for the open; a refresh published a
+        // new generation meanwhile; then the open failed.
+        let runtime = newer_runtime(&plan);
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(outcome.outcome, "refreshed_not_loaded");
+        let claim = record_open_failure_with(&plan, 1, "broker open failed: fixture", || {
+            reverify_claim(&plan, &bytes, Duration::ZERO, |_| Ok(()))
+        })
+        .unwrap();
+        assert!(claim.is_none());
+        assert!(
+            !plan.receipt_path.exists(),
+            "no last pass of the old generation"
+        );
+        let error = read_bounded_json(&plan.directory.join("last-error.json"), plan.uid).unwrap();
+        assert!(error["error"].as_str().unwrap().contains("plan changed"));
+        let fresh = refreshed_plan(&plan, &runtime);
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["plan_digest"], fresh.digest);
+        // Unchanged plan: recorded as this generation's pass, claim held.
+        let fresh_bytes = serde_json::to_vec(&fresh).unwrap();
+        let claim = record_open_failure_with(&fresh, 1, "broker open failed: fixture", || {
+            reverify_claim(&fresh, &fresh_bytes, Duration::ZERO, |_| Ok(()))
+        })
+        .unwrap();
+        assert!(claim.is_some());
+        assert_eq!(read_last_pass(&fresh).unwrap().unwrap().outcome, "error");
+    }
+
+    #[test]
+    fn another_generations_last_pass_reads_as_none_and_is_overwritten() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let mut other = plan.clone();
+        other.generation = "f".repeat(64);
+        write_last_pass(&other, 1, None, Some("old generation")).unwrap();
+        assert!(read_last_pass(&plan).unwrap().is_none());
+        control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        write_last_pass(&plan, 2, None, Some("this generation")).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.generation, plan.generation);
+        // Another service's receipt is still refused.
+        let mut foreign = plan.clone();
+        foreign.repository_uuid = "00000000-0000-4000-8000-000000000000".into();
+        assert!(read_last_pass(&foreign).is_err());
+    }
+
+    #[test]
+    fn a_deactivated_service_never_reports_a_blocked_tick() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_tick_started(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            None,
+            4242,
+            None,
+        )
+        .unwrap();
+        write_control(
+            &plan,
+            &ControlReceipt {
+                schema: CONTROL_SCHEMA.to_string(),
+                plan_digest: plan.digest.clone(),
+                generation: plan.generation.clone(),
+                action: "deactivate".to_string(),
+                scheduler_state: "unloaded".to_string(),
+                operation_result: "acknowledged".to_string(),
+                observed_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let later = now_unix_ms().unwrap() + TICK_BLOCKED_AFTER_MS + 60_000;
+        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Alive).is_none());
+        // A pid that cannot be signalled, with no native listing here, is
+        // unverified: never blocked, never ended.
+        assert_eq!(tick_process(0, Some(1)), TickProcess::Unverified);
+    }
+
+    #[test]
+    fn a_tick_that_never_answers_is_reported_as_blocked() {
+        let interval = TICK_BLOCKED_AFTER_MS;
+        assert!(tick_unanswered(10, None, None, 10 + interval));
+        assert!(!tick_unanswered(10, None, None, 10 + interval - 1));
+        assert!(!tick_unanswered(10, Some(10), None, 10 + interval));
+        assert!(!tick_unanswered(10, None, Some(11), 10 + interval));
+        assert!(tick_unanswered(10, Some(9), Some(9), 10 + interval));
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        // The uuid comes from the environment: it must name an installed namespace.
+        assert!(write_tick_started(&plan.home, "../escape", plan.uid, None, 1, None).is_err());
+        let other = "00000000-0000-4000-8000-000000000000";
+        assert!(write_tick_started(&plan.home, other, plan.uid, None, 1, None).is_err());
+        assert!(!expected_directory(&plan.home, other).exists());
+        write_tick_started(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Some(&plan.generation),
+            4242,
+            Some(77_000),
+        )
+        .unwrap();
+        let receipt =
+            read_bounded_json(&plan.directory.join(TICK_STARTED_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["schema"], STARTED_SCHEMA);
+        assert_eq!(receipt["pid"], 4242);
+        let started = receipt["started_at_unix_ms"].as_u64().unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        // Young, it is a running tick: nothing to say.
+        assert!(
+            blocked_tick_advice(&record, plan.uid, started + 1, |_, _| TickProcess::Alive)
+                .is_none()
+        );
+        let later = started + interval + 60_000;
+        let advice = blocked_tick_advice(&record, plan.uid, later, |pid, process_started| {
+            assert_eq!(process_started, Some(77_000));
+            assert_eq!(pid, 4242);
+            TickProcess::Alive
+        })
+        .unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-blocked");
+        assert!(advice.reason.contains("privacy consent"));
+        assert!(
+            advice
+                .evidence
+                .iter()
+                .any(|line| line.contains("Privacy & Security"))
+        );
+        // A process known to be gone is not blocked, and not advised.
+        assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Gone).is_none());
+        let ended =
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Gone).unwrap();
+        assert_eq!(ended.describe(later)["state"], "tick_ended_without_receipt");
+        assert!(ended.describe(later)["person_action"].is_null());
+        let blocked =
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Alive).unwrap();
+        let described = blocked.describe(later);
+        assert_eq!(described["state"], "tick_blocked");
+        assert_eq!(
+            described["minutes_since_start"],
+            (interval + 60_000) / 60_000
+        );
+        assert_eq!(described["person_action"], TICK_BLOCKED_ACTION);
+        // An error written after the start answers it.
+        write_private(
+            &plan.directory.join("last-error.json"),
+            &serde_json::to_vec(&json!({
+                "schema": ERROR_SCHEMA,
+                "observed_at_unix_ms": started + 5,
+                "error": "fixture",
+            }))
+            .unwrap(),
+        );
+        assert!(
+            unanswered_tick(&plan.directory, plan.uid, later, |_, _| TickProcess::Alive).is_none()
+        );
+        // This process exists; a pid that cannot exist does not.
+        assert_eq!(signal_probe(std::process::id()), SignalAnswer::Exists);
+        assert_eq!(signal_probe(0), SignalAnswer::Unanswered);
+        assert_eq!(signal_probe(u32::MAX), SignalAnswer::Unanswered);
+        assert_eq!(
+            signal_probe(u32::try_from(i32::MAX).unwrap()),
+            SignalAnswer::NoSuchProcess
+        );
+    }
+
+    #[test]
+    fn status_reports_a_blocked_tick_and_a_refresh_archives_its_receipt() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let long_ago = now_unix_ms().unwrap() - TICK_BLOCKED_AFTER_MS - 120_000;
+        write_private(
+            &plan.directory.join(TICK_STARTED_RECEIPT),
+            &serde_json::to_vec(&json!({
+                "schema": STARTED_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "pid": std::process::id(),
+                "started_at_unix_ms": long_ago,
+            }))
+            .unwrap(),
+        );
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["unanswered_tick"]["state"], "tick_blocked");
+        assert_eq!(status["tick_started"]["started_at_unix_ms"], long_ago);
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-blocked");
+        // A refresh archives the started receipt with the other receipts.
+        let runtime = newer_runtime(&plan);
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(outcome.outcome, "refreshed_not_loaded");
+        assert!(!plan.directory.join(TICK_STARTED_RECEIPT).exists());
+        assert!(
+            outcome
+                .archived_to
+                .unwrap()
+                .join(TICK_STARTED_RECEIPT)
+                .is_file()
+        );
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    #[test]
+    fn an_unanswered_signal_lets_the_native_table_decide_or_reports_unverified() {
+        use SignalAnswer::*;
+        let never = |_: i64| -> Option<bool> { panic!("the table is not needed") };
+        assert_eq!(
+            decide_tick_process(NoSuchProcess, Some(1), never),
+            TickProcess::Gone
+        );
+        // EPERM: the table decides.
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| Some(false)),
+            TickProcess::Alive
+        );
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| Some(true)),
+            TickProcess::Gone
+        );
+        // Neither can answer: unverified, never blocked or ended.
+        assert_eq!(
+            decide_tick_process(Unanswered, Some(1), |_| None),
+            TickProcess::Unverified
+        );
+        assert_eq!(
+            decide_tick_process(Unanswered, None, never),
+            TickProcess::Unverified
+        );
+        // The pid exists: a reused pid is caught by the table, else alive.
+        assert_eq!(
+            decide_tick_process(Exists, Some(1), |_| Some(true)),
+            TickProcess::Gone
+        );
+        assert_eq!(
+            decide_tick_process(Exists, Some(1), |_| None),
+            TickProcess::Alive
+        );
+        assert_eq!(decide_tick_process(Exists, None, never), TickProcess::Alive);
+        // The native-only listing never falls back to a child: off macOS it
+        // has no source at all.
+        #[cfg(not(target_os = "macos"))]
+        assert!(crate::session_holder::ProcessTable::observe_native().is_none());
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_tick_started(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            None,
+            4242,
+            Some(1),
+        )
+        .unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let later = now_unix_ms().unwrap() + TICK_BLOCKED_AFTER_MS + 60_000;
+        let advice =
+            blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Unverified).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-unverified");
+        assert!(advice.reason.contains("could not be checked"));
+        let tick = unanswered_tick(&plan.directory, plan.uid, later, |_, _| {
+            TickProcess::Unverified
+        })
+        .unwrap();
+        let described = tick.describe(later);
+        assert_eq!(described["state"], "tick_unverified");
+        assert_eq!(described["process"], "unverified");
+        assert_eq!(described["person_action"], TICK_UNVERIFIED_ACTION);
+    }
+
+    #[test]
+    fn a_scheduled_refresh_receipt_from_the_future_has_expired() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        let record = || read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let router = || Some(runtime.router.clone());
+        let now = 10_000_000;
+        for name in [SCHEDULED_REFRESH_RECEIPT, "last-refresh.json"] {
+            write_private(
+                &plan.directory.join(name),
+                &serde_json::to_vec(&json!({
+                    "observed_at_unix_ms": now + 3_600_000,
+                    "current_bundle": "v0.8.51-test",
+                    "attempts": 1,
+                }))
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            schedule_refresh_with(&record(), plan.uid, router, now, |_| Ok(())),
+            Some(ScheduledRefresh::Started)
+        );
     }
 
     #[test]

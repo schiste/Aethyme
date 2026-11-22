@@ -1,5 +1,9 @@
 use super::*;
 
+/// Session ids bound into one [`BrokerStore::session_statuses`] query: well
+/// under SQLite's smallest host-parameter limit (999).
+const SESSION_STATUS_CHUNK: usize = 500;
+
 /// One live session's own live lease paths (none unless the session is live).
 const SESSION_OWN_LIVE_LEASE_PATHS_SQL: &str = "SELECT DISTINCT mine.path
      FROM leases mine JOIN sessions own_session ON own_session.id = mine.session_id
@@ -158,6 +162,20 @@ fn session_abandonment_snapshot_matches(expected: &Session, current: &Session) -
 }
 
 impl BrokerStore {
+    /// Whether this store cannot write: a read-only snapshot (opened
+    /// read-only or `query_only`). An unreadable answer counts as read-only,
+    /// so a caller skips its write rather than attempt it.
+    pub(crate) fn is_read_only(&self) -> bool {
+        !matches!(
+            self.conn
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0)),
+            Ok(0)
+        ) || self
+            .conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(true)
+    }
+
     /// A controller may outlive a compatible open and then wait behind an
     /// upgrade. Re-read compatibility before changing checkout ownership.
     pub(crate) fn require_live_schema_compatible(&self) -> Result<(), BrokerError> {
@@ -662,6 +680,42 @@ impl BrokerStore {
             )
             .optional()?
             .ok_or(BrokerError::SessionNotFound(id))?
+    }
+
+    /// The status of every session among `ids`, as [`Self::session`] reports
+    /// it (a closed or cleaned cleanup state wins over the stored status), in
+    /// one query per `SESSION_STATUS_CHUNK` ids instead of one per session.
+    /// An id that names no session is absent from the map. Any row that does
+    /// not parse fails the whole read, so a caller that falls back to
+    /// [`Self::session`] per id sees exactly the per-id answers.
+    pub(crate) fn session_statuses(
+        &self,
+        ids: &[i64],
+    ) -> Result<BTreeMap<i64, SessionStatus>, BrokerError> {
+        let mut statuses = BTreeMap::new();
+        for chunk in ids.chunks(SESSION_STATUS_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, status, cleanup_state FROM sessions WHERE id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, stored_status, cleanup_state) = row?;
+                let status = match SessionCleanupState::parse(&cleanup_state)? {
+                    SessionCleanupState::Closed => SessionStatus::Closed,
+                    SessionCleanupState::Cleaned => SessionStatus::Cleaned,
+                    SessionCleanupState::Open => SessionStatus::parse(&stored_status)?,
+                };
+                statuses.insert(id, status);
+            }
+        }
+        Ok(statuses)
     }
 
     /// The non-cleaned session registered for exactly this worktree

@@ -1677,7 +1677,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     #[cfg(target_os = "macos")]
-    let managed_tick = {
+    let mut managed_tick = {
         if action != "sweep" && crate::gc_sweep_service::managed_tick_requested() {
             return Err(UsageError::Message(
                 "managed GC service markers are valid only for the fixed `gc sweep --json` tick"
@@ -1725,21 +1725,37 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     // journal-recovery commands must operate on the pending journal before
     // any startup maintenance can consume it, so use its read-only DB snapshot
     // while the command itself takes the repository GC lock for file changes.
+    // The open validates the worktree root on the pool volume and can block
+    // there (a privacy consent nobody answers from a launchd job): a managed
+    // tick holds no installer claim across it, so refresh, install and
+    // control stay usable, and takes the claim back before sweeping.
+    #[cfg(target_os = "macos")]
+    if let Some(tick) = managed_tick.as_mut() {
+        tick.release_claim();
+    }
     let broker_result = if matches!(action, "abandon" | "forget-abandoned") {
         open_broker(true)
     } else {
         open_broker(parsed.read_only_snapshot)
     };
+    // A generation changed meanwhile gets `last-error.json` (generation-free),
+    // never a last-pass receipt bound to the plan it no longer is.
+    #[cfg(target_os = "macos")]
+    if let (Ok(_), Some(tick)) = (&broker_result, managed_tick.as_mut())
+        && let Err(error) = tick.reclaim()
+    {
+        let message = format!("managed GC tick refused after the broker opened: {error}");
+        crate::gc_sweep_service::record_tick_failure(&message);
+        return Err(UsageError::Message(message));
+    }
     let mut broker = match broker_result {
         Ok(broker) => broker,
         Err(error) => {
+            // The claim was released for the open: record under it again, or
+            // generation-free when the plan changed meanwhile.
             #[cfg(target_os = "macos")]
-            if let Some(tick) = managed_tick.as_ref() {
-                crate::gc_sweep_service::record_managed_tick(
-                    tick,
-                    None,
-                    Some(&format!("broker open failed: {error:?}")),
-                )?;
+            if let Some(tick) = managed_tick.as_mut() {
+                tick.record_open_failure(&format!("broker open failed: {error:?}"))?;
             }
             return Err(error);
         }
@@ -1959,7 +1975,22 @@ fn gc_trash_drain(
     let unlinks: usize = laps.iter().map(|lap| lap.unlinks).sum();
     let rows = broker.checkout_trash_rows();
     let remaining = crate::checkout_trash::TrashBacklog::of(&rows);
+    // Entries kept because they exist with another identity than recorded:
+    // never deleted, not part of `entries_remaining`'s deletable share.
+    let identity_changed = broker.checkout_trash_identity_changed();
+    let mut identity_changed_by_cause = std::collections::BTreeMap::<&str, usize>::new();
+    for (_, _, cause) in &identity_changed {
+        *identity_changed_by_cause.entry(cause.as_str()).or_default() += 1;
+    }
+    // Rows rebound to their trash's new device number after a remount, and
+    // rows refused a rebind by cause, over every lap.
+    let mut rebind = crate::checkout_trash::RebindTally::default();
+    for lap in &laps {
+        rebind.merge(&lap.rebind);
+    }
     Ok(serde_json::json!({
+        "rebound": rebind.rebound,
+        "rebind_refused": rebind.refused,
         "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
         "laps": laps.len(),
         "slices": laps.iter().map(|lap| u64::from(lap.slices)).sum::<u64>(),
@@ -1973,6 +2004,14 @@ fn gc_trash_drain(
             0
         },
         "entries_remaining": rows.values().map(std::collections::BTreeMap::len).sum::<usize>(),
+        "entries_deletable_remaining": remaining.entries,
+        "identity_changed": identity_changed.len(),
+        "identity_changed_by_cause": identity_changed_by_cause,
+        "identity_changed_entries": identity_changed
+            .iter()
+            .take(20)
+            .map(|(_, name, cause)| serde_json::json!({"entry": name, "cause": cause.as_str()}))
+            .collect::<Vec<_>>(),
         "io_policy": crate::gc::current_io_policy(),
         "oldest_remaining_age_hours": remaining
             .oldest_age_ms(crate::clock::epoch_ms())
@@ -2637,6 +2676,9 @@ fn preflight_managed_gc_tick(
             "managed GC service accepts only the fixed `broker gc sweep --json` invocation".into(),
         ));
     }
+    // Before the first access to the repository or its pool volumes, so a
+    // tick that blocks there is reported instead of silent.
+    crate::gc_sweep_service::record_tick_started();
     let preflight = (|| -> Result<Option<crate::gc_sweep_service::ManagedTick>, UsageError> {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
@@ -2808,6 +2850,32 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
         }
     );
     out!("  scope: {} at {}", report.scope, report.at_ms);
+    if report.artifact_lane != crate::ArtifactSweepLane::Ran {
+        out!(
+            "  artifact cache lane did not run: {}",
+            report.artifact_lane.as_str()
+        );
+    }
+    let trash = &report.checkout_trash;
+    if trash.recorded > 0 || trash.confirmed_this_pass > 0 {
+        out!(
+            "  checkout trash: {} recorded, {} deletable by the paced deleter, {} unconfirmed ({} stale); {} confirmed by this sweep; {} kept with a changed identity (never deleted)",
+            trash.recorded,
+            trash.deletable,
+            trash.pending,
+            trash.stale_pending,
+            trash.confirmed_this_pass,
+            trash.identity_changed
+        );
+    }
+    if trash.rebound_this_pass > 0 || trash.rebind_refused_this_pass > 0 {
+        out!(
+            "  checkout trash after a remount: {} entr(y/ies) rebound to the volume's new device number (deleted later with the usual checks); {} refused (each failed its own proof; `rebind_refused` counters name why); {} trash(es) whose rebound rows spanned more than one old device",
+            trash.rebound_this_pass,
+            trash.rebind_refused_this_pass,
+            trash.rebind_proven_old_devices_mixed_this_pass
+        );
+    }
     out!(
         "  logical file bytes observed during traversal for later-unlinked entries: {} (sizes can change before unlink; physical space recovered is not measured)",
         human_bytes(report.observed_logical_file_bytes)

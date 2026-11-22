@@ -1345,6 +1345,130 @@ impl ArtifactSweepOutcome {
     }
 }
 
+/// What the artifact cache lane of one sweep pass did: it ran, or why it
+/// returned without inspecting the namespace. A pass that reclaimed nothing
+/// says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSweepLane {
+    /// The lane inspected the namespace (it may still have stopped at its
+    /// budget: see `complete`).
+    Ran,
+    /// Another GC owned the repository's GC lock, normally the detached
+    /// worker running this same lane with its own, larger budget.
+    GcLockHeld,
+    /// `artifact_sweep_budget_ms = 0` disables the lane.
+    Disabled,
+    /// Strict cleanup pauses the lane (whole-checkout cleanup may still run).
+    PausedByStrictCleanup,
+    /// An inline pass inside its cadence window.
+    Spaced,
+}
+
+impl ArtifactSweepLane {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::GcLockHeld => "gc_lock_held",
+            Self::Disabled => "disabled",
+            Self::PausedByStrictCleanup => "paused_by_strict_cleanup",
+            Self::Spaced => "spaced",
+        }
+    }
+}
+
+thread_local! {
+    /// The lane outcome of this thread's last artifact sweep pass, read by
+    /// the explicit sweep right after its own pass on the same thread.
+    static LAST_ARTIFACT_SWEEP_LANE: std::cell::Cell<ArtifactSweepLane> =
+        const { std::cell::Cell::new(ArtifactSweepLane::Ran) };
+}
+
+fn note_artifact_sweep_lane(lane: ArtifactSweepLane) {
+    LAST_ARTIFACT_SWEEP_LANE.with(|cell| cell.set(lane));
+}
+
+fn last_artifact_sweep_lane() -> ArtifactSweepLane {
+    LAST_ARTIFACT_SWEEP_LANE.with(std::cell::Cell::get)
+}
+
+/// The checkout trash this repository recorded, as one sweep pass found it:
+/// how much the paced host deleter can work on, how much still waits for a
+/// confirmation, and how many entries the pass confirmed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CheckoutTrashBacklog {
+    /// Entries recorded in the trash.
+    pub recorded: usize,
+    /// Confirmed entries the paced deleter can delete now.
+    pub deletable: usize,
+    /// Entries still unconfirmed: their mover is not proven gone (a pending
+    /// entry held with a changed identity counts in `identity_changed`).
+    pub pending: usize,
+    /// Of `pending`, entries over a day old whose mover's start time was
+    /// unreadable, so no process table can ever prove it gone.
+    pub stale_pending: usize,
+    /// Stale entries this pass confirmed under the explicit-apply proofs.
+    pub confirmed_this_pass: usize,
+    /// When the oldest deletable entry was moved in; it moves forward as the
+    /// paced deleter (which takes the oldest first) drains the trash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_deletable_created_ms: Option<i64>,
+    /// Stale rows dropped by this pass: no entry by that name exists in a
+    /// trash that is present, so nothing was left to delete.
+    pub dropped_missing_this_pass: usize,
+    /// Unconfirmable rows kept by this pass, by why: not a day old yet ...
+    pub kept_too_young: usize,
+    /// ... something else has the entry's name ...
+    pub kept_identity_changed: usize,
+    /// ... an open session uses the path ...
+    pub kept_session_in_use: usize,
+    /// ... or the trash could not be read as recorded (unmounted volume).
+    pub kept_trash_unavailable: usize,
+    /// Confirmed rows dropped by this pass: no entry by that name in a
+    /// trash that is present, private, marked and on the recorded device.
+    pub confirmed_dropped_missing_this_pass: usize,
+    /// Rows this pass rebound to the device their trash is on now after a
+    /// remount (confirmed and pending; a pending row stays pending) ...
+    pub rebound_this_pass: usize,
+    /// ... rows recording another device that failed their own proof ...
+    pub rebind_refused_this_pass: usize,
+    /// ... and trash directories whose proven rows recorded more than one
+    /// old device (several remounts; an observation, each row was still
+    /// rebound on its own proof).
+    pub rebind_proven_old_devices_mixed_this_pass: usize,
+    /// Entries present with another identity than recorded (confirmed ones,
+    /// and pending ones held on another device): never deleted and not
+    /// `deletable`, so they neither keep the trash behind nor count as a
+    /// deleter that is not draining.
+    pub identity_changed: usize,
+    /// Of those, by cause: the recorded inode on another device (the volume
+    /// was mounted again) ...
+    pub identity_changed_device: usize,
+    /// ... another inode ...
+    pub identity_changed_inode: usize,
+    /// ... or not a real directory.
+    pub identity_changed_not_a_directory: usize,
+    /// Confirmed entries out of `deletable` because they failed to delete
+    /// [`crate::checkout_trash::TRASH_FAILURE_REPORT_AFTER`] times.
+    pub failing: usize,
+    /// Confirmed entries out of `deletable` because the last deleter run
+    /// found a process using them.
+    pub in_use: usize,
+}
+
+impl CheckoutTrashBacklog {
+    /// Confirmed entries that are not `deletable` for a reason other than
+    /// their deletion: identity changed, failing or in use. Read by the
+    /// GC service's receipts, which only the macOS service writes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn held_back(&self) -> usize {
+        self.identity_changed
+            .saturating_add(self.failing)
+            .saturating_add(self.in_use)
+    }
+}
+
 /// Result of an explicit `gc sweep`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1376,6 +1500,10 @@ pub struct ArtifactSweepReport {
     /// Whether durable pre-namespace state remains outside this context's
     /// scoped sweep. The legacy values are inspected but never changed.
     pub legacy_unscoped_state: ArtifactSweepLegacyUnscopedState,
+    /// Whether the artifact cache lane ran, or why it did not.
+    pub artifact_lane: ArtifactSweepLane,
+    /// The checkout trash after this pass's confirmations.
+    pub checkout_trash: CheckoutTrashBacklog,
     /// Disposable checkouts removed or kept by this sweep (#588).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
@@ -7541,8 +7669,63 @@ impl Broker {
     /// ones broker open applies; only the budget and the schedule differ.
     pub fn gc_sweep_artifacts(&mut self) -> Result<ArtifactSweepReport, BrokerOpError> {
         let policy = load_retention_policy(self.main_root())?;
+        // An explicit sweep (an operator's, or the scheduled service's tick)
+        // confirms the checkout trash entries no process table can: their
+        // mover's start time was unreadable (a sandboxed command), so the
+        // paced deleter would keep them forever. The proofs are those of
+        // `gc apply`, which applies them whatever plan it is given: the entry
+        // still has its recorded identity, it is over a day old, and no open
+        // session uses its path. Nothing is deleted here; the paced host
+        // deleter removes confirmed entries with its own checks.
+        // A read-only snapshot (`--read-only-snapshot`) writes nothing.
+        let reconcile = if self.store_ref().is_read_only() {
+            crate::broker::StaleTrashReconcile::default()
+        } else {
+            let _span = crate::phase_telemetry::span("gc_sweep_confirm_stale_trash");
+            self.reconcile_stale_pending_trash_rows()
+        };
+        // A rebound confirmed row is deletable again: the paced deleter
+        // takes it with its usual checks.
+        if reconcile.confirmed > 0 || reconcile.rebound > 0 {
+            self.request_checkout_retirement_run();
+        }
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
+        let artifact_lane = last_artifact_sweep_lane();
+        let checkout_trash = CheckoutTrashBacklog {
+            confirmed_this_pass: reconcile.confirmed,
+            dropped_missing_this_pass: reconcile.dropped_missing,
+            kept_too_young: reconcile.too_young,
+            kept_identity_changed: reconcile.identity_changed,
+            kept_session_in_use: reconcile.session_in_use,
+            kept_trash_unavailable: reconcile.trash_unavailable,
+            confirmed_dropped_missing_this_pass: reconcile.confirmed_dropped_missing,
+            rebound_this_pass: reconcile.rebound,
+            rebind_refused_this_pass: reconcile.rebind_refused,
+            rebind_proven_old_devices_mixed_this_pass: reconcile.rebind_proven_old_devices_mixed,
+            ..self.checkout_trash_backlog_summary()
+        };
+        crate::phase_telemetry::attach(
+            "gc_sweep_pass",
+            serde_json::json!({
+                "artifact_lane": artifact_lane.as_str(),
+                "artifact_complete": outcome.complete,
+                "directories_reclaimed": outcome.directories_reclaimed,
+                "trash_confirmed": checkout_trash.confirmed_this_pass,
+                "trash_deletable": checkout_trash.deletable,
+                "trash_pending": checkout_trash.pending,
+                "trash_stale_pending": checkout_trash.stale_pending,
+                "trash_dropped_missing": checkout_trash.dropped_missing_this_pass,
+                "trash_confirmed_dropped_missing": checkout_trash.confirmed_dropped_missing_this_pass,
+                "trash_identity_changed": checkout_trash.identity_changed,
+                "trash_rebound": checkout_trash.rebound_this_pass,
+                "trash_rebind_refused": checkout_trash.rebind_refused_this_pass,
+                "trash_rebind_proven_old_devices_mixed": checkout_trash
+                    .rebind_proven_old_devices_mixed_this_pass,
+                "trash_failing": checkout_trash.failing,
+                "trash_in_use": checkout_trash.in_use,
+            }),
+        );
         // The launcher admits artifact, checkout-cleanup and compaction work.
         // A compact-only backlog must not depend on a checkout-cleanup request.
         crate::warn_unrecorded(
@@ -7565,6 +7748,8 @@ impl Broker {
             budget_ms,
             disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
             legacy_unscoped_state: self.legacy_artifact_sweep_state(),
+            artifact_lane,
+            checkout_trash,
             auto_cleanup: outcome.auto_cleanup,
         })
     }
@@ -12528,13 +12713,16 @@ impl Broker {
         // a bounded tail for whole-checkout cleanup so cache discovery cannot
         // consume the entire foreground budget first.
         let budget_started_at = Instant::now();
+        note_artifact_sweep_lane(ArtifactSweepLane::Ran);
         if scope == ArtifactSweepScope::Inline
             && self.inline_artifact_sweep_is_spaced(policy, now, urgency)?
             && policy.artifact_sweep_budget_ms != 0
         {
+            note_artifact_sweep_lane(ArtifactSweepLane::Spaced);
             return Ok((ArtifactSweepOutcome::no_work(true, None), 0));
         }
         if policy.artifact_sweep_budget_ms == 0 {
+            note_artifact_sweep_lane(ArtifactSweepLane::Disabled);
             if scope_runs_checkout_cleanup(scope) {
                 // The cache lane can be disabled while session retirement is
                 // still enabled. Its single-row zero-timeout CAS can enqueue
@@ -12597,6 +12785,7 @@ impl Broker {
             // Strict mode pauses the artifact lane without consuming its pending
             // generation. Ignored-free checkouts may still satisfy their own
             // cleanup policy, under the same bounded lock/proof discipline.
+            note_artifact_sweep_lane(ArtifactSweepLane::PausedByStrictCleanup);
             let auto_cleanup = if scope_runs_checkout_cleanup(scope) {
                 if let Ok(_lock) = GcLock::acquire(self.main_root()) {
                     let report =
@@ -12629,6 +12818,8 @@ impl Broker {
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
+            note_artifact_sweep_lane(ArtifactSweepLane::GcLockHeld);
+            crate::phase_telemetry::add("artifact_sweep_gc_lock_held", Duration::ZERO);
             if closed_session_id.is_some() {
                 // A just-closed session's build output is due now, under
                 // `artifact_reclaim_days`, not when the closed-worktree grace

@@ -302,6 +302,40 @@ recovery archive) are operator surfaces; `storage.toml` `[budget]` adds
 paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the
 start-of-command check off or on.
 
+Host temp folders (2026-11-22): after each pass the worker reads the per-user
+temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
+`/tmp`, at most every 10 minutes, into
+`<host state>/storage-ledger-host-temp/reading.json` (`updated_at_ms`,
+`roots[]` with `kind` `user_temp`|`system_tmp`, `path`, `entries`,
+`entries_capped`, `other_users_entries` (counted, never sized),
+`aethyme_entries_excluded` (the broker's `ae<uid>` alias directory),
+`bytes`, `unmeasured_entries`, `partial`, `free_bytes`,
+`total_bytes`, `walked_entries`, `measure_ms`; `history[]` hourly samples,
+72 per root), `sizes.json` (per-entry sizes keyed by a 16-hex-digit
+SHA-256 of a per-host salt and the name; no names stored) and `salt` (32
+random bytes, created once, mode 0600), classified `coordination`. The walk
+lists at most 100,000 entries per root, sizes only entries owned by the
+worker's user, shares a 10-second deadline across roots, reads directories
+lazily, checks the deadline and the worker heartbeat every 256 children,
+queues at most 4,096 directories per entry (beyond that the entry is
+partial), never follows a link or leaves the root's device, stops without
+writing when the worker lock is lost, and deletes nothing. A reading stamped
+in the future does not block the next one and advises nothing. Known limit:
+each top-level entry is `lstat`ed, which a dead network or automount mount
+can block with no timeout.
+`aethyme storage status --json` adds `host_temp` (the reading); `broker
+status` adds advice `storage.host-temp-large` (notice; warning when the volume
+is below `host_temp_free_floor_bytes`) from the reading only, skipped when the
+reading is over a day old. `storage.toml` `[budget]` adds
+`host_temp_advice_bytes` (8 GiB), `host_temp_advice_entries` (5,000) and
+`host_temp_free_floor_bytes` (10 GiB); an older binary on the same host (a
+pinned GC service runtime included) rejects a file that sets them and runs
+with default budgets, so set them only once every binary on the host is at
+least this version. Span `storage_host_temp_measure` times the
+reading; counters `storage_host_temp_root_measured` (one per root, with its
+time), `storage_host_temp_partial` (a root left partial by the deadline) and
+`storage_host_temp_lock_lost` (a reading stopped by a lost worker lock).
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
@@ -3024,6 +3058,14 @@ Changed 2026-11-21 (GC service survives self-update). The service stays pinned t
 
 Changed 2026-11-21 (GC service refresh never leaves the service silently gone). If publishing the refreshed plan or unit fails, the archived record is moved back exactly (anything matching the failed new record is dropped first, then the plan, then the unit, then the receipts; the plan and unit refuse a conflict, while a receipt already in the directory, such as a `last-error.json` a tick wrote without the installer claim, is treated as newer and kept, leaving the archived copy in the archive): outcome `refresh_failed_restored`. If that restore fails too, the outcome is `refresh_failed_unrestored`, `last-refresh.json` names the archive, `gc service status` reports `installation_state: refresh_interrupted` with `archived_record`, `last_refresh` and `next_action`, and `gc service refresh` restores the record from that archive (only a numeric child of the service's own `archive/`) before refreshing it. A record whose last control receipt was an `activate` or `refresh` that was not acknowledged (refused, unknown or interrupted) is retried by `gc service status` under the automatic-refresh proofs plus a present runtime: launchd not loaded gets one `bootstrap gui/<uid> <unit>` (receipt `action: activate`), loaded records `operation_result: observed_loaded`, unknown does nothing; the result is `load_retry` in the status JSON. `broker status` reads files only (no launchctl) and warns with one of `storage.gc-service-runtime-missing`, `storage.gc-service-record-interrupted` (command `aethyme broker gc service refresh`), `storage.gc-service-unit-missing` (a plan without its unit file and a present runtime; commands `aethyme broker gc service status --json` and `aethyme broker gc service plan`) or `storage.gc-service-load-unconfirmed` (commands `aethyme broker gc service status --json` and `aethyme broker gc service activate --confirm <plan digest>`). The refresh walk inside one self-update has an overall budget of 30 seconds, checked before each service; a service not reached gets `label_state_unknown` with an error saying the budget was spent, a `last-refresh.json`, and keeps its bundle. Each kept bundle is named in the outcome's `kept_bundle`, and the update's text output prints one line per kept bundle and why. Spans `gc_service_record_restore` and `gc_service_load_retry`; counts `gc_service_record_restored`, `gc_service_load_retried` and `gc_service_refresh_budget_spent`.
 
+Changed 2026-11-22 (GC service passes say why they reclaimed nothing, and confirm stuck trash). `broker gc sweep` (an operator's, and the scheduled service's tick) first runs the confirmation `gc apply` already applies whatever plan it is given: a checkout trash row still pending because its mover's start time was unreadable (a sandboxed command records `creator_started_ms: 0`, and no process table can then prove the mover gone) is confirmed when it is over a day old, its entry still has the recorded device and inode, and no open session uses its session's path. It deletes nothing: the paced host deleter removes confirmed entries with its own identity and open-file checks, and a confirmation requests a checkout retirement run. The confirmed count is the rows the compare-and-set actually flipped. The same pass drops a stale row whose entry does not exist, but only when its trash is present, private, carries the broker's marker and is on the device the row recorded; the look never creates the trash, so an unmounted volume or a cleared temporary directory keeps its rows. The row is written before the rename, so such a row is a rename that never happened (the checkout is still in the pool) or an entry already gone. `gc apply` runs the same confirmation and drop. `gc sweep --read-only-snapshot` skips this step and writes nothing. The sweep JSON adds `artifact_lane` (`ran`, `gc_lock_held` when another GC, normally the detached worker, owns the repository's GC lock, `disabled`, `paused_by_strict_cleanup`, `spaced`) and `checkout_trash` (`recorded`, `deletable`, `pending`, `stale_pending`, `confirmed_this_pass`, `oldest_deletable_created_ms`, `dropped_missing_this_pass`, and the unconfirmable rows kept by cause: `kept_too_young`, `kept_identity_changed`, `kept_session_in_use`, `kept_trash_unavailable`); the text output prints a line for each when relevant. `aethyme.gc-sweep-service-last-pass/v1` keeps its schema and adds optional fields older readers ignore: `artifact_lane`, `entries_reclaimed`, `bytes_reclaimed` (observed logical file bytes plus preparation-cache bytes), `checkouts_removed`, `checkouts_kept`, `trash` (the `checkout_trash` object; a failed pass keeps the last observation), `trash_entries_drained` (entries gone from the deletable backlog since the previous pass, net of this pass's confirmations; a floor), `reclaimed_nothing_because` (when the pass reclaimed and confirmed nothing and the deleter made no progress, the first of `trash_not_draining` (deletable entries, and neither fewer of them nor a later oldest one than at the previous pass), `artifact_lane_yielded_to_worker`, `artifact_lane_disabled`, `artifact_lane_paused_by_strict_cleanup`, `artifact_lane_budget_spent`, `trash_entries_kept_by_proofs`, `trash_entries_awaiting_mover`), `passes_without_reclaim` (consecutive empty passes, kept across a failed pass and reset by one that reclaims, confirms, or finds the paced deleter draining the trash) and `unreclaimed_since_unix_ms`. After eight consecutive empty passes (two hours at the fixed 900 s interval), `broker status` warns with `storage.gc-service-reclaiming-nothing` when the recorded cause is one a command can act on: `trash_not_draining` (`aethyme broker gc trash drain --json`) or `artifact_lane_budget_spent` (`aethyme broker gc sweep --json`); rows the proofs keep are never advised, each with `aethyme broker gc service status --json`; it reads the service's files only, after the repair advices, inside span `status_gc_service_runtime`. Span `gc_sweep_confirm_stale_trash`; count `artifact_sweep_gc_lock_held`; attachment `gc_sweep_pass` (`artifact_lane`, `artifact_complete`, `directories_reclaimed`, `trash_confirmed`, `trash_deletable`, `trash_pending`, `trash_stale_pending`, `trash_dropped_missing`); count `checkout_trash_stale_missing_rows_dropped`.
+
+Changed 2026-11-22 (trash movers record a provable start, and entries whose identity changed stop counting as backlog). A trash mover now reads its own start for itself alone (`KERN_PROC_PID` on macOS; `/proc/self/stat` field 22 plus `btime` on Linux), falling back to a process-table snapshot; it no longer parses the table's start text, which a sandboxed command cannot list and which parses only in C-locale words. Counts `trash_creator_start_direct`, `trash_creator_start_from_table`, `trash_creator_start_unknown` (one per move). The deleter proves a creator gone only when the table lists no process with its pid or one with another start; a listed start it cannot read no longer counts as gone, and a listed start within 2 s of the recorded one, or exactly one hour away (a `ps` text read back in the repeated daylight-saving hour), is the same process (the abandoned-operation archive sweep uses the same proof). A confirmed trash row may carry `identity_mismatch` (`device_changed`: the recorded inode on another device number, as after a remount; `inode_changed`; `not_a_directory`) in `checkout_retirement.trash_rows`: set while the entry exists with another identity, cleared when it matches again; such an entry is never deleted, is left out of the deletable backlog, of the drain's `entries_pending` and of the catch-up decision. The deleter's pre-pass and `gc sweep`'s reconcile set and clear it; the reconcile also drops a confirmed row whose entry is missing from a present, private, marked trash on the recorded device, and concludes nothing for a row whose directory is not named as the trash. The sweep JSON's `checkout_trash` adds `confirmed_dropped_missing_this_pass`, `identity_changed` with `identity_changed_device`, `identity_changed_inode`, `identity_changed_not_a_directory`, and the other confirmed entries held out of `deletable`: `failing` (failure cap) and `in_use`. The last-pass receipt adds `trash_entries_held_back` (entries that left the deletable backlog without being deleted since the previous pass), and `trash_entries_drained` and `trash_not_draining` no longer count those as drained; `reclaimed_nothing_because` may be `trash_entries_identity_changed`, which is never advised. `gc trash drain --json` adds `entries_deletable_remaining`, `identity_changed`, `identity_changed_by_cause` and `identity_changed_entries` (at most 20 `{entry, cause}`). `broker status` adds the Notice `cleanup.trash-identity-changed` (entries and causes, at most 20; command `aethyme broker gc sweep --json`); it asks people to leave `device_changed` entries alone and to look at `inode_changed` and `not_a_directory` ones by hand. Attachment `gc_sweep_pass` adds `trash_confirmed_dropped_missing`, `trash_identity_changed`, `trash_failing`, `trash_in_use`; counts `checkout_trash_identity_changed` (per held-back entry per deleter run), `checkout_trash_confirmed_missing_rows_dropped`, `checkout_trash_identity_marks_changed`.
+
+Changed 2026-11-22 (trash rows are rebound after a remount). A remount gives every directory on the volume a new device number and keeps inode numbers, so trash rows in `checkout_retirement.trash_rows` recorded before it no longer match. `gc sweep`'s reconcile and the deleter's pre-pass now rebind such a row, confirmed or pending, to the device its trash is on now, each row on its own proof: its directory is named as the trash and the trash, opened under its pool without following links, is a real directory owned by this user, closed to group and others, holding the broker's marker (a regular file, opened without blocking) with the broker's content; the trash's current device differs from the row's (another inode on the same device is another directory, never rebound); the entry is a real directory on that device with the recorded inode; and the entry name is a broker entry name whose session field is the row's session. No other row's state is needed (the name is generated once per move and never reused), so rows written before several remounts are each rebound and a row refused for good never blocks the others. The trash's ownership, mode and marker are judged only once some row records another device than the trash's; a directory not named as the trash, an absent pool or trash, or a trash reached through a link concludes nothing and counts nothing. The rebind sets `device` and clears `identity_mismatch`, nothing else, inside the compare-and-set and only onto a stored row unchanged since the proof; a pending row stays pending and still needs its own confirmation, and the run that rebinds a row neither confirms nor deletes it. Deletion keeps its pinned-identity checks unchanged. The pre-pass no longer drops a pending row whose creator is gone and whose entry has the recorded inode on another device: one that fails its rebind proof is kept with `identity_mismatch: device_changed` (never deleted, left out of `entries_pending`), so its entry no longer turns unrecognized; the sweep JSON's `checkout_trash` counts such a row under `identity_changed` (with `identity_changed_device`), not `pending`, as `broker status` and the drain report do. `cleanup.trash-identity-changed` lists held pending rows too and gives the remedy for a `device_changed` entry still listed after a sweep (`trash_unverified`: restore the trash's mode, owner or marker; `name_not_for_session`: handle like `inode_changed`). The sweep JSON's `checkout_trash` and the GC service receipt add `rebound_this_pass`, `rebind_refused_this_pass` (rows) and `rebind_proven_old_devices_mixed_this_pass` (trash directories whose rebound rows spanned more than one old device: an observation); `gc trash drain --json` adds `rebound` and `rebind_refused` (rows by cause); attachment `gc_sweep_pass` adds `trash_rebound`, `trash_rebind_refused`, `trash_rebind_proven_old_devices_mixed`; attachment `checkout_trash_drain` adds `rebound` and `rebind_refused` (rows by cause). Span `checkout_trash_rebind` (each trash with a row on another device, in the sweep and the drain); counts `checkout_trash_rebound`, `checkout_trash_rebind_refused_<cause>` (one per refused row per look) with cause `trash_unverified`, `name_not_for_session`, `entry_missing`, `entry_unreadable`, `not_a_directory`, `entry_on_other_device` or `inode_changed`, `checkout_trash_rebind_proven_old_devices_mixed`, and `checkout_trash_pending_identity_held`. A catch-up slice that only rebound rows counts as progress.
+
+Changed 2026-11-22 (GC service rebinds itself after an update). A managed tick verifies its recorded router as the installer receipt's router, which resolves through the installation's `current` selector, so a service stays usable only while it is bound to the bundle `current` selects; the bundle an update keeps as `previous` still exists but every tick refuses it ("scheduled GC requires an installer-managed immutable runtime pair"). The update refresh (`update apply`/`execute` and the installer's `update bootstrap`, which share one activation path) now rebinds every service of the installation whose recorded router lies in any bundle other than the one it just selected, or is gone, instead of only bundles it removes; the steps and proofs are unchanged. A service's runtime binding is `current`, `stale` (present but not what `managed_root/current/aethyme` resolves to), `gone` or `unknown` (the selector cannot be read; proves nothing). `gc service status` runs its automatic refresh for `stale` as well as `gone`, and only when the command itself runs from the installation's current selection (the runtime the refresh binds); the status JSON adds `runtime_binding`, and `next_action` is `aethyme broker gc service refresh` whenever the runtime does not verify, the binding is `stale` or `gone`, or the last tick error is newer than the last finished pass. `broker status` reads files and selector links only: for a `stale` or `gone` binding, when it runs from the current selection, it writes `gc-sweep-services/<uuid>/refresh-scheduled.json` (`aethyme.gc-sweep-service-refresh-scheduled/v1`: `repository_uuid`, `observed_at_unix_ms`) and then starts one detached `<current router> broker gc service status --json` in the main checkout (own process group, no stdio, the service's tick variables removed), at most once per 900 s counting any refresh attempt recorded in `last-refresh.json`; the child repeats every proof under the installer claim and launchd decides as before (an unknown answer changes nothing). `broker status` warns with `storage.gc-service-runtime-stale` (a present runtime that is no longer current) or `storage.gc-service-ticks-refusing` (`last-error.json`'s `observed_at_unix_ms` newer than `last-pass.json`'s `finished_at_unix_ms`, or no pass), each with `aethyme broker gc service refresh` then `aethyme broker gc service status --json`, and adds an evidence line when it started or held back a background refresh. Span `gc_service_refresh_schedule`; count `gc_service_refresh_scheduled`. A managed tick now writes `gc-sweep-services/<uuid>/tick-started.json` (`aethyme.gc-sweep-service-tick-started/v1`: `repository_uuid`, `generation` when it is a valid digest, `pid`, `started_at_unix_ms`) before its first access to the repository or a pool volume; it is archived and restored with the other receipts. The tick releases the service's installer claim (`.install.lock`) around the writable broker open, which validates the worktree root on the pool volume and can block there, and takes it back afterwards, re-loading the plan (same bytes) and re-verifying the runtime; a mismatch refuses the tick into `last-error.json`. A tick that started at least one service interval (900 s) ago with no `last-error.json` or finished `last-pass.json` since is unanswered: `gc service status` adds `unanswered_tick` (`state` `tick_blocked` while its pid exists, else `tick_ended_without_receipt`; `started_at_unix_ms`, `minutes_since_start`, `pid`, `process_alive`, `cause_hint`, `person_action`) and `tick_started`; `broker status` warns with `storage.gc-service-tick-blocked` (the pid still exists, checked with signal 0) naming the likely macOS cause, a privacy consent for the new runtime binary on a removable or protected volume, and the person's action. launchd does not start a second instance of a running job when its `StartInterval` fires, so a blocked tick stops the service until it ends. Review follow-up: the tick retakes the claim waiting up to 2 s; when its broker open fails it records the failure as this generation's last pass only after retaking the claim and re-proving the plan, otherwise generation-free into `last-error.json`. A `last-pass.json` of another generation now reads as no pass for this one (count `gc_service_foreign_generation_receipt`) and the next pass overwrites it, instead of failing `status` and every later receipt write. `tick-started.json` adds `process_started_at_unix_ms` (this process's own start); an unanswered tick counts as blocked only while signal 0 finds its pid and a process-table snapshot does not prove that pid now belongs to a process with another start, and a service whose last control is an acknowledged `deactivate` is never advised as blocked. `broker status` reads the service record once and asks for its own executable only when the binding is stale or gone; it decides under the service's installer claim taken without waiting (a contended claim starts nothing), and `refresh-scheduled.json` adds `current_bundle` and `attempts`: the wait after an attempt is 900 s doubling per attempt that left the binding stale for the same current bundle, capped at 6 h, and a new current bundle resets it (a later success alone does not, since the binding is then current and nothing is scheduled). It prints nothing: counts `gc_service_refresh_receipt_unwritable` (no spawn, and none for the rest of that process), `gc_service_refresh_start_failed` and `gc_service_refresh_reap_failed`. It starts nothing from an App Sandbox process (`APP_SANDBOX_CONTAINER_ID` set); other sandboxes are bounded by the backoff. Second review: the tick's process is `alive`, `gone` or `unverified`. Signal 0 answering `ESRCH` is gone, and `EPERM` proves nothing; the native process listing alone (never `ps`, never a timeout; a failure is latched for the process) then decides. When neither answers, `unanswered_tick.state` is `tick_unverified` (`process: unverified`) and `broker status` warns with `storage.gc-service-tick-unverified`, which says the tick has no receipt and its process could not be checked from here; it is never called blocked or ended. The scheduler releases the claim right after writing its receipt, before starting the child. A lock file that cannot be opened at all (not contention) is `gc_service_refresh_lock_unavailable`, latched per process and shown nowhere. A scheduling or refresh receipt dated in the future counts as expired.
+
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
 where the work happens rather than by each command: `subprocess_git` and
@@ -4228,6 +4270,26 @@ New surface consumers may begin to depend on:
 - Broker metadata key `session_scratch.records` (path to record: session,
   pool, entry, device, inode, created time, `superseded`, last `keep` reason
   and `attempts`) and `session_scratch.bytes_freed_total`.
+- The bytes in the `session_scratch` class come from a measurement lap
+  spread over runs (broker metadata key `session_scratch.measure_lap`, JSON
+  `started_ms` and `after`, the lap in progress and the last record it
+  measured; `so_far`, its totals; `last` and `last_completed_ms`, the last
+  lap that went round; totals carry `measured`, `bytes`, `largest_bytes`,
+  `largest_session_id`, `partial`, `finished_runs`, `finished_run_bytes`).
+  A run walks the records after `after`, in key order, for at most 2 s (at
+  least one record); a new lap starts 15 minutes after the last one went
+  round, and between laps a run walks nothing (counter
+  `session_scratch_measure_not_due`). The class shows the last complete lap
+  (`partial` only when a record's walk stopped at the budget), or the lap in
+  progress as `partial` before any went round; `directories`, `kept` and
+  `refused` are counted from the records on every run. Through 0.8.158 every
+  run walked from the first record for its 2 s, never went round and so
+  reported only the first records, always `partial`. Counters
+  `session_scratch_measure_lap_started`,
+  `session_scratch_measure_lap_completed`; span
+  `session_scratch_measure_record` (one per record walked: the phase count
+  is the records walked); the `session_scratch_usage` attachment gains
+  `measure_due`, `measured` (records walked this run) and `lap_open`.
 - Trash rows (`checkout_retirement.trash_rows`) gain `scratch: true` (omitted
   when false); such rows also carry `stripped: true`, so older binaries treat
   them as stripped directories, never as the checkout. `TrashDrainReport`
@@ -4354,29 +4416,79 @@ attachment gains `command_temps_retired` and `command_temps_kept`; the
 `finished_run_bytes`.
 
 **Scratch pass order, cursor and failure causes.** The scratch pass first
-classifies records for at most 2 s (one store lookup each; for an open
-session, one listing of its `tmp-done` container by path, a hint that only
-decides whether the verified walk is worth its cost), resuming where the
-last classification stopped. It then takes the run's open-file observation
+classifies every record from its session's state, read for all records in
+one store query (`SELECT id, status, cleanup_state FROM sessions WHERE id IN
+(...)`, 500 ids per query; when that read fails, one lookup per record, counter
+`session_scratch_retire_session_states_fallback`), with no filesystem access.
+It then touches the filesystem only where there can be work, every step
+within a budget of its own, because one directory operation on the busiest
+repository's volume took from under 1 ms to about 1 s depending on what
+else used the volume. The classification, at most 2 s from before its
+first filesystem call (the container listing and the signal clear are
+charged to it, unlike in 0.8.158), lists each pool's container, clears the
+signals it accounts for, and lists by path the `tmp-done` container of each
+open record due for a listing (a hint that only decides whether the
+verified walk is worth its cost), at least one per pass, resuming after the
+last record listed. A record is due when a finished-run signal names it,
+when its last listing showed a finished run (it leaves only after a
+listing, or the verified walk, showed none; a container that cannot be
+read, other than one that does not exist, keeps it due, counter
+`session_scratch_retire_listing_unknown`). The full listing lap, the
+backstop for a marker whose signal is missing, starts at most once an hour
+and never while the previous lap is unfinished (counter
+`session_scratch_retire_full_listing`; `session_scratch_retire_lap_completed`
+when it went round); it is paced to reach every open record within half an
+hour: each pass lists, after where the lap stopped and in key order, its
+share of the open records (the records the elapsed fraction of half an hour
+owes, minus those already reached, at least 8), for at most 0.5 s (at least
+one listing when it owes any). A record already due, or listed by the
+classification, is reached without a listing of its own; one whose listing
+shows a finished run is taken by this pass's finished-runs phase and stays
+due; one whose listing cannot be read becomes due. In 0.8.158 a lap made
+every open record due at once (about 600 on the busiest repository), so
+every pass spent its whole budget listing 1 to 22 of them. Then a closed
+(or replaced) record whose directory is proven gone (the walk from `/`
+without links finds no entry, and the pool is not on a volume that is away)
+is forgotten at once, with no open-file observation and no lifecycle claim
+(counter `session_scratch_missing_forgotten_early`): probed in the closed
+phase's order (from its cursor), at least one per pass, for at most 0.5 s.
+A finished-run signal is the empty file
+`<pool>/.aethyme-session-scratch/.aethyme-finished.<entry>`, created (never
+following a link) right after the marker by whichever process finished the
+run (counters `command_temp_finish_signaled`,
+`command_temp_finish_signal_failed`); the pass reads the signals with the one
+listing of each pool's container it already takes for unrecorded entries,
+stores what they made due (only when there is a signal to clear), then
+clears, through the container opened without links and before any listing, the signals of records stored as due,
+of records it retires, and of entries no longer in the container (a signal
+of a record it did not read or could not classify stays for the next pass) (when storing fails they stay, counter
+`session_scratch_retire_signals_kept`). Signals are broker bookkeeping like
+the container's marker: never unrecorded entries, never content that keeps a
+container or a worktree root, and removed with an emptied container. It then
+takes the run's open-file observation
 outside its 5 s budget; when that observation failed, nothing is judged and
-the cursors stay. Otherwise it judges the closed (or replaced) directories
+the phase cursors stay (what is due stays due). Otherwise it judges the closed (or replaced) directories
 with half the budget while finished runs wait (all of it otherwise), then
 the finished runs of open sessions until the budget's end, but never less
 than half the budget after the closed phase. Each phase resumes after the
 record where the previous pass stopped (broker metadata key
-`session_scratch.retire_cursor`, JSON `classify`, `closed` and
+`session_scratch.retire_cursor`, JSON `closed` and
 `command_temps`, each the last record key judged, absent once it went
-round, and `command_temp_runs`, an object from record key to the name of
+round; `classify`, the last record listed; `listing_due`, the record keys
+due for a listing; `full_listing_started_ms`, when the last full listing lap
+started; `lap_open`, `lap_after` and `lap_listed`, whether a lap is in
+progress, the last record it reached and how many it reached; the pass merges `listing_due` into the stored value rather than
+replacing it, removing only the keys it proved need no listing and the
+keys whose record is gone; and `command_temp_runs`, an object from record key to the name of
 the last finished run judged when that record's visit ended before it
-went through its runs). Classification judges at least one record per
-pass. When it stops at its budget, the pass judges only the records it
-classified, in classification order, and `classify` moves past the records
-every phase judged and no further (never when the observation failed);
-`closed` and `command_temps` then stay for the next complete
-classification. With R records holding N finished runs, every record is
-judged (or passed with its pool or volume closed) within R + N passes whose
-observation succeeds and whose moves do not fail with a cause that affects
-the whole process (`too_many_open_files`). An unfinished classification counts as more to do
+went through its runs). Every closed record is classified on every pass; a
+finished run's record is due from the pass after its marker (within the
+full listing lap without its signal: started hourly, paced over half an
+hour, later only when its per-pass budget cannot keep that pace), listed within as many passes as there are due
+records, and then judged like any record with finished runs, given passes
+whose observation succeeds and whose moves do not fail with a cause that
+affects the whole process (`too_many_open_files`). Records still due when
+the budget ends count as more to do
 only when the pass retired or forgot something. Finished runs are taken in
 name order after the record's run cursor: a failed move that is not
 systemic goes on to the record's next run, three failed moves in a row in
@@ -4438,16 +4550,28 @@ Counters `session_scratch_retire_cursor_resumed`,
 `session_scratch_retire_classify_stopped`,
 `session_scratch_retire_stopped_after_failures`,
 `command_temp_retire_stopped_after_failures`,
-`session_scratch_retire_classify_held` (a partial classification's cursor
-held before a record a phase did not judge),
 `command_temp_record_passed_after_failures` (a record passed after three
 failed moves in a row), `command_temp_run_cursor_resumed` (a record's
-visit resumed after its run cursor); span
-`session_scratch_retire_classify`; attachment `scratch_move_failures`,
+visit resumed after its run cursor); spans
+`session_scratch_retire_classify` (the whole classification),
+`session_scratch_retire_session_states` (the store read),
+`session_scratch_retire_signals` (the container listings),
+`session_scratch_retire_signal_clear` (storing what signals made due and
+clearing them), `session_scratch_retire_due_listing` and
+`session_scratch_retire_lap_listing` (one per `tmp-done` listing, so the
+span total over its phase count is the per-listing latency),
+`session_scratch_retire_lap` (the lap's share), `session_scratch_retire_probes`
+(the probe step) and `session_scratch_retire_probe` (one per probe); attachment `scratch_move_failures`,
 keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
 `total_ms`, `max_ms`). The `session_scratch_retire` attachment gains
 `records`, `sessions_with_finished_runs`, `kept_causes` (directories kept
-by `<step>.<cause>`), `stopped_after_failures`, `classify_incomplete`,
+by `<step>.<cause>`), `stopped_after_failures`, `classify_incomplete`
+(records still due for a listing when the budget ended), `listed` (done
+containers listed), `probed` (closed records probed for a gone directory),
+`signals` (finished-run signals read), `lap_listed` (of `listed`, by the
+lap), `lap_remaining` (open records the lap in progress has still to
+reach), `listing_due` (records due after the
+pass), `listing_unknown` (due records whose container could not be read), `full_listing` (the pass started a full listing lap),
 `process_use_unknown` and
 `command_temps_kept_by_reason` (`in_use`, `process_use_unknown`, a refusal
 code, or `move_failed.<step>.<cause>`).

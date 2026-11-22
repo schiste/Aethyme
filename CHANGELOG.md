@@ -4,6 +4,71 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.160] - 2026-11-22
+
+### Fixed
+
+- The scheduled GC service rebinds itself after an update. A managed tick only accepts the runtime the installation's `current` selector names; an update keeps the old bundle as `previous`, and every repair path was guarded by "the old bundle is gone", so each tick refused with "scheduled GC requires an installer-managed immutable runtime pair" until someone ran `gc service refresh`. An update now rebinds every service that is not on the new current bundle; `gc service status` refreshes a stale binding as well as a missing one when it runs from the current router; and `broker status`, run from the current router, starts one detached refresh for a stale or missing binding, decided under the service's install lock, backing off from 15 minutes to 6 hours while attempts keep failing and reset by a new current bundle. It prints nothing new and starts nothing from an App Sandbox process (#1953).
+- A tick that cannot finish is visible and no longer blocks a refresh. The tick writes `tick-started.json` before its first access to the repository or a pool volume and releases the service's install lock around the writable broker open, then retakes it (waiting up to 2 s) and re-checks the plan and runtime before recording anything; on a failed open it records a last pass only after that re-check, otherwise the generation-free error. A tick with no receipt 900 s after it started is reported as `tick_blocked`, `tick_ended_without_receipt` or `tick_unverified` (the process could not be checked from this process; no child process is started for the check) (#1953).
+- A last-pass receipt of another generation reads as "no pass for this generation" and is overwritten by the next pass, instead of failing `gc service status` and every later receipt (#1953).
+
+### Added
+
+- `gc service status --json` fields `runtime_binding` (`current`, `stale`, `gone`, `unknown`), `tick_started` and `unanswered_tick`; `next_action` names the refresh whenever the runtime does not verify or the last tick error is newer than the last pass. `broker status` advices `storage.gc-service-runtime-stale`, `storage.gc-service-ticks-refusing`, `storage.gc-service-tick-blocked` and `storage.gc-service-tick-unverified`. Receipts `tick-started.json` and `refresh-scheduled.json`; span `gc_service_refresh_schedule`; counters `gc_service_refresh_scheduled`, `gc_service_refresh_start_failed`, `gc_service_refresh_receipt_unwritable`, `gc_service_refresh_lock_unavailable` and `gc_service_foreign_generation_receipt` (#1953).
+
+### Known issues
+
+- On macOS each new runtime is a new code identity, so its first scheduled run on a removable or protected volume can wait on a privacy consent prompt; the tick is then reported as blocked until the prompt is answered. A stable signing identity for released runtimes is not in place.
+- The background refresh fires only when `broker status` runs from the installation's managed current router; an update run by an older binary is repaired by the first such `broker status` in each repository.
+
+## [0.8.159] - 2026-11-22
+
+### Fixed
+
+- Checkout trash entries recorded before a remount are deletable again. When a volume is remounted with a new device number, every trash row recorded before it stopped matching its entry: confirmed entries were refused by the deleter on every run, and a pending row whose mover was gone was dropped, stranding its entry. A row is now rebound to the trash's current device on its own proof: the trash is a real, private directory owned by this user and carrying the broker's marker, and the row's own entry name is a real directory on the trash's device with the recorded inode and the row's session. Only the device changes; a rebound row is not confirmed or deleted in the same run, and deletion keeps its pinned identity checks. A pending row with a changed device is kept and held instead of dropped (#1952).
+- A mover records a start time that can be proven gone. On the busiest repository 217 of 218 trash rows held no creator start, so each waited a day for the stale reconcile. The mover now reads its own start directly (macOS `KERN_PROC_PID`, Linux `/proc/self/stat`), falling back to the process table. A listed process whose start cannot be read no longer counts as gone, in the trash deleter and in the partial-archive sweep; starts within 2 s, or exactly one hour apart, name the same process (#1951).
+- A confirmed trash entry whose identity changed (`device_changed`, `inode_changed`, `not_a_directory`) is held aside: never deleted, left out of the deletable backlog, and no longer keeps the deleter "behind" or the reclaiming-nothing advice on. A confirmed row whose entry is missing from a present, private, marked trash on the recorded device is dropped (#1951).
+- The session scratch retirement pass costs what its budget says. In 0.8.158 the hourly full listing made every open record due at once (classification 2.1 to 5.6 s for several passes, against about 2.05 s before), and the container listing and signal clear ran outside the budget. The deadline now starts before the container listing; the signal clear and its store write run only when there is a signal; the full listing is a paced lap (a share per pass over 30 minutes, at most 0.5 s, at least one listing); closed-record probes are their own 0.5 s step (#1954).
+- The session scratch size measurement completes. It walked from the first record on every pass for 2 to 3.7 s, never reached the end and usually reported nothing, so `aethyme storage status` and the scratch advices saw only the first records. It is now a resumable lap that rests 15 minutes between laps; `kept` and `refused` count every record, so `storage.session-scratch-unidentified` may newly appear where it was undercounted (#1954).
+
+### Added
+
+- `broker status` notice `cleanup.trash-identity-changed` with a remedy per cause. Sweep receipt, `gc trash drain --json` and `gc_sweep_pass` fields for identity-changed, held-back, rebound and refused entries; `trash_entries_held_back`; span `checkout_trash_rebind`; counters `trash_creator_start_direct`, `trash_creator_start_from_table`, `trash_creator_start_unknown`, `checkout_trash_rebound`, `checkout_trash_rebind_refused_<cause>`, `checkout_trash_pending_identity_held` (#1951, #1952).
+- Per-operation spans `session_scratch_retire_due_listing`, `session_scratch_retire_lap_listing`, `session_scratch_retire_probe`, `session_scratch_retire_signal_clear` and `session_scratch_measure_record`; cursor fields `lap_open`, `lap_after`, `lap_listed`; metadata key `session_scratch.measure_lap` (#1954).
+
+### Upgrade notes
+
+- An older binary's deleter running in a non-C locale can misjudge a new mover's row while the move is in flight; the mover records its row again and no entry is deleted wrongly. An older binary rewriting the scratch cursor drops the lap fields; the lap restarts within the hour.
+- A block-level clone of a pool volume keeps names and inode numbers: the clone's trash entries are rebound and deleted with the usual checks.
+
+### Known issues
+
+- On macOS the scheduled GC service is not rebound to a new runtime after an update, and its first run from the new runtime can wait on a privacy consent prompt for a removable volume with no receipt and no advice. Run `aethyme broker gc service refresh --json` after an update and answer the prompt.
+- A real remount is not exercised by CI; the rebind is tested by renumbering recorded devices. The full listing lap has no time bound when listings are very slow (one listing per pass at worst). `gc plan` does not complete within its deadline on a very large repository.
+
+## [0.8.158] - 2026-11-22
+
+### Fixed
+
+- The background GC sweep reclaims the checkout trash it could never confirm. On the busiest repository about 200 of 218 trashed checkouts stayed pending: an entry is confirmed when a process listing proves its mover has exited, a move made from a sandboxed command records no start time, and the only step that confirmed such entries was `gc apply`, which needs a plan that never completed there. `broker gc sweep`, and so the service pass, now runs the same reconcile `gc apply` ran before its digest check, with its proofs unchanged: the entry has its recorded identity, it is over a day old, its session is not open and no open session uses its path. It deletes nothing itself; the paced host deleter removes confirmed entries with its usual checks. A stale pending row whose entry is missing from a present, private, broker-marked trash on the recorded device is dropped. A read-only snapshot skips the reconcile (#1947).
+- The session scratch retirement pass no longer lists every open session's directory on each run. With about 600 open sessions the classification took 2.0 to 3.4 s per pass and never completed. Session states are read in one batched query, and a session's finished-run container is listed only when a finished-run signal names it, when its last listing showed a run, or once an hour in a full listing lap. A listing error keeps the record due. A closed record whose directory is proven missing on a mounted volume is forgotten during classification (#1948).
+
+### Added
+
+- `broker gc sweep --json` reports `artifact_lane` (`ran`, `gc_lock_held`, `disabled`, `paused_by_strict_cleanup`, `spaced`) and `checkout_trash` counts. The service receipt records per-lane counts, `reclaimed_nothing_because`, `passes_without_reclaim`, `unreclaimed_since_unix_ms` and `trash_entries_drained`; a shrinking deletable backlog counts as reclaim. `broker status` advice `storage.gc-service-reclaiming-nothing` after eight passes without reclaim, for a stalled deleter or a cache lane out of budget (#1947).
+- Host temp folders are measured, never cleaned. The storage worker reads the per-user temp folder and `/tmp` at most every ten minutes within a 10 s deadline, counting only this user's entries. `aethyme storage status` shows bytes, entries, free space and the last day's growth per folder; `broker status` advice `storage.host-temp-large` at 8 GiB, 5,000 entries or under 10 GiB free. `storage.toml` `[budget]` keys `host_temp_advice_bytes`, `host_temp_advice_entries` and `host_temp_free_floor_bytes` (#1946).
+- Agent guidance says builds, temp files, logs and checkouts go in the session `scratch_dir`, never `/tmp`; the `broker start` scratch note says the same, and the broker reference now states that broker-run commands get `TMPDIR` inside the scratch (#1946).
+- Finished-run signal files `.aethyme-finished.<entry>` in the scratch container; cursor fields `listing_due` and `full_listing_started_ms`; spans `gc_sweep_confirm_stale_trash`, `session_scratch_retire_session_states`, `session_scratch_retire_signals` and `storage_host_temp_measure`, with their counters (#1946, #1947, #1948).
+
+### Changed
+
+- Set the new `storage.toml` keys only once every Aethyme binary on the host, including a pinned GC service runtime, is at least this version: an older binary rejects a file with keys it does not know and runs with default budgets.
+
+### Known issues
+
+- A sandboxed move still records no start time, so new trash entries wait a day before the sweep confirms them. Trash rows that fail the deleter's identity check on every run stay counted as deletable and can keep `storage.gc-service-reclaiming-nothing` on. `gc plan` does not complete within its deadline on a very large repository, so recovery archives and other reviewed lanes stay unreachable there.
+- A dead network mount inside `/tmp` can block the temp folder reading; a single entry with more than 4,096 nested directories is reported partial.
+
 ## [0.8.157] - 2026-11-22
 
 ### Fixed

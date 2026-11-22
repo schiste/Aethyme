@@ -265,9 +265,7 @@ pub(super) fn sweep_stale_partials(archive_root: &Path) -> usize {
     };
     let mut removed = 0;
     for (name, pid, started) in stale {
-        let gone = table.process(pid).is_none_or(|process| {
-            crate::session_holder::lstart_epoch_ms(&process.started) != Some(started)
-        });
+        let gone = table.proves_gone(pid, started);
         let path = archive_root.join(&name);
         let real_directory = std::fs::symlink_metadata(&path)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
@@ -312,12 +310,7 @@ fn private_archive_root(root: &Path) -> Result<PathBuf, String> {
 
 /// This process's id and start time (epoch ms; 0 when unknown).
 fn this_process_identity() -> (i64, i64) {
-    let pid = i64::from(std::process::id());
-    let started = crate::session_holder::ProcessTable::snapshot()
-        .and_then(|table| table.process(pid))
-        .and_then(|process| crate::session_holder::lstart_epoch_ms(&process.started))
-        .unwrap_or(0);
-    (pid, started)
+    crate::checkout_trash::this_process_identity()
 }
 
 /// Why no archive was written; nothing is moved either way.
