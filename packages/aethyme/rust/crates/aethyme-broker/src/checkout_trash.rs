@@ -4043,8 +4043,8 @@ mod tests {
     }
 
     /// The write-back applies a rebind only onto a stored row that is still
-    /// the one the drain read, and only while the stored rows of that trash
-    /// show one old device.
+    /// the one the drain read and proved; other rows of the trash, whatever
+    /// device they record, neither block nor change it.
     #[test]
     fn a_rebind_is_written_only_onto_an_unchanged_stored_row() {
         let dir = PathBuf::from("/pool").join(TRASH_DIR);
@@ -4076,14 +4076,17 @@ mod tests {
         apply_drain_rows(&mut stored, &before, &after);
         assert_eq!(stored[&dir][&name].device, 5);
 
-        // A row on a third device appeared meanwhile: no rebind.
+        // A row on a third device appeared meanwhile: this row's own proof
+        // still stands, so it is rebound, and the other row is untouched.
+        let other = TrashRow { device: 6, ..was };
         let mut stored = before.clone();
         stored
             .get_mut(&dir)
             .unwrap()
-            .insert("0000000000002-8-1-1".into(), TrashRow { device: 6, ..was });
+            .insert("0000000000002-8-1-1".into(), other);
         apply_drain_rows(&mut stored, &before, &after);
-        assert_eq!(stored[&dir][&name].device, 5);
+        assert_eq!(stored[&dir][&name].device, 9);
+        assert_eq!(stored[&dir]["0000000000002-8-1-1"], other);
     }
 
     /// No rebind without the row's own proof: another inode on the same
