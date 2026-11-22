@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.157] - 2026-11-22
+
+### Fixed
+
+- One finished command temp run that fails every time no longer hides the runs behind it. A session's finished runs are visited in name order after a per-session run cursor; a failed move goes on to the session's next run, three failed moves in a row pass to the next session, and the failing runs are tried again when the order wraps (#1944).
+- A failure that belongs to one pool or one volume closes only that pool or volume for the pass. A refused or unrecordable trash closes its pool; no space, a read-only volume or an unsupported exclusive rename closes its volume; the other pools are still served and the closed one is tried again on a later lap. Only running out of file descriptors stops the phase (#1944).
+- A classification cut at its budget no longer skips records. The pass judges only what it classified, the classification cursor moves past what every phase judged and no further, and not at all when the open-file observation failed. Every record is judged within a bounded number of passes, as long as no move fails for a process-wide cause. An unfinished classification keeps the lane on its busy cadence only when the pass retired or forgot something (#1944).
+- A scratch record whose pool directory was removed on a mounted volume is forgotten instead of kept forever; an open session's record is kept while its volume is away, and no new scratch is created in the empty mount point (#1944).
+
+### Added
+
+- Optional field `command_temp_runs` in metadata key `session_scratch.retire_cursor`; report field `skipped_closed_scope`; counters `session_scratch_retire_classify_held`, `command_temp_record_passed_after_failures`, `command_temp_run_cursor_resumed`, `session_scratch_retire_pool_closed`, `session_scratch_retire_volume_closed`, `session_scratch_retire_skipped_closed`, `session_scratch_pool_absent_volume_away`, `session_scratch_pool_absent_volume_mounted` and `session_scratch_unavailable_pool_unavailable` (#1944).
+
+### Known issues
+
+- After a remount gives a volume a new device number, a record whose directory is really gone is kept and judged again each lap. A different disk reusing the device number at the same mount path can make a record be forgotten; that leaves a directory behind and never deletes one.
+
 ## [0.8.156] - 2026-11-22
 
 ### Fixed
