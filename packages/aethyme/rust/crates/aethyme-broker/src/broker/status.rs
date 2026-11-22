@@ -870,6 +870,7 @@ impl Broker {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = outcome_evidence;
             None
         }
     }

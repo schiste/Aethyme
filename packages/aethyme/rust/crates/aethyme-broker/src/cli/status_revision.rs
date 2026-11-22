@@ -26,6 +26,10 @@ const SECTIONS: &[&str] = &[
     "drilldown",
 ];
 
+/// The longest well-formed token: `v1`, the scope hash and one hash per
+/// section, colon separated. Longer input is refused before it is split.
+const MAX_TOKEN_LEN: usize = 2 + 65 + SECTIONS.len() * 65;
+
 fn digest(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
@@ -80,7 +84,7 @@ fn render_inner(
     }
     let revision = format!("v1:{scope}:{}", hashes.join(":"));
     let prior = since.and_then(|token| {
-        if token.len() > 1024 {
+        if token.len() > MAX_TOKEN_LEN {
             return None;
         }
         let fields: Vec<&str> = token.split(':').collect();
@@ -174,6 +178,7 @@ mod tests {
         );
         let advised = render_session(with(&advice), root, Some(7), None).unwrap();
         let advised_revision = advised["revision"].as_str().unwrap().to_string();
+        assert_eq!(advised_revision.len(), super::MAX_TOKEN_LEN);
         assert_ne!(advised_revision, quiet_revision);
         // The same advice on a later look: unchanged.
         let same = render_session(with(&advice), root, Some(7), Some(&advised_revision)).unwrap();
