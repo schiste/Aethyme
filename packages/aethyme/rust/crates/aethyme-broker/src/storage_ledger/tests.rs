@@ -1463,4 +1463,90 @@ fn session_scratch_usage_is_reported_and_advised_when_large() {
         .expect("advice");
     assert_eq!(row.evidence.len(), 1, "{row:?}");
     assert!(row.evidence[0].contains("session 9"), "{row:?}");
+    assert!(
+        advice
+            .iter()
+            .all(|row| row.id != "storage.command-temp-backlog"),
+        "no finished runs, no backlog advice"
+    );
+    let backlog = super::SessionScratchUsage {
+        finished_runs: super::COMMAND_TEMP_BACKLOG_ADVICE_RUNS,
+        finished_run_bytes: 2048,
+        ..super::SessionScratchUsage::default()
+    };
+    super::record_session_scratch_usage(host_state, "/repo/c", backlog).unwrap();
+    let advice = super::cli::status_advice(host_state);
+    let row = advice
+        .iter()
+        .find(|row| row.id == "storage.command-temp-backlog")
+        .expect("backlog advice");
+    assert_eq!(row.evidence.len(), 1, "{row:?}");
+    assert!(row.evidence[0].contains("64 finished"), "{row:?}");
+}
+
+/// A gate cache prune stages its units under the host cache root. The
+/// staged entry is listed with the size its stager recorded, shown in
+/// `broker status` once it has waited, makes the next command start a
+/// worker, and goes with the worker's sweep (its size record too).
+#[test]
+fn a_staged_prune_is_advised_starts_the_worker_and_is_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    fs::create_dir_all(cache.join("gates")).unwrap();
+    let name = ".aethyme-storage-evicting-14616-1795248476768-pruned";
+    let staged = cache.join(name);
+    fs::create_dir_all(staged.join("000001-unit")).unwrap();
+    fs::write(staged.join("000001-unit/lib"), b"artefact").unwrap();
+    fs::write(cache.join(format!("{name}.bytes")), "5368709120").unwrap();
+
+    let found = check::staged_deletions(&cache);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, name);
+    assert_eq!(found[0].bytes, Some(5_368_709_120));
+    assert!(
+        super::cli::staged_deletion_advice(found.clone()).is_none(),
+        "a fresh staging is not advice yet"
+    );
+    let waited: Vec<_> = found
+        .into_iter()
+        .map(|mut staged| {
+            staged.age_ms = 10 * 60_000;
+            staged
+        })
+        .collect();
+    let advice = super::cli::staged_deletion_advice(waited).unwrap();
+    assert_eq!(advice.id, "storage.staged-deletion-pending");
+    assert!(
+        advice.summary.contains("awaiting deletion"),
+        "{}",
+        advice.summary
+    );
+
+    // A staging that waited past the threshold starts a worker even while
+    // the ledger is fresh.
+    let old = SystemTime::now() - Duration::from_secs(10 * 60);
+    fs::File::open(&staged).unwrap().set_modified(old).unwrap();
+    Summary {
+        updated_at_ms: super::now_ms(),
+        roots: vec![
+            Root::new(&host_state, RootKind::HostState),
+            Root::new(&cache, RootKind::HostCache),
+        ],
+        ..Summary::default()
+    }
+    .save(&host_state)
+    .unwrap();
+    let mut kicks = 0;
+    let decision = check::decide(&host_state, &[], None, &mut |_| Some(u64::MAX), &mut || {
+        kicks += 1;
+    });
+    assert!(decision.kick, "{decision:?}");
+    assert_eq!(kicks, 1);
+
+    evict::sweep_aside(&cache, &mut || {});
+    assert!(check::staged_deletions(&cache).is_empty());
+    assert!(!cache.join(format!("{name}.bytes")).exists());
+    assert!(cache.join("gates").is_dir(), "only staged entries go");
 }

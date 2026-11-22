@@ -111,6 +111,12 @@ pub(crate) struct TrashRow {
     /// checkout); its bytes are counted as scratch, not as strip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) scratch: bool,
+    /// The entry is a submit verification worktree
+    /// ([`move_verification_worktree_to_trash`]). Always recorded with
+    /// `stripped` set too (it is not the session's checkout); its bytes are
+    /// counted as neither strip nor scratch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) verification: bool,
 }
 
 /// This process's id and start time, as a process-table snapshot reads it.
@@ -577,6 +583,50 @@ pub(crate) fn move_worktree_to_trash(
     session_id: i64,
     record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
 ) -> Result<TrashedCheckout, String> {
+    move_worktree_to_trash_as(
+        repo,
+        common_dir,
+        pool,
+        worktree,
+        session_id,
+        false,
+        record_pending,
+    )
+}
+
+/// [`move_worktree_to_trash`] for a broker-created worktree that is not the
+/// session's checkout (a submit verification slot): its row is recorded as
+/// `stripped` and `verification`, so nothing reads it as the session's
+/// checkout having gone into the trash, and its bytes are not counted as
+/// strip.
+pub(crate) fn move_verification_worktree_to_trash(
+    repo: &crate::git::GitRepo,
+    common_dir: &Path,
+    pool: &Path,
+    worktree: &Path,
+    session_id: i64,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
+) -> Result<TrashedCheckout, String> {
+    move_worktree_to_trash_as(
+        repo,
+        common_dir,
+        pool,
+        worktree,
+        session_id,
+        true,
+        record_pending,
+    )
+}
+
+fn move_worktree_to_trash_as(
+    repo: &crate::git::GitRepo,
+    common_dir: &Path,
+    pool: &Path,
+    worktree: &Path,
+    session_id: i64,
+    verification: bool,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
+) -> Result<TrashedCheckout, String> {
     let _span = crate::phase_telemetry::span("checkout_trash_move");
     if worktree.parent() != Some(pool) {
         return Err(format!(
@@ -628,8 +678,9 @@ pub(crate) fn move_worktree_to_trash(
         pending: true,
         creator_pid,
         creator_started_ms,
-        stripped: false,
+        stripped: verification,
         scratch: false,
+        verification,
     };
     record_pending(&trash.path, &entry, row)?;
     rename_noreplace(
@@ -782,6 +833,7 @@ pub(crate) fn move_directory_to_trash(
         creator_started_ms,
         stripped: true,
         scratch: false,
+        verification: false,
     };
     record_pending(&trash.path, &entry, row).map_err(Failed)?;
     rename_noreplace(parent.as_raw_fd(), last, trash.trash.as_raw_fd(), &entry).map_err(
@@ -1414,6 +1466,13 @@ pub(crate) struct TrashDrainReport {
     pub(crate) scratch_bytes: u64,
     /// Session scratch entries removed this run.
     pub(crate) scratch_entries_removed: usize,
+    /// Submit verification worktrees removed this run; their bytes are in
+    /// `bytes` only.
+    pub(crate) verification_entries_removed: usize,
+    /// Rows dropped because the directory holding their trash no longer
+    /// exists (a temporary directory a reboot cleared): nothing is left to
+    /// delete.
+    pub(crate) vanished_rows_dropped: usize,
     /// Entries that failed this run.
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
@@ -1692,6 +1751,21 @@ fn drain_trash_in(
                 report.invalid_trash_dirs += 1;
                 continue;
             }
+            // The directory holding this trash is gone (a temporary
+            // directory a reboot or the system cleaner removed), and with it
+            // every entry: nothing is left to delete, and keeping the rows
+            // would hold the trash "behind" forever. A removable volume that
+            // is merely unmounted keeps its rows.
+            if matches!(
+                std::fs::symlink_metadata(pool),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) && crate::verification::removable_volume_unavailable_reason(pool).is_none()
+            {
+                report.vanished_rows_dropped += entries.len();
+                crate::phase_telemetry::add("checkout_trash_vanished_rows_dropped", Duration::ZERO);
+                entries.clear();
+                continue;
+            }
             let Ok(trash) = open_trash(pool) else {
                 report.invalid_trash_dirs += 1;
                 crate::phase_telemetry::add("checkout_trash_invalid_dir", Duration::ZERO);
@@ -1869,6 +1943,12 @@ fn drain_trash_in(
                                 "session_scratch_trash_entries_removed",
                                 Duration::ZERO,
                             );
+                        } else if row.verification {
+                            report.verification_entries_removed += 1;
+                            crate::phase_telemetry::add(
+                                "verification_slot_trash_entries_removed",
+                                Duration::ZERO,
+                            );
                         } else if row.stripped {
                             report.stripped_entries_removed += 1;
                             report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
@@ -1885,6 +1965,8 @@ fn drain_trash_in(
                         report.bytes = report.bytes.saturating_add(bytes);
                         if row.scratch {
                             report.scratch_bytes = report.scratch_bytes.saturating_add(bytes);
+                        } else if row.verification {
+                            // Neither strip nor scratch: in `bytes` only.
                         } else if row.stripped {
                             report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
                         }
@@ -2007,6 +2089,8 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
         // and stripped and scratch bytes stay out of the ledger.
         merged.stripped_entries_removed += part.stripped_entries_removed;
         merged.scratch_entries_removed += part.scratch_entries_removed;
+        merged.verification_entries_removed += part.verification_entries_removed;
+        merged.vanished_rows_dropped += part.vanished_rows_dropped;
         merged.failed.extend(part.failed);
         merged.reported.extend(part.reported);
         merged.unrecognized += part.unrecognized;
@@ -2481,6 +2565,7 @@ mod tests {
             creator_started_ms: 0,
             stripped: true,
             scratch: false,
+            verification: false,
         }
     }
 

@@ -2331,7 +2331,12 @@ impl Broker {
             progress,
             storage,
         );
-        verification_slot.cleanup();
+        // One rename into the trash instead of Git deleting the whole tree
+        // inline (21 s a submit on the busiest repository); Git's removal
+        // stays the fallback.
+        if !self.trash_verification_slot(verification_slot.path(), entry.session_id) {
+            verification_slot.cleanup();
+        }
         // Promotion may re-simulate another in-flight entry, and a stale
         // verification may recursively re-simulate this entry. Both paths
         // acquire the same stable slot. Release the non-reentrant flock

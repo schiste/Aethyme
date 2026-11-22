@@ -87,6 +87,17 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
             "--untracked-files=all",
         ])
         .current_dir(worktree);
+    // A checkout whose status call already ran out of time in this process
+    // gets the same answer at once: the worker's lanes ask about the same
+    // checkouts several times a run, and on the busiest repository the
+    // repeats cost 52 to 59 s of 2 s timeouts per run.
+    if timed_out_before(worktree) {
+        crate::phase_telemetry::add(
+            "worktree_status_activity_unavailable_remembered",
+            Duration::ZERO,
+        );
+        return StatusActivity::default();
+    }
     #[cfg(test)]
     if STATUS_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
         crate::phase_telemetry::add("worktree_status_activity_unavailable", started.elapsed());
@@ -99,6 +110,11 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
     ) {
         Ok(crate::bounded_output::LimitedOutput::Completed(output)) if output.status.success() => {
             output.stdout
+        }
+        Ok(crate::bounded_output::LimitedOutput::Deadline) => {
+            remember_timeout(worktree);
+            crate::phase_telemetry::add("worktree_status_activity_unavailable", started.elapsed());
+            return StatusActivity::default();
         }
         _ => {
             crate::phase_telemetry::add("worktree_status_activity_unavailable", started.elapsed());
@@ -128,6 +144,26 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
     }
     crate::phase_telemetry::add("worktree_status_activity", started.elapsed());
     activity
+}
+
+/// Checkouts whose status call ran out of time in this process. A process
+/// is one command or one worker run, so a checkout is asked again by the
+/// next one.
+static TIMED_OUT: std::sync::Mutex<Option<std::collections::BTreeSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+fn timed_out_before(worktree: &Path) -> bool {
+    TIMED_OUT
+        .lock()
+        .ok()
+        .is_some_and(|set| set.as_ref().is_some_and(|set| set.contains(worktree)))
+}
+
+fn remember_timeout(worktree: &Path) {
+    if let Ok(mut set) = TIMED_OUT.lock() {
+        set.get_or_insert_with(Default::default)
+            .insert(worktree.to_path_buf());
+    }
 }
 
 /// Whether the changed files show activity at or after `since`: `Some(true)`
@@ -273,6 +309,34 @@ pub(crate) fn age_tree_for_test(dir: &Path, then: SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkout whose status call ran out of time is not waited on again
+    /// by the same process: the answer is the timeout's, at once.
+    #[test]
+    fn a_checkout_that_timed_out_is_answered_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("checkout");
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert!(!timed_out_before(&worktree));
+        remember_timeout(&worktree);
+        assert!(timed_out_before(&worktree));
+        assert!(!timed_out_before(&dir.path().join("other")));
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let activity = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            status_activity(&worktree, STATUS_ACTIVITY_BUDGET, STATUS_ACTIVITY_PATH_CAP)
+        };
+
+        assert_eq!(activity, StatusActivity::default());
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("worktree_status_activity_unavailable_remembered"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert!(!counts.contains_key("subprocess_git"), "{counts:?}");
+    }
 
     #[test]
     fn porcelain_entries_yield_changed_paths_and_skip_rename_sources() {

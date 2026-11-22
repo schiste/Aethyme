@@ -2039,6 +2039,32 @@ fn push_without_a_hook_splits_at_the_ref_read_with_a_zero_hook() {
     assert!(push_process_split(&trace, std::time::Duration::from_secs(1)).is_none());
 }
 
+#[test]
+fn push_timeout_attributes_an_interrupted_hook_and_preserves_unknowns() {
+    let elapsed = Duration::from_millis(1_000);
+    let prefix = PUSH_TRACE_WITH_PRE_PUSH_HOOK
+        .lines()
+        .take_while(|line| !line.contains("git\",\"rev-parse"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trace = parse_git_transfer_trace(&prefix);
+    let timing = push_timeout_timing(&trace, elapsed);
+    assert_eq!(timing["stage"], "pre_push_hook");
+    assert_eq!(timing["before_hook_ms"], 17);
+    assert_eq!(timing["hook_elapsed_ms"], 983);
+    assert!(timing.get("after_hook_ms").is_none());
+
+    let trace = parse_git_transfer_trace(PUSH_TRACE_WITHOUT_HOOK);
+    let timing = push_timeout_timing(&trace, elapsed);
+    assert_eq!(timing["stage"], "transfer");
+    assert_eq!(timing["hook_ms"], 0);
+    assert_eq!(timing["after_hook_ms"], 974);
+
+    let timing = push_timeout_timing(&GitTransferTrace::default(), elapsed);
+    assert_eq!(timing["stage"], "unknown");
+    assert!(timing.get("hook_ms").is_none());
+}
+
 /// A real `git push https://host.invalid/o/r.git HEAD:refs/heads/x` (Git
 /// 2.55.0) that failed with "Could not resolve host", captured with
 /// `GIT_TRACE2_EVENT`. Version, parameter and nested start/exit events are

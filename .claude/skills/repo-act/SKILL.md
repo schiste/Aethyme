@@ -103,7 +103,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   both arms. Keep PATH and the tool environment stable so unrelated discovery
   caches behave normally. Count an avoided execution only when a reused verdict
   points to a fresh producer in that pair with the same execution profile.
-  Record pair wall time and child work separately.
+  Record pair wall time and child work separately. To assess opportunistic
+  batching, give both arms the same ready-time schedule and runner capacity.
+  Measure ready-to-landing time including queue wait, alongside gate
+  executions and total gate work. Include a lone ready change, staggered
+  arrivals and changes that are already waiting. Timing from the point when
+  all members are ready cannot show whether batching delayed the first one.
 
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and verify the actual `SessionStart` payload arrives in
@@ -958,6 +963,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
+
+- For macOS MCP listener-verification failures, compare an ephemeral loopback
+  listener against host-wide `netstat` and group-scoped `lsof` using counts only;
+  check command exit status and stderr without logging connection details. Test
+  both the normal and authorized elevated environment: elevation alone does not
+  prove `netstat` can see the host socket table. Check that the TCP rows include
+  the test listener: a nonempty general listing may contain no TCP sockets.
+  An empty or incomplete global listing is unverified, not evidence that all
+  listeners are owned; do not replace
+  it with group-only `lsof`, which may omit other processes.
 
 ## Useful Commands
 

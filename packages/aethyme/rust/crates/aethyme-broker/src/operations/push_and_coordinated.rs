@@ -479,6 +479,39 @@ fn push_process_split(
     ])
 }
 
+/// Attribute the stopped process without treating an incomplete trace as proof
+/// that a remote write did or did not happen.
+fn push_timeout_timing(trace: &GitTransferTrace, elapsed: Duration) -> serde_json::Value {
+    let stage = if trace.push_refs_started {
+        "transfer"
+    } else if trace.pre_push_hook_started_ms.is_some() && trace.pre_push_hook_ms.is_none() {
+        "pre_push_hook"
+    } else if trace.remote_refs_list_started && !trace.remote_refs_list_finished {
+        "remote_ref_listing"
+    } else {
+        "unknown"
+    };
+    let before = trace
+        .pre_push_hook_started_ms
+        .or(trace.remote_refs_read_ms)
+        .map(Duration::from_millis)
+        .filter(|before| *before <= elapsed);
+    let mut timing = json!({ "stage": stage, "process_ms": elapsed.as_millis() });
+    if let Some(before) = before {
+        timing["before_hook_ms"] = json!(before.as_millis());
+        if stage == "pre_push_hook" {
+            timing["hook_elapsed_ms"] = json!((elapsed - before).as_millis());
+        }
+    }
+    if let Some([_, (_, hook), (_, after)]) = push_process_split(trace, elapsed) {
+        timing["hook_ms"] = json!(hook.as_millis());
+        if stage == "transfer" {
+            timing["after_hook_ms"] = json!(after.as_millis());
+        }
+    }
+    timing
+}
+
 impl GitTransferTrace {
     /// Whether the push provably ended before it could send any ref update.
     ///
@@ -3397,6 +3430,15 @@ impl Broker {
         let push_shape = (request.provider == OperationProvider::Git)
             .then(|| classify_push(&request.args))
             .flatten();
+        // A push runs the repository's pre-push hook (in the dry run below,
+        // in the push itself, or both): its commands get a temp directory of
+        // this session's, so what they leave under `$TMPDIR` goes with the
+        // run. Held until both commands ended; dropping it ends the run.
+        let command_temp = (effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+            && is_push(&request.args))
+        .then(|| self.command_temp_for_session(request.session_id))
+        .flatten();
         let hooks_ran_outside_lock = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
@@ -3495,6 +3537,9 @@ impl Broker {
             dry_run.args(&pinned[command_index + 1..]);
             dry_run.current_dir(cwd);
             export_push_shape(&mut dry_run, push_shape.as_ref());
+            if let Some(temp) = &command_temp {
+                temp.apply(&mut dry_run);
+            }
             match output_within(
                 dry_run,
                 admission,
@@ -4180,6 +4225,9 @@ impl Broker {
         if request.provider == OperationProvider::Git {
             export_push_shape(&mut command, push_shape.as_ref());
         }
+        if let Some(temp) = &command_temp {
+            temp.apply(&mut command);
+        }
         // Trace2 gives us process-level evidence for the one useful
         // pre-transfer distinction Git itself does not expose in its exit
         // status: a local pre-push hook can reject the command before any
@@ -4255,6 +4303,8 @@ impl Broker {
         };
         drop(process_span);
         let process_elapsed = process_started.elapsed();
+        // The hook has ended with the push: end its run now.
+        self.finish_command_temp(request.session_id, command_temp);
         let _record_span = push_stage_span(push_stages, "push_git_record");
         let output = match provider_output {
             Ok(output) => output,
@@ -4300,6 +4350,13 @@ impl Broker {
                         &push_planning,
                     ),
                 );
+                if push_stages && let Some(trace) = &git_trace {
+                    let _span = crate::phase_telemetry::span("push_git_timeout_trace");
+                    details["push_timeout_timing"] = push_timeout_timing(
+                        &inspect_git_transfer_trace(trace.path()),
+                        process_elapsed,
+                    );
+                }
                 if let Some(liveness) = operation_liveness {
                     add_operation_liveness(&mut details, liveness);
                 }

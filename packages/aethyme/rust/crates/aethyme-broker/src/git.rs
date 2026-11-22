@@ -1287,6 +1287,92 @@ pub(crate) fn git_command() -> Command {
     command
 }
 
+/// Git subcommands that only read, judged from the arguments: the only
+/// Git children of a throttled process given an ordinary disk priority.
+/// Anything not known to be a read keeps the inherited throttle.
+pub(crate) fn git_subcommand_is_read_only(args: &[&str]) -> bool {
+    let mut words = args.iter().copied();
+    let subcommand = loop {
+        match words.next() {
+            Some("-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace") => {
+                words.next();
+            }
+            Some(option) if option.starts_with('-') => {}
+            Some(subcommand) => break subcommand,
+            None => return false,
+        }
+    };
+    let rest = words.collect::<Vec<_>>();
+    match subcommand {
+        "status" | "diff" | "diff-index" | "diff-files" | "diff-tree" | "ls-files" | "ls-tree"
+        | "rev-parse" | "rev-list" | "merge-base" | "for-each-ref" | "show-ref" | "cat-file"
+        | "log" | "show" | "name-rev" | "describe" | "check-ignore" | "check-attr"
+        | "count-objects" | "var" | "grep" | "blame" => true,
+        "worktree" | "stash" => rest.first() == Some(&"list"),
+        "bundle" => matches!(rest.first(), Some(&"verify" | &"list-heads")),
+        "config" => rest.iter().any(|word| {
+            matches!(
+                *word,
+                "--get" | "--get-all" | "--get-regexp" | "-l" | "--list"
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Before spawning a Git child of a process at `IOPOL_THROTTLE` (the
+/// detached worker, throttled to pace its deletions): no Git child starts
+/// automatic maintenance (`gc.auto=0`, `maintenance.auto=false`, through
+/// Git's environment configuration), and only a read-only one
+/// ([`git_subcommand_is_read_only`]) runs at an ordinary process's disk
+/// priority. On the busiest repository the worker's status proofs took
+/// 16.1 s each (70) and its cleanup status checks 9.9 s (114), while the
+/// same status in the retirement lane, at an ordinary priority, took a
+/// median 0.87 s. Everything else keeps the throttle.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn prepare_git_child_io(command: &mut Command) {
+    if crate::gc::current_io_policy() != "throttle" {
+        return;
+    }
+    if !command
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new("GIT_CONFIG_COUNT"))
+    {
+        command
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "gc.auto")
+            .env("GIT_CONFIG_VALUE_0", "0")
+            .env("GIT_CONFIG_KEY_1", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_1", "false");
+    }
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if !crate::gc::git_child_wants_ordinary_io(
+        crate::gc::current_io_policy(),
+        !git_subcommand_is_read_only(&args),
+    ) {
+        crate::phase_telemetry::add("git_child_kept_throttle", Duration::ZERO);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook runs in the child between fork and exec and only
+        // makes integer-only system calls on that child, which are
+        // async-signal-safe; it allocates nothing and takes no lock.
+        unsafe {
+            command.pre_exec(|| {
+                crate::gc::raise_git_child_before_exec();
+                Ok(())
+            });
+        }
+        crate::phase_telemetry::add("git_child_ordinary_io", Duration::ZERO);
+    }
+}
+
 thread_local! {
     static DROP_INHERITED_GIT_ENVIRONMENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -3274,6 +3360,7 @@ fn run_git_process_output(
     args: &[&str],
     budget: Duration,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(&mut command);
     let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
@@ -3317,6 +3404,7 @@ fn run_git_process_output_in_owned_group(
     budget: Duration,
     writers_quiescent: &mut bool,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(&mut command);
     let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
@@ -10278,6 +10366,7 @@ pub(crate) fn run_git_process_output_limited(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Result<std::process::Output, GitError> {
+    prepare_git_child_io(command);
     let effective_deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
     let remaining = effective_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
