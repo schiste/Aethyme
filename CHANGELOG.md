@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.160] - 2026-11-22
+
+### Fixed
+
+- The scheduled GC service rebinds itself after an update. A managed tick only accepts the runtime the installation's `current` selector names; an update keeps the old bundle as `previous`, and every repair path was guarded by "the old bundle is gone", so each tick refused with "scheduled GC requires an installer-managed immutable runtime pair" until someone ran `gc service refresh`. An update now rebinds every service that is not on the new current bundle; `gc service status` refreshes a stale binding as well as a missing one when it runs from the current router; and `broker status`, run from the current router, starts one detached refresh for a stale or missing binding, decided under the service's install lock, backing off from 15 minutes to 6 hours while attempts keep failing and reset by a new current bundle. It prints nothing new and starts nothing from an App Sandbox process (#1953).
+- A tick that cannot finish is visible and no longer blocks a refresh. The tick writes `tick-started.json` before its first access to the repository or a pool volume and releases the service's install lock around the writable broker open, then retakes it (waiting up to 2 s) and re-checks the plan and runtime before recording anything; on a failed open it records a last pass only after that re-check, otherwise the generation-free error. A tick with no receipt 900 s after it started is reported as `tick_blocked`, `tick_ended_without_receipt` or `tick_unverified` (the process could not be checked from this process; no child process is started for the check) (#1953).
+- A last-pass receipt of another generation reads as "no pass for this generation" and is overwritten by the next pass, instead of failing `gc service status` and every later receipt (#1953).
+
+### Added
+
+- `gc service status --json` fields `runtime_binding` (`current`, `stale`, `gone`, `unknown`), `tick_started` and `unanswered_tick`; `next_action` names the refresh whenever the runtime does not verify or the last tick error is newer than the last pass. `broker status` advices `storage.gc-service-runtime-stale`, `storage.gc-service-ticks-refusing`, `storage.gc-service-tick-blocked` and `storage.gc-service-tick-unverified`. Receipts `tick-started.json` and `refresh-scheduled.json`; span `gc_service_refresh_schedule`; counters `gc_service_refresh_scheduled`, `gc_service_refresh_start_failed`, `gc_service_refresh_receipt_unwritable`, `gc_service_refresh_lock_unavailable` and `gc_service_foreign_generation_receipt` (#1953).
+
+### Known issues
+
+- On macOS each new runtime is a new code identity, so its first scheduled run on a removable or protected volume can wait on a privacy consent prompt; the tick is then reported as blocked until the prompt is answered. A stable signing identity for released runtimes is not in place.
+- The background refresh fires only when `broker status` runs from the installation's managed current router; an update run by an older binary is repaired by the first such `broker status` in each repository.
+
 ## [0.8.159] - 2026-11-22
 
 ### Fixed
