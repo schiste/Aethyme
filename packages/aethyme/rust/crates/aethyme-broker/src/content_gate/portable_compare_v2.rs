@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Inputs independently acquired for a fresh offline evaluation. This draft
-/// supports a host-provided collection and requires external evidence to be
-/// independently established absent, not inferred from an old verdict.
+/// supports a host-provided collection and source-bound link observations.
+/// The host must independently establish evidence provenance and freshness.
 pub struct Inputs<'a> {
     pub base: &'a Snapshot,
     pub after: &'a [Item],
@@ -21,6 +21,7 @@ pub struct Inputs<'a> {
     pub resolved_policy: &'a [u8],
     pub host_options: &'a [u8],
     pub collection: Option<&'a [u8]>,
+    pub external_evidence: Option<&'a [u8]>,
     pub evaluator_identity: &'a [u8],
     pub expected_validator_name: &'a str,
     pub expected_validator_version: &'a str,
@@ -119,12 +120,23 @@ fn closed_verdict(v: &Value) -> Result<(), &'static str> {
             ext,
             &[
                 "aexeo.offline-input-binding.v1",
+                "aexeo.observed-link-binding.v1",
                 "aexeo.html-content-scope.v1",
             ],
         )?;
-        if !ext["aexeo.offline-input-binding.v1"]
-            .as_str()
-            .is_some_and(valid_sha)
+        let offline = ext.get("aexeo.offline-input-binding.v1");
+        let observed = ext.get("aexeo.observed-link-binding.v1");
+        let valid_offline = offline.and_then(Value::as_str).is_some_and(valid_sha);
+        let valid_observed = observed.is_some_and(|value| {
+            closed(value, &["inputs_sha256", "observations_sha256"]).is_ok()
+                && value.as_object().is_some_and(|m| m.len() == 2)
+                && ["inputs_sha256", "observations_sha256"]
+                    .iter()
+                    .all(|key| value[*key].as_str().is_some_and(valid_sha))
+        });
+        if (valid_offline as u8 + valid_observed as u8) != 1
+            || offline.is_some() != valid_offline
+            || observed.is_some() != valid_observed
             || ext
                 .get("aexeo.html-content-scope.v1")
                 .is_some_and(|scope| scope.as_str() != Some("main"))
@@ -353,11 +365,69 @@ fn policy_coverage(
     Ok((gates.len(), expected))
 }
 
+// Validate the supported snapshot shape, but do not claim to authenticate the
+// host's observations or independently re-extract destinations from prose.
+fn validate_link_evidence(bytes: &[u8], change: &Value) -> Result<(), &'static str> {
+    let snapshot = parse_unique(bytes)?;
+    closed(&snapshot, &["version", "change_id", "entries"])?;
+    if snapshot.as_object().is_none_or(|m| m.len() != 3)
+        || snapshot["version"].as_u64() != Some(1)
+        || snapshot["change_id"] != change["change_id"]
+    {
+        return Err("invalid link observation snapshot");
+    }
+    let entries = snapshot["entries"]
+        .as_object()
+        .ok_or("invalid link observation snapshot")?;
+    let change_entries: BTreeMap<_, _> = change["entries"]
+        .as_array()
+        .ok_or("invalid change entries")?
+        .iter()
+        .map(|entry| {
+            entry["entity_id"]
+                .as_str()
+                .map(|id| (id, entry))
+                .ok_or("invalid entity")
+        })
+        .collect::<Result<_, _>>()?;
+    for (id, item) in entries {
+        closed(
+            item,
+            &["version", "source_sha256", "destinations", "observations"],
+        )?;
+        let entry = change_entries
+            .get(id.as_str())
+            .ok_or("invalid link observation snapshot entry")?;
+        let destinations = item["destinations"]
+            .as_array()
+            .ok_or("invalid link observation snapshot entry")?;
+        let observations = item["observations"]
+            .as_array()
+            .ok_or("invalid link observation snapshot entry")?;
+        if item.as_object().is_none_or(|m| m.len() != 4)
+            || item["version"].as_u64() != Some(1)
+            || entry.get("after").is_none_or(Value::is_null)
+            || item["source_sha256"] != entry["after"]["sha256"]
+            || destinations.len() != observations.len()
+            || destinations.iter().any(|v| !v.is_string())
+            || observations.iter().any(|v| {
+                !matches!(
+                    v.as_str(),
+                    Some("reachable" | "not_found" | "not_checked" | "not_applicable")
+                )
+            })
+        {
+            return Err("invalid link observation snapshot entry");
+        }
+    }
+    Ok(())
+}
+
 /// Compare an earlier and a freshly produced envelope against independently
 /// reconstructed inputs. Passing is never permission to publish. In addition
 /// to caller obligations above, snapshots must be duplicate-safe parsed. This
 /// host must independently establish that any collection faithfully projects
-/// the candidate; external evidence is not supported.
+/// the candidate and establish link observation provenance and freshness.
 pub fn compare(
     previous: &[u8],
     fresh: &[u8],
@@ -384,13 +454,16 @@ pub fn compare(
     if let Some(bytes) = input.collection {
         validate_collection(bytes, &candidate, &change)?;
     }
+    if let Some(bytes) = input.external_evidence {
+        validate_link_evidence(bytes, &change)?;
+    }
     let binding = candidate_binding(&CandidateArtifacts {
         change: input.change,
         resolved_policy: input.resolved_policy,
         host_options: input.host_options,
         evaluator: input.evaluator_identity,
         collection: input.collection,
-        external_evidence: None,
+        external_evidence: input.external_evidence,
         base_revision_sha256: snapshot_digest(input.base)?,
         candidate_revision_sha256: snapshot_digest(&candidate)?,
     })?;
@@ -424,7 +497,7 @@ pub fn compare(
         policy: input.resolved_policy.to_vec(),
         options: input.host_options.to_vec(),
         collection: input.collection.map(<[u8]>::to_vec),
-        external: None,
+        external: input.external_evidence.map(<[u8]>::to_vec),
         additional: BTreeMap::new(),
     };
     let mut coverage = None;
@@ -433,6 +506,13 @@ pub fn compare(
             return Err("candidate input binding differs");
         }
         let verdict = &env["verdict"];
+        let observed = verdict
+            .get("extensions")
+            .and_then(|ext| ext.get("aexeo.observed-link-binding.v1"))
+            .is_some();
+        if observed != input.external_evidence.is_some() {
+            return Err("link evidence does not match the verdict profile");
+        }
         if verdict["subject"] != subject
             || verdict["validator"]["name"] != input.expected_validator_name
             || verdict["validator"]["version"] != input.expected_validator_version
@@ -508,6 +588,7 @@ mod tests {
                 .as_bytes(),
             host_options: v["artifacts"]["host_options"].as_str().unwrap().as_bytes(),
             collection: None,
+            external_evidence: None,
             evaluator_identity: v["artifacts"]["evaluator"].as_str().unwrap().as_bytes(),
             expected_validator_name: "aexeo",
             expected_validator_version: "0.0.24",
@@ -677,6 +758,74 @@ mod tests {
             .unwrap()
             .remove("aexeo.offline-input-binding.v1");
         assert!(closed_verdict(&verdict["verdict"]).is_err());
+    }
+    #[test]
+    fn accepts_only_exact_observed_link_extension() {
+        let (_, _, _, mut verdict) = fixture();
+        let v = &mut verdict["verdict"];
+        assert!(closed_verdict(v).is_ok());
+        v["extensions"] = json!({"aexeo.observed-link-binding.v1": {
+            "inputs_sha256": "a".repeat(64), "observations_sha256": "b".repeat(64)
+        }});
+        assert!(closed_verdict(v).is_ok());
+        v["extensions"]["aexeo.offline-input-binding.v1"] = json!("c".repeat(64));
+        assert!(closed_verdict(v).is_err());
+        v["extensions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aexeo.offline-input-binding.v1");
+        v["extensions"]["aexeo.observed-link-binding.v1"]["unexpected"] = json!(true);
+        assert!(closed_verdict(v).is_err());
+    }
+    #[test]
+    fn rejects_malformed_link_evidence_and_profile_mismatches() {
+        let (v, base, after, mut verdict) = fixture();
+        let change = parse_change(v["artifacts"]["change"].as_str().unwrap().as_bytes()).unwrap();
+        let mut snapshot = json!({"version":1,"change_id":change["change_id"],"entries":{"article":{
+            "version":1,"source_sha256":change["entries"][0]["after"]["sha256"],
+            "destinations":["https://example.org/"],"observations":["reachable"]}}});
+        assert!(validate_link_evidence(snapshot.to_string().as_bytes(), &change).is_ok());
+        let original = snapshot.clone();
+        for (pointer, invalid) in [
+            ("/version", json!(true)),
+            ("/change_id", json!("wrong")),
+            ("/entries/article/source_sha256", json!("0".repeat(64))),
+            ("/entries/article/observations", json!([])),
+            ("/entries/article/observations", json!(["unknown"])),
+            ("/entries/article/destinations", json!([42])),
+        ] {
+            *snapshot.pointer_mut(pointer).unwrap() = invalid;
+            assert!(
+                validate_link_evidence(snapshot.to_string().as_bytes(), &change).is_err(),
+                "{pointer}"
+            );
+            snapshot = original.clone();
+        }
+        let bytes = snapshot.to_string().into_bytes();
+        let mut input = inputs(&v, &base, &after);
+        input.external_evidence = Some(&bytes);
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let hash = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: input.collection,
+            external_evidence: input.external_evidence,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] =
+            json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        // Rebinding cannot make offline metadata accept external evidence.
+        assert!(!run(&verdict, &verdict, &input));
+        verdict["verdict"]["extensions"] = json!({"aexeo.observed-link-binding.v1": {
+            "inputs_sha256": "a".repeat(64), "observations_sha256": "b".repeat(64)
+        }});
+        assert!(run(&verdict, &verdict, &input));
+        input.external_evidence = None;
+        assert!(!run(&verdict, &verdict, &input));
     }
     #[test]
     fn rejects_unknown_nested_fields_duplicates_and_inconsistent_results() {

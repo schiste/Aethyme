@@ -24,6 +24,8 @@ struct Manifest {
     host_options: PathBuf,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     collection: Option<PathBuf>,
+    #[serde(default)]
+    external_evidence: Option<PathBuf>,
     evaluator_identity: PathBuf,
     validator_name: String,
     validator_version: String,
@@ -53,6 +55,7 @@ fn execute(
     let policy = read(&m.resolved_policy)?;
     let options = read(&m.host_options)?;
     let collection = optional(&m.collection)?;
+    let evidence = optional(&m.external_evidence)?;
     let identity = read(&m.evaluator_identity)?;
     let required: Vec<_> = m.required_checks.iter().map(String::as_str).collect();
     timings.insert("input_read_and_parse_ms", started.elapsed().as_millis());
@@ -67,6 +70,7 @@ fn execute(
             resolved_policy: &policy,
             host_options: &options,
             collection: collection.as_deref(),
+            external_evidence: evidence.as_deref(),
             evaluator_identity: &identity,
             expected_validator_name: &m.validator_name,
             expected_validator_version: &m.validator_version,
