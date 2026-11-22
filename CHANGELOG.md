@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.159] - 2026-11-22
+
+### Fixed
+
+- Checkout trash entries recorded before a remount are deletable again. When a volume is remounted with a new device number, every trash row recorded before it stopped matching its entry: confirmed entries were refused by the deleter on every run, and a pending row whose mover was gone was dropped, stranding its entry. A row is now rebound to the trash's current device on its own proof: the trash is a real, private directory owned by this user and carrying the broker's marker, and the row's own entry name is a real directory on the trash's device with the recorded inode and the row's session. Only the device changes; a rebound row is not confirmed or deleted in the same run, and deletion keeps its pinned identity checks. A pending row with a changed device is kept and held instead of dropped (#1952).
+- A mover records a start time that can be proven gone. On the busiest repository 217 of 218 trash rows held no creator start, so each waited a day for the stale reconcile. The mover now reads its own start directly (macOS `KERN_PROC_PID`, Linux `/proc/self/stat`), falling back to the process table. A listed process whose start cannot be read no longer counts as gone, in the trash deleter and in the partial-archive sweep; starts within 2 s, or exactly one hour apart, name the same process (#1951).
+- A confirmed trash entry whose identity changed (`device_changed`, `inode_changed`, `not_a_directory`) is held aside: never deleted, left out of the deletable backlog, and no longer keeps the deleter "behind" or the reclaiming-nothing advice on. A confirmed row whose entry is missing from a present, private, marked trash on the recorded device is dropped (#1951).
+- The session scratch retirement pass costs what its budget says. In 0.8.158 the hourly full listing made every open record due at once (classification 2.1 to 5.6 s for several passes, against about 2.05 s before), and the container listing and signal clear ran outside the budget. The deadline now starts before the container listing; the signal clear and its store write run only when there is a signal; the full listing is a paced lap (a share per pass over 30 minutes, at most 0.5 s, at least one listing); closed-record probes are their own 0.5 s step (#1954).
+- The session scratch size measurement completes. It walked from the first record on every pass for 2 to 3.7 s, never reached the end and usually reported nothing, so `aethyme storage status` and the scratch advices saw only the first records. It is now a resumable lap that rests 15 minutes between laps; `kept` and `refused` count every record, so `storage.session-scratch-unidentified` may newly appear where it was undercounted (#1954).
+
+### Added
+
+- `broker status` notice `cleanup.trash-identity-changed` with a remedy per cause. Sweep receipt, `gc trash drain --json` and `gc_sweep_pass` fields for identity-changed, held-back, rebound and refused entries; `trash_entries_held_back`; span `checkout_trash_rebind`; counters `trash_creator_start_direct`, `trash_creator_start_from_table`, `trash_creator_start_unknown`, `checkout_trash_rebound`, `checkout_trash_rebind_refused_<cause>`, `checkout_trash_pending_identity_held` (#1951, #1952).
+- Per-operation spans `session_scratch_retire_due_listing`, `session_scratch_retire_lap_listing`, `session_scratch_retire_probe`, `session_scratch_retire_signal_clear` and `session_scratch_measure_record`; cursor fields `lap_open`, `lap_after`, `lap_listed`; metadata key `session_scratch.measure_lap` (#1954).
+
+### Upgrade notes
+
+- An older binary's deleter running in a non-C locale can misjudge a new mover's row while the move is in flight; the mover records its row again and no entry is deleted wrongly. An older binary rewriting the scratch cursor drops the lap fields; the lap restarts within the hour.
+- A block-level clone of a pool volume keeps names and inode numbers: the clone's trash entries are rebound and deleted with the usual checks.
+
+### Known issues
+
+- On macOS the scheduled GC service is not rebound to a new runtime after an update, and its first run from the new runtime can wait on a privacy consent prompt for a removable volume with no receipt and no advice. Run `aethyme broker gc service refresh --json` after an update and answer the prompt.
+- A real remount is not exercised by CI; the rebind is tested by renumbering recorded devices. The full listing lap has no time bound when listings are very slow (one listing per pass at worst). `gc plan` does not complete within its deadline on a very large repository.
+
 ## [0.8.158] - 2026-11-22
 
 ### Fixed
