@@ -124,6 +124,8 @@ const GROUP_TEXT: &[(&str, &str)] = &[
     The publication host must revalidate and synchronize the final decision.
   aethyme content-gate compare-v2 <manifest.json>
     Compare experimental v2 evidence offline; never authorizes publication.
+  aethyme content-gate run-v2 <manifest.json>
+    Run an experimental fresh comparison; never authorizes publication.
 "#,
     ),
     (

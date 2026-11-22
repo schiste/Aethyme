@@ -1,5 +1,7 @@
 //! Host-facing execution of an Aexeo v1 check. Publication remains the host's responsibility.
 mod portable_compare;
+mod portable_run;
+mod supervisor;
 
 use aethyme_broker::content_gate::strict::{DecisionInputs, strict_precheck_v1};
 use serde::Deserialize;
@@ -8,11 +10,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
 };
 
 const LIMIT: u64 = 16 * 1024 * 1024;
@@ -141,61 +139,15 @@ fn execute(path: &Path) -> Result<(), String> {
     // create an isolated group for their own timeout and liveness checks.
     let broker_mode = std::env::var("AETHYME_CONTENT_GATE_MODE").as_deref() == Ok("v1-uncached")
         && std::env::var_os("AETHYME_GATE_WORKER_ID").is_some();
-    let mut command = Command::new(&m.validator[0]);
-    command
-        .env_clear()
-        .envs(&m.env)
-        .args(&m.validator[1..])
-        .env("CONTENT_GATE_CHANGE_FILE", change_path)
-        .env("CONTENT_GATE_VERDICT_FILE", &verdict_path)
-        .stdin(Stdio::null());
-    if !broker_mode {
-        command.process_group(0);
-    }
-    let mut child = command.spawn().map_err(|_| "validator could not start")?;
-    let deadline = Instant::now() + Duration::from_secs(m.timeout_seconds);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if Instant::now() <= deadline => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Ok(Some(_)) => return Err("validator exceeded deadline".into()),
-            _ => {
-                if broker_mode {
-                    let _ = child.kill();
-                } else {
-                    // SAFETY: kill(2) takes plain integers and touches no Rust memory;
-                    // the negated pid targets the validator's own process group.
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                }
-                let _ = child.wait();
-                return Err("validator timed out or could not be observed".into());
-            }
-        }
-    };
-    // A surviving process group could still mutate the verdict. Never trust it.
-    if !broker_mode
-        // SAFETY: signal 0 only probes the validator's own process group and
-        // touches no Rust memory.
-        && (unsafe { libc::kill(-(child.id() as i32), 0) } == 0
-            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
-    {
-        return Err("validator descendants may still be active".into());
-    }
-    // Nonzero exits are always blocked; distinguish the v1 protocol's outcomes
-    // without claiming that an unvalidated verdict is authentic or complete.
-    match status.code() {
-        Some(0) => {}
-        Some(1) => {
-            return Err("validator exited with code 1 (failed verdict or execution error)".into());
-        }
-        Some(2) => {
-            return Err("validator exited with code 2 (not checked or invalid input)".into());
-        }
-        Some(code) => return Err(format!("validator exited with code {code}")),
-        None => return Err("validator terminated without an exit code".into()),
-    }
+    let status = supervisor::run(
+        &m.validator,
+        &m.env,
+        &change_path,
+        &verdict_path,
+        m.timeout_seconds,
+        broker_mode,
+        false,
+    )?;
     let meta =
         fs::symlink_metadata(&verdict_path).map_err(|_| "validator did not produce verdict")?;
     if !meta.file_type().is_file() {
@@ -225,6 +177,13 @@ fn execute(path: &Path) -> Result<(), String> {
     Ok(())
 }
 pub fn run(args: &[String]) -> u8 {
+    if args.first().is_some_and(|arg| arg == "run-v2") {
+        if std::env::var_os("AETHYME_GATE_WORKER_ID").is_some() {
+            eprintln!("experimental comparison is forbidden in broker gates");
+            return 2;
+        }
+        return portable_run::run(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "compare-v2") {
         if std::env::var_os("AETHYME_GATE_WORKER_ID").is_some() {
             eprintln!("offline comparison is forbidden in broker gates");
@@ -239,7 +198,7 @@ pub fn run(args: &[String]) -> u8 {
         return 2;
     }
     if args.len() != 2 || args[0] != "run" {
-        eprintln!("usage: aethyme content-gate <run|compare-v2> MANIFEST.json");
+        eprintln!("usage: aethyme content-gate <run|compare-v2|run-v2> MANIFEST.json");
         return 2;
     }
     match execute(Path::new(&args[1])) {
