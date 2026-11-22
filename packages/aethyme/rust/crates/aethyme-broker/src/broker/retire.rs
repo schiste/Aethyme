@@ -238,6 +238,17 @@ pub(crate) struct StaleTrashReconcile {
     /// Confirmed rows dropped: no entry by that name in a trash that is
     /// present, private, marked and on the recorded device.
     pub(crate) confirmed_dropped_missing: usize,
+    /// Rows (confirmed or pending) rebound to the device their trash is on
+    /// now after a remount ([`crate::checkout_trash::rebind_rows`]).
+    pub(crate) rebound: usize,
+    /// Rows recording another device than their verified trash's current
+    /// one that failed their own proof (each cause is counted as
+    /// `checkout_trash_rebind_refused_<cause>`).
+    pub(crate) rebind_refused: usize,
+    /// Trash directories whose proven rows recorded more than one old
+    /// device (several remounts since they were written): an observation;
+    /// each row was rebound on its own proof.
+    pub(crate) rebind_proven_old_devices_mixed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -321,6 +332,9 @@ pub(crate) struct TrashCatchupReport {
     pub(crate) entries_removed: usize,
     pub(crate) unlinks: usize,
     pub(crate) bytes: u64,
+    /// Rows rebound after a remount, and rows refused a rebind, over the
+    /// lap's slices ([`crate::checkout_trash::RebindTally`]).
+    pub(crate) rebind: crate::checkout_trash::RebindTally,
     /// Time spent inside drains (the rest is gaps and lock waits).
     pub(crate) drain_time: std::time::Duration,
     pub(crate) elapsed: std::time::Duration,
@@ -342,6 +356,7 @@ impl TrashCatchupReport {
             entries_removed: 0,
             unlinks: 0,
             bytes: 0,
+            rebind: crate::checkout_trash::RebindTally::default(),
             drain_time: std::time::Duration::ZERO,
             elapsed: std::time::Duration::ZERO,
             busy_retries: 0,
@@ -1786,6 +1801,12 @@ impl Broker {
     /// is deleted as usual; only a mover that crashes between the rename and
     /// that record leaves an entry no row names, which the drain reports as
     /// unrecognized and leaves alone.
+    ///
+    /// First, rows whose trash was mounted again under a new device number
+    /// are rebound to it ([`crate::checkout_trash::rebind_rows`]):
+    /// confirmed and pending rows alike, only the device changes (a pending
+    /// row stays pending), written by the same compare-and-set onto a
+    /// stored row unchanged since the look. Nothing is deleted here.
     pub(crate) fn reconcile_stale_pending_trash_rows(&self) -> StaleTrashReconcile {
         use crate::checkout_trash::TrashEntryState;
         let now = crate::clock::epoch_ms();
@@ -1793,8 +1814,31 @@ impl Broker {
         let mut eligible = Vec::new();
         let mut missing = Vec::new();
         let mut marks = Vec::new();
-        for (dir, entries) in self.checkout_trash_rows() {
+        let all_rows = self.checkout_trash_rows();
+        // A remount renumbers a trash's device: rows found again on the new
+        // device by name, session and inode are rebound, confirmed and
+        // pending alike, each on its own proof.
+        let mut rebinds = Vec::new();
+        let mut tally = crate::checkout_trash::RebindTally::default();
+        for (dir, entries) in &all_rows {
+            for (name, device) in crate::checkout_trash::rebind_rows(dir, entries, &mut tally) {
+                if let Some(row) = entries.get(&name) {
+                    rebinds.push((dir.clone(), name, *row, device));
+                }
+            }
+        }
+        outcome.rebind_refused = tally.refused_total();
+        outcome.rebind_proven_old_devices_mixed = tally.proven_old_devices_mixed;
+        let rebinding = rebinds
+            .iter()
+            .map(|(dir, name, _, _)| (dir.clone(), name.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (dir, entries) in all_rows {
             for (name, row) in entries {
+                // Rebound below; looked at as usual by the next pass.
+                if rebinding.contains(&(dir.clone(), name.clone())) {
+                    continue;
+                }
                 if !row.pending {
                     if !crate::checkout_trash::is_broker_entry_name(&name) {
                         continue;
@@ -1858,13 +1902,14 @@ impl Broker {
                 eligible.push((dir.clone(), name, row));
             }
         }
-        if eligible.is_empty() && missing.is_empty() && marks.is_empty() {
+        if eligible.is_empty() && missing.is_empty() && marks.is_empty() && rebinds.is_empty() {
             return outcome;
         }
         let mut flipped = Vec::new();
         let mut dropped = 0usize;
         let mut confirmed_dropped = 0usize;
         let mut marked = 0usize;
+        let mut rebound = 0usize;
         let applied = self.update_meta_json(
             CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
             |rows: &mut crate::checkout_trash::TrashRows| {
@@ -1873,6 +1918,16 @@ impl Broker {
                 dropped = 0;
                 confirmed_dropped = 0;
                 marked = 0;
+                rebound = 0;
+                // Only onto a stored row unchanged since the proof, with
+                // the device that proof was taken against.
+                for (dir, name, row, device) in &rebinds {
+                    if let Some(entries) = rows.get_mut(dir)
+                        && crate::checkout_trash::apply_rebind(entries, name, row, *device)
+                    {
+                        rebound += 1;
+                    }
+                }
                 for (dir, name, row) in &eligible {
                     if let Some(stored) =
                         rows.get_mut(dir).and_then(|entries| entries.get_mut(name))
@@ -1920,6 +1975,13 @@ impl Broker {
                 outcome.confirmed = flipped.len();
                 outcome.dropped_missing = dropped;
                 outcome.confirmed_dropped_missing = confirmed_dropped;
+                outcome.rebound = rebound;
+                for _ in 0..rebound {
+                    crate::phase_telemetry::add(
+                        "checkout_trash_rebound",
+                        std::time::Duration::ZERO,
+                    );
+                }
                 for _ in 0..dropped {
                     crate::phase_telemetry::add(
                         "checkout_trash_stale_missing_rows_dropped",
@@ -1965,7 +2027,9 @@ impl Broker {
         };
         for (name, row) in rows.values().flat_map(|entries| entries.iter()) {
             summary.recorded += 1;
-            if row.pending {
+            // A pending row held with a changed identity counts as identity
+            // changed, as `broker status` and the drain report count it.
+            if row.pending && row.identity_mismatch.is_none() {
                 summary.pending += 1;
                 if crate::checkout_trash::stale_unconfirmable(name, row, now) {
                     summary.stale_pending += 1;
@@ -1975,8 +2039,9 @@ impl Broker {
             if !crate::checkout_trash::is_broker_entry_name(name) {
                 continue;
             }
-            // Confirmed entries out of the deletable backlog, each counted
-            // once: identity changed, then failing, then in use.
+            // Entries out of the deletable backlog, each counted once:
+            // identity changed, then failing, then in use (the last two
+            // only for confirmed entries).
             if let Some(cause) = row.identity_mismatch {
                 summary.identity_changed += 1;
                 match cause {
@@ -1999,9 +2064,10 @@ impl Broker {
         summary
     }
 
-    /// Confirmed trash entries marked as present with another identity
-    /// than recorded: trash directory, entry name and why, oldest first.
-    /// Metadata reads only.
+    /// Trash entries marked as present with another identity than
+    /// recorded (confirmed ones, and pending ones held with the recorded
+    /// inode on another device): trash directory, entry name and why,
+    /// oldest first. Metadata reads only.
     pub(crate) fn checkout_trash_identity_changed(
         &self,
     ) -> Vec<(PathBuf, String, crate::checkout_trash::IdentityMismatch)> {
@@ -2010,9 +2076,7 @@ impl Broker {
             .into_iter()
             .flat_map(|(dir, entries)| {
                 entries.into_iter().filter_map(move |(name, row)| {
-                    (!row.pending)
-                        .then_some(row.identity_mismatch)
-                        .flatten()
+                    row.identity_mismatch
                         .map(|cause| (dir.clone(), name, cause))
                 })
             })
@@ -4300,6 +4364,8 @@ impl Broker {
                 "entries_removed": report.entries_removed,
                 "unlinks": report.unlinks,
                 "bytes": report.bytes,
+                "rebound": report.rebind.rebound,
+                "rebind_refused": &report.rebind.refused,
                 "elapsed_ms": elapsed_ms,
                 "unlinks_per_second_observed": observed_rate,
                 "passed_over": {
@@ -4447,10 +4513,16 @@ impl Broker {
                 .saturating_add(drained.entries_removed);
             report.unlinks = report.unlinks.saturating_add(drained.unlinks);
             report.bytes = report.bytes.saturating_add(drained.bytes);
+            report.rebind.merge(&drained.rebind);
             if drained.yielded_to_pressure {
                 break TrashCatchupEnd::Pressure;
             }
-            if drained.entries_removed == 0 && !drained.budget_stopped {
+            // A slice that only rebound rows made progress: the next slice
+            // deletes them from the stored rows.
+            if drained.entries_removed == 0
+                && drained.rebind.rebound == 0
+                && !drained.budget_stopped
+            {
                 break TrashCatchupEnd::NoProgress;
             }
             // Let a retirement drain (this repository's next run, or
@@ -7363,8 +7435,8 @@ mod tests {
 
     /// The sweep looks at confirmed rows too. One whose entry is gone from
     /// its present, marked trash on the recorded device is dropped. One
-    /// whose entry exists with another identity (here the device number the
-    /// row recorded is not the volume's, as after a remount) is marked: it
+    /// whose entry exists with another identity (here another inode on the
+    /// recorded device: another directory, never a remount) is marked: it
     /// leaves the deletable backlog, is reported in the sweep, the drain and
     /// `broker status`, and is never deleted. Once it matches again the mark
     /// is cleared and it is deleted as usual.
@@ -7374,7 +7446,7 @@ mod tests {
         let (gone, trash) = confirmed_trash_entry(&mut broker, "confirmed-gone", |_| {});
         std::fs::remove_dir_all(trash.join(&gone)).unwrap();
         let (changed, _) = confirmed_trash_entry(&mut broker, "confirmed-changed", |row| {
-            row.device = row.device.wrapping_add(1);
+            row.inode = row.inode.wrapping_add(1);
         });
         assert_eq!(broker.checkout_trash_backlog_summary().deletable, 2);
 
@@ -7385,13 +7457,14 @@ mod tests {
             "{trash_report:?}"
         );
         assert_eq!(trash_report.identity_changed, 1, "{trash_report:?}");
-        assert_eq!(trash_report.identity_changed_device, 1, "{trash_report:?}");
+        assert_eq!(trash_report.identity_changed_inode, 1, "{trash_report:?}");
+        assert_eq!(trash_report.rebound_this_pass, 0, "{trash_report:?}");
         assert_eq!(trash_report.deletable, 0, "{trash_report:?}");
         assert_eq!(trash_report.held_back(), 1, "{trash_report:?}");
         assert!(row_of(&broker, &gone).is_none(), "nothing left to delete");
         assert_eq!(
             row_of(&broker, &changed).unwrap().identity_mismatch,
-            Some(crate::checkout_trash::IdentityMismatch::DeviceChanged)
+            Some(crate::checkout_trash::IdentityMismatch::InodeChanged)
         );
         assert!(trash.join(&changed).exists(), "the sweep deletes nothing");
 
@@ -7401,7 +7474,7 @@ mod tests {
             .iter()
             .find(|advice| advice.id == "cleanup.trash-identity-changed")
             .expect("status names the held-back entry");
-        assert!(advice.evidence[0].ends_with(&format!("{changed}: device_changed")));
+        assert!(advice.evidence[0].ends_with(&format!("{changed}: inode_changed")));
 
         let drained = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
         assert_eq!(drained.entries_removed, 0, "{drained:?}");
@@ -7409,13 +7482,13 @@ mod tests {
         assert_eq!(drained.unrecognized, 0, "{drained:?}");
         assert!(trash.join(&changed).exists(), "never deleted");
 
-        // The volume is back under the recorded device number.
+        // The record is put right: it matches again.
         broker
             .update_meta_json(
                 CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
                 |rows: &mut crate::checkout_trash::TrashRows| {
                     let row = rows.get_mut(&trash).unwrap().get_mut(&changed).unwrap();
-                    row.device = row.device.wrapping_sub(1);
+                    row.inode = row.inode.wrapping_sub(1);
                 },
             )
             .unwrap();
@@ -7426,13 +7499,78 @@ mod tests {
         assert_eq!(drained.entries_removed, 1, "{drained:?}");
     }
 
+    /// After a remount every directory on the volume has a new device
+    /// number while inodes stay, so every row of the trash records the one
+    /// old device. The sweep rebinds the confirmed row and the pending row
+    /// (only the device changes: the pending row stays pending), deletes
+    /// nothing, and the paced deleter then deletes the confirmed entry
+    /// through its usual checks. The pending entry is left until its own
+    /// proofs confirm it on a later pass.
+    #[test]
+    fn the_sweep_rebinds_confirmed_and_pending_rows_after_a_remount() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (confirmed, trash) = confirmed_trash_entry(&mut broker, "remount-confirmed", |_| {});
+        let (_session, pending, pending_trash) =
+            stale_unconfirmable_trash_entry(&mut broker, "remount-pending");
+        assert_eq!(trash, pending_trash, "one trash holds both");
+        let device = row_of(&broker, &confirmed).unwrap().device;
+        assert_eq!(row_of(&broker, &pending).unwrap().device, device);
+        broker
+            .update_meta_json(
+                CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+                |rows: &mut crate::checkout_trash::TrashRows| {
+                    for row in rows.get_mut(&trash).unwrap().values_mut() {
+                        row.device = row.device.wrapping_add(1000);
+                    }
+                },
+            )
+            .unwrap();
+
+        let report = broker.gc_sweep_artifacts().unwrap();
+        let trash_report = report.checkout_trash;
+        assert_eq!(trash_report.rebound_this_pass, 2, "{trash_report:?}");
+        assert_eq!(trash_report.rebind_refused_this_pass, 0, "{trash_report:?}");
+        assert_eq!(
+            trash_report.confirmed_this_pass, 0,
+            "a rebind confirms nothing: {trash_report:?}"
+        );
+        assert_eq!(trash_report.identity_changed, 0, "{trash_report:?}");
+        assert_eq!(trash_report.deletable, 1, "{trash_report:?}");
+        let rebound = row_of(&broker, &confirmed).unwrap();
+        assert_eq!((rebound.device, rebound.identity_mismatch), (device, None));
+        let rebound_pending = row_of(&broker, &pending).unwrap();
+        assert!(rebound_pending.pending, "{rebound_pending:?}");
+        assert_eq!(rebound_pending.device, device);
+        assert!(trash.join(&confirmed).exists(), "the sweep deletes nothing");
+        assert!(trash.join(&pending).exists(), "the sweep deletes nothing");
+
+        let drained = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 1, "{drained:?}");
+        assert_eq!(drained.rebind.rebound, 0, "already rebound: {drained:?}");
+        assert!(!trash.join(&confirmed).exists());
+        assert!(
+            trash.join(&pending).exists(),
+            "a pending row waits for its own confirmation"
+        );
+
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert_eq!(report.checkout_trash.confirmed_this_pass, 1, "{report:?}");
+        assert_eq!(report.checkout_trash.rebound_this_pass, 0, "{report:?}");
+    }
+
     /// A row recorded under a directory that is not named as the trash
     /// concludes nothing: the sweep neither drops nor confirms it.
     #[test]
     fn the_sweep_concludes_nothing_under_another_directory_name() {
         let (_owner, _storage, mut broker) = fixture();
         let (_session, old, trash) = stale_unconfirmable_trash_entry(&mut broker, "renamed-dir");
-        let row = row_of(&broker, &old).unwrap();
+        // Recorded on another device too, as after a remount: a directory
+        // not named as the trash still concludes nothing and counts no
+        // rebind refusal.
+        let row = crate::checkout_trash::TrashRow {
+            device: row_of(&broker, &old).unwrap().device.wrapping_add(1000),
+            ..row_of(&broker, &old).unwrap()
+        };
         let elsewhere = trash.with_file_name("not-the-trash");
         broker
             .update_meta_json(
@@ -7449,7 +7587,12 @@ mod tests {
         assert_eq!(reconcile.confirmed, 0, "{reconcile:?}");
         assert_eq!(reconcile.dropped_missing, 0, "{reconcile:?}");
         assert_eq!(reconcile.trash_unavailable, 1, "{reconcile:?}");
-        assert!(row_of(&broker, &old).is_some_and(|row| row.pending));
+        assert_eq!(
+            (reconcile.rebound, reconcile.rebind_refused),
+            (0, 0),
+            "{reconcile:?}"
+        );
+        assert_eq!(row_of(&broker, &old), Some(row), "untouched");
     }
 
     /// Record a pending trash entry for a new closed session, named as moved

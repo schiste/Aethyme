@@ -181,14 +181,15 @@ fn trash_drain_since(
     })
 }
 
-/// Whether a pass reclaimed or confirmed anything, counting what the paced
-/// deleter removed from the trash since the previous pass.
+/// Whether a pass reclaimed, confirmed or rebound anything, counting what
+/// the paced deleter removed from the trash since the previous pass.
 fn pass_reclaimed(report: &crate::ArtifactSweepReport, drain: Option<TrashDrain>) -> bool {
     report.directories_reclaimed > 0
         || report.entries_reclaimed > 0
         || report.observed_logical_file_bytes > 0
         || report.preparation_cache_bytes_reclaimed > 0
         || report.checkout_trash.confirmed_this_pass > 0
+        || report.checkout_trash.rebound_this_pass > 0
         || drain.is_some_and(|drain| drain.draining)
         || report
             .auto_cleanup
@@ -2362,14 +2363,17 @@ fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
     }
     if let Some(trash) = receipt.trash {
         evidence.push(format!(
-            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use",
+            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use; after a remount: {} rebound, {} refused, {} trash(es) whose rebound rows spanned more than one old device",
             trash.recorded,
             trash.deletable,
             trash.pending,
             trash.stale_pending,
             trash.identity_changed,
             trash.failing,
-            trash.in_use
+            trash.in_use,
+            trash.rebound_this_pass,
+            trash.rebind_refused_this_pass,
+            trash.rebind_proven_old_devices_mixed_this_pass
         ));
     }
     if let Some(lane) = &receipt.artifact_lane {

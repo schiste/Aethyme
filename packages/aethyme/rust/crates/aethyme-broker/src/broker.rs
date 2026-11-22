@@ -2995,9 +2995,10 @@ pub struct StatusAdvice {
 /// Most entries named in `cleanup.trash-identity-changed`'s evidence.
 const TRASH_IDENTITY_CHANGED_EVIDENCE_MAX: usize = 20;
 
-/// The `status` row for confirmed checkout trash entries present with
-/// another identity than the broker recorded. They are never deleted and
-/// are out of the deletable backlog, so nothing else reports them.
+/// The `status` row for checkout trash entries present with another
+/// identity than the broker recorded (confirmed ones, and pending ones held
+/// on another device). They are never deleted and are out of the deletable
+/// backlog, so nothing else reports them.
 fn push_trash_identity_changed_advice(
     view: &mut StatusView,
     entries: &[(
@@ -3023,7 +3024,7 @@ fn push_trash_identity_changed_advice(
     view.advice.push(StatusAdvice {
         id: "cleanup.trash-identity-changed",
         severity: StatusAdviceSeverity::Notice,
-        reason: "these checkout trash entries exist but no longer have the device and inode the broker recorded when it moved them in, so the broker does not delete them and they do not count as a trash backlog. device_changed (the recorded inode on a new device number, as after the volume is mounted again): leave them; they are held until the broker identifies them again on the new device number, or until the volume comes back under its recorded one, and are then deleted with the usual checks. inode_changed or not_a_directory (something else now has the name): the broker will never delete these; look at each one, remove it yourself only if you know what it is, and the next sweep or deleter run drops its record once it is gone",
+        reason: "these checkout trash entries exist but no longer have the device and inode the broker recorded when it moved them in, so the broker does not delete them and they do not count as a trash backlog. device_changed (the recorded inode on a new device number, as after the volume is mounted again): leave them; the next sweep or deleter run rebinds each one, on its own proof, to the new device number when its trash is the broker's private, marked directory and the entry is a real directory there with the recorded inode under a name made for its session; a rebound entry is then deleted with the usual checks (a pending one still waits for its own confirmation). One still listed after a sweep failed that proof (`aethyme broker gc sweep --json` counts these in `rebind_refused_this_pass`, and the command metrics counters `checkout_trash_rebind_refused_<cause>` name the check): trash_unverified means the trash lost its mode 0700, its owner or the broker's marker, so put the trash back as the broker made it and the next sweep rebinds the entries; name_not_for_session means the record and the name disagree, so treat the entry like inode_changed below. inode_changed or not_a_directory (something else now has the name): the broker will never delete these; look at each one, remove it yourself only if you know what it is, and the next sweep or deleter run drops its record once it is gone",
         summary: format!(
             "{} checkout trash entr(y/ies) kept: identity changed since they were moved in",
             entries.len()
