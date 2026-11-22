@@ -16,11 +16,14 @@
 //!   group, gives the listening sockets the group owns (deduplicated by
 //!   socket, since forked workers share one). Ours only when both counts
 //!   are equal and every listener is on 127.0.0.1; fewer owned than
-//!   listening is `listener_not_ours`; anything unreadable or of an
-//!   unexpected shape is unverifiable. No pid or process name is ever read
-//!   from another user's socket entry, so a crafted process name cannot
-//!   claim a listener. A process name with a line break could add a fake
-//!   `LISTEN` line, which only raises the count: it fails closed.
+//!   listening is `listener_not_ours`; more owned than listening is
+//!   inconsistent (`lsof` runs after `netstat`, so a listener bound between
+//!   the two shows only in the second); anything unreadable or of an
+//!   unexpected shape, an empty `netstat` table included, is unverifiable.
+//!   No pid or process name is ever read from another user's socket entry,
+//!   so a crafted process name cannot claim a listener. A process name
+//!   with a line break could add a fake `LISTEN` line, which only raises
+//!   the count: it fails closed.
 //! - Anywhere else, or when the tool is missing or too slow: unverifiable,
 //!   and the server is not used.
 
@@ -37,6 +40,12 @@ pub enum Listeners {
     NotLoopback,
     /// Ownership could not be determined here.
     Unverifiable(String),
+    /// The two snapshots disagree the way a listener bound between them
+    /// would explain: the group's own listing, taken second, shows more
+    /// listeners than the host-wide one. Reported exactly like
+    /// `Unverifiable`; a caller still waiting for the server may look again
+    /// (see [`Listeners::transient`]), and never treats it as ours.
+    Inconsistent(String),
 }
 
 impl Listeners {
@@ -46,8 +55,22 @@ impl Listeners {
             Self::Ours | Self::None => None,
             Self::NotOurs => Some("listener_not_ours".into()),
             Self::NotLoopback => Some("not_loopback".into()),
-            Self::Unverifiable(why) => Some(format!("listener_unverifiable:{why}")),
+            Self::Unverifiable(why) | Self::Inconsistent(why) => {
+                Some(format!("listener_unverifiable:{why}"))
+            }
         }
+    }
+
+    /// Ownership is unknown: nothing is proven wrong with the server.
+    pub fn unproven(&self) -> bool {
+        matches!(self, Self::Unverifiable(_) | Self::Inconsistent(_))
+    }
+
+    /// Unknown only because the two snapshots raced: looking again shortly
+    /// may give a verdict. An `Unverifiable` listing (an empty `netstat`
+    /// table, a missing or failing tool) stays so, and is never transient.
+    pub fn transient(&self) -> bool {
+        matches!(self, Self::Inconsistent(_))
     }
 }
 
@@ -259,20 +282,26 @@ pub(crate) fn lsof_owned_sockets(text: &str, port: u16) -> Option<Vec<bool>> {
 /// Why a listing is unverifiable when it shows nothing the group holds, or
 /// nothing at all.
 pub const LISTING_EMPTY: &str = "listener_listing_empty";
+/// Why a listing is inconsistent when the group holds more listeners than
+/// the host-wide listing shows on the port, and at least one shows there.
+pub const COUNT_MISMATCH: &str = "listener_count_mismatch";
 
 /// Combine the host-wide listeners on the port with the ones the group owns.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reconcile(all: &[bool], owned: &[bool]) -> Listeners {
     if all.is_empty() && !owned.is_empty() {
-        // The group holds a listener the host-wide listing does not show: the
-        // listing is incomplete (a sandbox can make it print nothing).
-        Listeners::Unverifiable(LISTING_EMPTY.into())
+        // The group holds a listener the host-wide listing, taken just
+        // before, does not show: bound between the two snapshots, or hidden
+        // from that listing. (A listing hidden entirely, an empty table, is
+        // refused before `lsof` runs.)
+        Listeners::Inconsistent(LISTING_EMPTY.into())
     } else if all.is_empty() {
         Listeners::None
     } else if owned.len() < all.len() {
         Listeners::NotOurs
     } else if owned.len() > all.len() {
-        Listeners::Unverifiable("listener_count_mismatch".into())
+        // The same race with another listener already shown.
+        Listeners::Inconsistent(COUNT_MISMATCH.into())
     } else if all.iter().chain(owned).any(|loopback| !loopback) {
         Listeners::NotLoopback
     } else {
@@ -460,16 +489,40 @@ tcp6       0      0  ::1.47300              *.*                    LISTEN       
         assert_eq!(reconcile(&[], &[]), Listeners::None);
         assert_eq!(
             reconcile(&[], &[true]),
-            Listeners::Unverifiable(LISTING_EMPTY.into())
+            Listeners::Inconsistent(LISTING_EMPTY.into())
         );
         assert_eq!(reconcile(&[true], &[true]), Listeners::Ours);
         assert_eq!(reconcile(&[true, true], &[true]), Listeners::NotOurs);
         assert_eq!(reconcile(&[true], &[]), Listeners::NotOurs);
         assert_eq!(
             reconcile(&[true], &[true, true]),
-            Listeners::Unverifiable("listener_count_mismatch".into())
+            Listeners::Inconsistent(COUNT_MISMATCH.into())
         );
         assert_eq!(reconcile(&[false], &[false]), Listeners::NotLoopback);
+    }
+
+    #[test]
+    fn only_a_snapshot_race_is_transient_and_both_report_as_unverifiable() {
+        let race = reconcile(&[], &[true]);
+        assert!(race.transient() && race.unproven());
+        assert!(reconcile(&[true], &[true, true]).transient());
+        // The empty-table refusal and every other unknown are not retried.
+        let empty_table = Listeners::Unverifiable(LISTING_EMPTY.into());
+        assert!(!empty_table.transient() && empty_table.unproven());
+        for settled in [
+            Listeners::Ours,
+            Listeners::None,
+            Listeners::NotOurs,
+            Listeners::NotLoopback,
+        ] {
+            assert!(!settled.transient() && !settled.unproven());
+        }
+        // Consumers see the same reason string for either.
+        assert_eq!(race.reason(), empty_table.reason());
+        assert_eq!(
+            race.reason().as_deref(),
+            Some("listener_unverifiable:listener_listing_empty")
+        );
     }
 
     #[cfg(target_os = "linux")]

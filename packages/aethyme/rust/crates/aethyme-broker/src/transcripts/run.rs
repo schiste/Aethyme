@@ -38,6 +38,53 @@ pub(crate) const REMOVAL_BATCH_FILES: usize = 200;
 pub(crate) const REMOVAL_BATCH_AGE: Duration = Duration::from_secs(60);
 /// Wall time one background-worker pass may spend; the next pass resumes.
 pub(crate) const WORKER_RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
+/// Every repository's detached worker runs the transcripts lane, and the
+/// lane's work is host-wide. After a worker pass that found nothing to
+/// archive and finished within its budget, the next worker pass on this
+/// host waits this long: transcripts become eligible after days of
+/// inactivity, so a quarter of an hour changes no verdict. On the busiest
+/// host 189 worker passes ran in 10.7 h (median gap 113 s, 24,011 s in
+/// all) and 184 of them found nothing eligible.
+pub(crate) const WORKER_PASS_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// The last worker pass's outcome, in the transcripts host directory.
+const LAST_WORKER_PASS_FILE: &str = "last-worker-pass.json";
+
+/// What the next worker pass needs to know about the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+struct LastWorkerPass {
+    at_ms: i64,
+    /// It found nothing to archive and was not cut short by its budget.
+    idle: bool,
+}
+
+/// Whether a worker pass is due: no record of the last one, the last one
+/// found work or ran out of budget, the record is unreadable, or the
+/// interval has passed (a clock that went back counts as passed).
+fn worker_pass_due(host_dir: &Path, now_ms: i64) -> bool {
+    let Some(last) = std::fs::read(host_dir.join(LAST_WORKER_PASS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LastWorkerPass>(&bytes).ok())
+    else {
+        return true;
+    };
+    let interval_ms = i64::try_from(WORKER_PASS_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    !last.idle || now_ms < last.at_ms || now_ms.saturating_sub(last.at_ms) >= interval_ms
+}
+
+fn record_worker_pass(host_dir: &Path, report: &RunReport, now_ms: i64) {
+    let last = LastWorkerPass {
+        at_ms: now_ms,
+        idle: report.first_run_gate == Gate::Open
+            && report.eligible.is_empty()
+            && !report.budget_exhausted,
+    };
+    crate::warn_unrecorded(
+        "record the transcripts worker pass",
+        serde_json::to_vec(&last)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(host_dir.join(LAST_WORKER_PASS_FILE), bytes)),
+    );
+}
 /// Examples of skipped transcripts a report lists (all are counted).
 const MAX_SKIPPED_EXAMPLES: usize = 50;
 /// The run log rotates past this size.
@@ -1105,22 +1152,23 @@ pub(crate) fn run_worker_lane() {
     if !config.archive {
         return;
     }
+    let now_ms = super::now_ms();
+    if !worker_pass_due(&environment.host_dir, now_ms) {
+        crate::phase_telemetry::add("transcripts_worker_pass_not_due", Duration::ZERO);
+        return;
+    }
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
     let mut agents = SystemAgents;
     let mut probes = Probes {
         open_files: &mut open_files,
         agents: &mut agents,
     };
-    crate::warn_unrecorded(
-        "archive closed agent transcripts",
-        worker_pass(
-            environment,
-            config,
-            &mut probes,
-            &mut NoHooks,
-            super::now_ms(),
-        ),
-    );
+    match worker_pass(environment, config, &mut probes, &mut NoHooks, now_ms) {
+        Ok(report) => record_worker_pass(&environment.host_dir, &report, now_ms),
+        Err(error) => {
+            crate::warn_unrecorded("archive closed agent transcripts", Err::<(), _>(error));
+        }
+    }
 }
 
 /// `transcripts status`.
@@ -1473,4 +1521,48 @@ pub(crate) fn restore<P: OpenFileProbe>(
     counters.insert("restored".to_string(), restored.len() as u64);
     index.add_counters(&counters)?;
     Ok(restored)
+}
+
+#[cfg(test)]
+mod worker_cadence_tests {
+    use super::*;
+
+    fn report(eligible: usize, budget_exhausted: bool) -> RunReport {
+        let mut report = RunReport::new(&TranscriptsConfig::default(), true);
+        report.first_run_gate = Gate::Open;
+        report.budget_exhausted = budget_exhausted;
+        report.eligible = (0..eligible)
+            .map(|index| TranscriptView {
+                provider: Provider::Claude,
+                path: PathBuf::from(format!("transcript-{index}.jsonl")),
+                destination: PathBuf::from(format!("archive-{index}.jsonl.zst")),
+                agent_session_id: None,
+                bytes: 1,
+            })
+            .collect();
+        report
+    }
+
+    #[test]
+    fn an_idle_pass_defers_the_next_worker_pass_on_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let interval = i64::try_from(WORKER_PASS_INTERVAL.as_millis()).unwrap();
+        let at = 1_800_000_000_000_i64;
+        // No record: due.
+        assert!(worker_pass_due(dir.path(), at));
+        record_worker_pass(dir.path(), &report(0, false), at);
+        assert!(!worker_pass_due(dir.path(), at + 1));
+        assert!(!worker_pass_due(dir.path(), at + interval - 1));
+        assert!(worker_pass_due(dir.path(), at + interval));
+        // A clock that went back runs the pass.
+        assert!(worker_pass_due(dir.path(), at - 1));
+        // A pass that found work, or ran out of budget, does not defer.
+        record_worker_pass(dir.path(), &report(1, false), at);
+        assert!(worker_pass_due(dir.path(), at + 1));
+        record_worker_pass(dir.path(), &report(0, true), at);
+        assert!(worker_pass_due(dir.path(), at + 1));
+        // An unreadable record runs the pass.
+        std::fs::write(dir.path().join(LAST_WORKER_PASS_FILE), b"{").unwrap();
+        assert!(worker_pass_due(dir.path(), at + 1));
+    }
 }

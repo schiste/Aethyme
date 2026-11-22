@@ -449,6 +449,9 @@ pub(crate) enum AbandonmentKeepReason {
     LifecycleBusy,
     /// The pass deadline ran out during the running-work checks.
     DeadlineReached,
+    /// The re-checks under the lifecycle claim, just before the close, took
+    /// longer than the close may hold that claim.
+    CloseClaimBudget,
     /// The working-tree status the work class depends on could not be taken
     /// to the end (its deadline cut it, or Git failed): the session was not
     /// examined this pass, and nothing about its work is recorded.
@@ -545,6 +548,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "start_reserved",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::DeadlineReached => "deadline_reached",
+            Self::CloseClaimBudget => "close_claim_budget",
             Self::WorkingTreeNotExamined => "working_tree_not_examined",
             Self::GateRunning => "gate_running",
             Self::GatesUnknown => "gates_unknown",
@@ -609,6 +613,7 @@ impl AbandonmentKeepReason {
             Self::StartReserved => "session_abandonment_kept_start_reserved",
             Self::LifecycleBusy => "session_abandonment_kept_lifecycle_busy",
             Self::DeadlineReached => "session_abandonment_kept_deadline_reached",
+            Self::CloseClaimBudget => "session_abandonment_kept_close_claim_budget",
             Self::WorkingTreeNotExamined => "session_abandonment_kept_working_tree_not_examined",
             Self::GateRunning => "session_abandonment_kept_gate_running",
             Self::GatesUnknown => "session_abandonment_kept_gates_unknown",
@@ -990,6 +995,189 @@ pub(crate) fn is_broker_state_file(
         return matches!(first.as_ref(), "run" | "logs" | "locks");
     }
     first.starts_with("broker.db") || first.ends_with(".lock")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seams around the abandoned-session close: after its second look,
+    /// before it takes the lifecycle claim; and under the claim, just before
+    /// the compare-and-set.
+    pub(crate) static AFTER_SECOND_LOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+    pub(crate) static BEFORE_CLOSE_CAS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// The longest the abandoned-session close holds the repository lifecycle
+/// claim before its compare-and-set; past it the session waits for a pass.
+const ABANDONED_CLOSE_CLAIM_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// What a commit, a reset, a checkout of another branch or a staged change
+/// in a session's checkout moves: its HEAD commit, the session branch's tip
+/// and the identity of the checkout's index file. Read from files only (no
+/// Git), so taking it under the lifecycle claim is a few reads. A part that
+/// is not there (no checkout, no such branch, no index) is `None`, which
+/// compares equal only to another `None`; a part that is there but cannot
+/// be read or understood makes the stamp `unreadable`, and the close keeps
+/// the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AbandonmentCheckoutStamp {
+    head: Option<String>,
+    branch_tip: Option<String>,
+    index: Option<IndexIdentity>,
+    unreadable: bool,
+}
+
+/// An index file's `(device, inode, modification seconds, nanoseconds,
+/// length)`.
+type IndexIdentity = (u64, u64, i64, i64, u64);
+
+impl AbandonmentCheckoutStamp {
+    fn complete(&self) -> bool {
+        !self.unreadable
+    }
+}
+
+/// A file's text: `Ok(None)` when it does not exist, `Err` when it exists
+/// but cannot be read.
+fn read_optional(path: &std::path::Path) -> Result<Option<String>, ()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+fn abandonment_checkout_stamp(session: &crate::types::Session) -> AbandonmentCheckoutStamp {
+    let _span = crate::phase_telemetry::span("abandoned_close_checkout_stamp");
+    let worktree = std::path::Path::new(&session.worktree_path);
+    let mut stamp = AbandonmentCheckoutStamp {
+        head: None,
+        branch_tip: None,
+        index: None,
+        unreadable: false,
+    };
+    let (git_dir, common_dir) = match checkout_git_dirs(worktree) {
+        Ok(Some(dirs)) => dirs,
+        Ok(None) => return stamp,
+        Err(()) => {
+            stamp.unreadable = true;
+            return stamp;
+        }
+    };
+    let head = read_head_commit(&git_dir, &common_dir);
+    let tip = read_ref_commit(&common_dir, &format!("refs/heads/{}", session.branch));
+    let index = index_identity(&git_dir);
+    stamp.unreadable = head.is_err() || tip.is_err() || index.is_err();
+    stamp.head = head.ok().flatten();
+    stamp.branch_tip = tip.ok().flatten();
+    stamp.index = index.ok().flatten();
+    stamp
+}
+
+/// A checkout's own Git directory and the repository's common directory,
+/// through its `.git` entry: a directory (both the same), or a linked
+/// worktree's `gitdir:` file whose directory names the common one in its
+/// `commondir` file. `Ok(None)` when the checkout has no `.git` entry.
+fn checkout_git_dirs(
+    worktree: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, ()> {
+    let dot_git = worktree.join(".git");
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if metadata.is_dir() {
+        return Ok(Some((dot_git.clone(), dot_git)));
+    }
+    let text = read_optional(&dot_git)?.ok_or(())?;
+    let target = std::path::PathBuf::from(text.trim().strip_prefix("gitdir:").ok_or(())?.trim());
+    let git_dir = if target.is_absolute() {
+        target
+    } else {
+        worktree.join(target)
+    };
+    let common_dir = match read_optional(&git_dir.join("commondir"))? {
+        Some(text) => {
+            let common = std::path::PathBuf::from(text.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        }
+        None => git_dir.clone(),
+    };
+    Ok(Some((git_dir, common_dir)))
+}
+
+fn object_id(text: &str) -> Result<String, ()> {
+    let id = text.trim();
+    if matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id.to_ascii_lowercase())
+    } else {
+        Err(())
+    }
+}
+
+/// The commit HEAD names: detached, or through the branch it points at.
+fn read_head_commit(
+    git_dir: &std::path::Path,
+    common_dir: &std::path::Path,
+) -> Result<Option<String>, ()> {
+    let Some(text) = read_optional(&git_dir.join("HEAD"))? else {
+        return Ok(None);
+    };
+    match text.trim().strip_prefix("ref:") {
+        Some(target) => read_ref_commit(common_dir, target.trim()),
+        None => object_id(&text).map(Some),
+    }
+}
+
+/// A branch or other ref under the common directory: its loose file, else
+/// its line in `packed-refs`. `Ok(None)` when neither names it.
+fn read_ref_commit(common_dir: &std::path::Path, name: &str) -> Result<Option<String>, ()> {
+    if !name.starts_with("refs/")
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(());
+    }
+    if let Some(text) = read_optional(&common_dir.join(name))? {
+        return object_id(&text).map(Some);
+    }
+    let Some(packed) = read_optional(&common_dir.join("packed-refs"))? else {
+        return Ok(None);
+    };
+    for line in packed.lines() {
+        if line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        if let Some((id, reference)) = line.split_once(' ')
+            && reference.trim() == name
+        {
+            return object_id(id).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The identity of a checkout's index file; `Ok(None)` when it has none.
+fn index_identity(git_dir: &std::path::Path) -> Result<Option<IndexIdentity>, ()> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(git_dir.join("index")) {
+        Ok(index) => Ok(Some((
+            index.dev(),
+            index.ino(),
+            index.mtime(),
+            index.mtime_nsec(),
+            index.len(),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 /// The checkout's HEAD commit, or `None` when it cannot be read.
@@ -2642,9 +2830,9 @@ impl Broker {
         lane: SessionCloseLane,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
         // Every Git child of a budgeted close attempt stops at the pass
-        // deadline, the cleanliness listings re-run under the session and
-        // lifecycle claims included: a listing that outlives the pass would
-        // hold the lane past its share and the lifecycle claim with it. All
+        // deadline, the cleanliness listings re-run under the operation claim
+        // included: a listing that outlives the pass would hold the lane past
+        // its share. All
         // Git here only reads, and a stopped listing keeps the session.
         let _git_deadline = deadline.map(crate::git::limit_git_until);
         let require_landed = matches!(
@@ -2652,7 +2840,7 @@ impl Broker {
             SessionCloseLane::Landed | SessionCloseLane::MergedPullRequest
         );
         // One session deadline for the whole landed judgement: the proof, a
-        // memoized re-proof before the claims and the re-checks under them
+        // memoized re-proof before the operation claim and the re-checks under it
         // share this session's budget.
         let session_deadline = if require_landed {
             self.landed_proof_session_deadline(session_id, deadline)
@@ -2846,7 +3034,7 @@ impl Broker {
         // Past the abandonment window, what closing would put at risk sets
         // how much longer the session waits (landed, pushed but unmerged,
         // unpushed or uncommitted work). Asked before any holder or process
-        // evidence: it is the cheaper keep, and asked again under the claims.
+        // evidence: it is the cheaper keep, and asked again under the operation claim.
         if lane == SessionCloseLane::Abandonment
             && let Err(kept) = self.stale_class_gate(
                 &candidate,
@@ -2860,7 +3048,7 @@ impl Broker {
         }
         // The landing proof is asked before any holder, lease or process
         // evidence: most open sessions have not landed, and saying so costs
-        // one ancestry check. It is asked again under both claims below.
+        // one ancestry check. It is asked again under the operation claim below.
         // The merged-pull-request lane is the exception: its sessions usually
         // have landed, so the proof is the content search that costs seconds,
         // and the holder (one process table per pass) is asked first.
@@ -3008,7 +3196,7 @@ impl Broker {
             crate::phase_telemetry::add("holder_moved_on_candidates", std::time::Duration::ZERO);
         }
         // A moved-on holder is no live holder of this session: the per-class
-        // gate above (and again under the claims) decides how long its work
+        // gate above (and again under the operation claim) decides how long its work
         // waits, uncommitted work included (the unpushed window, then the
         // archive path). Moved on means the same process (pid and start
         // time) was bound to another session of this repository after this
@@ -3150,11 +3338,11 @@ impl Broker {
         // exclusive side closes the startup-admission race and stays held
         // through the final lifecycle/CAS checks.
         // A remembered landing is a shortcut for judging, never for the
-        // close. Before the claims are taken (so the lifecycle claim is never
-        // held through a content search), search again without the memo; the
-        // claims then re-check only that HEAD and the default-branch tip are
-        // those this fresh search proved, and that nothing new is in the
-        // checkout.
+        // close. Before the operation claim is taken (so no claim is held
+        // through a content search), search again without the memo; the
+        // second look then re-checks only that HEAD and the default-branch
+        // tip are those this fresh search proved, and that nothing new is in
+        // the checkout.
         if let Some(remembered) = landed_proof.as_ref().filter(|proof| proof.memoized) {
             let _span = crate::phase_telemetry::span("landed_reproof_before_claims");
             match self.landed_session_decline_with_memo(
@@ -3184,7 +3372,8 @@ impl Broker {
                 }
             }
         }
-        // Both claims below are non-blocking: a busy one declines the session
+        // Both claims (the operation claim below, the lifecycle claim at the
+        // close) are non-blocking: a busy one declines the session
         // (`busy`) instead of waiting, so this pass never waits on a lock here.
         let _operation_claim = match crate::file_lock::try_acquire_session_operation_guard(
             self.main_root(),
@@ -3215,15 +3404,19 @@ impl Broker {
             ));
         }
 
-        // A maintenance pass must keep moving when another lifecycle operation
-        // is active; status callers also leave the row open and retry later.
-        let Some(_lifecycle_claim) = self.try_claim_worktree_lifecycle("abandoned_close")? else {
-            return Ok(keep_with(
-                process_table,
-                AbandonmentKeepReason::LifecycleBusy,
-                AbandonedSessionCloseOutcome::LifecycleBusy,
-            ));
-        };
+        // The repository lifecycle claim is taken only for the close itself,
+        // at the end. Every check from here to there runs under the
+        // per-session operation claim taken above; held through them, the
+        // lifecycle claim kept foreground `start` and `finish` waiting for
+        // 9 to 14 s per close on the busiest repository (the remote, status,
+        // process-use and pull-request reads below). Under the lifecycle
+        // claim the close compares this stamp of the checkout's commit state
+        // (HEAD, the branch tip, the index file) with the same stamp taken
+        // then, re-checks the start reservation and the spawned process, and
+        // the close compare-and-set re-checks the session row, its holder
+        // binding and its leases. Anything that moved keeps the session for
+        // this pass.
+        let stamp_before = abandonment_checkout_stamp(&candidate);
 
         let current = match self.store_ref().session(session_id) {
             Ok(session) => session,
@@ -3292,8 +3485,9 @@ impl Broker {
             ));
         };
 
-        // Recheck the spawned PID after taking the lifecycle claim. PID reuse
-        // can only make this conservative: any occupant keeps the session open.
+        // Recheck the spawned PID under the operation claim (and again under
+        // the lifecycle claim before the close). PID reuse can only make
+        // this conservative: any occupant keeps the session open.
         if current.pid.is_some_and(crate::broker::session_pid_alive) {
             return Ok(keep_with(
                 process_table,
@@ -3821,7 +4015,7 @@ impl Broker {
             }
         }
 
-        // A moved-on holder is asked again under the claims: the same later
+        // A moved-on holder is asked again under the operation claim: the same later
         // binding elsewhere, after this session's current activity and its
         // own latest binding. What the checkout holds is left to the work
         // class, read again below.
@@ -3843,8 +4037,9 @@ impl Broker {
             }
         }
 
-        // Recheck delivery and local changes while lifecycle and operation
-        // guards are held. Unknown evidence preserves the session.
+        // Recheck delivery and local changes while the operation claim is
+        // held (the close then compares the commit state under the lifecycle
+        // claim). Unknown evidence preserves the session.
         if require_landed {
             let Ok(policy) = crate::load_retention_policy(self.main_root()) else {
                 return Ok(keep_with(
@@ -3886,7 +4081,7 @@ impl Broker {
                 ));
             }
             // A memoised proof was replaced by a fresh search before the
-            // claims were taken (see above); a close never rests on the memo.
+            // operation claim was taken (see above); a close never rests on the memo.
             if proof.memoized {
                 return Ok(keep_with(
                     process_table,
@@ -3914,7 +4109,7 @@ impl Broker {
                     ),
                 ));
             }
-            // The pull requests are read again under the claims, last: a new pull
+            // The pull requests are read again under the operation claim, last: a new pull
             // request, a reopened one or a later merge changes the evidence.
             if let Some((merges, _)) = merged_evidence.as_ref() {
                 match self.merged_pull_request_evidence(&current) {
@@ -3974,7 +4169,7 @@ impl Broker {
                 ));
             }
         }
-        // The no-work conditions are read last, under both claims.
+        // The no-work conditions are read last, under the operation claim.
         if no_work_lane && let Some(reason) = self.no_work_decline(&current) {
             return Ok(keep_with(
                 process_table,
@@ -3982,11 +4177,13 @@ impl Broker {
                 AbandonedSessionCloseOutcome::NotDue,
             ));
         }
-        // The work class is read again under both claims: a push, a merge or
-        // new uncommitted work since the first look changes its window.
+        // The work class is read again under the operation claim, last before
+        // the close: a push, a merge or new uncommitted work since the first
+        // look changes its window. The close then re-checks, under the
+        // lifecycle claim, that the commit state it read has not moved.
         let stale_class = if lane == SessionCloseLane::Abandonment {
             match self.stale_class_gate(&current, activity_at, observed_at, process_table, true) {
-                // The early-close rule first held here, under the claims,
+                // The early-close rule first held here, on the second look,
                 // after the process checks ran on the first look's verdict
                 // (no rule held then): they may have exempted the holder's
                 // working directory or skipped the open-file observation. An
@@ -4094,8 +4291,112 @@ impl Broker {
             }
         };
         let cleanup_request = self.checkout_cleanup_request_policy(&current);
-        let _close_span = crate::phase_telemetry::span("session_close_cas");
+        #[cfg(test)]
+        AFTER_SECOND_LOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        // A maintenance pass must keep moving when another lifecycle operation
+        // is active; status callers also leave the row open and retry later.
+        let Some(lifecycle_claim) = self.try_claim_worktree_lifecycle("abandoned_close")? else {
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::LifecycleBusy,
+                AbandonedSessionCloseOutcome::LifecycleBusy,
+            ));
+        };
+        let claimed = std::time::Instant::now();
+        let claimed_span = crate::phase_telemetry::span("abandoned_close_claimed");
+        // A `start --reuse` or an adoption that completed in the window
+        // registers another live row at this path: the checkout is in use.
         match self
+            .store_ref()
+            .sessions_at_worktree_path(&current.worktree_path)
+        {
+            Ok(sessions)
+                if sessions.iter().any(|other| {
+                    other.id != session_id
+                        && other.cleanup_state == crate::SessionCleanupState::Open
+                        && !other.status.is_closed()
+                }) =>
+            {
+                crate::phase_telemetry::add(
+                    "abandoned_close_path_reused_before_close",
+                    std::time::Duration::ZERO,
+                );
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::StartReserved,
+                    AbandonedSessionCloseOutcome::OperationActive,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A running `broker start` (a `--reuse` of this checkout included)
+        // reserves the path before it records anything.
+        if crate::start_reservation::path_is_reserved(
+            self.main_root(),
+            std::path::Path::new(&current.worktree_path),
+        ) {
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::StartReserved,
+                AbandonedSessionCloseOutcome::OperationActive,
+            ));
+        }
+        // PID reuse can only make this conservative: any occupant keeps it.
+        if current.pid.is_some_and(crate::broker::session_pid_alive) {
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::SessionPidAlive,
+                AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
+        }
+        // A commit, a reset, a checkout of another branch or a staged change
+        // since the evidence above began moves the stamp.
+        let stamp_now = abandonment_checkout_stamp(&current);
+        if !stamp_now.complete() || !stamp_before.complete() {
+            crate::phase_telemetry::add(
+                "abandoned_close_checkout_stamp_unreadable",
+                std::time::Duration::ZERO,
+            );
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::WorktreeActivityUnavailable,
+                AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
+            ));
+        }
+        if stamp_now != stamp_before {
+            crate::phase_telemetry::add(
+                "abandoned_close_checkout_moved_before_close",
+                std::time::Duration::ZERO,
+            );
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
+        }
+        // These re-checks are a few reads; on a disk so slow that they took
+        // most of a foreground command's patience, the close waits.
+        if claimed.elapsed() >= ABANDONED_CLOSE_CLAIM_BUDGET {
+            crate::phase_telemetry::add("abandoned_close_claim_budget", std::time::Duration::ZERO);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::CloseClaimBudget,
+                AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+            ));
+        }
+        #[cfg(test)]
+        BEFORE_CLOSE_CAS.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let _close_span = crate::phase_telemetry::span("session_close_cas");
+        let closed = self
             .store()
             .abandon_session_if_unchanged_with_cleanup_request(
                 &current,
@@ -4105,7 +4406,10 @@ impl Broker {
                 &abandoned_payload,
                 cleanup_request.map(|request| request.grace_hours),
                 cleanup_request.is_some_and(|request| request.compact_checkout),
-            ) {
+            );
+        drop(claimed_span);
+        drop(lifecycle_claim);
+        match closed {
             Ok(true) => {
                 self.settle_dead_receipts_after_close(session_id);
                 // The checkout is retired by the worker's retirement lane:
@@ -4626,7 +4930,19 @@ impl Broker {
                 .collect::<Vec<_>>();
             let _span = crate::phase_telemetry::span("implicit_lease_scan_all");
             let scanned = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
-                implicit_lease_paths(session, &rules, &refs)
+                // Only the acting session decides anything here; every
+                // other session's changes feed overlap reports, which never
+                // refuse, so their answers may be reused.
+                implicit_lease_paths(
+                    session,
+                    &rules,
+                    &refs,
+                    if acting == Some(session.id) {
+                        ChangedFilesScan::Acting
+                    } else {
+                        ChangedFilesScan::Peer
+                    },
+                )
             });
             pending_implicit_leases.extend(
                 sessions
@@ -4643,7 +4959,9 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            let Some(paths) = implicit_lease_paths(&session, &rules, &refs) else {
+            let Some(paths) =
+                implicit_lease_paths(&session, &rules, &refs, ChangedFilesScan::Acting)
+            else {
                 // `baseline_refs`, baseline and
                 // changed-file helpers deliberately hide ordinary Git
                 // failures behind `Option`. A timeout is different: a
@@ -5440,7 +5758,9 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            if let Some(paths) = implicit_lease_paths(&session, &rules, &refs) {
+            if let Some(paths) =
+                implicit_lease_paths(&session, &rules, &refs, ChangedFilesScan::Acting)
+            {
                 refreshed.insert(session.id, paths);
             }
         }
@@ -6085,7 +6405,13 @@ impl Broker {
         } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
         let scratch = self.session_scratch_environment(session_id);
-        self.guarded_exec_with_runner(
+        // Held until the command has ended: dropping it ends the run.
+        let command_temp = self.command_temp_for_session(session_id);
+        let temp_environment = command_temp
+            .as_ref()
+            .map(crate::command_temp::CommandTemp::environment)
+            .unwrap_or_default();
+        let result = self.guarded_exec_with_runner(
             session_id,
             command,
             record_receipt,
@@ -6105,6 +6431,7 @@ impl Broker {
                     ),
                 ];
                 execution_environment.extend(scratch);
+                execution_environment.extend(temp_environment);
                 execution_environment.extend_from_slice(environment);
 
                 let result = match select_mode() {
@@ -6246,7 +6573,9 @@ impl Broker {
                 };
                 Ok(result)
             },
-        )
+        );
+        self.finish_command_temp(session_id, command_temp);
+        result
     }
 
     pub(crate) fn start_preparation_exec_supervisor(
@@ -6325,34 +6654,42 @@ impl Broker {
             ),
         ];
         execution_environment.extend(self.session_scratch_environment(session_id));
+        // Held until the step has ended: dropping it ends the run.
+        let command_temp = self.command_temp_for_session(session_id);
+        if let Some(temp) = &command_temp {
+            execution_environment.extend(temp.environment());
+        }
         execution_environment.extend_from_slice(environment);
-        self.guarded_exec_with_runner(
-            session_id,
-            command,
-            false,
-            move |session, _observation, artifact_use, _dispatch| {
-                let result = supervisor
-                    .with_artifact_use(artifact_use.take())
-                    .run(
-                        Path::new(&session.worktree_path),
-                        command,
-                        &execution_environment,
-                        heartbeat,
-                    )
-                    .map_err(|error| {
-                        map_preparation_exec_supervisor_error(session_id, command, error)
-                    })?;
-                Ok(GuardedCommandResult {
-                    exit_code: result.exit_code,
-                    succeeded: result.succeeded,
-                    timed_out: result.termination
-                        == crate::inline_exec_supervisor::CommandTermination::TimedOut,
-                    command_started: result.command_started,
-                    process_group_cleanup: "verified",
-                })
-            },
-        )
-        .map(|(report, _, _)| report)
+        let result = self
+            .guarded_exec_with_runner(
+                session_id,
+                command,
+                false,
+                move |session, _observation, artifact_use, _dispatch| {
+                    let result = supervisor
+                        .with_artifact_use(artifact_use.take())
+                        .run(
+                            Path::new(&session.worktree_path),
+                            command,
+                            &execution_environment,
+                            heartbeat,
+                        )
+                        .map_err(|error| {
+                            map_preparation_exec_supervisor_error(session_id, command, error)
+                        })?;
+                    Ok(GuardedCommandResult {
+                        exit_code: result.exit_code,
+                        succeeded: result.succeeded,
+                        timed_out: result.termination
+                            == crate::inline_exec_supervisor::CommandTermination::TimedOut,
+                        command_started: result.command_started,
+                        process_group_cleanup: "verified",
+                    })
+                },
+            )
+            .map(|(report, _, _)| report);
+        self.finish_command_temp(session_id, command_temp);
+        result
     }
 
     fn guarded_exec_with_runner<F>(
@@ -6971,10 +7308,23 @@ struct GuardedCommandResult {
 
 /// The paths a lease refresh records as `session`'s implicit leases, or
 /// `None` where the refresh leaves them as they are.
+/// Whose changed paths a lease refresh scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedFilesScan {
+    /// The session the command acts for, or a scan feeding a decision (a
+    /// lease claim): reuses an answer only where the command already allows
+    /// reuse (`agents`, `status`).
+    Acting,
+    /// Another session, whose paths only feed overlap reports: may reuse a
+    /// watcher-proven answer in any command.
+    Peer,
+}
+
 fn implicit_lease_paths(
     session: &crate::types::Session,
     rules: &crate::leases::LeaseIgnoreRules,
     refs: &crate::merge::BaselineRefs,
+    scan: ChangedFilesScan,
 ) -> Option<Vec<String>> {
     let _span = crate::phase_telemetry::span("implicit_lease_scan");
     let checkout = {
@@ -6991,7 +7341,11 @@ fn implicit_lease_paths(
             .unwrap_or_else(|| "HEAD".to_string())
     };
     let _span = crate::phase_telemetry::span("implicit_lease_changed_files");
-    let changed = crate::worktree_watch::changed_files(&checkout, &base).ok()?;
+    let changed = match scan {
+        ChangedFilesScan::Acting => crate::worktree_watch::changed_files(&checkout, &base),
+        ChangedFilesScan::Peer => crate::worktree_watch::changed_files_for_peer(&checkout, &base),
+    }
+    .ok()?;
     Some(
         changed
             .into_iter()
@@ -7369,6 +7723,91 @@ mod generic_guarded_exec_tests {
     /// to later sessions. Once its task lease on this one has expired, the
     /// landed proof closes the session without the abandonment opt-in; while
     /// the lease is current the session is kept with a reason.
+    /// The window between the second look and the close: a commit or a
+    /// staged change keeps the session as changed, and a start reserving
+    /// the checkout (as `start --reuse` does first) keeps it as in use. A
+    /// second live row at the same path cannot exist: the database's unique
+    /// live-path index refuses it while this row is open.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_after_the_second_look_keeps_the_session() {
+        for case in ["commit", "stage", "reservation"] {
+            let (repository, _storage, mut broker) = fixture();
+            let session = landed_by_pull_request(
+                &mut broker,
+                repository.path(),
+                "closed in the window",
+                aethyme_testkit::MergeStyle::MergeCommit,
+            );
+            let old = age_worktree_for_task_retirement(&mut broker, &session);
+            let holder = task_lease_holder(std::process::id() as i64);
+            let binding_id = install_task_lease_binding(&mut broker, &session, &holder, old);
+            let mut table = synthetic_holder_process_table(session.id, binding_id, &holder, true);
+            table.install_process_use_snapshot_for_test(
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+            );
+            let checkout = PathBuf::from(&session.worktree_path);
+            let root = broker.main_root().to_path_buf();
+            let branch = session.branch.clone();
+            let base = GitRepo::discover(&checkout).unwrap().head_commit().unwrap();
+            let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let held_in_window = std::rc::Rc::clone(&held);
+            super::AFTER_SECOND_LOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || match case {
+                    "commit" => {
+                        git(
+                            &checkout,
+                            &["commit", "--allow-empty", "-qm", "late commit"],
+                        );
+                    }
+                    "stage" => {
+                        std::fs::write(checkout.join("late.txt"), "late work\n").unwrap();
+                        git(&checkout, &["add", "late.txt"]);
+                    }
+                    _ => {
+                        *held_in_window.borrow_mut() =
+                            Some(crate::start_reservation::hold_foreign_reservation(
+                                &root,
+                                "reuse-in-the-window",
+                                &checkout,
+                                &branch,
+                                &base,
+                            ));
+                    }
+                }));
+            });
+
+            let outcome = broker
+                .try_close_landed_session(
+                    session.id,
+                    crate::clock::epoch_ms(),
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None,
+                )
+                .unwrap();
+            super::AFTER_SECOND_LOOK.with(|hook| *hook.borrow_mut() = None);
+            drop(held);
+
+            let expected = if case == "reservation" {
+                AbandonedSessionCloseOutcome::OperationActive
+            } else {
+                AbandonedSessionCloseOutcome::Changed
+            };
+            assert_eq!(outcome, expected, "{case}");
+            assert!(
+                !broker
+                    .store()
+                    .session(session.id)
+                    .unwrap()
+                    .status
+                    .is_closed(),
+                "{case}: the session stays open"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn landed_session_outlives_a_live_holder_only_after_its_task_lease_expired() {
@@ -8283,6 +8722,39 @@ mod generic_guarded_exec_tests {
         );
         fetch_broker.close(unrelated_session.id).unwrap();
         fetch_broker.cleanup(unrelated_session.id, true).unwrap();
+    }
+
+    /// The stamp the abandoned-session close compares under the lifecycle
+    /// claim moves with a commit and with a staged change, and stays put
+    /// when nothing happened.
+    #[test]
+    fn the_abandonment_stamp_moves_with_a_commit_or_a_staged_change() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("abandonment stamp", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        git(&worktree, &["config", "user.name", "Fixture"]);
+        git(
+            &worktree,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        let stamp = || super::abandonment_checkout_stamp(&session);
+        let first = stamp();
+        assert!(
+            first.head.is_some() && first.branch_tip.is_some(),
+            "{first:?}"
+        );
+        assert_eq!(stamp(), first, "nothing happened");
+
+        std::fs::write(worktree.join("staged.txt"), "staged\n").unwrap();
+        git(&worktree, &["add", "staged.txt"]);
+        let staged = stamp();
+        assert_ne!(staged.index, first.index, "a staged change moves the index");
+        assert_eq!(staged.head, first.head);
+
+        git(&worktree, &["commit", "-qm", "late commit"]);
+        let committed = stamp();
+        assert_ne!(committed.head, first.head, "a commit moves HEAD");
+        assert_ne!(committed.branch_tip, first.branch_tip, "and the branch tip");
     }
 
     #[test]

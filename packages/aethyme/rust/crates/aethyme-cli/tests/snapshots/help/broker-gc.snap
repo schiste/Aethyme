@@ -69,7 +69,14 @@ exit: 0
   aethyme broker gc service install --confirm <plan-sha256> [--json]
       Install exact service files without loading launchd.
   aethyme broker gc service status [--json]
-      Observe service scheduler state and the bounded last-pass receipt.
+      Observe service scheduler state and the bounded last-pass, last-error
+      and last-refresh receipts. A service whose runtime is gone is refreshed
+      by itself when its unit and plan verify for this repository.
+  aethyme broker gc service refresh [--json]
+      Rebind the service to the running managed runtime: archive the old
+      plan and unit, publish new ones, and reload only if launchd confirmed
+      the label loaded; an unknown answer changes nothing. Self-update does
+      this for services bound to a bundle it removes.
   aethyme broker gc service activate --confirm <installed-plan-sha256> [--json]
   aethyme broker gc service deactivate --confirm <installed-plan-sha256> [--json]
       Load or unload the exact per-repository service. A changed runtime

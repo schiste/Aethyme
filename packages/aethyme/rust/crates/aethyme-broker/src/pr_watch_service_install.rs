@@ -183,6 +183,21 @@ pub(crate) fn claim_installer(
     Ok(claim)
 }
 
+/// Create `directory` (private, under `home`) and take its installer claim.
+/// Callers that must decide what to replace before publishing hold this
+/// claim across the decision and [`install_exact_files_claimed`].
+pub(crate) fn claim_service_directory(
+    home: &Path,
+    directory: &Path,
+    uid: u32,
+) -> io::Result<crate::file_lock::ExclusiveFileLock> {
+    let relative = directory
+        .strip_prefix(home)
+        .map_err(|_| invalid("service helpers are outside the reviewed home"))?;
+    let root = ensure_directories(home, relative, uid, true)?;
+    claim_installer(&root, uid)
+}
+
 /// Publish an exact list of bounded service files, then the unit last. The
 /// caller owns the purpose-specific plan validation; this shared path performs
 /// only secure, no-replace installation and never activates the service.
@@ -194,6 +209,21 @@ pub(crate) fn install_exact_files(
     files: &[(&str, &[u8])],
     unit_bytes: &[u8],
 ) -> io::Result<Vec<PathBuf>> {
+    let claim = claim_service_directory(home, directory, uid)?;
+    install_exact_files_claimed(home, directory, unit_path, uid, files, unit_bytes, &claim)
+}
+
+/// [`install_exact_files`] for a caller that already holds the directory's
+/// installer claim (from [`claim_service_directory`]).
+pub(crate) fn install_exact_files_claimed(
+    home: &Path,
+    directory: &Path,
+    unit_path: &Path,
+    uid: u32,
+    files: &[(&str, &[u8])],
+    unit_bytes: &[u8],
+    _claim: &crate::file_lock::ExclusiveFileLock,
+) -> io::Result<Vec<PathBuf>> {
     let relative = directory
         .strip_prefix(home)
         .map_err(|_| invalid("service helpers are outside the reviewed home"))?;
@@ -204,7 +234,6 @@ pub(crate) fn install_exact_files(
         }
     }
     let root = ensure_directories(home, relative, uid, true)?;
-    let _claim = claim_installer(&root, uid)?;
     let unit_parent = unit_path
         .parent()
         .ok_or_else(|| invalid("service unit has no parent"))?;

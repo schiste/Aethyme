@@ -73,6 +73,13 @@ pub(crate) const CHECKOUT_STRIP_DONE_KEY: &str = "checkout_strip.done";
 /// `closed_at`); dropped when the folder shows up again in its pool's
 /// listing.
 pub(crate) const CHECKOUT_STRIP_ABSENT_KEY: &str = "checkout_strip.absent";
+/// Meta key: checkout folders the backlog census last found to be retired
+/// checkouts' tombstones, with the folder's identity then (JSON: path to
+/// `[device, inode, modification time in ns]`). A folder whose identity is
+/// unchanged is still that tombstone: replacing or removing the note, or
+/// adding anything beside it, changes the folder's modification time, and
+/// a folder put in its place is another inode.
+pub(crate) const CHECKOUT_BACKLOG_TOMBSTONES_KEY: &str = "checkout_strip.backlog_tombstones";
 /// Remembered handled sessions at most; the lowest ids go first.
 const STRIP_DONE_MAX: usize = 16_384;
 /// Meta key: checkouts whose directories were last kept only for a
@@ -1141,6 +1148,43 @@ impl PoolListing {
 /// Whether a checkout folder the backlog found is a retired checkout's
 /// tombstone: one `lstat` of the tombstone note, and the full check only for
 /// a folder that holds one.
+/// [`is_backlog_tombstone`], answered from the last census's memory when
+/// the folder's identity (device, inode, modification time) is unchanged.
+/// A tombstone found either way is recorded in `seen` with its identity.
+fn backlog_tombstone(
+    folder: &str,
+    remembered: &BTreeMap<String, (u64, u64, u64)>,
+    seen: &mut BTreeMap<String, (u64, u64, u64)>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = Path::new(folder);
+    let identity = std::fs::symlink_metadata(path).ok().and_then(|metadata| {
+        let modified = metadata.modified().ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        metadata.is_dir().then_some((
+            metadata.dev(),
+            metadata.ino(),
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
+        ))
+    });
+    let Some(identity) = identity else {
+        return false;
+    };
+    if remembered.get(folder) == Some(&identity) {
+        crate::phase_telemetry::add(
+            "checkout_strip_backlog_tombstone_remembered",
+            Duration::ZERO,
+        );
+        seen.insert(folder.to_string(), identity);
+        return true;
+    }
+    if is_backlog_tombstone(path) {
+        seen.insert(folder.to_string(), identity);
+        return true;
+    }
+    false
+}
+
 fn is_backlog_tombstone(folder: &Path) -> bool {
     std::fs::symlink_metadata(folder.join(super::tombstone::TOMBSTONE_FILE))
         .is_ok_and(|metadata| metadata.is_file())
@@ -2080,6 +2124,14 @@ impl Broker {
         };
         let mut folders = BTreeSet::new();
         let mut tombstones = BTreeSet::new();
+        // The tombstone set barely changes between runs (136 to 141 on the
+        // busiest repository), and the full check reads each one's
+        // directory and note: 82 to 89 s of census in runs whose disk was
+        // busy. A folder whose identity matches the last census is judged
+        // from one `lstat` of the folder.
+        let remembered: BTreeMap<String, (u64, u64, u64)> =
+            self.meta_json(CHECKOUT_BACKLOG_TOMBSTONES_KEY);
+        let mut seen_tombstones: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         let folder_census = crate::phase_telemetry::span("checkout_strip_backlog_folders");
         for session in live.iter().chain(closed.iter()) {
             if folders.contains(session.worktree_path.as_str())
@@ -2094,7 +2146,11 @@ impl Broker {
                 // out before the full check.
                 Some(true)
                     if !open_paths.contains(session.worktree_path.as_str())
-                        && is_backlog_tombstone(Path::new(&session.worktree_path)) =>
+                        && backlog_tombstone(
+                            &session.worktree_path,
+                            &remembered,
+                            &mut seen_tombstones,
+                        ) =>
                 {
                     tombstones.insert(session.worktree_path.as_str());
                     crate::phase_telemetry::add("checkout_strip_backlog_tombstone", Duration::ZERO);
@@ -2107,6 +2163,23 @@ impl Broker {
             }
         }
         drop(folder_census);
+        // A census cut short by an unavailable listing keeps what it could
+        // not see; one that saw everything replaces the memory.
+        if seen_tombstones != remembered {
+            let keep_unseen = backlog.regenerable_partial;
+            crate::warn_unrecorded(
+                "remember the backlog's tombstones",
+                self.update_meta_json(
+                    CHECKOUT_BACKLOG_TOMBSTONES_KEY,
+                    |stored: &mut BTreeMap<String, (u64, u64, u64)>| {
+                        if !keep_unseen {
+                            stored.clear();
+                        }
+                        stored.extend(seen_tombstones.clone());
+                    },
+                ),
+            );
+        }
         backlog.folders = folders.len();
         let closed_folders = closed
             .iter()
@@ -2610,6 +2683,48 @@ mod tests {
             tombstone
                 .join(super::super::tombstone::TOMBSTONE_FILE)
                 .is_file()
+        );
+
+        // The next census judges the unchanged tombstone from its identity
+        // alone, and counts it the same.
+        let census = |broker: &crate::Broker| {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let backlog = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                broker.observe_checkout_backlog(
+                    &mut PoolListing::default(),
+                    &[],
+                    &closed,
+                    &BTreeSet::new(),
+                    far(),
+                    true,
+                )
+            };
+            let (_, counts) = recorder.totals();
+            (
+                backlog,
+                counts
+                    .get("checkout_strip_backlog_tombstone_remembered")
+                    .copied(),
+            )
+        };
+        let (again, remembered) = census(&broker);
+        assert_eq!(remembered, Some(1));
+        assert_eq!((again.folders, again.closed_folders), (1, 1), "{again:?}");
+        // Anything added beside the note changes the folder's identity: it
+        // is judged in full again, and is no tombstone any more.
+        std::fs::write(tombstone.join("work.txt"), "new work\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::open(&tombstone)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let (changed, remembered) = census(&broker);
+        assert_eq!(remembered, None);
+        assert_eq!(
+            (changed.folders, changed.closed_folders),
+            (2, 2),
+            "{changed:?}"
         );
     }
 

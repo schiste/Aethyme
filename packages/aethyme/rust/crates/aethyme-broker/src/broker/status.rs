@@ -70,6 +70,8 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
+        #[cfg(target_os = "macos")]
+        self.push_gc_service_runtime_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -801,6 +803,41 @@ impl Broker {
         }
     }
 
+    /// Warn when this repository's scheduled GC service is silently gone: it
+    /// names a runtime that is no longer installed, a refresh left its record
+    /// archived, or a load was meant and never confirmed. A few file reads
+    /// under the user's Library; no launchctl.
+    #[cfg(target_os = "macos")]
+    fn push_gc_service_runtime_advice(&self, view: &mut StatusView) {
+        let _span = crate::phase_telemetry::span("status_gc_service_runtime");
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Ok(common) = self.repo_handle().git_common_dir() else {
+            return;
+        };
+        let Ok(Some(uuid)) =
+            crate::store::repository_identity::read_repository_uuid_marker(&common)
+        else {
+            return;
+        };
+        // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+        let uid = unsafe { libc::geteuid() };
+        let Some(advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid) else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: advice.id,
+            severity: StatusAdviceSeverity::Warning,
+            reason: advice.reason,
+            summary: advice.summary.into(),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: advice.evidence,
+            commands: advice.commands,
+        });
+    }
+
     /// Warn when the last preparation could not verify a runtime probe: that
     /// checkout reinstalls on every preparation, never reports current, and a
     /// `required_for_hooks` step then blocks its hooks. One metadata read.
@@ -1003,6 +1040,8 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
+        #[cfg(target_os = "macos")]
+        self.push_gc_service_runtime_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

@@ -294,6 +294,71 @@ pub fn writes_to(args: &[String]) -> Vec<RootKind> {
     }
 }
 
+/// Name prefix of an entry moved aside for the storage worker to delete:
+/// an interrupted eviction, or a managed gate cache prune's staging
+/// directory. The worker deletes every such entry of each of its roots at
+/// the start and at the end of every pass, whichever process made it.
+pub const STAGED_DELETION_PREFIX: &str = ".aethyme-storage-evicting-";
+/// Suffix of the file beside a staged directory that records its logical
+/// size, written by the stager (swept with it: it has the same prefix).
+pub const STAGED_BYTES_SUFFIX: &str = ".bytes";
+/// A staged deletion older than this makes any command start a worker
+/// (when none runs) and shows in `broker status`.
+pub const STAGED_DELETION_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// One entry staged for deletion in a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedDeletion {
+    pub name: String,
+    /// Milliseconds since it was staged (its modification time).
+    pub age_ms: u64,
+    /// The size its stager recorded, when it did.
+    pub bytes: Option<u64>,
+}
+
+/// The staged deletions directly under `root`: one directory listing, one
+/// `lstat` per staged entry and one small read per recorded size.
+pub fn staged_deletions(root: &Path) -> Vec<StagedDeletion> {
+    let now = std::time::SystemTime::now();
+    let mut found = Vec::new();
+    for name in super::read_names(root) {
+        if !name.starts_with(STAGED_DELETION_PREFIX) || name.ends_with(STAGED_BYTES_SUFFIX) {
+            continue;
+        }
+        let path = root.join(&name);
+        let age_ms = fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map_or(0, duration_ms);
+        let bytes = fs::read_to_string(root.join(format!("{name}{STAGED_BYTES_SUFFIX}")))
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok());
+        found.push(StagedDeletion {
+            name,
+            age_ms,
+            bytes,
+        });
+    }
+    found
+}
+
+/// A process just staged something for deletion: start the storage worker
+/// when none runs, so the space comes back within a pass and not at the
+/// next routine refresh. A worker that runs deletes it at the end of its
+/// pass. Never deletes anything itself.
+pub fn request_staged_deletion(host_state: &Path) {
+    if !enabled(host_state) || worker_alive(host_state) {
+        crate::phase_telemetry::add("storage_staged_deletion_worker_running", Duration::ZERO);
+        return;
+    }
+    crate::phase_telemetry::add("storage_staged_deletion_worker_started", Duration::ZERO);
+    let mut summary = Summary::load(host_state);
+    summary.last_kick_ms = now_ms();
+    crate::warn_unrecorded("record a storage worker start", summary.save(host_state));
+    crate::warn_unrecorded("start the storage worker", spawn_worker());
+}
+
 /// Whether a live worker holds the lock (read from the lock file only).
 fn worker_alive(host_state: &Path) -> bool {
     fs::read(host_state.join(LOCK_FILE))
@@ -342,7 +407,21 @@ pub fn decide(
     }
     let now = now_ms();
     let stale = now.saturating_sub(summary.updated_at_ms) > duration_ms(REFRESH_EVERY);
-    let wanted = stale || !decision.below_floor.is_empty() || !summary.over_budget.is_empty();
+    // A staged deletion left waiting (its stager could not start a worker,
+    // or the worker that ran had already swept): one listing of the host
+    // cache root.
+    let staged_waiting = roots
+        .iter()
+        .filter(|root| root.kind == RootKind::HostCache)
+        .any(|root| {
+            staged_deletions(&root.path)
+                .iter()
+                .any(|staged| staged.age_ms >= duration_ms(STAGED_DELETION_WAIT))
+        });
+    let wanted = stale
+        || staged_waiting
+        || !decision.below_floor.is_empty()
+        || !summary.over_budget.is_empty();
     // One spawn a minute at most, and never while a worker runs.
     let recently_kicked = now.saturating_sub(summary.last_kick_ms) < duration_ms(KICK_EVERY);
     if wanted && !recently_kicked && !worker_alive(host_state) {
@@ -1019,6 +1098,18 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         }
     }
     report.phases_ms.insert("evict".into(), elapsed(phase));
+    // Again at the end: a pass runs for minutes, and what a gate staged
+    // after its start would otherwise wait for the next pass.
+    let phase = Instant::now();
+    let mut beat_end = || {
+        if let Some(lock) = lock.as_deref_mut() {
+            lock.beat();
+        }
+    };
+    for root in &ledger.roots {
+        evict::sweep_aside(&root.path, &mut beat_end);
+    }
+    report.phases_ms.insert("sweep_end".into(), elapsed(phase));
     report.phases_ms.insert("total".into(), elapsed(started));
 
     ledger.volumes = volumes.into_values().collect();
