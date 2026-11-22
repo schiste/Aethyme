@@ -310,9 +310,7 @@ fn policy_coverage(
     checks: &BTreeMap<&str, &Value>,
 ) -> Result<(usize, usize), &'static str> {
     closed(policy, &["version", "name", "gates"])?;
-    if policy["version"].as_u64() != Some(1)
-        || !policy["name"].as_str().is_some_and(|name| !name.is_empty())
-    {
+    if policy["version"].as_u64() != Some(1) || policy["name"].as_str().is_none_or(str::is_empty) {
         return Err("unsupported resolved policy");
     }
     let gates = policy["gates"].as_array().ok_or("invalid resolved gates")?;
@@ -344,18 +342,18 @@ fn policy_coverage(
         }
         if collection {
             let check_id = format!("collection:0::{id}");
-            if !checks
+            if checks
                 .get(check_id.as_str())
-                .is_some_and(|c| c["blocking"].as_bool() == Some(blocking))
+                .is_none_or(|c| c["blocking"].as_bool() != Some(blocking))
             {
                 return Err("resolved policy check is missing or has inconsistent blocking");
             }
         } else {
             for entity in &entities {
                 let check_id = format!("gate:{}:{entity}:{id}", entity.len());
-                if !checks
+                if checks
                     .get(check_id.as_str())
-                    .is_some_and(|c| c["blocking"].as_bool() == Some(blocking))
+                    .is_none_or(|c| c["blocking"].as_bool() != Some(blocking))
                 {
                     return Err("resolved policy check is missing or has inconsistent blocking");
                 }
