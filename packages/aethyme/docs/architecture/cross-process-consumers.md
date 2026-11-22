@@ -4268,6 +4268,26 @@ New surface consumers may begin to depend on:
 - Broker metadata key `session_scratch.records` (path to record: session,
   pool, entry, device, inode, created time, `superseded`, last `keep` reason
   and `attempts`) and `session_scratch.bytes_freed_total`.
+- The bytes in the `session_scratch` class come from a measurement lap
+  spread over runs (broker metadata key `session_scratch.measure_lap`, JSON
+  `started_ms` and `after`, the lap in progress and the last record it
+  measured; `so_far`, its totals; `last` and `last_completed_ms`, the last
+  lap that went round; totals carry `measured`, `bytes`, `largest_bytes`,
+  `largest_session_id`, `partial`, `finished_runs`, `finished_run_bytes`).
+  A run walks the records after `after`, in key order, for at most 2 s (at
+  least one record); a new lap starts 15 minutes after the last one went
+  round, and between laps a run walks nothing (counter
+  `session_scratch_measure_not_due`). The class shows the last complete lap
+  (`partial` only when a record's walk stopped at the budget), or the lap in
+  progress as `partial` before any went round; `directories`, `kept` and
+  `refused` are counted from the records on every run. Through 0.8.158 every
+  run walked from the first record for its 2 s, never went round and so
+  reported only the first records, always `partial`. Counters
+  `session_scratch_measure_lap_started`,
+  `session_scratch_measure_lap_completed`; span
+  `session_scratch_measure_record` (one per record walked: the phase count
+  is the records walked); the `session_scratch_usage` attachment gains
+  `measure_due`, `measured` (records walked this run) and `lap_open`.
 - Trash rows (`checkout_retirement.trash_rows`) gain `scratch: true` (omitted
   when false); such rows also carry `stripped: true`, so older binaries treat
   them as stripped directories, never as the checkout. `TrashDrainReport`
@@ -4398,28 +4418,46 @@ classifies every record from its session's state, read for all records in
 one store query (`SELECT id, status, cleanup_state FROM sessions WHERE id IN
 (...)`, 500 ids per query; when that read fails, one lookup per record, counter
 `session_scratch_retire_session_states_fallback`), with no filesystem access.
-It then probes the filesystem only where there can be work, for at most 2 s:
-a closed (or replaced) record whose directory is proven gone (the walk from
-`/` without links finds no entry, and the pool is not on a volume that is
-away) is forgotten at once, with no open-file observation and no lifecycle
-claim (counter `session_scratch_missing_forgotten_early`); and the `tmp-done`
-container of each open record due for a listing is listed by path (a hint
-that only decides whether the verified walk is worth its cost), at least one
-per pass, resuming after the last record listed. A record is due when a
-finished-run signal names it, when its last listing showed a finished run
-(it leaves only after a listing, or the verified walk, showed none; a
-container that cannot be read, other than one that does not exist, keeps it
-due, counter `session_scratch_retire_listing_unknown`), and,
-once an hour, every open record (the full listing lap, counter
-`session_scratch_retire_full_listing`: the backstop for a marker whose signal
-is missing). A finished-run signal is the empty file
+It then touches the filesystem only where there can be work, every step
+within a budget of its own, because one directory operation on the busiest
+repository's volume took from under 1 ms to about 1 s depending on what
+else used the volume. The classification, at most 2 s from before its
+first filesystem call (the container listing and the signal clear are
+charged to it, unlike in 0.8.158), lists each pool's container, clears the
+signals it accounts for, and lists by path the `tmp-done` container of each
+open record due for a listing (a hint that only decides whether the
+verified walk is worth its cost), at least one per pass, resuming after the
+last record listed. A record is due when a finished-run signal names it,
+when its last listing showed a finished run (it leaves only after a
+listing, or the verified walk, showed none; a container that cannot be
+read, other than one that does not exist, keeps it due, counter
+`session_scratch_retire_listing_unknown`). The full listing lap, the
+backstop for a marker whose signal is missing, starts at most once an hour
+and never while the previous lap is unfinished (counter
+`session_scratch_retire_full_listing`; `session_scratch_retire_lap_completed`
+when it went round); it is paced to reach every open record within half an
+hour: each pass lists, after where the lap stopped and in key order, its
+share of the open records (the records the elapsed fraction of half an hour
+owes, minus those already reached, at least 8), for at most 0.5 s (at least
+one listing when it owes any). A record already due, or listed by the
+classification, is reached without a listing of its own; one whose listing
+shows a finished run is taken by this pass's finished-runs phase and stays
+due; one whose listing cannot be read becomes due. In 0.8.158 a lap made
+every open record due at once (about 600 on the busiest repository), so
+every pass spent its whole budget listing 1 to 22 of them. Then a closed
+(or replaced) record whose directory is proven gone (the walk from `/`
+without links finds no entry, and the pool is not on a volume that is away)
+is forgotten at once, with no open-file observation and no lifecycle claim
+(counter `session_scratch_missing_forgotten_early`): probed in the closed
+phase's order (from its cursor), at least one per pass, for at most 0.5 s.
+A finished-run signal is the empty file
 `<pool>/.aethyme-session-scratch/.aethyme-finished.<entry>`, created (never
 following a link) right after the marker by whichever process finished the
 run (counters `command_temp_finish_signaled`,
 `command_temp_finish_signal_failed`); the pass reads the signals with the one
 listing of each pool's container it already takes for unrecorded entries,
-stores what they made due, then clears, through the container opened
-without links and before any listing, the signals of records stored as due,
+stores what they made due (only when there is a signal to clear), then
+clears, through the container opened without links and before any listing, the signals of records stored as due,
 of records it retires, and of entries no longer in the container (a signal
 of a record it did not read or could not classify stays for the next pass) (when storing fails they stay, counter
 `session_scratch_retire_signals_kept`). Signals are broker bookkeeping like
@@ -4436,13 +4474,15 @@ record where the previous pass stopped (broker metadata key
 `command_temps`, each the last record key judged, absent once it went
 round; `classify`, the last record listed; `listing_due`, the record keys
 due for a listing; `full_listing_started_ms`, when the last full listing lap
-started; the pass merges `listing_due` into the stored value rather than
+started; `lap_open`, `lap_after` and `lap_listed`, whether a lap is in
+progress, the last record it reached and how many it reached; the pass merges `listing_due` into the stored value rather than
 replacing it, removing only the keys it proved need no listing and the
 keys whose record is gone; and `command_temp_runs`, an object from record key to the name of
 the last finished run judged when that record's visit ended before it
 went through its runs). Every closed record is classified on every pass; a
 finished run's record is due from the pass after its marker (within the
-hour without its signal), listed within as many passes as there are due
+full listing lap without its signal: started hourly, paced over half an
+hour, later only when its per-pass budget cannot keep that pace), listed within as many passes as there are due
 records, and then judged like any record with finished runs, given passes
 whose observation succeeds and whose moves do not fail with a cause that
 affects the whole process (`too_many_open_files`). Records still due when
@@ -4512,15 +4552,23 @@ Counters `session_scratch_retire_cursor_resumed`,
 failed moves in a row), `command_temp_run_cursor_resumed` (a record's
 visit resumed after its run cursor); spans
 `session_scratch_retire_classify` (the whole classification),
-`session_scratch_retire_session_states` (the store read) and
-`session_scratch_retire_signals` (the container listings); attachment `scratch_move_failures`,
+`session_scratch_retire_session_states` (the store read),
+`session_scratch_retire_signals` (the container listings),
+`session_scratch_retire_signal_clear` (storing what signals made due and
+clearing them), `session_scratch_retire_due_listing` and
+`session_scratch_retire_lap_listing` (one per `tmp-done` listing, so the
+span total over its phase count is the per-listing latency),
+`session_scratch_retire_lap` (the lap's share), `session_scratch_retire_probes`
+(the probe step) and `session_scratch_retire_probe` (one per probe); attachment `scratch_move_failures`,
 keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
 `total_ms`, `max_ms`). The `session_scratch_retire` attachment gains
 `records`, `sessions_with_finished_runs`, `kept_causes` (directories kept
 by `<step>.<cause>`), `stopped_after_failures`, `classify_incomplete`
 (records still due for a listing when the budget ended), `listed` (done
 containers listed), `probed` (closed records probed for a gone directory),
-`signals` (finished-run signals read), `listing_due` (records due after the
+`signals` (finished-run signals read), `lap_listed` (of `listed`, by the
+lap), `lap_remaining` (open records the lap in progress has still to
+reach), `listing_due` (records due after the
 pass), `listing_unknown` (due records whose container could not be read), `full_listing` (the pass started a full listing lap),
 `process_use_unknown` and
 `command_temps_kept_by_reason` (`in_use`, `process_use_unknown`, a refusal
