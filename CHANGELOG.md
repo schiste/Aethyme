@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.156] - 2026-11-22
+
+### Fixed
+
+- Finished command temp runs are actually retired. On the busiest repository 65 finished runs waited and none was retired in two hours: the session scratch pass walked every record (about 650) from the first one on each run with a 5 s budget and no cursor, so the newest sessions, which hold the finished runs, were never reached. The pass now classifies records first (2 s budget, resumable), takes the process-use observation outside its budget, gives closed directories and finished runs each a share (the finished runs a guaranteed floor), resumes each phase after the last record it judged, and moves at most 256 entries per phase per run. It is no longer capped by what earlier phases used of the lane deadline, and starts no new work later than 20 s past it (#1942).
+- A failing move is counted by cause instead of being hidden. In the one pass that reached the finished runs every move failed with the error discarded. Each keep and each failed command temp setup is now recorded by step and cause; a phase stops after three failed moves in a row, or at once on a systemic cause (no file descriptors, no space, read-only, unsupported exclusive rename, trash unusable), and such a stop does not put the lane on its busy cadence. An `openat` failure other than "missing" or "not a directory" is a failure, not a refusal (#1942).
+- A closed session's scratch record is kept, not forgotten, while the pool volume is not mounted (#1942).
+
+### Added
+
+- Metadata key `session_scratch.retire_cursor`; attachments `scratch_move_failures` and `command_temp_create_failures`; fields `command_temps_kept_by_reason`, `kept_causes`, `sessions_with_finished_runs` and `process_use_unknown` in `session_scratch_retire`; keep reason `pool_unavailable`; span `session_scratch_retire_classify`; counters `session_scratch_retire_cursor_resumed`, `session_scratch_retire_classify_stopped`, `session_scratch_retire_process_use_unknown`, `session_scratch_retire_stopped_after_failures`, `command_temp_retire_stopped_after_failures` and `session_scratch_kept_pool_unavailable` (#1942).
+
+### Known issues
+
+- Within one session, finished runs listed after three permanently failing ones are not retried. When classification does not finish inside its budget, records past the point a phase reached may wait several laps. A record is kept indefinitely when the pool directory itself was deleted on a mounted volume.
+- Files that scripts or agents write to `/tmp` by name are outside the command temp directory and are not cleaned by Aethyme.
+
 ## [0.8.155] - 2026-11-22
 
 ### Added
