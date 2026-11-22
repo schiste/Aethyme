@@ -7607,9 +7607,16 @@ mod tests {
             let (_, name, trash) =
                 stale_unconfirmable_trash_entry(&mut broker, &format!("replaced-{index}"));
             let entry = trash.join(&name);
+            // The replacement directory is made before the entry goes, so
+            // it can never reuse the entry's inode (ext4 hands a freed
+            // inode straight back, which made this a same-identity entry).
+            let replacement_dir = trash.with_file_name(format!("replacement-{index}"));
+            if replacement == "directory" {
+                std::fs::create_dir(&replacement_dir).unwrap();
+            }
             std::fs::remove_dir_all(&entry).unwrap();
             match replacement {
-                "directory" => std::fs::create_dir(&entry).unwrap(),
+                "directory" => std::fs::rename(&replacement_dir, &entry).unwrap(),
                 "file" => std::fs::write(&entry, b"not the checkout").unwrap(),
                 _ => std::os::unix::fs::symlink(trash.parent().unwrap(), &entry).unwrap(),
             }
