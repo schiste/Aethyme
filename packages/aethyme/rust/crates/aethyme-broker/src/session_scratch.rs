@@ -47,6 +47,12 @@ pub(crate) const SCRATCH_CONTAINER: &str = ".aethyme-session-scratch";
 /// Marker file proving the container is the broker's.
 const SCRATCH_MARKER: &str = ".aethyme-scratch-marker";
 const SCRATCH_MARKER_CONTENT: &str = "aethyme session scratch v1\n";
+/// Prefix of a finished-run signal, `<container>/.aethyme-finished.<entry>`:
+/// an empty file written after a finished-run marker of the scratch
+/// directory `<entry>` ([`signal_finished_run`]), so the retirement pass
+/// lists only the done containers that changed. Broker bookkeeping, like the
+/// marker: never content of the container.
+const FINISHED_SIGNAL_PREFIX: &str = ".aethyme-finished.";
 /// The variable commands the broker runs for a session receive.
 pub const SESSION_SCRATCH_ENV: &str = "AETHYME_SESSION_SCRATCH_DIR";
 /// Longest accepted entry name (`s<i64>-<hex ms>-<n>` fits easily).
@@ -891,6 +897,103 @@ pub(crate) fn may_have_finished_runs(record: &ScratchRecord) -> bool {
     )
 }
 
+/// The scratch entry a finished-run signal named `name` stands for.
+fn finished_signal_entry(name: &str) -> Option<&str> {
+    name.strip_prefix(FINISHED_SIGNAL_PREFIX)
+        .filter(|entry| is_entry_name(entry))
+}
+
+/// Signal that the scratch directory `scratch` has a new finished-run marker:
+/// create (or leave) the empty file `.aethyme-finished.<entry>` beside it in
+/// its container, never following a link. Written after the marker, so a
+/// retirement pass that consumes the signal before listing the done
+/// container sees the marker. `None` when `scratch` is not a scratch entry
+/// inside a scratch container (nothing to signal); `Some(false)` when the
+/// file could not be made (the pass's periodic full listing still finds the
+/// marker).
+pub(crate) fn signal_finished_run(scratch: &Path) -> Option<bool> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let container = scratch.parent()?;
+    let entry = scratch.file_name()?.to_str()?;
+    if container.file_name() != Some(SCRATCH_CONTAINER.as_ref()) || !is_entry_name(entry) {
+        return None;
+    }
+    Some(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(container.join(format!("{FINISHED_SIGNAL_PREFIX}{entry}")))
+            .is_ok(),
+    )
+}
+
+/// One listing of a pool's scratch container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ContainerListing {
+    /// Every name but the broker's bookkeeping (the marker and the signals).
+    pub(crate) entries: Vec<String>,
+    /// The scratch entries a finished-run signal names.
+    pub(crate) signals: Vec<String>,
+}
+
+/// List `pool`'s scratch container once, by path: its entries and its
+/// finished-run signals. Empty when there is no readable container.
+pub(crate) fn list_container(pool: &Path) -> ContainerListing {
+    read_container(pool).unwrap_or_default()
+}
+
+/// [`list_container`], `None` when the container cannot be read.
+fn read_container(pool: &Path) -> Option<ContainerListing> {
+    let mut listing = ContainerListing::default();
+    let names = std::fs::read_dir(pool.join(SCRATCH_CONTAINER)).ok()?;
+    for name in names
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+    {
+        if name == SCRATCH_MARKER {
+            continue;
+        }
+        match finished_signal_entry(&name) {
+            Some(entry) => listing.signals.push(entry.to_owned()),
+            None => listing.entries.push(name),
+        }
+    }
+    Some(listing)
+}
+
+/// Remove the finished-run signals of `entries` from `pool`'s container,
+/// opened from `/` without following a link and verified as the broker's
+/// (`unlinkat` without flags never removes a directory). How many went.
+pub(crate) fn clear_finished_signals(pool: &Path, entries: &[String]) -> usize {
+    let Ok(pool_fd) = open_path_without_links(pool) else {
+        return 0;
+    };
+    let Ok(stat) = fstat(pool_fd.as_raw_fd()) else {
+        return 0;
+    };
+    #[allow(clippy::unnecessary_cast)]
+    let Ok(container) = open_container(pool_fd.as_raw_fd(), stat.st_dev as u64) else {
+        return 0;
+    };
+    entries
+        .iter()
+        .filter(|entry| is_entry_name(entry))
+        .filter(|entry| unlink_signal(container.as_raw_fd(), entry))
+        .count()
+}
+
+/// Unlink the signal of `entry` in the open container `container`.
+fn unlink_signal(container: RawFd, entry: &str) -> bool {
+    let Ok(name) = c_name(&format!("{FINISHED_SIGNAL_PREFIX}{entry}")) else {
+        return false;
+    };
+    // SAFETY: `name` is NUL-terminated and `container` is an open directory;
+    // `unlinkat` without flags removes only a non-directory.
+    unsafe { libc::unlinkat(container, name.as_ptr(), 0) == 0 }
+}
+
 /// Remove `run`'s marker from `record`'s done container (only a regular
 /// file: `unlinkat` without flags never removes a directory).
 pub(crate) fn forget_finished_run(record: &ScratchRecord, run: &FinishedRun) {
@@ -978,18 +1081,20 @@ pub(crate) fn move_finished_run_to_trash(
     })
 }
 
-/// Remove a container that holds nothing but its marker, so an emptied pool
-/// is left as it was found. `rmdir` refuses a container that gained an entry
+/// Remove a container that holds nothing but its marker (and finished-run
+/// signals, whose scratch entries are then gone), so an emptied pool is left
+/// as it was found. `rmdir` refuses a container that gained an entry
 /// meanwhile (and a link in its place); the marker is then written again.
 fn remove_container_if_empty(pool: &Path, container: RawFd) {
     let path = pool.join(SCRATCH_CONTAINER);
-    let only_marker = std::fs::read_dir(&path).is_ok_and(|listing| {
-        listing
-            .filter_map(Result::ok)
-            .all(|entry| entry.file_name() == SCRATCH_MARKER)
-    });
-    if !only_marker {
+    let Some(listing) = read_container(pool) else {
         return;
+    };
+    if !listing.entries.is_empty() {
+        return;
+    }
+    for entry in &listing.signals {
+        unlink_signal(container, entry);
     }
     let Ok(marker) = c_name(SCRATCH_MARKER) else {
         return;
@@ -1005,8 +1110,9 @@ fn remove_container_if_empty(pool: &Path, container: RawFd) {
 }
 
 /// Whether `container` (a pool's scratch container, not followed if a link)
-/// holds nothing but the broker's marker and scratch-named real
-/// directories: the broker's own state, removed with its sessions.
+/// holds nothing but the broker's marker, its finished-run signals and
+/// scratch-named real directories: the broker's own state, removed with its
+/// sessions.
 pub(crate) fn container_holds_only_scratch(container: &Path) -> bool {
     let Ok(listing) = std::fs::read_dir(container) else {
         return false;
@@ -1016,38 +1122,54 @@ pub(crate) fn container_holds_only_scratch(container: &Path) -> bool {
             let kind = entry.file_type().ok();
             match entry.file_name().to_str() {
                 Some(SCRATCH_MARKER) => kind.is_some_and(|kind| kind.is_file()),
+                Some(name) if finished_signal_entry(name).is_some() => {
+                    kind.is_some_and(|kind| kind.is_file())
+                }
                 Some(name) => is_entry_name(name) && kind.is_some_and(|kind| kind.is_dir()),
                 None => false,
             }
         })
 }
 
-/// Whether `container` holds any entry besides the broker's marker.
+/// Whether `container` holds any entry besides the broker's marker and its
+/// finished-run signals.
 pub(crate) fn container_has_entries(container: &Path) -> bool {
     // An unreadable container counts as holding entries: nothing is removed.
     match std::fs::read_dir(container) {
-        Ok(listing) => listing
-            .flatten()
-            .any(|entry| entry.file_name() != SCRATCH_MARKER),
+        Ok(listing) => listing.flatten().any(|entry| {
+            let name = entry.file_name();
+            name != SCRATCH_MARKER
+                && !name
+                    .to_str()
+                    .is_some_and(|name| finished_signal_entry(name).is_some())
+        }),
         Err(_) => true,
     }
 }
 
 /// Names in the container of `pool` that are not recorded (`recorded` holds
 /// the recorded entry names), at most `limit`. Left alone, only counted.
+#[cfg(test)]
 pub(crate) fn unrecorded_entries(
     pool: &Path,
     recorded: &std::collections::BTreeSet<String>,
     limit: usize,
 ) -> Vec<String> {
-    let Ok(listing) = std::fs::read_dir(pool.join(SCRATCH_CONTAINER)) else {
-        return Vec::new();
-    };
+    unrecorded_in(&list_container(pool), recorded, limit)
+}
+
+/// [`unrecorded_entries`] from a listing already taken.
+pub(crate) fn unrecorded_in(
+    listing: &ContainerListing,
+    recorded: &std::collections::BTreeSet<String>,
+    limit: usize,
+) -> Vec<String> {
     listing
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .filter(|name| name != SCRATCH_MARKER && !recorded.contains(name))
+        .entries
+        .iter()
+        .filter(|name| !recorded.contains(*name))
         .take(limit)
+        .cloned()
         .collect()
 }
 
@@ -1361,5 +1483,53 @@ mod tests {
             vec!["someone-else".to_string()]
         );
         assert!(pool.join(SCRATCH_CONTAINER).join("someone-else").is_dir());
+    }
+
+    /// Finishing a non-empty run signals its scratch directory beside it in
+    /// the container. A signal is broker bookkeeping: never an unrecorded
+    /// entry, never content that keeps a root or a container, cleared only
+    /// through the verified container, and gone with the last directory.
+    #[test]
+    fn a_finished_run_signal_is_broker_bookkeeping() {
+        let (_owner, pool) = pool();
+        let record = create(&pool, 31).unwrap();
+        let container = pool.join(SCRATCH_CONTAINER);
+        let temp = crate::command_temp::CommandTemp::create_in(
+            &record.path(),
+            &[PathBuf::from("/tmp")],
+            false,
+        )
+        .unwrap();
+        std::fs::write(temp.run_dir().join("left.tmp"), b"x").unwrap();
+        drop(temp);
+        let listing = list_container(&pool);
+        assert_eq!(listing.signals, vec![record.entry.clone()]);
+        assert_eq!(listing.entries, vec![record.entry.clone()]);
+        let recorded = std::collections::BTreeSet::from([record.entry.clone()]);
+        assert!(unrecorded_entries(&pool, &recorded, 10).is_empty());
+        assert!(container_holds_only_scratch(&container));
+
+        // Not a scratch directory inside a container: nothing to signal.
+        assert_eq!(signal_finished_run(&pool), None);
+        // A signal whose directory is gone is no content of the container.
+        let orphan = format!("{FINISHED_SIGNAL_PREFIX}s32-abc");
+        std::fs::write(container.join(&orphan), b"").unwrap();
+        assert_eq!(list_container(&pool).signals.len(), 2);
+        assert_eq!(
+            clear_finished_signals(&pool, &[record.entry.clone(), "s32-abc".into()]),
+            2
+        );
+        assert!(list_container(&pool).signals.is_empty());
+
+        assert_eq!(signal_finished_run(&record.path()), Some(true));
+        std::fs::write(container.join(&orphan), b"").unwrap();
+        let mut record_pending =
+            |_: &Path, _: &str, _: crate::checkout_trash::TrashRow| Ok::<(), String>(());
+        // Only signals and the marker are left once the directory moved:
+        // the emptied container goes as before.
+        let runs = finished_runs(&record, 10);
+        forget_finished_run(&record, &runs[0]);
+        move_to_trash(&record, &mut record_pending).unwrap();
+        assert!(!container.exists(), "the emptied container is removed");
     }
 }
