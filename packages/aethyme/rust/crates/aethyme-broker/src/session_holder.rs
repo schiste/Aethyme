@@ -139,6 +139,9 @@ struct ProcessRow {
     /// The short command name a native listing shows, `(name)` like `ps`,
     /// when the command line itself cannot be read.
     comm: String,
+    /// The start in epoch seconds as the kernel reported it (a native
+    /// listing); `None` for a `ps` row, whose `started` text is parsed.
+    started_epoch_s: Option<i64>,
 }
 
 impl ProcessRow {
@@ -281,6 +284,7 @@ impl ProcessTable {
                     started: fields[2..7].join(" "),
                     args: std::sync::OnceLock::from(fields[7..].join(" ")),
                     comm: String::new(),
+                    started_epoch_s: None,
                 },
             );
         }
@@ -294,6 +298,35 @@ impl ProcessTable {
             started: row.started.clone(),
             command: row.args(pid).to_owned(),
         })
+    }
+
+    /// When the process `pid` started, in epoch milliseconds (whole
+    /// seconds, as `ps -o lstart` shows them): the kernel's number for a
+    /// native row, the parsed `lstart` text for a `ps` row. `None` when `pid`
+    /// is not listed or its start cannot be read exactly, whatever the
+    /// locale the text was printed in.
+    pub(crate) fn start_epoch_ms(&self, pid: i64) -> Option<i64> {
+        let row = self.rows.get(&pid)?;
+        match row.started_epoch_s {
+            Some(seconds) => seconds.checked_mul(1_000),
+            None => lstart_epoch_ms(&row.started),
+        }
+    }
+
+    /// Whether this table proves gone the process recorded as `pid` started
+    /// at `started_ms` ([`Self::start_epoch_ms`] units): no process has the
+    /// pid, or the one that has it provably started at another time. An
+    /// unknown record (pid or start not positive) or a listed process whose
+    /// start cannot be read proves nothing.
+    pub(crate) fn proves_gone(&self, pid: i64, started_ms: i64) -> bool {
+        if pid <= 0 || started_ms <= 0 {
+            return false;
+        }
+        if !self.rows.contains_key(&pid) {
+            return true;
+        }
+        self.start_epoch_ms(pid)
+            .is_some_and(|listed| listed != started_ms)
     }
 
     /// Whether `process` is still running: same pid and same start time.
@@ -432,6 +465,60 @@ fn is_agent_runtime(args: &str) -> bool {
     first_name == "node" && words.next().is_some_and(is_agent)
 }
 
+/// This process's start in epoch milliseconds (whole seconds, the value
+/// [`ProcessTable::start_epoch_ms`] reads for it), read for this process
+/// alone and with no text in between: `KERN_PROC_PID` on macOS,
+/// `/proc/self/stat` and the boot time on Linux. `None` elsewhere or when
+/// the read fails; the caller falls back to a process-table snapshot.
+pub(crate) fn own_start_epoch_ms() -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    let seconds = native_process_table::own_start_seconds();
+    #[cfg(target_os = "linux")]
+    let seconds = linux_own_start_seconds();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let seconds: Option<i64> = None;
+    seconds?.checked_mul(1_000)
+}
+
+/// This process's start in epoch seconds the way procps computes `lstart`:
+/// the boot time (`btime` in `/proc/stat`) plus the start in clock ticks
+/// (field 22 of `/proc/self/stat`) divided by the tick rate, truncated.
+#[cfg(target_os = "linux")]
+// `c_long` is already `i64` on 64-bit targets only.
+#[allow(clippy::useless_conversion)]
+fn linux_own_start_seconds() -> Option<i64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let boot = std::fs::read_to_string("/proc/stat").ok()?;
+    // SAFETY: `sysconf` has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    linux_start_seconds(&stat, &boot, i64::from(ticks))
+}
+
+/// [`linux_own_start_seconds`] over given `/proc/self/stat` and `/proc/stat`
+/// texts and tick rate. The command name (field 2) may hold spaces and
+/// parentheses, so fields are counted after its last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn linux_start_seconds(stat: &str, boot: &str, ticks: i64) -> Option<i64> {
+    if ticks <= 0 {
+        return None;
+    }
+    let (_, after_name) = stat.rsplit_once(')')?;
+    // Field 3 (state) is the first after the name; field 22 is starttime.
+    let start_ticks = after_name
+        .split_whitespace()
+        .nth(22 - 3)?
+        .parse::<i64>()
+        .ok()?;
+    let boot_seconds = boot
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let seconds = boot_seconds.checked_add(start_ticks / ticks)?;
+    (seconds > 0).then_some(seconds)
+}
+
 const LSTART_WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const LSTART_MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -544,6 +631,7 @@ pub(crate) struct NativeProcess {
     ppid: i64,
     started: String,
     comm: String,
+    started_epoch_s: Option<i64>,
 }
 
 /// Build a process table from a native listing, refusing to call a partial
@@ -571,6 +659,7 @@ fn assemble_native_table(
                         started: process.started,
                         args: std::sync::OnceLock::new(),
                         comm: process.comm,
+                        started_epoch_s: process.started_epoch_s,
                     },
                 );
             }
@@ -818,6 +907,7 @@ mod native_process_table {
                     ppid: i64::from(process.kp_eproc.e_ppid),
                     started,
                     comm,
+                    started_epoch_s: i64::try_from(start_seconds).ok(),
                 })
             },
         )
@@ -873,6 +963,36 @@ mod native_process_table {
             }
         };
         super::list_kinfo_with_retries(element, size_query, fetch)
+    }
+
+    /// This process's start in epoch seconds, from
+    /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid())`: one entry,
+    /// this process only, so it needs no right to list other processes
+    /// (the `KERN_PROC_ALL` listing and `ps` a sandbox refuses).
+    pub(super) fn own_start_seconds() -> Option<i64> {
+        let pid = libc::c_int::try_from(std::process::id()).ok()?;
+        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        // SAFETY: `KinfoProc` is plain old data; zero is a valid value.
+        let mut entry: KinfoProc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<KinfoProc>();
+        // SAFETY: `name` holds four MIB entries and `entry` owns `size`
+        // writable bytes; the kernel updates `size` to the bytes written.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                4,
+                (&mut entry as *mut KinfoProc).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size != std::mem::size_of::<KinfoProc>() || entry.kp_proc.p_pid != pid {
+            return None;
+        }
+        // `time_t` is `i64` on LP64 macOS.
+        let seconds: i64 = entry.kp_proc.p_starttime.tv_sec;
+        (seconds > 0).then_some(seconds)
     }
 
     fn errno() -> i32 {
@@ -2793,6 +2913,40 @@ mod tests {
         );
     }
 
+    /// `/proc/self/stat` is read after the command name's last `)`, so a
+    /// name holding spaces and parentheses cannot shift field 22; the start
+    /// is the boot time plus whole seconds of ticks, as procps computes it.
+    #[test]
+    fn a_linux_start_is_read_after_the_command_name() {
+        let tail = (4..=21).map(|field| field.to_string()).collect::<Vec<_>>();
+        let stat = format!("4242 (a (weird) name) S {} 250 23 24\n", tail.join(" "));
+        // Fields 3..=21 are `S 4 5 ... 21`, field 22 is `250`.
+        assert_eq!(
+            stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19),
+            Some("250")
+        );
+        let boot = "cpu  1 2 3\nbtime 1700000000\nprocesses 9\n";
+        assert_eq!(linux_start_seconds(&stat, boot, 100), Some(1_700_000_002));
+        assert_eq!(linux_start_seconds(&stat, boot, 0), None);
+        assert_eq!(linux_start_seconds(&stat, "cpu 1\n", 100), None);
+        assert_eq!(linux_start_seconds("4242 (truncated", boot, 100), None);
+    }
+
+    /// This process's start, read for itself alone, is the start a process
+    /// table reads for it (where one can be taken).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_own_start_matches_the_process_table() {
+        let own = own_start_epoch_ms().expect("this process's start is readable");
+        assert!(own > 0 && own % 1_000 == 0, "{own}");
+        if let Some(table) = ProcessTable::snapshot() {
+            assert_eq!(
+                table.start_epoch_ms(i64::from(std::process::id())),
+                Some(own)
+            );
+        }
+    }
+
     /// Only an exact C-locale `lstart` text is read as a clock time.
     #[cfg(unix)]
     #[test]
@@ -2963,6 +3117,7 @@ mod tests {
             ppid,
             started: "Mon Jan 1 00:00:00 2024".into(),
             comm: "fixture".into(),
+            started_epoch_s: None,
         };
         let read_with = |errors: Vec<(i64, i32)>| {
             move |pid: i64| match errors.iter().find(|(failing, _)| *failing == pid) {

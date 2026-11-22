@@ -1959,6 +1959,13 @@ fn gc_trash_drain(
     let unlinks: usize = laps.iter().map(|lap| lap.unlinks).sum();
     let rows = broker.checkout_trash_rows();
     let remaining = crate::checkout_trash::TrashBacklog::of(&rows);
+    // Entries kept because they exist with another identity than recorded:
+    // never deleted, not part of `entries_remaining`'s deletable share.
+    let identity_changed = broker.checkout_trash_identity_changed();
+    let mut identity_changed_by_cause = std::collections::BTreeMap::<&str, usize>::new();
+    for (_, _, cause) in &identity_changed {
+        *identity_changed_by_cause.entry(cause.as_str()).or_default() += 1;
+    }
     Ok(serde_json::json!({
         "end_reason": laps.last().map_or("none", |lap| lap.end.as_str()),
         "laps": laps.len(),
@@ -1973,6 +1980,14 @@ fn gc_trash_drain(
             0
         },
         "entries_remaining": rows.values().map(std::collections::BTreeMap::len).sum::<usize>(),
+        "entries_deletable_remaining": remaining.entries,
+        "identity_changed": identity_changed.len(),
+        "identity_changed_by_cause": identity_changed_by_cause,
+        "identity_changed_entries": identity_changed
+            .iter()
+            .take(20)
+            .map(|(_, name, cause)| serde_json::json!({"entry": name, "cause": cause.as_str()}))
+            .collect::<Vec<_>>(),
         "io_policy": crate::gc::current_io_policy(),
         "oldest_remaining_age_hours": remaining
             .oldest_age_ms(crate::clock::epoch_ms())
@@ -2817,12 +2832,13 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
     let trash = &report.checkout_trash;
     if trash.recorded > 0 || trash.confirmed_this_pass > 0 {
         out!(
-            "  checkout trash: {} recorded, {} deletable by the paced deleter, {} unconfirmed ({} stale); {} confirmed by this sweep",
+            "  checkout trash: {} recorded, {} deletable by the paced deleter, {} unconfirmed ({} stale); {} confirmed by this sweep; {} kept with a changed identity (never deleted)",
             trash.recorded,
             trash.deletable,
             trash.pending,
             trash.stale_pending,
-            trash.confirmed_this_pass
+            trash.confirmed_this_pass,
+            trash.identity_changed
         );
     }
     out!(

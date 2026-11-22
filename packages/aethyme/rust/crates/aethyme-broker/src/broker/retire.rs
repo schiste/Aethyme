@@ -235,6 +235,12 @@ pub(crate) struct StaleTrashReconcile {
     /// Kept: the trash could not be read as recorded (absent, unmarked,
     /// another device, an unmounted volume).
     pub(crate) trash_unavailable: usize,
+    /// Confirmed rows dropped: no entry by that name in a trash that is
+    /// present, private, marked and on the recorded device.
+    pub(crate) confirmed_dropped_missing: usize,
+    /// Confirmed rows whose entry this pass found with another identity
+    /// (marked; never deleted).
+    pub(crate) confirmed_identity_changed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1764,46 +1770,75 @@ impl Broker {
 
     /// [`Self::confirm_stale_pending_trash_rows`], also dropping the stale
     /// rows whose entry does not exist in a trash that is present, and
-    /// counting why the others stay.
+    /// counting why the others stay. Confirmed rows are looked at too: one
+    /// whose entry is missing is dropped under the same rule, and one whose
+    /// entry exists with another identity is marked
+    /// ([`crate::checkout_trash::TrashRow::identity_mismatch`]) so it leaves
+    /// the deletable backlog; it is never deleted.
     ///
     /// Dropping a row forgets nothing that exists: the row is written before
-    /// the rename, so a row with no entry is a rename that never happened
-    /// (the mover failed or crashed first; its checkout is still in the pool
-    /// and retirement handles it as before) or an entry already gone. It is
-    /// dropped only when the trash itself is there, private, carrying the
+    /// the rename, so a pending row with no entry is a rename that never
+    /// happened (the mover failed or crashed first; its checkout is still in
+    /// the pool and retirement handles it as before) or an entry already
+    /// gone, and a confirmed row with no entry is an entry already gone. It
+    /// is dropped only when the trash itself is there, private, carrying the
     /// broker's marker and on the device the row recorded, and never created
     /// by the look: an unmounted volume or a cleared temporary directory
-    /// keeps its rows. Should a mover more than a day late still complete
-    /// its rename, the entry is unrecorded and the deleter leaves it alone.
+    /// keeps its rows. A mover more than a day late that still completes its
+    /// rename records its row again when it confirms the move, so that entry
+    /// is deleted as usual; only a mover that crashes between the rename and
+    /// that record leaves an entry no row names, which the drain reports as
+    /// unrecognized and leaves alone.
     pub(crate) fn reconcile_stale_pending_trash_rows(&self) -> StaleTrashReconcile {
-        use crate::checkout_trash::PendingEntryState;
+        use crate::checkout_trash::TrashEntryState;
         let now = crate::clock::epoch_ms();
         let mut outcome = StaleTrashReconcile::default();
         let mut eligible = Vec::new();
         let mut missing = Vec::new();
+        let mut marks = Vec::new();
         for (dir, entries) in self.checkout_trash_rows() {
-            let Some(pool) = dir.parent().map(Path::to_path_buf) else {
-                continue;
-            };
             for (name, row) in entries {
-                if !row.pending || row.creator_started_ms > 0 {
+                if !row.pending {
+                    if !crate::checkout_trash::is_broker_entry_name(&name) {
+                        continue;
+                    }
+                    match crate::checkout_trash::trash_entry_state(&dir, &name, &row) {
+                        TrashEntryState::Matches => {
+                            if row.identity_mismatch.is_some() {
+                                marks.push((dir.clone(), name, row, None));
+                            }
+                        }
+                        TrashEntryState::Missing => {
+                            missing.push((dir.clone(), name, row));
+                        }
+                        TrashEntryState::Mismatch(cause) => {
+                            outcome.confirmed_identity_changed += 1;
+                            if row.identity_mismatch != Some(cause) {
+                                marks.push((dir.clone(), name, row, Some(cause)));
+                            }
+                        }
+                        TrashEntryState::TrashUnavailable => {}
+                    }
+                    continue;
+                }
+                if row.creator_started_ms > 0 {
                     continue;
                 }
                 if !crate::checkout_trash::stale_unconfirmable(&name, &row, now) {
                     outcome.too_young += 1;
                     continue;
                 }
-                match crate::checkout_trash::pending_entry_state(&pool, &name, &row) {
-                    PendingEntryState::Matches => {}
-                    PendingEntryState::Missing => {
+                match crate::checkout_trash::trash_entry_state(&dir, &name, &row) {
+                    TrashEntryState::Matches => {}
+                    TrashEntryState::Missing => {
                         missing.push((dir.clone(), name, row));
                         continue;
                     }
-                    PendingEntryState::IdentityChanged => {
+                    TrashEntryState::Mismatch(_) => {
                         outcome.identity_changed += 1;
                         continue;
                     }
-                    PendingEntryState::TrashUnavailable => {
+                    TrashEntryState::TrashUnavailable => {
                         outcome.trash_unavailable += 1;
                         continue;
                     }
@@ -1825,17 +1860,21 @@ impl Broker {
                 eligible.push((dir.clone(), name, row));
             }
         }
-        if eligible.is_empty() && missing.is_empty() {
+        if eligible.is_empty() && missing.is_empty() && marks.is_empty() {
             return outcome;
         }
         let mut flipped = Vec::new();
         let mut dropped = 0usize;
+        let mut confirmed_dropped = 0usize;
+        let mut marked = 0usize;
         let applied = self.update_meta_json(
             CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
             |rows: &mut crate::checkout_trash::TrashRows| {
                 // A retried compare-and-set starts its count again.
                 flipped.clear();
                 dropped = 0;
+                confirmed_dropped = 0;
+                marked = 0;
                 for (dir, name, row) in &eligible {
                     if let Some(stored) =
                         rows.get_mut(dir).and_then(|entries| entries.get_mut(name))
@@ -1851,7 +1890,21 @@ impl Broker {
                         && entries.get(name).is_some_and(|stored| stored == row)
                     {
                         entries.remove(name);
-                        dropped += 1;
+                        if row.pending {
+                            dropped += 1;
+                        } else {
+                            confirmed_dropped += 1;
+                        }
+                    }
+                }
+                for (dir, name, row, cause) in &marks {
+                    if let Some(stored) =
+                        rows.get_mut(dir).and_then(|entries| entries.get_mut(name))
+                        && !stored.pending
+                        && (stored.device, stored.inode) == (row.device, row.inode)
+                    {
+                        stored.identity_mismatch = *cause;
+                        marked += 1;
                     }
                 }
                 rows.retain(|_, entries| !entries.is_empty());
@@ -1868,9 +1921,22 @@ impl Broker {
                 }
                 outcome.confirmed = flipped.len();
                 outcome.dropped_missing = dropped;
+                outcome.confirmed_dropped_missing = confirmed_dropped;
                 for _ in 0..dropped {
                     crate::phase_telemetry::add(
                         "checkout_trash_stale_missing_rows_dropped",
+                        std::time::Duration::ZERO,
+                    );
+                }
+                for _ in 0..confirmed_dropped {
+                    crate::phase_telemetry::add(
+                        "checkout_trash_confirmed_missing_rows_dropped",
+                        std::time::Duration::ZERO,
+                    );
+                }
+                for _ in 0..marked {
+                    crate::phase_telemetry::add(
+                        "checkout_trash_identity_marks_changed",
                         std::time::Duration::ZERO,
                     );
                 }
@@ -1888,7 +1954,12 @@ impl Broker {
     pub(crate) fn checkout_trash_backlog_summary(&self) -> crate::CheckoutTrashBacklog {
         let rows = self.checkout_trash_rows();
         let now = crate::clock::epoch_ms();
-        let deletable = self.checkout_trash_deletable_backlog(&rows);
+        let in_use = self
+            .checkout_retirement_progress()
+            .trash_in_use_entries
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let deletable = crate::checkout_trash::TrashBacklog::deletable(&rows, &in_use);
         let mut summary = crate::CheckoutTrashBacklog {
             deletable: deletable.entries,
             oldest_deletable_created_ms: deletable.oldest_created_ms,
@@ -1901,9 +1972,55 @@ impl Broker {
                 if crate::checkout_trash::stale_unconfirmable(name, row, now) {
                     summary.stale_pending += 1;
                 }
+                continue;
+            }
+            if !crate::checkout_trash::is_broker_entry_name(name) {
+                continue;
+            }
+            // Confirmed entries out of the deletable backlog, each counted
+            // once: identity changed, then failing, then in use.
+            if let Some(cause) = row.identity_mismatch {
+                summary.identity_changed += 1;
+                match cause {
+                    crate::checkout_trash::IdentityMismatch::DeviceChanged => {
+                        summary.identity_changed_device += 1;
+                    }
+                    crate::checkout_trash::IdentityMismatch::InodeChanged => {
+                        summary.identity_changed_inode += 1;
+                    }
+                    crate::checkout_trash::IdentityMismatch::NotADirectory => {
+                        summary.identity_changed_not_a_directory += 1;
+                    }
+                }
+            } else if row.failures >= crate::checkout_trash::TRASH_FAILURE_REPORT_AFTER {
+                summary.failing += 1;
+            } else if in_use.contains(name) {
+                summary.in_use += 1;
             }
         }
         summary
+    }
+
+    /// Confirmed trash entries marked as present with another identity
+    /// than recorded: trash directory, entry name and why, oldest first.
+    /// Metadata reads only.
+    pub(crate) fn checkout_trash_identity_changed(
+        &self,
+    ) -> Vec<(PathBuf, String, crate::checkout_trash::IdentityMismatch)> {
+        let mut found = self
+            .checkout_trash_rows()
+            .into_iter()
+            .flat_map(|(dir, entries)| {
+                entries.into_iter().filter_map(move |(name, row)| {
+                    (!row.pending)
+                        .then_some(row.identity_mismatch)
+                        .flatten()
+                        .map(|cause| (dir.clone(), name, cause))
+                })
+            })
+            .collect::<Vec<_>>();
+        found.sort_by(|a, b| a.1.cmp(&b.1));
+        found
     }
 
     /// Whether a trash row names `session_id`'s checkout itself (a stripped
@@ -4071,7 +4188,7 @@ impl Broker {
         options: DrainOptions,
     ) -> crate::checkout_trash::TrashDrainReport {
         let mut rows = self.checkout_trash_rows();
-        let pending = rows.values().map(std::collections::BTreeMap::len).sum();
+        let pending = crate::checkout_trash::rows_awaiting_deletion(&rows);
         let Some(first) = rows.keys().next().cloned() else {
             return crate::checkout_trash::TrashDrainReport::default();
         };
@@ -4141,7 +4258,7 @@ impl Broker {
         );
         crate::warn_unrecorded("record the checkout trash drain", applied);
         let after = self.checkout_trash_rows();
-        report.entries_pending = after.values().map(std::collections::BTreeMap::len).sum();
+        report.entries_pending = crate::checkout_trash::rows_awaiting_deletion(&after);
         report.oldest_pending_created_ms =
             crate::checkout_trash::TrashBacklog::of(&after).oldest_created_ms;
         let elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6837,6 +6954,7 @@ mod tests {
                     stripped: false,
                     scratch: false,
                     verification: false,
+                    identity_mismatch: None,
                 },
             )
             .unwrap();
@@ -7007,6 +7125,7 @@ mod tests {
                     stripped: true,
                     scratch: false,
                     verification: true,
+                    identity_mismatch: None,
                 },
             )
             .unwrap();
@@ -7212,6 +7331,127 @@ mod tests {
         assert_eq!(broker.confirm_stale_pending_trash_rows(), 1);
         let report = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
         assert_eq!(report.entries_removed, 1, "{report:?}");
+    }
+
+    /// Move a new closed session's checkout into the trash and record its
+    /// confirmed row as `change` leaves it; returns the entry name and the
+    /// trash directory.
+    fn confirmed_trash_entry(
+        broker: &mut crate::Broker,
+        label: &str,
+        change: impl FnOnce(&mut crate::checkout_trash::TrashRow),
+    ) -> (String, PathBuf) {
+        let (session, worktree) = closed(broker, label, |_| {});
+        let pool = worktree.parent().unwrap().to_path_buf();
+        let common = broker.main_git_common_dir().unwrap();
+        let repo = crate::git::GitRepo::discover(broker.main_root()).unwrap();
+        let trashed = crate::checkout_trash::move_worktree_to_trash(
+            &repo,
+            &common,
+            &pool,
+            &worktree,
+            session.id,
+            &mut |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let mut row = trashed.row;
+        assert!(!row.pending);
+        change(&mut row);
+        broker
+            .record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, row)
+            .unwrap();
+        (trashed.entry.clone(), trashed.trash_dir.clone())
+    }
+
+    /// The sweep looks at confirmed rows too. One whose entry is gone from
+    /// its present, marked trash on the recorded device is dropped. One
+    /// whose entry exists with another identity (here the device number the
+    /// row recorded is not the volume's, as after a remount) is marked: it
+    /// leaves the deletable backlog, is reported in the sweep, the drain and
+    /// `broker status`, and is never deleted. Once it matches again the mark
+    /// is cleared and it is deleted as usual.
+    #[test]
+    fn the_sweep_drops_a_missing_confirmed_row_and_holds_back_a_changed_one() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (gone, trash) = confirmed_trash_entry(&mut broker, "confirmed-gone", |_| {});
+        std::fs::remove_dir_all(trash.join(&gone)).unwrap();
+        let (changed, _) = confirmed_trash_entry(&mut broker, "confirmed-changed", |row| {
+            row.device = row.device.wrapping_add(1);
+        });
+        assert_eq!(broker.checkout_trash_backlog_summary().deletable, 2);
+
+        let report = broker.gc_sweep_artifacts().unwrap();
+        let trash_report = report.checkout_trash;
+        assert_eq!(
+            trash_report.confirmed_dropped_missing_this_pass, 1,
+            "{trash_report:?}"
+        );
+        assert_eq!(trash_report.identity_changed, 1, "{trash_report:?}");
+        assert_eq!(trash_report.identity_changed_device, 1, "{trash_report:?}");
+        assert_eq!(trash_report.deletable, 0, "{trash_report:?}");
+        assert_eq!(trash_report.held_back(), 1, "{trash_report:?}");
+        assert!(row_of(&broker, &gone).is_none(), "nothing left to delete");
+        assert_eq!(
+            row_of(&broker, &changed).unwrap().identity_mismatch,
+            Some(crate::checkout_trash::IdentityMismatch::DeviceChanged)
+        );
+        assert!(trash.join(&changed).exists(), "the sweep deletes nothing");
+
+        let view = broker.status(crate::clock::epoch_ms()).unwrap();
+        let advice = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "cleanup.trash-identity-changed")
+            .expect("status names the held-back entry");
+        assert!(advice.evidence[0].ends_with(&format!("{changed}: device_changed")));
+
+        let drained = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 0, "{drained:?}");
+        assert_eq!(drained.identity_changed, 1, "{drained:?}");
+        assert_eq!(drained.unrecognized, 0, "{drained:?}");
+        assert!(trash.join(&changed).exists(), "never deleted");
+
+        // The volume is back under the recorded device number.
+        broker
+            .update_meta_json(
+                CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+                |rows: &mut crate::checkout_trash::TrashRows| {
+                    let row = rows.get_mut(&trash).unwrap().get_mut(&changed).unwrap();
+                    row.device = row.device.wrapping_sub(1);
+                },
+            )
+            .unwrap();
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert_eq!(report.checkout_trash.identity_changed, 0, "{report:?}");
+        assert_eq!(report.checkout_trash.deletable, 1, "{report:?}");
+        let drained = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// A row recorded under a directory that is not named as the trash
+    /// concludes nothing: the sweep neither drops nor confirms it.
+    #[test]
+    fn the_sweep_concludes_nothing_under_another_directory_name() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, old, trash) = stale_unconfirmable_trash_entry(&mut broker, "renamed-dir");
+        let row = row_of(&broker, &old).unwrap();
+        let elsewhere = trash.with_file_name("not-the-trash");
+        broker
+            .update_meta_json(
+                CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+                |rows: &mut crate::checkout_trash::TrashRows| {
+                    rows.clear();
+                    rows.entry(elsewhere.clone())
+                        .or_default()
+                        .insert(old.clone(), row);
+                },
+            )
+            .unwrap();
+        let reconcile = broker.reconcile_stale_pending_trash_rows();
+        assert_eq!(reconcile.confirmed, 0, "{reconcile:?}");
+        assert_eq!(reconcile.dropped_missing, 0, "{reconcile:?}");
+        assert_eq!(reconcile.trash_unavailable, 1, "{reconcile:?}");
+        assert!(row_of(&broker, &old).is_some_and(|row| row.pending));
     }
 
     /// Record a pending trash entry for a new closed session, named as moved

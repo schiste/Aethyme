@@ -642,6 +642,7 @@ pub(crate) fn move_to_trash(
         stripped: true,
         scratch: true,
         verification: false,
+        identity_mismatch: None,
     };
     record_pending(trash.path(), &entry, row).map_err(|_| {
         let refusal = Refusal::Failed(STORE_FAILURE);
@@ -1088,6 +1089,7 @@ pub(crate) fn move_finished_run_to_trash(
         stripped: true,
         scratch: true,
         verification: false,
+        identity_mismatch: None,
     };
     record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed(STORE_FAILURE))?;
     check(live.as_raw_fd())?;

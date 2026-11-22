@@ -117,31 +117,97 @@ pub(crate) struct TrashRow {
     /// counted as neither strip nor scratch.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) verification: bool,
+    /// Set while a confirmed entry is present but no longer has the
+    /// recorded identity (and why), by the deleter's look or the sweep's
+    /// reconcile; cleared once it matches again. Such an entry is never
+    /// deleted and is not part of the deletable backlog
+    /// ([`TrashBacklog::deletable`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_mismatch: Option<IdentityMismatch>,
 }
 
-/// This process's id and start time, as a process-table snapshot reads it.
+/// Why a trash entry that exists no longer has the identity the broker
+/// recorded for it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IdentityMismatch {
+    /// The recorded inode number on another device: typically the volume
+    /// was mounted again and given a new device number.
+    DeviceChanged,
+    /// Another inode.
+    InodeChanged,
+    /// Not a real directory (a file or a symbolic link).
+    NotADirectory,
+}
+
+impl IdentityMismatch {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceChanged => "device_changed",
+            Self::InodeChanged => "inode_changed",
+            Self::NotADirectory => "not_a_directory",
+        }
+    }
+}
+
+/// How the entry `stat` (looked up without following a link) differs from
+/// what `row` recorded; `None` when it is the recorded directory.
+pub(crate) fn identity_mismatch(stat: &libc::stat, row: &TrashRow) -> Option<IdentityMismatch> {
+    #[allow(clippy::unnecessary_cast)]
+    let (device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
+    if !is_directory(stat) {
+        Some(IdentityMismatch::NotADirectory)
+    } else if (device, inode) == (row.device, row.inode) {
+        None
+    } else if inode == row.inode {
+        Some(IdentityMismatch::DeviceChanged)
+    } else {
+        Some(IdentityMismatch::InodeChanged)
+    }
+}
+
+/// This process's id and start time (epoch ms, whole seconds; 0 when
+/// unknown).
+///
+/// The start is read for this process alone
+/// ([`crate::session_holder::own_start_epoch_ms`]): a sandboxed command is
+/// refused the whole-table listing (`KERN_PROC_ALL` and `ps`), and a table's
+/// start text only parses in the C locale's words, so reading it through a
+/// snapshot recorded 0 for most moves, rows only a day-old reconcile could
+/// confirm. The snapshot stays the fallback. Either way the number is the one
+/// [`crate::session_holder::ProcessTable::start_epoch_ms`] reads for this
+/// process later, which is what proves it gone.
 pub(crate) fn this_process_identity() -> (i64, i64) {
     let pid = i64::from(std::process::id());
-    let started = crate::session_holder::ProcessTable::snapshot()
-        .and_then(|table| table.process(pid))
-        .and_then(|process| crate::session_holder::lstart_epoch_ms(&process.started))
-        .unwrap_or(0);
+    let started = match crate::session_holder::own_start_epoch_ms() {
+        Some(started) => {
+            crate::phase_telemetry::add("trash_creator_start_direct", Duration::ZERO);
+            started
+        }
+        None => match crate::session_holder::ProcessTable::snapshot()
+            .and_then(|table| table.start_epoch_ms(pid))
+        {
+            Some(started) => {
+                crate::phase_telemetry::add("trash_creator_start_from_table", Duration::ZERO);
+                started
+            }
+            None => {
+                crate::phase_telemetry::add("trash_creator_start_unknown", Duration::ZERO);
+                0
+            }
+        },
+    };
     (pid, started)
 }
 
-/// Whether the creator recorded in `row` is proven gone: `table` does not
-/// list a process with its pid and start time. Unknown start time or no
+/// Whether the creator recorded in `row` is proven gone: `table` lists no
+/// process with its pid, or the one listed provably started at another
+/// time. An unknown start time, a listed start that cannot be read, or no
 /// table proves nothing.
 fn creator_gone(row: &TrashRow, table: Option<&crate::session_holder::ProcessTable>) -> bool {
-    let Some(table) = table else {
-        return false;
-    };
-    if row.creator_pid <= 0 || row.creator_started_ms <= 0 {
-        return false;
-    }
-    table.process(row.creator_pid).is_none_or(|process| {
-        crate::session_holder::lstart_epoch_ms(&process.started) != Some(row.creator_started_ms)
-    })
+    table.is_some_and(|table| table.proves_gone(row.creator_pid, row.creator_started_ms))
 }
 
 #[cfg(test)]
@@ -487,60 +553,67 @@ pub(crate) fn stale_unconfirmable(name: &str, row: &TrashRow, now_ms: i64) -> bo
             .is_some_and(|created| now_ms.saturating_sub(created) > STALE_PENDING_AFTER_MS)
 }
 
-/// What one look at the trash finds for a pending row's entry.
+/// What one look at the trash finds for a row's entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingEntryState {
+pub(crate) enum TrashEntryState {
     /// A real directory with the recorded device and inode.
     Matches,
     /// The trash exists, already marked as the broker's, on the device the
     /// row recorded, and holds no entry by that name: the rename never
     /// happened (or the entry is long gone), so nothing exists to delete.
     Missing,
-    /// Something else is there: another inode, a file or a link.
-    IdentityChanged,
+    /// Something else is there (another inode, a file or a link), or the
+    /// recorded inode on another device (the volume was mounted again): it
+    /// is never deleted.
+    Mismatch(IdentityMismatch),
     /// The trash cannot be read as it was: absent (an unmounted volume, a
-    /// cleared temporary directory), unmarked, foreign, on another device, or
-    /// the look failed. Nothing is concluded.
+    /// cleared temporary directory), unmarked, foreign, not named
+    /// [`TRASH_DIR`], on another device with no entry by that name, or the
+    /// look failed. Nothing is concluded.
     TrashUnavailable,
 }
 
-/// [`PendingEntryState`] of `name` in the trash of `pool`. Unlike
-/// [`open_trash`] it never creates the trash: a trash created now (on an
-/// empty mount point, say) would make every entry look missing.
-pub(crate) fn pending_entry_state(pool: &Path, name: &str, row: &TrashRow) -> PendingEntryState {
+/// [`TrashEntryState`] of `name` in `trash_dir`, the directory the row is
+/// recorded under. Unlike [`open_trash`] it never creates the trash: a trash
+/// created now (on an empty mount point, say) would make every entry look
+/// missing.
+pub(crate) fn trash_entry_state(trash_dir: &Path, name: &str, row: &TrashRow) -> TrashEntryState {
+    if trash_dir.file_name().and_then(|name| name.to_str()) != Some(TRASH_DIR) {
+        return TrashEntryState::TrashUnavailable;
+    }
+    let Some(pool) = trash_dir.parent() else {
+        return TrashEntryState::TrashUnavailable;
+    };
     let Ok(pool_fd) = open_dir_nofollow(pool) else {
-        return PendingEntryState::TrashUnavailable;
+        return TrashEntryState::TrashUnavailable;
     };
     let Ok(trash_fd) = openat_dir_nofollow(pool_fd.as_raw_fd(), TRASH_DIR) else {
-        return PendingEntryState::TrashUnavailable;
+        return TrashEntryState::TrashUnavailable;
     };
     let Ok(trash) = fstat(trash_fd.as_raw_fd()) else {
-        return PendingEntryState::TrashUnavailable;
+        return TrashEntryState::TrashUnavailable;
     };
     // SAFETY: `geteuid` has no preconditions.
     let uid = unsafe { libc::geteuid() };
     #[allow(clippy::unnecessary_cast)]
-    let trash_device = trash.st_dev as u64;
+    let on_recorded_device = trash.st_dev as u64 == row.device;
     if !is_directory(&trash)
         || trash.st_uid != uid
         || trash.st_mode & 0o077 != 0
-        || trash_device != row.device
         || fstatat_nofollow(trash_fd.as_raw_fd(), TRASH_MARKER).is_err()
     {
-        return PendingEntryState::TrashUnavailable;
+        return TrashEntryState::TrashUnavailable;
     }
     match fstatat_nofollow(trash_fd.as_raw_fd(), name) {
-        Ok(stat) => {
-            #[allow(clippy::unnecessary_cast)]
-            let identity = (stat.st_dev as u64, stat.st_ino as u64);
-            if is_directory(&stat) && identity == (row.device, row.inode) {
-                PendingEntryState::Matches
-            } else {
-                PendingEntryState::IdentityChanged
-            }
+        Ok(stat) => match identity_mismatch(&stat, row) {
+            None if on_recorded_device => TrashEntryState::Matches,
+            None => TrashEntryState::TrashUnavailable,
+            Some(cause) => TrashEntryState::Mismatch(cause),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && on_recorded_device => {
+            TrashEntryState::Missing
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingEntryState::Missing,
-        Err(_) => PendingEntryState::TrashUnavailable,
+        Err(_) => TrashEntryState::TrashUnavailable,
     }
 }
 
@@ -809,6 +882,7 @@ fn move_worktree_to_trash_as(
         stripped: verification,
         scratch: false,
         verification,
+        identity_mismatch: None,
     };
     record_pending(&trash.path, &entry, row)?;
     rename_noreplace(
@@ -962,6 +1036,7 @@ pub(crate) fn move_directory_to_trash(
         stripped: true,
         scratch: false,
         verification: false,
+        identity_mismatch: None,
     };
     record_pending(&trash.path, &entry, row).map_err(Failed)?;
     rename_noreplace(parent.as_raw_fd(), last, trash.trash.as_raw_fd(), &entry).map_err(
@@ -1101,8 +1176,9 @@ impl DeleterPace {
 }
 
 /// The recorded entries the deleter still has to delete: how many, and when
-/// the oldest was moved in (from its name). Unconfirmed rows and entries
-/// already reported as failing do not count.
+/// the oldest was moved in (from its name). Unconfirmed rows, entries
+/// already reported as failing and entries whose identity changed do not
+/// count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TrashBacklog {
     pub(crate) entries: usize,
@@ -1126,6 +1202,7 @@ impl TrashBacklog {
             .filter(|(name, row)| {
                 !row.pending
                     && row.failures < TRASH_FAILURE_REPORT_AFTER
+                    && row.identity_mismatch.is_none()
                     && is_broker_entry_name(name)
                     && !in_use.contains(*name)
             })
@@ -1605,6 +1682,12 @@ pub(crate) struct TrashDrainReport {
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
     pub(crate) reported: Vec<String>,
+    /// Confirmed entries present with another identity than recorded
+    /// ([`TrashRow::identity_mismatch`]): never deleted, out of the
+    /// deletable backlog.
+    pub(crate) identity_changed: usize,
+    /// The first of those, as `<name> (<cause>)`.
+    pub(crate) identity_changed_entries: Vec<String>,
     /// Names in a trash the broker did not record (left alone).
     pub(crate) unrecognized: usize,
     /// The first of those names (entry names only).
@@ -1616,7 +1699,10 @@ pub(crate) struct TrashDrainReport {
     /// Trash directories that failed verification (left alone).
     pub(crate) invalid_trash_dirs: usize,
     pub(crate) pace: Option<DeleterPace>,
-    /// Recorded entries still in the trash after the run.
+    /// Recorded entries still in the trash after the run, less those kept
+    /// with a changed identity (counted in `identity_changed`): those are
+    /// never deleted, so they must not read as a trash that stopped
+    /// shrinking ([`rows_awaiting_deletion`]).
     pub(crate) entries_pending: usize,
     /// Entries left alone this run because a process had its working
     /// directory or an open file inside (a process that entered the checkout
@@ -1723,9 +1809,19 @@ pub(crate) const TRASH_IN_USE_NAMES_MAX: usize = 256;
 /// The longest one deleter run's open-file observation may take.
 const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 
+/// Recorded entries the deleter still has to delete or confirm: every row
+/// but confirmed ones kept with a changed identity.
+pub(crate) fn rows_awaiting_deletion(rows: &TrashRows) -> usize {
+    rows.values()
+        .flat_map(BTreeMap::values)
+        .filter(|row| row.pending || row.identity_mismatch.is_none())
+        .count()
+}
+
 /// Apply what one drain did to the stored rows `current`: the drain read
 /// `before` and left `after`. An entry it removed or forgot is dropped; for
-/// an entry it kept, only the fields it changed (failures, pending) are
+/// an entry it kept, only the fields it changed (failures, pending, identity
+/// mismatch) are
 /// written, so a confirmation or a new row another process stored during
 /// the drain survives.
 pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, after: &TrashRows) {
@@ -1741,6 +1837,9 @@ pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, afte
                         }
                         if now.pending != was.pending {
                             stored.pending = now.pending;
+                        }
+                        if now.identity_mismatch != was.identity_mismatch {
+                            stored.identity_mismatch = now.identity_mismatch;
                         }
                     }
                 }
@@ -1762,7 +1861,9 @@ pub(crate) fn apply_drain_rows(current: &mut TrashRows, before: &TrashRows, afte
 fn drain_order(entries: &BTreeMap<String, TrashRow>) -> Vec<String> {
     let mut order = entries
         .iter()
-        .filter(|(name, row)| is_broker_entry_name(name) && !row.pending)
+        .filter(|(name, row)| {
+            is_broker_entry_name(name) && !row.pending && row.identity_mismatch.is_none()
+        })
         .map(|(name, row)| (row.failures.min(TRASH_FAILURE_REPORT_AFTER), name.clone()))
         .collect::<Vec<_>>();
     order.sort();
@@ -1928,13 +2029,41 @@ fn drain_trash_in(
             // A pending row is never deleted while its creator may still
             // run (the move may be mid-way). Once the creator is proven
             // gone, an entry that still matches the recorded identity is
-            // confirmed; a mismatch, or no entry, drops the row.
+            // confirmed; a mismatch, or no entry, drops the row. A confirmed
+            // entry present with another identity is marked, never deleted,
+            // and left out of the deletable backlog until it matches again
+            // (a volume mounted back under its old device number).
             let mut dropped = Vec::new();
             for (name, row) in entries.iter_mut() {
                 let present = listed.contains(name);
                 if !row.pending {
                     if !present {
                         dropped.push(name.clone());
+                        continue;
+                    }
+                    match fstatat_nofollow(trash.trash.as_raw_fd(), name) {
+                        Ok(stat) => {
+                            let mismatch = identity_mismatch(&stat, row);
+                            row.identity_mismatch = mismatch;
+                            if let Some(cause) = mismatch {
+                                report.identity_changed += 1;
+                                if report.identity_changed_entries.len() < 20 {
+                                    report
+                                        .identity_changed_entries
+                                        .push(format!("{name} ({})", cause.as_str()));
+                                }
+                                crate::phase_telemetry::add(
+                                    "checkout_trash_identity_changed",
+                                    Duration::ZERO,
+                                );
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            dropped.push(name.clone());
+                        }
+                        // A failed look concludes nothing; the deletion's
+                        // own identity check still guards the entry.
+                        Err(_) => {}
                     }
                     continue;
                 }
@@ -2157,7 +2286,7 @@ fn drain_trash_in(
     report.pace_changes = limiter.pace_changes;
     report.final_pace = Some(limiter.pacer.pace());
     rows.retain(|_, entries| !entries.is_empty());
-    report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    report.entries_pending = rows_awaiting_deletion(rows);
     report
 }
 
@@ -2223,6 +2352,10 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
         merged.failed.extend(part.failed);
         merged.reported.extend(part.reported);
         merged.unrecognized += part.unrecognized;
+        merged.identity_changed += part.identity_changed;
+        merged
+            .identity_changed_entries
+            .extend(part.identity_changed_entries);
         merged.unrecognized_names.extend(part.unrecognized_names);
         merged.stale_pending.extend(part.stale_pending);
         merged.invalid_trash_dirs = merged.invalid_trash_dirs.max(part.invalid_trash_dirs);
@@ -2234,6 +2367,7 @@ fn merge_drain_reports(parts: Vec<TrashDrainReport>, threads: u32) -> TrashDrain
         merged.pace_changes = merged.pace_changes.saturating_add(part.pace_changes);
     }
     merged.unrecognized_names.truncate(20);
+    merged.identity_changed_entries.truncate(20);
     merged.in_use_names.truncate(TRASH_IN_USE_NAMES_MAX);
     merged.threads = threads;
     merged
@@ -2339,7 +2473,7 @@ pub(crate) fn drain_trash_parallel(
     report.bytes = available_before
         .zip(available())
         .map_or(0, |(before, after)| after.saturating_sub(before));
-    report.entries_pending = rows.values().map(BTreeMap::len).sum();
+    report.entries_pending = rows_awaiting_deletion(rows);
     DRAIN_NANOS_THIS_PROCESS.fetch_add(
         u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
@@ -2695,6 +2829,7 @@ mod tests {
             stripped: true,
             scratch: false,
             verification: false,
+            identity_mismatch: None,
         }
     }
 
@@ -3322,9 +3457,169 @@ mod tests {
         assert_eq!(report.entries_removed, 0);
         assert!(trashed.trash_dir.join(&old).join("base.txt").exists());
         assert_eq!(
-            pending_entry_state(&fixture.pool, &old, &row),
-            PendingEntryState::Matches
+            trash_entry_state(&trashed.trash_dir, &old, &row),
+            TrashEntryState::Matches
         );
+    }
+
+    /// A move records its creator's start time read for this process
+    /// alone, the number a process table later reads for it, so the deleter
+    /// can prove the creator gone without a day's wait.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_move_records_its_creators_start_time() {
+        let fixture = Fixture::new();
+        let (_, row) = move_unconfirmed(&fixture, "one");
+        assert_eq!(row.creator_pid, i64::from(std::process::id()));
+        assert!(row.creator_started_ms > 0, "{row:?}");
+        if let Some(table) = crate::session_holder::ProcessTable::snapshot() {
+            assert_eq!(
+                table.start_epoch_ms(row.creator_pid),
+                Some(row.creator_started_ms),
+                "the table reads the same start for the creator"
+            );
+            assert!(!table.proves_gone(row.creator_pid, row.creator_started_ms));
+        }
+    }
+
+    /// `trash_entry_state` concludes only from a present, private, marked
+    /// trash under the row's own directory name: an entry missing there on
+    /// the recorded device is `Missing`; on another device, or under a
+    /// directory not named as the trash, nothing is concluded; an entry with
+    /// another identity is a mismatch with its cause.
+    #[test]
+    fn the_entry_state_reads_only_the_named_trash_on_the_recorded_device() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        let trashed = fixture.trash(&checkout, 7).unwrap();
+        let row = trashed.row;
+        let trash = trashed.trash_dir.clone();
+        assert_eq!(
+            trash_entry_state(&trash, &trashed.entry, &row),
+            TrashEntryState::Matches
+        );
+        assert_eq!(
+            trash_entry_state(&fixture.pool.join("not-the-trash"), &trashed.entry, &row),
+            TrashEntryState::TrashUnavailable,
+            "a row under another directory name concludes nothing"
+        );
+        let absent = "0000000000001-7-1-1";
+        assert_eq!(
+            trash_entry_state(&trash, absent, &row),
+            TrashEntryState::Missing
+        );
+        let elsewhere = TrashRow {
+            device: row.device.wrapping_add(1),
+            ..row
+        };
+        assert_eq!(
+            trash_entry_state(&trash, absent, &elsewhere),
+            TrashEntryState::TrashUnavailable,
+            "no entry on another device than recorded is not proof it is gone"
+        );
+        assert_eq!(
+            trash_entry_state(&trash, &trashed.entry, &elsewhere),
+            TrashEntryState::Mismatch(IdentityMismatch::DeviceChanged)
+        );
+        let other_inode = TrashRow {
+            inode: row.inode.wrapping_add(1),
+            ..row
+        };
+        assert_eq!(
+            trash_entry_state(&trash, &trashed.entry, &other_inode),
+            TrashEntryState::Mismatch(IdentityMismatch::InodeChanged)
+        );
+        std::fs::write(trash.join(absent), "a file\n").unwrap();
+        assert_eq!(
+            trash_entry_state(&trash, absent, &row),
+            TrashEntryState::Mismatch(IdentityMismatch::NotADirectory)
+        );
+    }
+
+    /// A confirmed entry present with another identity than recorded (here
+    /// the volume's device number changed, as a remount does) is never
+    /// deleted, is reported with its cause, and leaves the deletable
+    /// backlog; once it matches again it is deleted as usual.
+    #[test]
+    fn a_confirmed_entry_with_another_identity_is_kept_out_of_the_backlog() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        let trashed = fixture.trash(&checkout, 7).unwrap();
+        let recorded = TrashRow {
+            device: trashed.row.device.wrapping_add(1),
+            ..trashed.row
+        };
+        let mut rows = rows_with(&trashed, recorded);
+        assert_eq!(TrashBacklog::of(&rows).entries, 1);
+        let before = rows.clone();
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert_eq!(report.unrecognized, 0, "{report:?}");
+        assert_eq!(report.identity_changed, 1, "{report:?}");
+        assert_eq!(
+            report.entries_pending, 0,
+            "nothing left to delete: {report:?}"
+        );
+        assert_eq!(
+            report.identity_changed_entries,
+            vec![format!("{} (device_changed)", trashed.entry)]
+        );
+        assert!(trashed.path().join("base.txt").exists(), "never deleted");
+        let kept = rows[&trashed.trash_dir][&trashed.entry];
+        assert_eq!(
+            kept.identity_mismatch,
+            Some(IdentityMismatch::DeviceChanged)
+        );
+        assert_eq!(TrashBacklog::of(&rows).entries, 0, "out of the backlog");
+        let mut stored = before.clone();
+        apply_drain_rows(&mut stored, &before, &rows);
+        assert_eq!(
+            stored[&trashed.trash_dir][&trashed.entry].identity_mismatch,
+            Some(IdentityMismatch::DeviceChanged),
+            "the mark is written back"
+        );
+
+        // The volume comes back under its recorded device number.
+        rows.get_mut(&trashed.trash_dir)
+            .unwrap()
+            .get_mut(&trashed.entry)
+            .unwrap()
+            .device = trashed.row.device;
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.identity_changed, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+        assert!(!trashed.path().exists());
+    }
+
+    /// A process table proves a creator gone only when it lists no process
+    /// with the pid, or one that provably started at another time: a listed
+    /// start it cannot read (a localized `ps` text) proves nothing.
+    #[test]
+    fn an_unreadable_listed_start_never_proves_a_creator_gone() {
+        let started = crate::session_holder::lstart_epoch_ms("Mon Jan 1 00:00:00 2024").unwrap();
+        let table = crate::session_holder::ProcessTable::parse(
+            "    7     1 Mon Jan 1 00:00:00 2024 creator\n    8     1 lun. 16 nov. 14:09:50 2026 creator\n",
+        );
+        assert!(!table.proves_gone(7, started), "same pid, same start");
+        assert!(table.proves_gone(7, started + 1_000), "the pid was reused");
+        assert!(!table.proves_gone(8, started), "an unreadable start");
+        assert!(table.proves_gone(9, started), "no such pid");
+        assert!(!table.proves_gone(9, 0), "an unknown start proves nothing");
+        let row = TrashRow {
+            creator_pid: 8,
+            creator_started_ms: started,
+            ..row_for_backlog(0, true)
+        };
+        assert!(!creator_gone(&row, Some(&table)));
+        assert!(!creator_gone(&row, None));
     }
 
     /// The rename never replaces an existing destination, so a failed move
