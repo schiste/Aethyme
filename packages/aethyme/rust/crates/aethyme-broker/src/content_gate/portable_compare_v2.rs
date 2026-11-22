@@ -323,6 +323,13 @@ fn policy_coverage(
         .filter(|entry| entry.get("after").is_some_and(|v| !v.is_null()))
         .map(|entry| entry["entity_id"].as_str().ok_or("invalid entity"))
         .collect::<Result<_, _>>()?;
+    let unsupported_item_media = entries.iter().any(|entry| {
+        entry.get("after").is_some_and(|v| !v.is_null())
+            && !matches!(
+                entry["media_type"].as_str(),
+                Some("text/plain" | "text/markdown" | "text/html")
+            )
+    });
     let mut ids = BTreeSet::new();
     let mut expected = 0usize;
     for gate in gates {
@@ -336,6 +343,9 @@ fn policy_coverage(
             return Err("unsupported resolved gate");
         }
         let collection = has_collection && kind == "unique_collection_metadata";
+        if !collection && unsupported_item_media {
+            return Err("item media type is not supported by this evaluator");
+        }
         let candidates = if collection { 1 } else { entities.len() };
         expected = expected
             .checked_add(candidates)
@@ -354,11 +364,14 @@ fn policy_coverage(
         } else {
             for entity in &entities {
                 let check_id = format!("gate:{}:{entity}:{id}", entity.len());
-                if checks
+                let check = checks
                     .get(check_id.as_str())
-                    .is_none_or(|c| c["blocking"].as_bool() != Some(blocking))
+                    .filter(|c| c["blocking"].as_bool() == Some(blocking))
+                    .ok_or("resolved policy check is missing or has inconsistent blocking")?;
+                if matches!(kind, "custom" | "site_group" | "site_audit")
+                    && check["status"] != "not_checked"
                 {
-                    return Err("resolved policy check is missing or has inconsistent blocking");
+                    return Err("candidate evaluator cannot execute site or custom gates");
                 }
             }
         }
@@ -697,6 +710,39 @@ mod tests {
             policy_coverage(&policy, &change, false, &checks),
             Err("empty resolved policy")
         );
+    }
+
+    #[test]
+    fn unsupported_candidate_capabilities_are_not_reported_as_executed() {
+        let (v, _, _, verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        let mut change: Value =
+            serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
+        let mut check = verdict["verdict"]["checks"][0].clone();
+        for kind in ["custom", "site_group", "site_audit"] {
+            policy["gates"][0]["kind"] = json!(kind);
+            let checks = BTreeMap::from([("gate:7:article:words", &check)]);
+            assert_eq!(
+                policy_coverage(&policy, &change, false, &checks),
+                Err("candidate evaluator cannot execute site or custom gates")
+            );
+            check["status"] = json!("not_checked");
+            let checks = BTreeMap::from([("gate:7:article:words", &check)]);
+            assert_eq!(policy_coverage(&policy, &change, false, &checks), Ok((1, 1)));
+            check["status"] = json!("passed");
+        }
+        policy["gates"][0]["kind"] = json!("word_count");
+        change["entries"][0]["media_type"] = json!("application/pdf");
+        let checks = BTreeMap::from([("gate:7:article:words", &check)]);
+        assert_eq!(
+            policy_coverage(&policy, &change, false, &checks),
+            Err("item media type is not supported by this evaluator")
+        );
+        policy["gates"][0]["kind"] = json!("unique_collection_metadata");
+        let collection = json!({"id":"collection:0::words", "blocking":true});
+        let checks = BTreeMap::from([("collection:0::words", &collection)]);
+        assert_eq!(policy_coverage(&policy, &change, true, &checks), Ok((1, 1)));
     }
 
     #[test]
