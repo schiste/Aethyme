@@ -1448,7 +1448,9 @@ pub struct CheckoutTrashBacklog {
 
 impl CheckoutTrashBacklog {
     /// Confirmed entries that are not `deletable` for a reason other than
-    /// their deletion: identity changed, failing or in use.
+    /// their deletion: identity changed, failing or in use. Read by the
+    /// GC service's receipts, which only the macOS service writes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn held_back(&self) -> usize {
         self.identity_changed
             .saturating_add(self.failing)
