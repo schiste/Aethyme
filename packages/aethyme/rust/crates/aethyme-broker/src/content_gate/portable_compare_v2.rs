@@ -314,6 +314,9 @@ fn policy_coverage(
         return Err("unsupported resolved policy");
     }
     let gates = policy["gates"].as_array().ok_or("invalid resolved gates")?;
+    if gates.is_empty() {
+        return Err("empty resolved policy");
+    }
     let entries = change["entries"].as_array().ok_or("invalid entries")?;
     let entities: Vec<&str> = entries
         .iter()
@@ -359,6 +362,9 @@ fn policy_coverage(
                 }
             }
         }
+    }
+    if expected != checks.len() {
+        return Err("unexpected check outside resolved policy");
     }
     Ok((gates.len(), expected))
 }
@@ -649,6 +655,47 @@ mod tests {
                 &input
             ),
             Err("resolved policy check is missing")
+        );
+    }
+
+    #[test]
+    fn rejects_extra_passed_check_outside_resolved_policy() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        assert!(run(&verdict, &verdict, &input));
+        verdict["verdict"]["checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "gate:7:article:unconfigured", "status": "passed", "blocking": true
+            }));
+        verdict["verdict"]["summary"]["checks"] = json!(2);
+        verdict["verdict"]["summary"]["passed"] = json!(2);
+        input.required_checks = &["gate:7:article:unconfigured"];
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("unexpected check outside resolved policy")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_resolved_policy_even_with_existing_checks() {
+        let (v, _, _, verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        let change: Value =
+            serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
+        let check = &verdict["verdict"]["checks"][0];
+        let checks = BTreeMap::from([("gate:7:article:words", check)]);
+        assert_eq!(policy_coverage(&policy, &change, false, &checks), Ok((1, 1)));
+        policy["gates"] = json!([]);
+        assert_eq!(
+            policy_coverage(&policy, &change, false, &checks),
+            Err("empty resolved policy")
         );
     }
 
