@@ -20,6 +20,13 @@ const CONTROL_SCHEMA: &str = "aethyme.gc-sweep-service-control/v1";
 const RECEIPT_SCHEMA: &str = "aethyme.gc-sweep-service-last-pass/v1";
 const REFRESH_SCHEMA: &str = "aethyme.gc-sweep-service-refresh/v1";
 const ERROR_SCHEMA: &str = "aethyme.gc-sweep-service-last-error/v1";
+const STARTED_SCHEMA: &str = "aethyme.gc-sweep-service-tick-started/v1";
+/// Written by a managed tick before it touches the repository or its pools.
+const TICK_STARTED_RECEIPT: &str = "tick-started.json";
+/// A tick that started this long ago and wrote neither a pass nor an error
+/// is reported as blocked: one full service interval, after which launchd
+/// has already coalesced (skipped) the next tick behind it.
+const TICK_BLOCKED_AFTER_MS: u64 = SERVICE_INTERVAL_SECONDS * 1000;
 /// The command that rebinds this repository's service to the running runtime.
 pub(crate) const REFRESH_COMMAND: &str = "aethyme broker gc service refresh";
 const SERVICE_DIRECTORY: &str = "Library/Application Support/Aethyme/gc-sweep-services";
@@ -231,13 +238,40 @@ fn reclaimed_nothing_because(
     }
 }
 
-/// Kept alive for the complete managed tick so uninstall and control cannot
-/// remove or change the generation while the sweep is running.
+/// Kept alive for the managed tick so uninstall and control cannot remove or
+/// change the generation while the sweep is running. The installer claim is
+/// released around the broker open (which may block on the pool volume,
+/// for instance on a privacy consent nobody can answer from a launchd job)
+/// and taken again, with the plan and runtime re-verified, before the sweep.
 #[cfg(target_os = "macos")]
 pub(crate) struct ManagedTick {
     plan: Plan,
+    bytes: Vec<u8>,
     started_at_unix_ms: u64,
-    _claim: crate::file_lock::ExclusiveFileLock,
+    claim: Option<crate::file_lock::ExclusiveFileLock>,
+}
+
+#[cfg(target_os = "macos")]
+impl ManagedTick {
+    /// Let refresh, install and control proceed while the broker opens.
+    pub(crate) fn release_claim(&mut self) {
+        self.claim = None;
+    }
+
+    /// Take the installer claim again and prove the generation this tick
+    /// verified is still the installed one with the same verified runtime.
+    pub(crate) fn reclaim(&mut self) -> io::Result<()> {
+        let claim =
+            crate::pr_watch_service_install::claim_installer(&self.plan.directory, self.plan.uid)?;
+        if load(&self.plan.home, &self.plan.repository_uuid)?.1 != self.bytes {
+            return Err(invalid(
+                "managed GC service plan changed while the broker opened",
+            ));
+        }
+        verify_runtime(&self.plan)?;
+        self.claim = Some(claim);
+        Ok(())
+    }
 }
 
 impl Plan {
@@ -901,15 +935,16 @@ pub(crate) fn preflight_managed_tick(snapshot: &crate::Broker) -> io::Result<Opt
         ));
     }
     verify_runtime(&plan)?;
-    let _claim = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)?;
+    let claim = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)?;
     if load(&home, &uuid)?.1 != bytes {
         return Err(invalid("managed GC service plan changed during preflight"));
     }
     verify_runtime(&plan)?;
     Ok(Some(ManagedTick {
         plan,
+        bytes,
         started_at_unix_ms: now_unix_ms()?,
-        _claim,
+        claim: Some(claim),
     }))
 }
 
@@ -1029,6 +1064,9 @@ fn control_with(
         let last_refresh = read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid);
         let binding = runtime_binding(&plan.router, &plan.managed_root);
         let (last_error_at, last_pass_at) = tick_timestamps(&plan.directory, plan.uid);
+        let now = now_unix_ms()?;
+        let tick = unanswered_tick(&plan.directory, plan.uid, now, process_alive)
+            .map(|tick| tick.describe(now));
         // Until the service runs a verified current pair again, say how.
         let next_action = (runtime_state != "verified"
             || binding.needs_refresh()
@@ -1043,6 +1081,8 @@ fn control_with(
             "scheduler_observation": observation_name(&observation),
             "runtime_state": runtime_state,
             "runtime_binding": binding.as_str(),
+            "tick_started": read_bounded_json(&plan.directory.join(TICK_STARTED_RECEIPT), plan.uid),
+            "unanswered_tick": tick,
             "control": control,
             "last_pass": last_pass,
             "last_error": last_error,
@@ -1363,6 +1403,7 @@ fn archive_record(record: &InstallationRecord) -> io::Result<PathBuf> {
         "control.json",
         "last-pass.json",
         "last-error.json",
+        TICK_STARTED_RECEIPT,
     ] {
         let source = record.directory.join(name);
         match fs::symlink_metadata(&source) {
@@ -1907,7 +1948,12 @@ fn restore_record(
             fs::File::open(parent)?.sync_all()?;
         }
     }
-    for name in ["control.json", "last-pass.json", "last-error.json"] {
+    for name in [
+        "control.json",
+        "last-pass.json",
+        "last-error.json",
+        TICK_STARTED_RECEIPT,
+    ] {
         let Some(source) = archived_file(name)? else {
             continue;
         };
@@ -2310,6 +2356,130 @@ fn tick_timestamps(directory: &Path, uid: u32) -> (Option<u64>, Option<u64>) {
     )
 }
 
+/// A managed tick that recorded its start and, for at least
+/// [`TICK_BLOCKED_AFTER_MS`], neither a pass nor an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnansweredTick {
+    started_at_unix_ms: u64,
+    pid: Option<u32>,
+    /// Whether that pid still exists (`None` when no pid was recorded).
+    process_alive: Option<bool>,
+}
+
+/// The cause hint and the person's action for a blocked tick. On macOS the
+/// usual cause is a privacy consent: consent is bound to the binary's code
+/// identity, which each managed runtime version changes, and a launchd job
+/// waits on the request without showing anyone a dialog.
+const TICK_BLOCKED_CAUSE: &str = "the tick has written neither a pass nor an error since it started and its process still exists; on macOS this is most often a pending privacy consent for the service's runtime binary (a new code identity with each version) to read a removable or protected volume, which a launchd job waits on without showing anyone a dialog";
+const TICK_BLOCKED_ACTION: &str = "answer the pending privacy prompt, or allow the service's runtime in System Settings > Privacy & Security (Files and Folders > Removable Volumes, or Full Disk Access); launchd starts no further tick while this one runs, so scheduled sweeps stay stopped until then";
+const TICK_ENDED_CAUSE: &str = "the tick process is gone and wrote neither a pass nor an error (killed or crashed); the next interval starts a new tick";
+
+impl UnansweredTick {
+    /// Blocked unless its process is known to be gone.
+    fn blocked(&self) -> bool {
+        self.process_alive != Some(false)
+    }
+
+    fn describe(&self, now_unix_ms: u64) -> Value {
+        json!({
+            "state": if self.blocked() { "tick_blocked" } else { "tick_ended_without_receipt" },
+            "started_at_unix_ms": self.started_at_unix_ms,
+            "minutes_since_start": now_unix_ms.saturating_sub(self.started_at_unix_ms) / 60_000,
+            "pid": self.pid,
+            "process_alive": self.process_alive,
+            "cause_hint": if self.blocked() { TICK_BLOCKED_CAUSE } else { TICK_ENDED_CAUSE },
+            "person_action": self.blocked().then_some(TICK_BLOCKED_ACTION),
+        })
+    }
+}
+
+/// Whether a tick that started at `started` is still unanswered at `now`:
+/// no error and no finished pass at or after its start, and one full
+/// service interval gone.
+fn tick_unanswered(
+    started: u64,
+    last_error_at_unix_ms: Option<u64>,
+    last_pass_finished_unix_ms: Option<u64>,
+    now_unix_ms: u64,
+) -> bool {
+    started > last_error_at_unix_ms.unwrap_or(0)
+        && started > last_pass_finished_unix_ms.unwrap_or(0)
+        && now_unix_ms.saturating_sub(started) >= TICK_BLOCKED_AFTER_MS
+}
+
+/// Read the service's receipts for a tick that started and never answered.
+/// Files only, plus `alive` for the recorded pid.
+fn unanswered_tick(
+    directory: &Path,
+    uid: u32,
+    now_unix_ms: u64,
+    alive: impl Fn(u32) -> bool,
+) -> Option<UnansweredTick> {
+    let started = read_bounded_json(&directory.join(TICK_STARTED_RECEIPT), uid)?;
+    let started_at_unix_ms = started.get("started_at_unix_ms")?.as_u64()?;
+    let (error_at, pass_at) = tick_timestamps(directory, uid);
+    if !tick_unanswered(started_at_unix_ms, error_at, pass_at, now_unix_ms) {
+        return None;
+    }
+    let pid = started
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    Some(UnansweredTick {
+        started_at_unix_ms,
+        pid,
+        process_alive: pid.map(alive),
+    })
+}
+
+/// Whether a process with this pid exists (signal 0 delivers nothing).
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 sends no signal; it only reports whether
+    // the pid exists and may be signalled by this user.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The `broker status` advice for a blocked tick (files and one signal-0
+/// probe; no launchctl).
+fn blocked_tick_advice(
+    record: &InstallationRecord,
+    uid: u32,
+    now_unix_ms: u64,
+    alive: impl Fn(u32) -> bool,
+) -> Option<RepairAdvice> {
+    record.plan_bytes.as_ref()?;
+    let tick = unanswered_tick(&record.directory, uid, now_unix_ms, alive)?;
+    if !tick.blocked() {
+        return None;
+    }
+    Some(RepairAdvice {
+        id: "storage.gc-service-tick-blocked",
+        reason: TICK_BLOCKED_CAUSE,
+        summary: "this repository's scheduled GC sweep tick has been blocked since it started; a person must answer a prompt",
+        evidence: vec![
+            format!(
+                "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                tick.started_at_unix_ms,
+                now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
+                tick.pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+            ),
+            format!(
+                "runtime {}",
+                record.runtime_version.as_deref().unwrap_or("unknown")
+            ),
+            format!("what to do: {TICK_BLOCKED_ACTION}"),
+        ],
+        commands: vec!["aethyme broker gc service status --json".into()],
+    })
+}
+
 /// Whether a foreground command may refresh this repository's service by
 /// itself: the recorded runtime is gone or no longer the installation's
 /// current selection, the command runs from exactly that current selection
@@ -2543,6 +2713,11 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
                 "aethyme broker gc service plan".into(),
             ],
         });
+    }
+    if let Some(advice) =
+        blocked_tick_advice(&record, uid, now_unix_ms().unwrap_or(0), process_alive)
+    {
+        return Some(advice);
     }
     if let Some(advice) = refusing_or_stale_advice(&record, uid) {
         return Some(advice);
@@ -2802,6 +2977,48 @@ pub(crate) fn record_tick_failure(error: &str) {
         "record the GC service tick failure",
         write_tick_failure(&home, &uuid, uid, generation.as_deref(), error),
     );
+}
+
+/// Record that a managed tick started, before it touches the repository or
+/// its pool volumes, so a tick that then blocks is visible (its output goes
+/// to /dev/null and it may never get to write a pass or an error).
+#[cfg(target_os = "macos")]
+pub(crate) fn record_tick_started() {
+    let Ok(uuid) = std::env::var(SERVICE_ENV_UUID) else {
+        return;
+    };
+    let generation = std::env::var(SERVICE_ENV_GENERATION).ok();
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+    let uid = unsafe { libc::geteuid() };
+    crate::warn_unrecorded(
+        "record the GC service tick start",
+        write_tick_started(&home, &uuid, uid, generation.as_deref(), std::process::id()),
+    );
+}
+
+fn write_tick_started(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    generation: Option<&str>,
+    pid: u32,
+) -> io::Result<()> {
+    crate::store::repository_identity::validate_uuid_v4(uuid).map_err(io::Error::other)?;
+    let home = absolute_directory(home)?;
+    let directory = expected_directory(&home, uuid);
+    crate::pr_watch_service_install::lifecycle::check_directories(&home, &directory, uid, true)?;
+    let receipt = json!({
+        "schema": STARTED_SCHEMA,
+        "repository_uuid": uuid,
+        "generation": generation.filter(|value| valid_hex_digest(value)),
+        "pid": pid,
+        "started_at_unix_ms": now_unix_ms()?,
+    });
+    let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+    write_bounded_receipt(&directory, TICK_STARTED_RECEIPT, &bytes)
 }
 
 fn write_tick_failure(
@@ -4678,6 +4895,127 @@ mod tests {
             None
         );
         assert_unchanged(&plan);
+    }
+
+    #[test]
+    fn a_tick_that_never_answers_is_reported_as_blocked() {
+        let interval = TICK_BLOCKED_AFTER_MS;
+        assert!(tick_unanswered(10, None, None, 10 + interval));
+        assert!(!tick_unanswered(10, None, None, 10 + interval - 1));
+        assert!(!tick_unanswered(10, Some(10), None, 10 + interval));
+        assert!(!tick_unanswered(10, None, Some(11), 10 + interval));
+        assert!(tick_unanswered(10, Some(9), Some(9), 10 + interval));
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        // The uuid comes from the environment: it must name an installed namespace.
+        assert!(write_tick_started(&plan.home, "../escape", plan.uid, None, 1).is_err());
+        let other = "00000000-0000-4000-8000-000000000000";
+        assert!(write_tick_started(&plan.home, other, plan.uid, None, 1).is_err());
+        assert!(!expected_directory(&plan.home, other).exists());
+        write_tick_started(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Some(&plan.generation),
+            4242,
+        )
+        .unwrap();
+        let receipt =
+            read_bounded_json(&plan.directory.join(TICK_STARTED_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["schema"], STARTED_SCHEMA);
+        assert_eq!(receipt["pid"], 4242);
+        let started = receipt["started_at_unix_ms"].as_u64().unwrap();
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        // Young, it is a running tick: nothing to say.
+        assert!(blocked_tick_advice(&record, plan.uid, started + 1, |_| true).is_none());
+        let later = started + interval + 60_000;
+        let advice = blocked_tick_advice(&record, plan.uid, later, |pid| {
+            assert_eq!(pid, 4242);
+            true
+        })
+        .unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-blocked");
+        assert!(advice.reason.contains("privacy consent"));
+        assert!(
+            advice
+                .evidence
+                .iter()
+                .any(|line| line.contains("Privacy & Security"))
+        );
+        // A process known to be gone is not blocked, and not advised.
+        assert!(blocked_tick_advice(&record, plan.uid, later, |_| false).is_none());
+        let ended = unanswered_tick(&plan.directory, plan.uid, later, |_| false).unwrap();
+        assert_eq!(ended.describe(later)["state"], "tick_ended_without_receipt");
+        assert!(ended.describe(later)["person_action"].is_null());
+        let blocked = unanswered_tick(&plan.directory, plan.uid, later, |_| true).unwrap();
+        let described = blocked.describe(later);
+        assert_eq!(described["state"], "tick_blocked");
+        assert_eq!(
+            described["minutes_since_start"],
+            (interval + 60_000) / 60_000
+        );
+        assert_eq!(described["person_action"], TICK_BLOCKED_ACTION);
+        // An error written after the start answers it.
+        write_private(
+            &plan.directory.join("last-error.json"),
+            &serde_json::to_vec(&json!({
+                "schema": ERROR_SCHEMA,
+                "observed_at_unix_ms": started + 5,
+                "error": "fixture",
+            }))
+            .unwrap(),
+        );
+        assert!(unanswered_tick(&plan.directory, plan.uid, later, |_| true).is_none());
+        // This process exists; a pid that cannot exist does not.
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+    }
+
+    #[test]
+    fn status_reports_a_blocked_tick_and_a_refresh_archives_its_receipt() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let long_ago = now_unix_ms().unwrap() - TICK_BLOCKED_AFTER_MS - 120_000;
+        write_private(
+            &plan.directory.join(TICK_STARTED_RECEIPT),
+            &serde_json::to_vec(&json!({
+                "schema": STARTED_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "pid": std::process::id(),
+                "started_at_unix_ms": long_ago,
+            }))
+            .unwrap(),
+        );
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["unanswered_tick"]["state"], "tick_blocked");
+        assert_eq!(status["tick_started"]["started_at_unix_ms"], long_ago);
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-tick-blocked");
+        // A refresh archives the started receipt with the other receipts.
+        let runtime = newer_runtime(&plan);
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(outcome.outcome, "refreshed_not_loaded");
+        assert!(!plan.directory.join(TICK_STARTED_RECEIPT).exists());
+        assert!(
+            outcome
+                .archived_to
+                .unwrap()
+                .join(TICK_STARTED_RECEIPT)
+                .is_file()
+        );
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
     }
 
     #[test]
