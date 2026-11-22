@@ -52,16 +52,39 @@ const MOVE_FAILURES_BEFORE_STOP: usize = 3;
 const MOVES_PER_PHASE: usize = 256;
 /// The attachment counting failed moves by `<subject>.<step>.<cause>`.
 const MOVE_FAILURES_ATTACHMENT: &str = "scratch_move_failures";
-/// The longest one pass spends probing the filesystem while it classifies
-/// records (listing the done containers of the records due for it, and
-/// proving a closed record's directory gone); what is left stays due for
-/// the next pass. Reading every session's state is one store query and is
-/// not cut short.
+/// The longest one pass spends on the filesystem while it classifies
+/// records: the listing of each pool's scratch container, clearing the
+/// finished-run signals it found, and listing the done containers of the
+/// records due for a listing (at least one); what is left stays due for the
+/// next pass. Reading every session's state is one store query and is not
+/// cut short. The full listing lap and the probes of closed records have
+/// their own, smaller budgets.
 const SCRATCH_CLASSIFY_BUDGET: Duration = Duration::from_secs(2);
 /// How often every open session's done container is listed whatever the
 /// finished-run signals say: the backstop for a marker whose signal could
-/// not be written, or that a broker without signals wrote.
+/// not be written, or that a broker without signals wrote. A lap starts at
+/// most this often, and never while the previous one is unfinished.
 const SCRATCH_FULL_LISTING_INTERVAL_MS: i64 = 60 * 60 * 1000;
+/// A full listing lap is paced to reach its last record this long after it
+/// started (half the interval): each pass lists its share of the lap, not
+/// the whole lap at once.
+const SCRATCH_LAP_SPREAD_MS: i64 = 30 * 60 * 1000;
+/// Lap listings a pass owes at least while records are left in the lap, so
+/// a repository with few records goes round in one pass.
+const SCRATCH_LAP_MIN_PER_PASS: usize = 8;
+/// The longest one pass spends on its share of the full listing lap (at
+/// least one listing when it owes any).
+const SCRATCH_LAP_BUDGET: Duration = Duration::from_millis(500);
+/// The longest one pass spends probing closed records for a gone directory
+/// (at least one probe when there is a closed record).
+const SCRATCH_PROBE_BUDGET: Duration = Duration::from_millis(500);
+/// Broker metadata key holding the measurement lap of live scratch
+/// directories ([`MeasureLap`]).
+const SESSION_SCRATCH_MEASURE_KEY: &str = "session_scratch.measure_lap";
+/// A measurement lap starts at most this often after the last one went
+/// round; between laps a pass walks nothing and the ledger shows the last
+/// complete lap.
+const SCRATCH_MEASURE_INTERVAL_MS: i64 = 15 * 60 * 1000;
 /// How far past the lane's own deadline the scratch pass may start new
 /// work. With an item already in flight (at most one fresh open-file
 /// observation of a replaced directory, 10 s, and one rename), a retirement
@@ -74,6 +97,35 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static CLASSIFY_BUDGET_FOR_TEST: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    static LAP_MIN_PER_PASS_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static MEASURED_PER_PASS_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn lap_min_per_pass() -> usize {
+    #[cfg(test)]
+    if let Some(min) = LAP_MIN_PER_PASS_FOR_TEST.with(std::cell::Cell::get) {
+        return min;
+    }
+    SCRATCH_LAP_MIN_PER_PASS
+}
+
+/// Records one pass measures at most (no cap outside tests: the budget
+/// bounds it).
+fn measured_per_pass() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = MEASURED_PER_PASS_FOR_TEST.with(std::cell::Cell::get) {
+        return cap;
+    }
+    usize::MAX
+}
+
+/// A share of the classification with its own cap: never more than the
+/// classification budget (so a test that sets that budget to zero sets
+/// these too).
+fn share_budget(cap: Duration) -> Duration {
+    classify_budget().min(cap)
 }
 
 fn moves_per_phase() -> usize {
@@ -102,15 +154,25 @@ struct ScratchRetireCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     classify: Option<String>,
     /// Open records whose done container the next pass lists: signaled
-    /// ones, every open one during a full listing lap, and the ones whose
-    /// last listing showed a finished run. A record leaves only after a
-    /// listing showed none.
+    /// ones, the ones whose last listing showed a finished run or could not
+    /// be read, and (from older brokers) every open one when a full listing
+    /// lap started. A record leaves only after a listing showed none.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     listing_due: std::collections::BTreeSet<String>,
     /// When the last full listing lap started (epoch ms); none yet means
     /// one is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     full_listing_started_ms: Option<i64>,
+    /// A full listing lap is in progress: each pass lists the open records
+    /// after `lap_after`, in key order, its paced share at a time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lap_open: bool,
+    /// The last record the lap in progress reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lap_after: Option<String>,
+    /// Records the lap in progress reached so far (its pace).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    lap_listed: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     closed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +295,99 @@ fn full_listing_due(started_ms: Option<i64>, now_ms: i64) -> bool {
     started_ms.is_none_or(|started| {
         now_ms < started || now_ms - started >= SCRATCH_FULL_LISTING_INTERVAL_MS
     })
+}
+
+/// Whether a pass at `now_ms` starts a full listing lap: none is in
+/// progress (an unfinished lap goes on rather than starting over, so a lap
+/// slower than the interval still goes round), and one is due.
+fn lap_starts(cursor: &ScratchRetireCursor, now_ms: i64) -> bool {
+    !cursor.lap_open && full_listing_due(cursor.full_listing_started_ms, now_ms)
+}
+
+/// Lap listings a pass owes `elapsed_ms` into a lap over `open` records of
+/// which `reached` were reached already: enough to keep pace to reach the
+/// last one [`SCRATCH_LAP_SPREAD_MS`] after the lap started, and at least
+/// [`SCRATCH_LAP_MIN_PER_PASS`]. A clock that went back owes the minimum.
+fn lap_quota(open: usize, reached: usize, elapsed_ms: i64) -> usize {
+    let elapsed = u128::try_from(elapsed_ms.clamp(0, SCRATCH_LAP_SPREAD_MS)).unwrap_or(0);
+    let spread = u128::try_from(SCRATCH_LAP_SPREAD_MS).unwrap_or(1);
+    let target = usize::try_from((open as u128 * elapsed).div_ceil(spread)).unwrap_or(usize::MAX);
+    target.saturating_sub(reached).max(lap_min_per_pass())
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+/// One by-path listing of `record`'s done container, timed under `span`
+/// (one span per listing, so the phase counts give the per-listing
+/// latency); an unreadable container is counted.
+fn list_done_container(
+    record: &ScratchRecord,
+    span: &'static str,
+    report: &mut ScratchRetireReport,
+) -> crate::session_scratch::RunsHint {
+    let hint = {
+        let _span = crate::phase_telemetry::span(span);
+        crate::session_scratch::finished_runs_hint(record)
+    };
+    if hint == crate::session_scratch::RunsHint::Unknown {
+        report.listing_unknown += 1;
+        crate::phase_telemetry::add("session_scratch_retire_listing_unknown", Duration::ZERO);
+    }
+    hint
+}
+
+/// What one measurement lap of live scratch directories found so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MeasureTotals {
+    /// Records measured.
+    #[serde(default)]
+    measured: usize,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    largest_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    largest_session_id: Option<i64>,
+    /// A record's walk stopped at the budget: the bytes are a lower bound.
+    #[serde(default)]
+    partial: bool,
+    #[serde(default)]
+    finished_runs: usize,
+    #[serde(default)]
+    finished_run_bytes: u64,
+}
+
+/// The measurement of live scratch directories, spread over passes: a lap
+/// walks the records in key order, resuming after `after`, until it goes
+/// round; the ledger shows the last complete lap (the lap in progress, as a
+/// lower bound, before any went round).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MeasureLap {
+    /// When the lap in progress started; none when none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_ms: Option<i64>,
+    /// The last record the lap in progress measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after: Option<String>,
+    #[serde(default)]
+    so_far: MeasureTotals,
+    /// The last lap that went round, and when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last: Option<MeasureTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_completed_ms: Option<i64>,
+}
+
+/// Whether a pass at `now_ms` measures: a lap is in progress, none ever
+/// went round, the last one went round [`SCRATCH_MEASURE_INTERVAL_MS`] ago
+/// or more, or the clock went back.
+fn measure_due(lap: &MeasureLap, now_ms: i64) -> bool {
+    lap.started_ms.is_some()
+        || lap.last_completed_ms.is_none_or(|completed| {
+            now_ms < completed || now_ms - completed >= SCRATCH_MEASURE_INTERVAL_MS
+        })
 }
 
 /// The finished-runs phase's deadline: the pass's budget from `started`,
@@ -476,8 +631,14 @@ pub(crate) struct ScratchRetireReport {
     /// The classification stopped at its budget with records still due for
     /// a listing; the next pass goes on.
     pub classify_incomplete: bool,
-    /// Done containers listed (records due for a listing reached).
+    /// Done containers listed (records due for a listing reached, and the
+    /// full listing lap's share).
     pub listed: usize,
+    /// Of those, listed by the full listing lap.
+    pub lap_listed: usize,
+    /// Open records the lap in progress has still to reach (none once it
+    /// went round, or when none is in progress).
+    pub lap_remaining: usize,
     /// Closed records whose directory was probed for being gone.
     pub probed: usize,
     /// Finished-run signals read (and cleared) this pass.
@@ -915,6 +1076,19 @@ impl Broker {
     /// run's open-file observation is taken outside the budget, the closed
     /// directories and the command runs each get a share of it, and each
     /// phase resumes after the record where the previous pass stopped.
+    ///
+    /// That design made the classification slower on the busiest
+    /// repository (2.1 to 5.6 s against about 2 s): the container listing
+    /// (0.02 to 1.9 s there, while the volume was busy) and the signal
+    /// clear ran outside the 2 s budget, at least one listing ran past it,
+    /// and the first full listing lap put every open record (about 600) due
+    /// at once, so every pass spent its whole budget listing 1 to 22 of
+    /// them. Now the budget is taken before the container listing, the
+    /// clear runs only when there is a signal to clear, the lap is paced
+    /// (its share of the records per pass, with its own 0.5 s budget), and
+    /// the probes of closed records have their own 0.5 s budget: an idle
+    /// pass costs one store read, one container listing and the lap's
+    /// share.
     pub(crate) fn retire_session_scratch(
         &self,
         run: &mut RetireRun,
@@ -946,17 +1120,26 @@ impl Broker {
             ..ScratchRetireCursor::default()
         };
         // Classify every record from its session's state (one store read,
-        // no filesystem access), then probe the filesystem only where there
-        // can be work, within the classification budget: closed records
-        // whose directory may be gone, and the done containers of the open
-        // records due for a listing (always at least one listing).
+        // no filesystem access), then touch the filesystem only where there
+        // can be work, each step within its own budget: the classification
+        // (each pool's container listing, the signal clear, the listings of
+        // the records due for one, at least one), the full listing lap's
+        // paced share, and the probes of closed records whose directory may
+        // be gone. On the busiest repository one directory operation took
+        // from under 1 ms to about 1 s depending on what else used the
+        // volume, so every step counts its operations under a span of its
+        // own, and none runs outside a budget.
         // Keys this pass proved need no listing: records it classified as
         // retired, and records whose listing showed no finished run. The
         // final cursor write removes them from the stored due set, and keeps
         // every other key a concurrent pass stored.
         let mut dropped = std::collections::BTreeSet::<String>::new();
-        let (mut closed, mut pending, mut due, containers) = {
+        let now_ms = crate::clock::epoch_ms();
+        let (mut closed, mut pending, mut due, containers, open) = {
             let _classify = crate::phase_telemetry::span("session_scratch_retire_classify");
+            // Taken first: the container listing and the signal clear are
+            // charged to it too.
+            let deadline = (Instant::now() + classify_budget()).min(latest);
             let classes = self.scratch_record_classes(&records);
             let mut closed = Vec::new();
             let mut open = std::collections::BTreeSet::<&str>::new();
@@ -975,10 +1158,9 @@ impl Broker {
                 }
             }
 
-            // What is due for a listing: what the last pass left due, every
-            // open record when a full lap starts, and every record a
-            // finished-run signal names (one listing of each pool's
-            // container, which also yields the unrecorded entries).
+            // What is due for a listing: what the last pass left due, and
+            // every record a finished-run signal names (one listing of each
+            // pool's container, which also yields the unrecorded entries).
             let mut due = cursor
                 .listing_due
                 .iter()
@@ -986,12 +1168,16 @@ impl Broker {
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>();
             next.full_listing_started_ms = cursor.full_listing_started_ms;
-            let now_ms = crate::clock::epoch_ms();
-            if full_listing_due(cursor.full_listing_started_ms, now_ms) {
+            next.lap_open = cursor.lap_open;
+            next.lap_after = cursor.lap_after.clone();
+            next.lap_listed = cursor.lap_listed;
+            if lap_starts(&cursor, now_ms) {
                 crate::phase_telemetry::add("session_scratch_retire_full_listing", Duration::ZERO);
                 report.full_listing = true;
-                due.extend(open.iter().map(|key| (*key).to_owned()));
                 next.full_listing_started_ms = Some(now_ms);
+                next.lap_open = true;
+                next.lap_after = None;
+                next.lap_listed = 0;
             }
             let containers = {
                 let _signals = crate::phase_telemetry::span("session_scratch_retire_signals");
@@ -1025,8 +1211,11 @@ impl Broker {
             // A signal is cleared only once what it made due is stored, and
             // before any listing: a marker written after its container was
             // listed signals again (its writer writes the signal after the
-            // marker), and one written before is seen by the listing.
-            if report.signals > 0 {
+            // marker), and one written before is seen by the listing. With
+            // nothing to clear, nothing is written here (the signals stay;
+            // the final cursor write stores what is due).
+            if !to_clear.is_empty() {
+                let _clear = crate::phase_telemetry::span("session_scratch_retire_signal_clear");
                 let stored = self.update_meta_json(
                     SESSION_SCRATCH_CURSOR_KEY,
                     |stored: &mut ScratchRetireCursor| {
@@ -1044,31 +1233,6 @@ impl Broker {
                     );
                 }
             }
-
-            let deadline = (Instant::now() + classify_budget()).min(latest);
-            // A closed record whose directory is proven gone (the same proof
-            // as a move's: the walk without links finds no entry, and the
-            // pool is on a mounted volume) has nothing to move: forget it now,
-            // with no open-file observation and no lifecycle claim. On a
-            // volume that is away it stays, and is judged as before.
-            closed.retain(|(_, record)| {
-                if Instant::now() >= deadline {
-                    return true;
-                }
-                report.probed += 1;
-                match crate::session_scratch::verify(record) {
-                    Err(Refusal::Missing) if !crate::session_scratch::pool_unavailable(record) => {
-                        self.forget_scratch_record(record);
-                        report.forgotten_missing += 1;
-                        crate::phase_telemetry::add(
-                            "session_scratch_missing_forgotten_early",
-                            Duration::ZERO,
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            });
 
             // List the due records, after the last one listed: a record with
             // a finished run stays due (the finished-runs phase takes it), one
@@ -1094,18 +1258,13 @@ impl Broker {
                 };
                 report.listed += 1;
                 last_listed = Some(key.clone());
-                match crate::session_scratch::finished_runs_hint(record) {
+                match list_done_container(record, "session_scratch_retire_due_listing", &mut report)
+                {
                     crate::session_scratch::RunsHint::Runs => pending.push((key.as_str(), record)),
                     crate::session_scratch::RunsHint::NoRuns => without_runs.push(key.as_str()),
                     // Unreadable (out of descriptors, denied, an I/O error):
                     // it says nothing, so the record stays due.
-                    crate::session_scratch::RunsHint::Unknown => {
-                        report.listing_unknown += 1;
-                        crate::phase_telemetry::add(
-                            "session_scratch_retire_listing_unknown",
-                            Duration::ZERO,
-                        );
-                    }
+                    crate::session_scratch::RunsHint::Unknown => {}
                 }
             }
             for key in without_runs {
@@ -1113,8 +1272,76 @@ impl Broker {
                 dropped.insert(key.to_owned());
             }
             next.classify = last_listed.or_else(|| cursor.classify.clone());
-            (closed, pending, due, containers)
+            (closed, pending, due, containers, open)
         };
+
+        // The full listing lap's share: the open records after where the lap
+        // stopped, in key order, as many as keep it on pace (at least one
+        // when it owes any), within its own budget. A record already due, or
+        // listed above, is reached without a listing of its own. One whose
+        // listing shows a finished run is taken this pass and stays due; one
+        // whose listing could not be read becomes due (listed again by the
+        // next pass); one with none needs nothing. The lap ends once it
+        // reached the last open record.
+        if next.lap_open {
+            let _lap = crate::phase_telemetry::span("session_scratch_retire_lap");
+            let lap_deadline = (Instant::now() + share_budget(SCRATCH_LAP_BUDGET)).min(latest);
+            let keys = open.iter().copied().collect::<Vec<_>>();
+            let start = next
+                .lap_after
+                .as_deref()
+                .map_or(0, |after| keys.partition_point(|key| *key <= after));
+            let owed = lap_quota(
+                keys.len(),
+                next.lap_listed,
+                now_ms - next.full_listing_started_ms.unwrap_or(now_ms),
+            );
+            let mut listed_now = 0_usize;
+            let mut went_round = true;
+            for key in &keys[start..] {
+                let key = *key;
+                if !due.contains(key) && !dropped.contains(key) {
+                    if listed_now >= owed || (listed_now > 0 && Instant::now() >= lap_deadline) {
+                        went_round = false;
+                        break;
+                    }
+                    let Some(record) = records.get(key) else {
+                        continue;
+                    };
+                    listed_now += 1;
+                    report.listed += 1;
+                    report.lap_listed += 1;
+                    match list_done_container(
+                        record,
+                        "session_scratch_retire_lap_listing",
+                        &mut report,
+                    ) {
+                        crate::session_scratch::RunsHint::Runs => {
+                            due.insert(key.to_owned());
+                            pending.push((key, record));
+                        }
+                        crate::session_scratch::RunsHint::Unknown => {
+                            due.insert(key.to_owned());
+                        }
+                        crate::session_scratch::RunsHint::NoRuns => {}
+                    }
+                }
+                next.lap_after = Some(key.to_owned());
+                next.lap_listed += 1;
+            }
+            if went_round {
+                crate::phase_telemetry::add("session_scratch_retire_lap_completed", Duration::ZERO);
+                next.lap_open = false;
+                next.lap_after = None;
+                next.lap_listed = 0;
+            } else {
+                let reached = next
+                    .lap_after
+                    .as_deref()
+                    .map_or(0, |after| keys.partition_point(|key| *key <= after));
+                report.lap_remaining = keys.len() - reached;
+            }
+        }
         // Both phases take their records in key order, each from its own
         // cursor.
         //
@@ -1122,23 +1349,56 @@ impl Broker {
         // every pass, so the closed phase reaches each one within as many
         // passes as there are closed records. A finished run's record is due
         // from the pass after its marker was written (its signal), or within
-        // the hour (the full listing lap) when the signal could not be
-        // written; a due record is listed within as many passes as there are
-        // due records (at least one listing per pass, resuming after the last
-        // one), stays due while its listing shows a finished run, and is
-        // then judged by the finished-runs phase within as many passes as
-        // there are records with finished runs, plus one per finished run.
-        // All of this given passes whose open-file observation succeeds and
-        // whose moves do not fail with a cause that affects the whole
-        // process (out of descriptors). A failure confined to one pool's
-        // trash or store row, or to one volume, closes only that pool or
-        // volume for the pass; its records are retried on a later lap. A
-        // record cut short by the deadline or a move cap keeps a run cursor
-        // past the runs it judged.
+        // the full listing lap (started hourly, paced over half an hour, its
+        // share bounded per pass) when the signal could not be written; a due
+        // record is listed within as many passes as there are due records
+        // (at least one listing per pass, resuming after the last one), stays
+        // due while its listing shows a finished run, and is then judged by
+        // the finished-runs phase within as many passes as there are records
+        // with finished runs, plus one per finished run. All of this given
+        // passes whose open-file observation succeeds and whose moves do not
+        // fail with a cause that affects the whole process (out of
+        // descriptors). A failure confined to one pool's trash or store row,
+        // or to one volume, closes only that pool or volume for the pass; its
+        // records are retried on a later lap. A record cut short by the
+        // deadline or a move cap keeps a run cursor past the runs it judged.
         closed.sort_by(|left, right| left.0.cmp(right.0));
         pending.sort_by(|left, right| left.0.cmp(right.0));
         closed = rotate_after(closed, cursor.closed.as_deref());
         pending = rotate_after(pending, cursor.command_temps.as_deref());
+        // A closed record whose directory is proven gone (the same proof as
+        // a move's: the walk without links finds no entry, and the pool is
+        // on a mounted volume) has nothing to move: forget it now, with no
+        // open-file observation and no lifecycle claim. On a volume that is
+        // away it stays, and is judged as before. Probed in the closed
+        // phase's order (from its cursor), at least one, within their own
+        // budget.
+        if !closed.is_empty() {
+            let _probes = crate::phase_telemetry::span("session_scratch_retire_probes");
+            let probe_deadline = (Instant::now() + share_budget(SCRATCH_PROBE_BUDGET)).min(latest);
+            closed.retain(|(_, record)| {
+                if report.probed > 0 && Instant::now() >= probe_deadline {
+                    return true;
+                }
+                report.probed += 1;
+                let verified = {
+                    let _probe = crate::phase_telemetry::span("session_scratch_retire_probe");
+                    crate::session_scratch::verify(record)
+                };
+                match verified {
+                    Err(Refusal::Missing) if !crate::session_scratch::pool_unavailable(record) => {
+                        self.forget_scratch_record(record);
+                        report.forgotten_missing += 1;
+                        crate::phase_telemetry::add(
+                            "session_scratch_missing_forgotten_early",
+                            Duration::ZERO,
+                        );
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        }
         report.sessions_with_finished_runs = pending.len();
         // The run's open-file observation, when this pass is the first to
         // need it, before the budget starts: `lsof` alone can take 10 s on
@@ -1293,6 +1553,8 @@ impl Broker {
                 "command_temps_kept": report.command_temps_kept,
                 "command_temps_kept_by_reason": report.command_temps_kept_by_reason,
                 "listed": report.listed,
+                "lap_listed": report.lap_listed,
+                "lap_remaining": report.lap_remaining,
                 "probed": report.probed,
                 "signals": report.signals,
                 "listing_due": report.listing_due,
@@ -1599,9 +1861,20 @@ impl Broker {
         }
     }
 
-    /// Measure the live scratch directories (bounded) and write this
-    /// repository's scratch usage into the storage ledger; `freed` is what
-    /// the deleter freed removing scratch directories in this run.
+    /// Measure the live scratch directories and write this repository's
+    /// scratch usage into the storage ledger; `freed` is what the deleter
+    /// freed removing scratch directories in this run.
+    ///
+    /// The walk is a lap spread over passes ([`MeasureLap`]): a pass walks
+    /// the records after where the lap stopped, in key order, within
+    /// [`SCRATCH_MEASURE_BUDGET`] (at least one), and a new lap starts only
+    /// [`SCRATCH_MEASURE_INTERVAL_MS`] after the last one went round. On the
+    /// busiest repository the previous walk, from the first record every
+    /// pass, spent its whole 2 s on every pass, never went round, and so
+    /// reported only the first records' bytes, always as partial. Between
+    /// laps a pass walks nothing. The ledger shows the last complete lap
+    /// (the lap in progress, as partial, until one went round); the counts
+    /// of directories, kept and refused come from the records every pass.
     pub(crate) fn record_session_scratch_usage(&self, freed: u64) {
         let _span = crate::phase_telemetry::span("session_scratch_measure");
         let freed_total = self
@@ -1620,41 +1893,96 @@ impl Broker {
             );
         }
         let records = self.session_scratch_records();
-        let deadline = Instant::now() + SCRATCH_MEASURE_BUDGET;
-        let mut usage = crate::storage_ledger::SessionScratchUsage {
-            bytes_freed_total: freed_total,
-            observed_at_ms: crate::clock::epoch_ms(),
-            ..crate::storage_ledger::SessionScratchUsage::default()
-        };
-        for record in records.values() {
-            usage.directories += 1;
-            if Instant::now() >= deadline {
-                usage.partial = true;
-                continue;
+        let now_ms = crate::clock::epoch_ms();
+        let mut lap: MeasureLap = self.meta_json(SESSION_SCRATCH_MEASURE_KEY);
+        let due = measure_due(&lap, now_ms);
+        let mut measured = 0_usize;
+        if due {
+            if lap.started_ms.is_none() {
+                crate::phase_telemetry::add("session_scratch_measure_lap_started", Duration::ZERO);
+                lap.started_ms = Some(now_ms);
+                lap.after = None;
+                lap.so_far = MeasureTotals::default();
             }
-            let (bytes, complete) = crate::session_scratch::measure(&record.path(), deadline);
-            usage.partial |= !complete;
-            usage.bytes = usage.bytes.saturating_add(bytes);
-            if bytes > usage.largest_bytes {
-                usage.largest_bytes = bytes;
-                usage.largest_session_id = Some(record.session_id);
-            }
-            if record.keep.is_some() {
-                usage.kept += 1;
-            }
-            if record.keep.as_deref().is_some_and(is_refusal_keep) {
-                usage.refused += 1;
-            }
-            // Finished command runs awaiting removal, from their markers
-            // (sizes measured at finish; nothing is walked again here).
-            for finished in crate::session_scratch::finished_runs(record, FINISHED_RUNS_COUNTED_MAX)
+            let deadline = Instant::now() + SCRATCH_MEASURE_BUDGET;
+            let mut went_round = true;
+            let after = lap.after.clone();
+            for (key, record) in records
+                .iter()
+                .filter(|(key, _)| after.as_deref().is_none_or(|after| key.as_str() > after))
             {
-                usage.finished_runs += 1;
-                usage.finished_run_bytes = usage
-                    .finished_run_bytes
-                    .saturating_add(finished.marker.bytes);
+                if measured > 0 && (Instant::now() >= deadline || measured >= measured_per_pass()) {
+                    went_round = false;
+                    break;
+                }
+                measured += 1;
+                let (bytes, complete) = {
+                    let _walk = crate::phase_telemetry::span("session_scratch_measure_record");
+                    crate::session_scratch::measure(&record.path(), deadline)
+                };
+                let totals = &mut lap.so_far;
+                totals.measured += 1;
+                totals.partial |= !complete;
+                totals.bytes = totals.bytes.saturating_add(bytes);
+                if bytes > totals.largest_bytes {
+                    totals.largest_bytes = bytes;
+                    totals.largest_session_id = Some(record.session_id);
+                }
+                // Finished command runs awaiting removal, from their markers
+                // (sizes measured at finish; nothing is walked again here).
+                for finished in
+                    crate::session_scratch::finished_runs(record, FINISHED_RUNS_COUNTED_MAX)
+                {
+                    totals.finished_runs += 1;
+                    totals.finished_run_bytes = totals
+                        .finished_run_bytes
+                        .saturating_add(finished.marker.bytes);
+                }
+                lap.after = Some(key.clone());
             }
+            if went_round {
+                crate::phase_telemetry::add(
+                    "session_scratch_measure_lap_completed",
+                    Duration::ZERO,
+                );
+                lap.last = Some(std::mem::take(&mut lap.so_far));
+                lap.last_completed_ms = Some(now_ms);
+                lap.started_ms = None;
+                lap.after = None;
+            }
+            let stored = lap.clone();
+            crate::warn_unrecorded(
+                "record where the scratch measurement lap stopped",
+                self.update_meta_json(SESSION_SCRATCH_MEASURE_KEY, |current: &mut MeasureLap| {
+                    *current = stored.clone();
+                }),
+            );
+        } else {
+            crate::phase_telemetry::add("session_scratch_measure_not_due", Duration::ZERO);
         }
+        let shown = lap.last.clone().unwrap_or_else(|| MeasureTotals {
+            partial: true,
+            ..lap.so_far.clone()
+        });
+        let usage = crate::storage_ledger::SessionScratchUsage {
+            directories: records.len(),
+            bytes: shown.bytes,
+            largest_bytes: shown.largest_bytes,
+            largest_session_id: shown.largest_session_id,
+            kept: records
+                .values()
+                .filter(|record| record.keep.is_some())
+                .count(),
+            refused: records
+                .values()
+                .filter(|record| record.keep.as_deref().is_some_and(is_refusal_keep))
+                .count(),
+            partial: shown.partial,
+            bytes_freed_total: freed_total,
+            observed_at_ms: now_ms,
+            finished_runs: shown.finished_runs,
+            finished_run_bytes: shown.finished_run_bytes,
+        };
         crate::phase_telemetry::attach(
             "session_scratch_usage",
             serde_json::json!({
@@ -1667,6 +1995,9 @@ impl Broker {
                 "bytes_freed_this_run": freed,
                 "finished_runs": usage.finished_runs,
                 "finished_run_bytes": usage.finished_run_bytes,
+                "measure_due": due,
+                "measured": measured,
+                "lap_open": lap.started_ms.is_some(),
             }),
         );
         if let Some((host_state, _)) = crate::host_state::resolve_host_state_dir() {
@@ -3103,6 +3434,248 @@ mod tests {
         assert!(!super::full_listing_due(Some(1_000), 1_000 + hour - 1));
         assert!(super::full_listing_due(Some(1_000), 1_000 + hour));
         assert!(super::full_listing_due(Some(1_000), 999));
+    }
+
+    /// A lap owes its share of the records by how far into its spread it
+    /// is, minus what it reached, and never less than the minimum; past the
+    /// spread it owes the rest, and a clock that went back owes the minimum.
+    #[test]
+    fn a_lap_owes_its_paced_share_and_at_least_the_minimum() {
+        let spread = super::SCRATCH_LAP_SPREAD_MS;
+        let min = super::SCRATCH_LAP_MIN_PER_PASS;
+        assert_eq!(super::lap_quota(600, 0, 0), min);
+        assert_eq!(super::lap_quota(600, 0, spread / 10), 60);
+        assert_eq!(super::lap_quota(600, 50, spread / 10), min.max(10));
+        assert_eq!(super::lap_quota(600, 100, spread / 2), 200);
+        assert_eq!(super::lap_quota(600, 590, spread * 3), min.max(10));
+        assert_eq!(super::lap_quota(600, 0, -5), min);
+        assert_eq!(
+            super::lap_quota(3, 0, 0),
+            min,
+            "a small lap goes round at once"
+        );
+    }
+
+    /// A lap starts when one is due and none is in progress; an unfinished
+    /// lap goes on past the interval instead of starting over.
+    #[test]
+    fn an_unfinished_lap_goes_on_instead_of_starting_over() {
+        let hour = super::SCRATCH_FULL_LISTING_INTERVAL_MS;
+        let mut cursor = super::ScratchRetireCursor {
+            full_listing_started_ms: Some(1_000),
+            ..super::ScratchRetireCursor::default()
+        };
+        assert!(!super::lap_starts(&cursor, 1_000 + hour - 1));
+        assert!(super::lap_starts(&cursor, 1_000 + hour));
+        cursor.lap_open = true;
+        cursor.lap_after = Some("k".into());
+        assert!(!super::lap_starts(&cursor, 1_000 + 5 * hour));
+        assert!(super::lap_starts(&super::ScratchRetireCursor::default(), 0));
+    }
+
+    /// Restores the lap's per-pass minimum when dropped.
+    struct LapMinimum;
+
+    impl LapMinimum {
+        fn set(min: usize) -> Self {
+            super::LAP_MIN_PER_PASS_FOR_TEST.with(|cell| cell.set(Some(min)));
+            Self
+        }
+    }
+
+    impl Drop for LapMinimum {
+        fn drop(&mut self) {
+            super::LAP_MIN_PER_PASS_FOR_TEST.with(|cell| cell.set(None));
+        }
+    }
+
+    /// The full listing lap is spread over passes: each pass lists its
+    /// share (here one record) after where the lap stopped, a marker
+    /// without its signal is found when the lap reaches its record, and once
+    /// the lap went round a pass lists nothing until the next one is due.
+    #[test]
+    fn the_full_listing_lap_is_spread_over_passes() {
+        let (_owner, _storage, mut broker) = fixture();
+        let sessions = sessions_in_record_order(&mut broker, 3, "scratch paced lap");
+        let run = finished_run(&broker, &sessions[2]);
+        let scratch = broker.session_scratch_dir(sessions[2].id).unwrap();
+        let pool = scratch.parent().unwrap().parent().unwrap().to_path_buf();
+        let entry = scratch.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            crate::session_scratch::clear_finished_signals(&pool, &[entry]),
+            1
+        );
+        let _min = LapMinimum::set(1);
+
+        let report = run_retirement(&mut broker);
+        assert!(report.scratch.full_listing, "{report:#?}");
+        assert_eq!(
+            (report.scratch.listed, report.scratch.lap_listed),
+            (1, 1),
+            "{report:#?}"
+        );
+        assert_eq!(report.scratch.lap_remaining, 2, "{report:#?}");
+        assert!(!report.scratch.classify_incomplete, "{report:#?}");
+        assert!(!report.scratch.more_remaining, "pacing is not a backlog");
+
+        let report = run_retirement(&mut broker);
+        assert!(!report.scratch.full_listing, "the lap goes on: {report:#?}");
+        assert_eq!(report.scratch.lap_listed, 1, "{report:#?}");
+        assert_eq!(report.scratch.lap_remaining, 1, "{report:#?}");
+        assert!(run.is_dir(), "not reached yet");
+
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.lap_listed, 1, "{report:#?}");
+        assert_eq!(report.scratch.lap_remaining, 0, "{report:#?}");
+        assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
+        assert!(!run.exists());
+
+        // Listed once more as due (its listing showed a run), then idle.
+        let report = run_retirement(&mut broker);
+        assert_eq!(
+            (report.scratch.listed, report.scratch.lap_listed),
+            (1, 0),
+            "{report:#?}"
+        );
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.listed, 0, "{report:#?}");
+        let cursor: super::ScratchRetireCursor =
+            broker.meta_json(super::SESSION_SCRATCH_CURSOR_KEY);
+        assert!(!cursor.lap_open, "{cursor:?}");
+        assert!(cursor.listing_due.is_empty(), "{cursor:?}");
+    }
+
+    /// The probes of closed records start where the closed phase resumes,
+    /// at least one per pass with no budget left: a gone directory behind
+    /// the cursor is not probed before the ones after it.
+    #[test]
+    fn probes_start_where_the_closed_phase_resumes() {
+        let (_owner, _storage, mut broker) = fixture();
+        let sessions = sessions_in_record_order(&mut broker, 2, "scratch probe order");
+        for session in &sessions {
+            let path = broker.session_scratch_dir(session.id).unwrap();
+            broker
+                .close_abandoning_unpushed(session.id, "scratch fixture")
+                .unwrap();
+            std::fs::remove_dir(&path).unwrap();
+        }
+        let keys = broker
+            .session_scratch_records()
+            .into_keys()
+            .collect::<Vec<_>>();
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_CURSOR_KEY,
+                |cursor: &mut super::ScratchRetireCursor| {
+                    cursor.closed = Some(keys[0].clone());
+                },
+            )
+            .unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Incomplete {
+                reason: "lsof refused".into(),
+                observed: Vec::new(),
+            },
+        ));
+        let _budget = ClassifyBudget::set(Duration::ZERO);
+
+        let report = run(&mut broker);
+        assert_eq!(
+            (report.scratch.probed, report.scratch.forgotten_missing),
+            (1, 1),
+            "{report:#?}"
+        );
+        let left = broker.session_scratch_records();
+        assert!(left.contains_key(&keys[0]), "behind the cursor: {left:?}");
+        assert!(!left.contains_key(&keys[1]), "after the cursor: {left:?}");
+
+        let report = run(&mut broker);
+        assert_eq!(report.scratch.forgotten_missing, 1, "{report:#?}");
+        assert!(broker.session_scratch_records().is_empty());
+    }
+
+    /// Restores the measurement's per-pass cap when dropped.
+    struct MeasuredPerPass;
+
+    impl MeasuredPerPass {
+        fn set(cap: usize) -> Self {
+            super::MEASURED_PER_PASS_FOR_TEST.with(|cell| cell.set(Some(cap)));
+            Self
+        }
+    }
+
+    impl Drop for MeasuredPerPass {
+        fn drop(&mut self) {
+            super::MEASURED_PER_PASS_FOR_TEST.with(|cell| cell.set(None));
+        }
+    }
+
+    /// The measurement goes round over passes, resuming after the last
+    /// record it measured; the ledger shows the lap in progress as partial
+    /// until it went round, then the complete lap; a pass before the next
+    /// lap is due walks nothing; once due, a new lap starts.
+    #[test]
+    fn the_measurement_goes_round_over_passes_then_rests() {
+        let (_owner, _storage, mut broker) = fixture();
+        let sessions = sessions_in_record_order(&mut broker, 3, "scratch measured");
+        let last = broker.session_scratch_dir(sessions[2].id).unwrap();
+        std::fs::write(last.join("output.bin"), vec![7_u8; 256 * 1024]).unwrap();
+        let _cap = MeasuredPerPass::set(1);
+        let lap = |broker: &crate::Broker| -> super::MeasureLap {
+            broker.meta_json(super::SESSION_SCRATCH_MEASURE_KEY)
+        };
+
+        broker.record_session_scratch_usage(0);
+        let first = lap(&broker);
+        assert!(first.started_ms.is_some(), "{first:?}");
+        assert_eq!(first.so_far.measured, 1, "{first:?}");
+        assert_eq!(first.last, None, "{first:?}");
+        broker.record_session_scratch_usage(0);
+        assert_eq!(lap(&broker).so_far.measured, 2);
+        broker.record_session_scratch_usage(0);
+        let done = lap(&broker);
+        assert_eq!(done.started_ms, None, "went round: {done:?}");
+        let totals = done.last.clone().unwrap();
+        assert_eq!(totals.measured, 3, "{done:?}");
+        assert!(totals.bytes >= 256 * 1024, "{done:?}");
+        assert_eq!(totals.largest_session_id, Some(sessions[2].id));
+        assert!(!totals.partial, "{done:?}");
+
+        broker.record_session_scratch_usage(0);
+        assert_eq!(lap(&broker), done, "not due: nothing walked or written");
+
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_MEASURE_KEY,
+                |stored: &mut super::MeasureLap| {
+                    stored.last_completed_ms =
+                        Some(crate::clock::epoch_ms() - super::SCRATCH_MEASURE_INTERVAL_MS - 1);
+                },
+            )
+            .unwrap();
+        broker.record_session_scratch_usage(0);
+        let again = lap(&broker);
+        assert!(again.started_ms.is_some(), "a new lap: {again:?}");
+        assert_eq!(again.so_far.measured, 1, "{again:?}");
+        assert_eq!(again.last, done.last, "the complete lap is still shown");
+    }
+
+    #[test]
+    fn a_measurement_is_due_between_laps_only_after_the_interval() {
+        let interval = super::SCRATCH_MEASURE_INTERVAL_MS;
+        let rested = super::MeasureLap {
+            last_completed_ms: Some(1_000),
+            ..super::MeasureLap::default()
+        };
+        assert!(super::measure_due(&super::MeasureLap::default(), 0));
+        assert!(!super::measure_due(&rested, 1_000 + interval - 1));
+        assert!(super::measure_due(&rested, 1_000 + interval));
+        assert!(super::measure_due(&rested, 999), "the clock went back");
+        let running = super::MeasureLap {
+            started_ms: Some(1_000),
+            ..rested
+        };
+        assert!(super::measure_due(&running, 1_001), "a lap in progress");
     }
 
     /// Every directory kept in a pass has its keep recorded exactly once
