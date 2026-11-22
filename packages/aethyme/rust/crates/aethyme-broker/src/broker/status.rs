@@ -71,8 +71,7 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        #[cfg(target_os = "macos")]
-        self.push_gc_service_runtime_advice(&mut view);
+        view.advice.extend(self.gc_service_status_advice());
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -115,6 +114,9 @@ impl Broker {
         let overlaps = self.lease_overlaps_after_agent_reconciliation(&agents)?;
         let overlaps_ms = overlaps_started.elapsed().as_millis() as u64;
         let mut brief = self.build_status_brief(agents, overlaps, now_ms)?;
+        // The status agents run by default must notice a stale GC service
+        // binding too, not only `--full` (0.8.160 missed it here).
+        brief.advice.extend(self.gc_service_status_advice());
         brief.phase_timings_ms.insert("agents".into(), agents_ms);
         brief
             .phase_timings_ms
@@ -808,48 +810,56 @@ impl Broker {
     /// names a runtime that is no longer installed, a refresh left its record
     /// archived, or a load was meant and never confirmed; or, while it runs,
     /// that its passes reclaimed nothing for two hours with reclaimable
-    /// storage in view. A few file reads
-    /// under the user's Library; no launchctl. A binding that is gone or no
-    /// longer current also starts one detached `gc service status`, whose
-    /// automatic refresh asks launchd.
-    #[cfg(target_os = "macos")]
-    fn push_gc_service_runtime_advice(&self, view: &mut StatusView) {
-        let _span = crate::phase_telemetry::span("status_gc_service_runtime");
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let Ok(common) = self.repo_handle().git_common_dir() else {
-            return;
-        };
-        let Ok(Some(uuid)) =
-            crate::store::repository_identity::read_repository_uuid_marker(&common)
-        else {
-            return;
-        };
-        // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
-        let uid = unsafe { libc::geteuid() };
-        // One read of the service record: a binding that is gone or no
-        // longer current is rebound in the background (with backoff); then a
-        // service silently gone, and one that runs and keeps reclaiming
-        // nothing while reclaimable storage remains.
-        let Some(advice) = crate::gc_sweep_service::status_service_advice(
-            &home,
-            &uuid,
-            uid,
-            &self.main_root_path(),
-        ) else {
-            return;
-        };
-        view.advice.push(StatusAdvice {
-            id: advice.id,
-            severity: StatusAdviceSeverity::Warning,
-            reason: advice.reason,
-            summary: advice.summary.into(),
-            session_id: None,
-            queue_entry_id: None,
-            evidence: advice.evidence,
-            commands: advice.commands,
-        });
+    /// storage in view. A few file reads under the user's Library; no
+    /// launchctl. A binding that is gone or no longer current also starts one
+    /// detached `gc service status`, whose automatic refresh asks launchd.
+    ///
+    /// Every form of `broker status` that may write runs this (full, compact,
+    /// summary and the session view); `--read-only-snapshot` does not. Each
+    /// call counts exactly one `gc_service_status_*` or `gc_service_refresh_*`
+    /// outcome, so a metrics line always says which branch ran. Off macOS
+    /// there is no service and nothing is read or counted.
+    pub(crate) fn gc_service_status_advice(&self) -> Option<StatusAdvice> {
+        #[cfg(target_os = "macos")]
+        {
+            let _span = crate::phase_telemetry::span("status_gc_service_runtime");
+            let identity = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .and_then(|home| {
+                    let common = self.repo_handle().git_common_dir().ok()?;
+                    let uuid =
+                        crate::store::repository_identity::read_repository_uuid_marker(&common)
+                            .ok()
+                            .flatten()?;
+                    Some((home, uuid))
+                });
+            let Some((home, uuid)) = identity else {
+                crate::gc_sweep_service::ServiceCheck::IdentityUnavailable.count();
+                return None;
+            };
+            // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
+            let uid = unsafe { libc::geteuid() };
+            let advice = crate::gc_sweep_service::status_service_advice(
+                &home,
+                &uuid,
+                uid,
+                &self.main_root_path(),
+            )?;
+            Some(StatusAdvice {
+                id: advice.id,
+                severity: StatusAdviceSeverity::Warning,
+                reason: advice.reason,
+                summary: advice.summary.into(),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: advice.evidence,
+                commands: advice.commands,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 
     /// Warn when the last preparation could not verify a runtime probe: that
@@ -1055,8 +1065,7 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        #[cfg(target_os = "macos")]
-        self.push_gc_service_runtime_advice(&mut view);
+        view.advice.extend(self.gc_service_status_advice());
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

@@ -2786,43 +2786,132 @@ fn current_bundle(managed_root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// How one `broker status` look at this repository's GC service ended. Every
+/// look ends in exactly one of these and counts it ([`ServiceCheck::counter`]),
+/// so a metrics line always says which branch ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum ServiceCheck {
+    /// No home directory, git common directory or repository identity
+    /// marker: there is no service namespace to read.
+    IdentityUnavailable,
+    /// The service directory or its plan could not be read.
+    RecordUnreadable,
+    /// Neither a plan nor a unit file is recorded: no service is installed.
+    NotInstalled,
+    /// A plan without a unit file, a unit file without a plan, or a plan
+    /// naming no router or installation root: nothing to rebind.
+    RecordIncomplete,
+    /// The recorded router is the one `current` selects.
+    BindingCurrent,
+    /// The installation's `current` selector cannot be read: proves nothing.
+    BindingUnknown,
+    /// An earlier lock or receipt failure in this process stops it starting
+    /// anything again.
+    Latched,
+    /// An App Sandbox process could not reach launchd.
+    Sandboxed,
+    /// This process could not name its own executable.
+    RunningUnknown,
+    /// The binding is stale or gone, but this process does not run the
+    /// router the installation's `current` selector names (canonical paths
+    /// compared), so it may not rebind the service.
+    NotCurrentRouter,
+    /// The binding is stale or gone and this process runs the current
+    /// router: what it did about it.
+    Refresh(ScheduledRefresh),
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl ServiceCheck {
+    /// The phase counter this outcome adds: a fixed name, never a path or id.
+    pub(crate) fn counter(self) -> &'static str {
+        match self {
+            Self::IdentityUnavailable => "gc_service_status_identity_unavailable",
+            Self::RecordUnreadable => "gc_service_status_record_unreadable",
+            Self::NotInstalled => "gc_service_status_not_installed",
+            Self::RecordIncomplete => "gc_service_status_record_incomplete",
+            Self::BindingCurrent => "gc_service_status_binding_current",
+            Self::BindingUnknown => "gc_service_status_binding_unknown",
+            Self::Latched => "gc_service_refresh_latched",
+            Self::Sandboxed => "gc_service_refresh_sandboxed",
+            Self::RunningUnknown => "gc_service_refresh_running_unknown",
+            Self::NotCurrentRouter => "gc_service_refresh_not_current_router",
+            Self::Refresh(ScheduledRefresh::Started) => "gc_service_refresh_scheduled",
+            Self::Refresh(ScheduledRefresh::BackingOff) => "gc_service_refresh_backing_off",
+            Self::Refresh(ScheduledRefresh::Contended) => "gc_service_refresh_contended",
+            Self::Refresh(ScheduledRefresh::LockUnavailable) => {
+                "gc_service_refresh_lock_unavailable"
+            }
+            Self::Refresh(ScheduledRefresh::ReceiptUnwritable) => {
+                "gc_service_refresh_receipt_unwritable"
+            }
+            Self::Refresh(ScheduledRefresh::StartFailed) => "gc_service_refresh_start_failed",
+        }
+    }
+
+    /// Add this outcome's counter to the running command's phase telemetry.
+    pub(crate) fn count(self) {
+        crate::phase_telemetry::add(self.counter(), Duration::ZERO);
+    }
+
+    /// The evidence line the advice carries, when this look acted or held
+    /// back. A lock file this process cannot open is its own sandbox, not
+    /// news for every status call: counted, said nowhere.
+    fn evidence(self) -> Option<&'static str> {
+        match self {
+            Self::Refresh(ScheduledRefresh::LockUnavailable) => None,
+            Self::Refresh(scheduled) => Some(scheduled.describe()),
+            _ => None,
+        }
+    }
+}
+
 /// `broker status` noticing a stale binding on `record`: when its recorded
 /// runtime is gone or no longer current and `running()` (asked only then)
-/// is the installation's current router, take the service's installer claim
-/// without waiting (so concurrent callers start at most one), re-read the
-/// receipt under it, honour the backoff, write the receipt and `start` one
-/// background refresh. Files, selector links and one lock; launchd is asked
-/// by the refresh, which repeats every proof under the claim. Prints
-/// nothing: failures are counted. `None` when the binding needs nothing.
+/// names the installation's current router, take the service's installer
+/// claim without waiting (so concurrent callers start at most one), re-read
+/// the receipt under it, honour the backoff, write the receipt and `start`
+/// one background refresh. Files, selector links and one lock; launchd is
+/// asked by the refresh, which repeats every proof under the claim. Prints
+/// nothing and counts nothing: the caller counts the returned outcome.
 fn schedule_refresh_with(
     record: &InstallationRecord,
     uid: u32,
-    running: impl FnOnce() -> Option<PathBuf>,
+    running: impl FnOnce() -> Result<PathBuf, ServiceCheck>,
     now_unix_ms: u64,
     start: impl FnOnce(&Path) -> io::Result<()>,
-) -> Option<ScheduledRefresh> {
+) -> ServiceCheck {
     let _span = crate::phase_telemetry::span("gc_service_refresh_schedule");
+    if !record.exists() {
+        return ServiceCheck::NotInstalled;
+    }
     if record.plan_bytes.is_none() || !record.unit_present {
-        return None;
+        return ServiceCheck::RecordIncomplete;
     }
-    let router = record.router.as_deref()?;
-    let managed_root = record.managed_root.as_deref()?;
-    if !runtime_binding(router, managed_root).needs_refresh() {
-        return None;
+    let (Some(router), Some(managed_root)) =
+        (record.router.as_deref(), record.managed_root.as_deref())
+    else {
+        return ServiceCheck::RecordIncomplete;
+    };
+    match runtime_binding(router, managed_root) {
+        RuntimeBinding::Current => return ServiceCheck::BindingCurrent,
+        RuntimeBinding::Unknown => return ServiceCheck::BindingUnknown,
+        RuntimeBinding::Stale | RuntimeBinding::Gone => {}
     }
-    let running = running()?;
+    let running = match running() {
+        Ok(running) => running,
+        Err(check) => return check,
+    };
     if !running_is_current_selection(&running, managed_root) {
-        return None;
+        return ServiceCheck::NotCurrentRouter;
     }
     let claim = match crate::pr_watch_service_install::claim_installer(&record.directory, uid) {
         Ok(claim) => claim,
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            return Some(ScheduledRefresh::Contended);
+            return ServiceCheck::Refresh(ScheduledRefresh::Contended);
         }
-        Err(_) => {
-            crate::phase_telemetry::add("gc_service_refresh_lock_unavailable", Duration::ZERO);
-            return Some(ScheduledRefresh::LockUnavailable);
-        }
+        Err(_) => return ServiceCheck::Refresh(ScheduledRefresh::LockUnavailable),
     };
     let bundle = current_bundle(managed_root);
     let previous = read_bounded_json(&record.directory.join(SCHEDULED_REFRESH_RECEIPT), uid);
@@ -2846,7 +2935,7 @@ fn schedule_refresh_with(
     let last = if same_bundle { previous_at } else { None }.max(refreshed_at);
     let wait = scheduled_refresh_backoff_ms(failed_attempts.saturating_sub(1));
     if last.is_some_and(|at| now_unix_ms.saturating_sub(at) < wait) {
-        return Some(ScheduledRefresh::BackingOff);
+        return ServiceCheck::Refresh(ScheduledRefresh::BackingOff);
     }
     // The receipt goes first: without it nothing bounds the next start.
     let receipt = json!({
@@ -2864,19 +2953,42 @@ fn schedule_refresh_with(
     // The receipt bounds the next start; the child takes the claim itself.
     drop(claim);
     if written.is_err() {
-        crate::phase_telemetry::add("gc_service_refresh_receipt_unwritable", Duration::ZERO);
-        return Some(ScheduledRefresh::ReceiptUnwritable);
+        return ServiceCheck::Refresh(ScheduledRefresh::ReceiptUnwritable);
     }
     match start(running.as_path()) {
-        Ok(()) => {
-            crate::phase_telemetry::add("gc_service_refresh_scheduled", Duration::ZERO);
-            Some(ScheduledRefresh::Started)
-        }
-        Err(_) => {
-            crate::phase_telemetry::add("gc_service_refresh_start_failed", Duration::ZERO);
-            Some(ScheduledRefresh::StartFailed)
-        }
+        Ok(()) => ServiceCheck::Refresh(ScheduledRefresh::Started),
+        Err(_) => ServiceCheck::Refresh(ScheduledRefresh::StartFailed),
     }
+}
+
+/// One `broker status` look at this repository's service, on any platform:
+/// read the record once, decide ([`schedule_refresh_with`]), count the
+/// outcome, and return it with the advice for the record (files only, no
+/// launchctl). `running` is asked only for a stale or gone binding.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn status_service_check(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    running: impl FnOnce() -> Result<PathBuf, ServiceCheck>,
+    now_unix_ms: u64,
+    start: impl FnOnce(&Path) -> io::Result<()>,
+) -> (ServiceCheck, Option<RepairAdvice>) {
+    let Ok(record) = read_record(home, uuid, uid) else {
+        ServiceCheck::RecordUnreadable.count();
+        return (ServiceCheck::RecordUnreadable, None);
+    };
+    let check = schedule_refresh_with(&record, uid, running, now_unix_ms, start);
+    check.count();
+    let advice = repair_advice_for(&record, home, uuid, uid)
+        .or_else(|| reclaim_advice(home, uuid))
+        .map(|mut advice| {
+            if let Some(line) = check.evidence() {
+                advice.evidence.push(line.into());
+            }
+            advice
+        });
+    (check, advice)
 }
 
 /// Set once a scheduling receipt could not be written, or the service's lock
@@ -2886,14 +2998,13 @@ fn schedule_refresh_with(
 static SCHEDULE_RECEIPT_UNWRITABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// `broker status` on macOS: read this repository's service record once,
-/// maybe start a background refresh ([`schedule_refresh_with`]), and return
-/// the advice for it. The background refresh is
-/// `<running> broker gc service status --json` in `repository`, in its own
-/// process group with no stdio and the tick variables removed. Not started
-/// from an App Sandbox process (`APP_SANDBOX_CONTAINER_ID` set), which could
-/// not reach launchd; other sandboxes are not cheaply knowable and are
-/// bounded by the backoff.
+/// `broker status` on macOS: [`status_service_check`] with this process's
+/// executable as the running router and the detached refresh as the start.
+/// The background refresh is `<running> broker gc service status --json` in
+/// `repository`, in its own process group with no stdio and the tick
+/// variables removed. Not started from an App Sandbox process
+/// (`APP_SANDBOX_CONTAINER_ID` set), which could not reach launchd; other
+/// sandboxes are not cheaply knowable and are bounded by the backoff.
 #[cfg(target_os = "macos")]
 pub(crate) fn status_service_advice(
     home: &Path,
@@ -2903,62 +3014,46 @@ pub(crate) fn status_service_advice(
 ) -> Option<RepairAdvice> {
     use std::os::unix::process::CommandExt as _;
     use std::sync::atomic::Ordering;
-    let record = read_record(home, uuid, uid).ok()?;
-    let scheduled = if SCHEDULE_RECEIPT_UNWRITABLE.load(Ordering::Relaxed)
-        || std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some()
-    {
-        None
-    } else {
-        let now = now_unix_ms().unwrap_or(0);
-        let outcome = schedule_refresh_with(
-            &record,
-            uid,
-            || std::env::current_exe().ok(),
-            now,
-            |running| {
-                let mut command = std::process::Command::new(running);
-                command
-                    .args(["broker", "gc", "service", "status", "--json"])
-                    .current_dir(repository)
-                    .env_remove(SERVICE_ENV_UUID)
-                    .env_remove(SERVICE_ENV_GENERATION)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .process_group(0);
-                let mut child = command.spawn()?;
-                // Reap it whenever it ends; a short-lived caller exits first.
-                std::thread::spawn(move || {
-                    if child.wait().is_err() {
-                        crate::phase_telemetry::add(
-                            "gc_service_refresh_reap_failed",
-                            Duration::ZERO,
-                        );
-                    }
-                });
-                Ok(())
-            },
-        );
-        match outcome {
-            Some(ScheduledRefresh::ReceiptUnwritable) => {
-                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
-                outcome
-            }
-            // Latched, and said nowhere: a denied lock is this process's
-            // sandbox, not news for every status call.
-            Some(ScheduledRefresh::LockUnavailable) => {
-                SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
-                None
-            }
-            other => other,
+    let running = || {
+        if SCHEDULE_RECEIPT_UNWRITABLE.load(Ordering::Relaxed) {
+            return Err(ServiceCheck::Latched);
         }
+        if std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some() {
+            return Err(ServiceCheck::Sandboxed);
+        }
+        std::env::current_exe().map_err(|_| ServiceCheck::RunningUnknown)
     };
-    let mut advice =
-        repair_advice_for(&record, home, uuid, uid).or_else(|| reclaim_advice(home, uuid))?;
-    if let Some(scheduled) = scheduled {
-        advice.evidence.push(scheduled.describe().into());
+    let start = |running: &Path| -> io::Result<()> {
+        let mut command = std::process::Command::new(running);
+        command
+            .args(["broker", "gc", "service", "status", "--json"])
+            .current_dir(repository)
+            .env_remove(SERVICE_ENV_UUID)
+            .env_remove(SERVICE_ENV_GENERATION)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn()?;
+        // Reap it whenever it ends; a short-lived caller exits first.
+        std::thread::spawn(move || {
+            if child.wait().is_err() {
+                crate::phase_telemetry::add("gc_service_refresh_reap_failed", Duration::ZERO);
+            }
+        });
+        Ok(())
+    };
+    let (check, advice) =
+        status_service_check(home, uuid, uid, running, now_unix_ms().unwrap_or(0), start);
+    if matches!(
+        check,
+        ServiceCheck::Refresh(
+            ScheduledRefresh::ReceiptUnwritable | ScheduledRefresh::LockUnavailable
+        )
+    ) {
+        SCHEDULE_RECEIPT_UNWRITABLE.store(true, Ordering::Relaxed);
     }
-    Some(advice)
+    advice
 }
 
 /// A `broker status` advice row about this repository's scheduled GC
@@ -5144,24 +5239,30 @@ mod tests {
         let runtime = newer_runtime(&plan);
         let record = || read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
         let never = |_: &Path| -> io::Result<()> { panic!("no refresh is started") };
-        let router = || Some(runtime.router.clone());
+        let router = || -> Result<PathBuf, ServiceCheck> { Ok(runtime.router.clone()) };
         // No selector, or a current binding: nothing, and the running
         // executable is not even asked for.
-        let unasked = || -> Option<PathBuf> { panic!("current_exe is not needed") };
+        let unasked = || -> Result<PathBuf, ServiceCheck> { panic!("current_exe is not needed") };
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
-            None
+            ServiceCheck::BindingUnknown
         );
         select_current(&plan, "v0.8.50-test");
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
-            None
+            ServiceCheck::BindingCurrent
         );
         select_current(&plan, "v0.8.51-test");
         // Stale, but the caller is not the current runtime: nothing.
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, || Some(plan.router.clone()), 1, never),
-            None
+            schedule_refresh_with(
+                &record(),
+                plan.uid,
+                || Ok::<_, ServiceCheck>(plan.router.clone()),
+                1,
+                never
+            ),
+            ServiceCheck::NotCurrentRouter
         );
         // Another caller holding the claim decides: this one starts nothing.
         let now = 10_000_000;
@@ -5170,7 +5271,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 schedule_refresh_with(&record(), plan.uid, router, now, never),
-                Some(ScheduledRefresh::Contended)
+                ServiceCheck::Refresh(ScheduledRefresh::Contended)
             );
         }
         let mut started = Vec::new();
@@ -5178,7 +5279,7 @@ mod tests {
             started.push(running.to_path_buf());
             Ok(())
         });
-        assert_eq!(scheduled, Some(ScheduledRefresh::Started));
+        assert_eq!(scheduled, ServiceCheck::Refresh(ScheduledRefresh::Started));
         assert_eq!(started, vec![runtime.router.clone()]);
         let receipt =
             read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
@@ -5188,7 +5289,7 @@ mod tests {
         // The callers that lost the race see the receipt under the claim.
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, router, now + 1, never),
-            Some(ScheduledRefresh::BackingOff)
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
         );
         // The first attempt left it stale: the second waits 15 minutes, the
         // third 30.
@@ -5196,12 +5297,12 @@ mod tests {
         let ok = |_: &Path| -> io::Result<()> { Ok(()) };
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, router, now + interval - 1, never),
-            Some(ScheduledRefresh::BackingOff)
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
         );
         let second = now + interval;
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, router, second, ok),
-            Some(ScheduledRefresh::Started)
+            ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
         assert_eq!(
             schedule_refresh_with(
@@ -5211,12 +5312,12 @@ mod tests {
                 second + 2 * interval - 1,
                 never
             ),
-            Some(ScheduledRefresh::BackingOff)
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
         );
         let third = second + 2 * interval;
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, router, third, ok),
-            Some(ScheduledRefresh::Started)
+            ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
         let receipt =
             read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
@@ -5226,12 +5327,12 @@ mod tests {
         fs::create_dir_all(&newest).unwrap();
         fs::write(newest.join("aethyme"), b"newest router fixture").unwrap();
         select_current(&plan, "v0.8.52-test");
-        let newest_router = || Some(newest.join("aethyme"));
+        let newest_router = || -> Result<PathBuf, ServiceCheck> { Ok(newest.join("aethyme")) };
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, newest_router, third + 1, |_| Err(
                 io::Error::other("spawn refused")
             )),
-            Some(ScheduledRefresh::StartFailed)
+            ServiceCheck::Refresh(ScheduledRefresh::StartFailed)
         );
         let receipt =
             read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
@@ -5247,6 +5348,243 @@ mod tests {
             assert!(!outcome.describe().is_empty());
         }
         assert_unchanged(&plan);
+    }
+
+    /// The counts `phase_telemetry` accumulated, by name.
+    fn counted(
+        recorder: &crate::phase_telemetry::Recorder,
+    ) -> std::collections::BTreeMap<String, u64> {
+        recorder.totals().1
+    }
+
+    #[test]
+    fn every_status_look_counts_exactly_one_outcome() {
+        let (_temp, plan) = fixture();
+        let never = |_: &Path| -> io::Result<()> { panic!("no refresh is started") };
+        let unasked = || -> Result<PathBuf, ServiceCheck> { panic!("current_exe is not needed") };
+        let look = |running: &dyn Fn() -> Result<PathBuf, ServiceCheck>,
+                    start: &dyn Fn(&Path) -> io::Result<()>| {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let (check, advice) = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                status_service_check(
+                    &plan.home,
+                    &plan.repository_uuid,
+                    plan.uid,
+                    running,
+                    10_000_000,
+                    start,
+                )
+            };
+            let counts = counted(&recorder);
+            let outcomes: Vec<_> = counts
+                .keys()
+                .filter(|name| {
+                    name.starts_with("gc_service_status_")
+                        || name.starts_with("gc_service_refresh_")
+                })
+                .filter(|name| name.as_str() != "gc_service_refresh_schedule")
+                .cloned()
+                .collect();
+            assert_eq!(outcomes, vec![check.counter().to_string()], "{counts:?}");
+            assert_eq!(counts[check.counter()], 1);
+            (check, advice)
+        };
+        // Nothing recorded: not installed, and the decision is still counted.
+        assert_eq!(look(&unasked, &never).0, ServiceCheck::NotInstalled);
+        install_fixture(&plan);
+        // No selector: the binding proves nothing.
+        assert_eq!(look(&unasked, &never).0, ServiceCheck::BindingUnknown);
+        select_current(&plan, "v0.8.50-test");
+        assert_eq!(look(&unasked, &never), (ServiceCheck::BindingCurrent, None));
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        // Stale: the running executable decides, and a reason it cannot be
+        // asked is that look's outcome.
+        for blocked in [
+            ServiceCheck::Latched,
+            ServiceCheck::Sandboxed,
+            ServiceCheck::RunningUnknown,
+        ] {
+            let (check, advice) = look(
+                &move || -> Result<PathBuf, ServiceCheck> { Err(blocked) },
+                &never,
+            );
+            assert_eq!(check, blocked);
+            assert_eq!(advice.unwrap().id, "storage.gc-service-runtime-stale");
+        }
+        let previous = plan.router.clone();
+        assert_eq!(
+            look(
+                &move || -> Result<PathBuf, ServiceCheck> { Ok(previous.clone()) },
+                &never
+            )
+            .0,
+            ServiceCheck::NotCurrentRouter
+        );
+        let current = runtime.router.clone();
+        let (check, advice) = look(
+            &move || -> Result<PathBuf, ServiceCheck> { Ok(current.clone()) },
+            &|_: &Path| -> io::Result<()> { Ok(()) },
+        );
+        assert_eq!(check, ServiceCheck::Refresh(ScheduledRefresh::Started));
+        let advice = advice.unwrap();
+        assert_eq!(advice.id, "storage.gc-service-runtime-stale");
+        assert!(
+            advice
+                .evidence
+                .iter()
+                .any(|line| line == ScheduledRefresh::Started.describe())
+        );
+        let current = runtime.router.clone();
+        assert_eq!(
+            look(
+                &move || -> Result<PathBuf, ServiceCheck> { Ok(current.clone()) },
+                &never
+            )
+            .0,
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
+        );
+        // A plan without its unit file is not rebound by `broker status`.
+        fs::remove_file(&plan.unit_path).unwrap();
+        let (check, advice) = look(&unasked, &never);
+        assert_eq!(check, ServiceCheck::RecordIncomplete);
+        assert_eq!(advice.unwrap().id, "storage.gc-service-unit-missing");
+        // A service path that is not a directory cannot be read at all.
+        fs::remove_dir_all(&plan.directory).unwrap();
+        fs::write(&plan.directory, b"not a directory").unwrap();
+        assert_eq!(
+            look(&unasked, &never),
+            (ServiceCheck::RecordUnreadable, None)
+        );
+    }
+
+    #[test]
+    fn service_check_counters_are_distinct_fixed_names() {
+        let all = [
+            ServiceCheck::IdentityUnavailable,
+            ServiceCheck::RecordUnreadable,
+            ServiceCheck::NotInstalled,
+            ServiceCheck::RecordIncomplete,
+            ServiceCheck::BindingCurrent,
+            ServiceCheck::BindingUnknown,
+            ServiceCheck::Latched,
+            ServiceCheck::Sandboxed,
+            ServiceCheck::RunningUnknown,
+            ServiceCheck::NotCurrentRouter,
+            ServiceCheck::Refresh(ScheduledRefresh::Started),
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff),
+            ServiceCheck::Refresh(ScheduledRefresh::Contended),
+            ServiceCheck::Refresh(ScheduledRefresh::LockUnavailable),
+            ServiceCheck::Refresh(ScheduledRefresh::ReceiptUnwritable),
+            ServiceCheck::Refresh(ScheduledRefresh::StartFailed),
+        ];
+        let names: std::collections::BTreeSet<_> = all.iter().map(|c| c.counter()).collect();
+        assert_eq!(names.len(), all.len());
+        for name in names {
+            assert!(name.starts_with("gc_service_"), "{name}");
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{name}"
+            );
+        }
+        // A lock this process cannot open is counted and said nowhere.
+        assert_eq!(
+            ServiceCheck::Refresh(ScheduledRefresh::LockUnavailable).evidence(),
+            None
+        );
+        assert_eq!(ServiceCheck::NotCurrentRouter.evidence(), None);
+        assert!(
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
+                .evidence()
+                .is_some()
+        );
+    }
+
+    /// The installation as a person's shell reaches it: a link on PATH to
+    /// `<managed>/current/aethyme`, `current` a relative link to the bundle,
+    /// and the installation itself reached through a directory alias.
+    #[test]
+    fn the_running_router_is_compared_through_links_both_ways() {
+        let (temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        let root = &plan.managed_root;
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // PATH link -> `current/aethyme` (unresolved through `current`).
+        let on_path = bin.join("aethyme");
+        std::os::unix::fs::symlink(root.join("current").join("aethyme"), &on_path).unwrap();
+        // A relative PATH link, as `ln -s ../install/...` makes it.
+        let relative = bin.join("aethyme-relative");
+        std::os::unix::fs::symlink(
+            PathBuf::from("../install/.aethyme-managed/current/aethyme"),
+            &relative,
+        )
+        .unwrap();
+        // The installation reached through a directory alias.
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path().join("install"), &alias).unwrap();
+        let aliased_root = alias.join(".aethyme-managed");
+        // A link that names the bundle kept as previous.
+        let to_previous = bin.join("aethyme-previous");
+        std::os::unix::fs::symlink(&plan.router, &to_previous).unwrap();
+        let dangling = bin.join("aethyme-dangling");
+        std::os::unix::fs::symlink(root.join("versions/v0.8.99-test/aethyme"), &dangling).unwrap();
+
+        for running in [
+            on_path.clone(),
+            relative.clone(),
+            root.join("current").join("aethyme"),
+            runtime.router.clone(),
+            aliased_root.join("current").join("aethyme"),
+            aliased_root.join("versions/v0.8.51-test/aethyme"),
+        ] {
+            assert!(
+                running_is_current_selection(&running, root),
+                "{}",
+                running.display()
+            );
+            assert!(
+                running_is_current_selection(&running, &aliased_root),
+                "{}",
+                running.display()
+            );
+        }
+        for running in [to_previous, dangling, plan.router.clone(), root.clone()] {
+            assert!(
+                !running_is_current_selection(&running, root),
+                "{}",
+                running.display()
+            );
+        }
+        // The recorded side through links too: a router recorded through the
+        // alias is the same file, so the binding classifies by file identity.
+        assert_eq!(
+            runtime_binding(&aliased_root.join("versions/v0.8.51-test/aethyme"), root),
+            RuntimeBinding::Current
+        );
+        assert_eq!(
+            runtime_binding(&plan.router, &aliased_root),
+            RuntimeBinding::Stale
+        );
+        // `broker status` run through the PATH link schedules the refresh and
+        // starts it with the path it was given.
+        let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        let mut started = Vec::new();
+        let check = schedule_refresh_with(
+            &record,
+            plan.uid,
+            || Ok::<_, ServiceCheck>(on_path.clone()),
+            10_000_000,
+            |running| {
+                started.push(running.to_path_buf());
+                Ok(())
+            },
+        );
+        assert_eq!(check, ServiceCheck::Refresh(ScheduledRefresh::Started));
+        assert_eq!(started, vec![on_path]);
     }
 
     #[test]
@@ -5572,7 +5910,7 @@ mod tests {
         let runtime = newer_runtime(&plan);
         select_current(&plan, "v0.8.51-test");
         let record = || read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
-        let router = || Some(runtime.router.clone());
+        let router = || -> Result<PathBuf, ServiceCheck> { Ok(runtime.router.clone()) };
         let now = 10_000_000;
         for name in [SCHEDULED_REFRESH_RECEIPT, "last-refresh.json"] {
             write_private(
@@ -5587,7 +5925,7 @@ mod tests {
         }
         assert_eq!(
             schedule_refresh_with(&record(), plan.uid, router, now, |_| Ok(())),
-            Some(ScheduledRefresh::Started)
+            ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
     }
 
