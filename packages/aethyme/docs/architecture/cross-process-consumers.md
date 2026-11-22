@@ -4555,7 +4555,7 @@ visit resumed after its run cursor); spans
 `session_scratch_retire_signal_clear` (storing what signals made due and
 clearing them), `session_scratch_retire_due_listing` and
 `session_scratch_retire_lap_listing` (one per `tmp-done` listing, so the
-phase count over the span total is the per-listing latency),
+span total over its phase count is the per-listing latency),
 `session_scratch_retire_lap` (the lap's share), `session_scratch_retire_probes`
 (the probe step) and `session_scratch_retire_probe` (one per probe); attachment `scratch_move_failures`,
 keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
