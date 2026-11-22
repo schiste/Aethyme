@@ -2808,6 +2808,23 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
         }
     );
     out!("  scope: {} at {}", report.scope, report.at_ms);
+    if report.artifact_lane != crate::ArtifactSweepLane::Ran {
+        out!(
+            "  artifact cache lane did not run: {}",
+            report.artifact_lane.as_str()
+        );
+    }
+    let trash = &report.checkout_trash;
+    if trash.recorded > 0 || trash.confirmed_this_pass > 0 {
+        out!(
+            "  checkout trash: {} recorded, {} deletable by the paced deleter, {} unconfirmed ({} stale); {} confirmed by this sweep",
+            trash.recorded,
+            trash.deletable,
+            trash.pending,
+            trash.stale_pending,
+            trash.confirmed_this_pass
+        );
+    }
     out!(
         "  logical file bytes observed during traversal for later-unlinked entries: {} (sizes can change before unlink; physical space recovered is not measured)",
         human_bytes(report.observed_logical_file_bytes)

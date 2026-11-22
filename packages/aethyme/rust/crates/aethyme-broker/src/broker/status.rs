@@ -805,7 +805,9 @@ impl Broker {
 
     /// Warn when this repository's scheduled GC service is silently gone: it
     /// names a runtime that is no longer installed, a refresh left its record
-    /// archived, or a load was meant and never confirmed. A few file reads
+    /// archived, or a load was meant and never confirmed; or, while it runs,
+    /// that its passes reclaimed nothing for two hours with reclaimable
+    /// storage in view. A few file reads
     /// under the user's Library; no launchctl.
     #[cfg(target_os = "macos")]
     fn push_gc_service_runtime_advice(&self, view: &mut StatusView) {
@@ -823,7 +825,11 @@ impl Broker {
         };
         // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
         let uid = unsafe { libc::geteuid() };
-        let Some(advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid) else {
+        // A service silently gone first; then one that runs and keeps
+        // reclaiming nothing while reclaimable storage remains.
+        let Some(advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid)
+            .or_else(|| crate::gc_sweep_service::reclaim_advice(&home, &uuid))
+        else {
             return;
         };
         view.advice.push(StatusAdvice {

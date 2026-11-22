@@ -92,6 +92,122 @@ struct LastPassReceipt {
     disk_pressured: Option<bool>,
     legacy_unscoped_state: Option<String>,
     error: Option<String>,
+    // Per-lane fields, added within v1: absent from older receipts, and
+    // ignored by older readers (no `deny_unknown_fields`).
+    /// `ran`, or why the artifact cache lane returned at once
+    /// ([`crate::ArtifactSweepLane`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_lane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entries_reclaimed: Option<usize>,
+    /// Logical file bytes observed before unlink plus preparation-cache bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes_reclaimed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkouts_removed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkouts_kept: Option<usize>,
+    /// The trash as this pass found it (the last observation on a failed
+    /// pass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash: Option<crate::CheckoutTrashBacklog>,
+    /// Entries the paced deleter removed from the deletable backlog since
+    /// the previous pass (a floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash_entries_drained: Option<usize>,
+    /// Set when the pass reclaimed nothing: the one cause that explains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reclaimed_nothing_because: Option<String>,
+    /// Consecutive passes, this one included, that reclaimed nothing.
+    #[serde(default)]
+    passes_without_reclaim: u64,
+    /// When the first of those passes started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unreclaimed_since_unix_ms: Option<u64>,
+}
+
+/// Consecutive passes that reclaimed nothing before `broker status` says so
+/// (two hours at the fixed 900 s interval).
+const UNRECLAIMED_PASSES_ADVICE_THRESHOLD: u64 = 8;
+
+/// What the paced host deleter did to the confirmed trash between the
+/// previous pass and this one. It deletes the oldest entries first, so a
+/// backlog that shrank (net of this pass's confirmations) or whose oldest
+/// entry moved forward is draining. `None` without a previous observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrashDrain {
+    /// Entries gone from the deletable backlog since the previous pass (a
+    /// floor: entries trashed meanwhile hide some).
+    entries: usize,
+    draining: bool,
+}
+
+fn trash_drain_since(
+    previous: Option<&crate::CheckoutTrashBacklog>,
+    current: &crate::CheckoutTrashBacklog,
+) -> Option<TrashDrain> {
+    let previous = previous?;
+    let entries = previous
+        .deletable
+        .saturating_add(current.confirmed_this_pass)
+        .saturating_sub(current.deletable);
+    let oldest_moved = match (
+        previous.oldest_deletable_created_ms,
+        current.oldest_deletable_created_ms,
+    ) {
+        (Some(before), Some(now)) => now > before,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    Some(TrashDrain {
+        entries,
+        draining: entries > 0 || oldest_moved,
+    })
+}
+
+/// Whether a pass reclaimed or confirmed anything, counting what the paced
+/// deleter removed from the trash since the previous pass.
+fn pass_reclaimed(report: &crate::ArtifactSweepReport, drain: Option<TrashDrain>) -> bool {
+    report.directories_reclaimed > 0
+        || report.entries_reclaimed > 0
+        || report.observed_logical_file_bytes > 0
+        || report.preparation_cache_bytes_reclaimed > 0
+        || report.checkout_trash.confirmed_this_pass > 0
+        || drain.is_some_and(|drain| drain.draining)
+        || report
+            .auto_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| !cleanup.removed.is_empty())
+}
+
+/// The one cause that explains a pass that reclaimed nothing: a stalled
+/// deleter first (actionable), then the lane that actually blocked, then
+/// trash rows no command can help. `None` when nothing reclaimable was in
+/// view, or a trash backlog had no previous observation to compare with.
+fn reclaimed_nothing_because(
+    report: &crate::ArtifactSweepReport,
+    drain: Option<TrashDrain>,
+) -> Option<&'static str> {
+    let trash = &report.checkout_trash;
+    if trash.deletable > 0 && drain.is_some_and(|drain| !drain.draining) {
+        Some("trash_not_draining")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::GcLockHeld {
+        Some("artifact_lane_yielded_to_worker")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::Disabled {
+        Some("artifact_lane_disabled")
+    } else if report.artifact_lane == crate::ArtifactSweepLane::PausedByStrictCleanup {
+        Some("artifact_lane_paused_by_strict_cleanup")
+    } else if !report.complete {
+        Some("artifact_lane_budget_spent")
+    } else if trash.stale_pending > 0 {
+        // Kept by the proofs (identity changed, session in use, trash not
+        // readable as recorded): nothing to run, so never advised.
+        Some("trash_entries_kept_by_proofs")
+    } else if trash.pending > 0 {
+        Some("trash_entries_awaiting_mover")
+    } else {
+        None
+    }
 }
 
 /// Kept alive for the complete managed tick so uninstall and control cannot
@@ -633,8 +749,28 @@ fn write_last_pass(
     error: Option<&str>,
 ) -> io::Result<()> {
     // Parse and bind any previous receipt before replacing it.
-    let _previous_pass = read_last_pass(plan)?;
+    let previous_pass = read_last_pass(plan)?;
     let finished_at_unix_ms = now_unix_ms()?;
+    let previous_trash = previous_pass.as_ref().and_then(|previous| previous.trash);
+    let drain = report
+        .and_then(|report| trash_drain_since(previous_trash.as_ref(), &report.checkout_trash));
+    // A failed pass neither extends nor resets the run of empty passes.
+    let reclaimed = report.map(|report| pass_reclaimed(report, drain));
+    let (passes_without_reclaim, unreclaimed_since_unix_ms) = match (reclaimed, &previous_pass) {
+        (Some(true), _) => (0, None),
+        (Some(false), Some(previous)) if previous.passes_without_reclaim > 0 => (
+            previous.passes_without_reclaim.saturating_add(1),
+            previous
+                .unreclaimed_since_unix_ms
+                .or(Some(started_at_unix_ms)),
+        ),
+        (Some(false), _) => (1, Some(started_at_unix_ms)),
+        (None, Some(previous)) => (
+            previous.passes_without_reclaim,
+            previous.unreclaimed_since_unix_ms,
+        ),
+        (None, None) => (0, None),
+    };
     let receipt = LastPassReceipt {
         schema: RECEIPT_SCHEMA.to_string(),
         repository_uuid: plan.repository_uuid.clone(),
@@ -657,6 +793,31 @@ fn write_last_pass(
             }
         }),
         error: error.map(bounded_error),
+        artifact_lane: report.map(|report| report.artifact_lane.as_str().to_string()),
+        entries_reclaimed: report.map(|report| report.entries_reclaimed),
+        bytes_reclaimed: report.map(|report| {
+            report
+                .observed_logical_file_bytes
+                .saturating_add(report.preparation_cache_bytes_reclaimed)
+        }),
+        checkouts_removed: report
+            .and_then(|report| report.auto_cleanup.as_ref())
+            .map(|cleanup| cleanup.removed.len()),
+        checkouts_kept: report
+            .and_then(|report| report.auto_cleanup.as_ref())
+            .map(|cleanup| cleanup.kept.len()),
+        // A failed pass keeps the last observation, so the next pass still
+        // measures the deleter against it.
+        trash: report
+            .map(|report| report.checkout_trash)
+            .or(previous_trash),
+        trash_entries_drained: drain.map(|drain| drain.entries),
+        reclaimed_nothing_because: report
+            .filter(|report| !pass_reclaimed(report, drain))
+            .and_then(|report| reclaimed_nothing_because(report, drain))
+            .map(str::to_string),
+        passes_without_reclaim,
+        unreclaimed_since_unix_ms,
     };
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     if bytes.len() > MAX_RECEIPT_BYTES {
@@ -2138,6 +2299,66 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
     })
 }
 
+/// What `broker status` should say when the service runs but its passes
+/// have reclaimed nothing for [`UNRECLAIMED_PASSES_ADVICE_THRESHOLD`] passes
+/// while the last one saw reclaimable work: the cause it recorded and the
+/// command that acts on it. Files only (no launchctl).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn reclaim_advice(home: &Path, uuid: &str) -> Option<RepairAdvice> {
+    let (plan, _) = load(home, uuid).ok()?;
+    let receipt = read_last_pass(&plan).ok().flatten()?;
+    reclaim_advice_for(&receipt)
+}
+
+fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
+    if receipt.passes_without_reclaim < UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+        return None;
+    }
+    let cause = receipt.reclaimed_nothing_because.as_deref()?;
+    // Only causes a command can act on: a lane that yielded to the detached
+    // worker or was disabled on purpose, and trash rows the proofs keep, are
+    // explained in the receipt and need nobody.
+    let (reason, command): (&'static str, &str) = match cause {
+        "trash_not_draining" => (
+            "confirmed checkout trash entries are waiting and the backlog has not shrunk between passes: the paced host deleter is not getting to them",
+            "aethyme broker gc trash drain --json",
+        ),
+        "artifact_lane_budget_spent" => (
+            "the artifact cache lane keeps stopping at its budget with work left and reclaims nothing",
+            "aethyme broker gc sweep --json",
+        ),
+        _ => return None,
+    };
+    let mut evidence = vec![format!(
+        "{} consecutive passes reclaimed nothing; recorded cause: {cause}",
+        receipt.passes_without_reclaim
+    )];
+    if let Some(since) = receipt.unreclaimed_since_unix_ms {
+        evidence.push(format!(
+            "first empty pass started at (ms since epoch): {since}"
+        ));
+    }
+    if let Some(trash) = receipt.trash {
+        evidence.push(format!(
+            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale)",
+            trash.recorded, trash.deletable, trash.pending, trash.stale_pending
+        ));
+    }
+    if let Some(lane) = &receipt.artifact_lane {
+        evidence.push(format!("artifact cache lane: {lane}"));
+    }
+    Some(RepairAdvice {
+        id: "storage.gc-service-reclaiming-nothing",
+        reason,
+        summary: "this repository's scheduled GC sweep has reclaimed nothing for at least two hours while reclaimable storage remains",
+        evidence,
+        commands: vec![
+            command.to_string(),
+            "aethyme broker gc service status --json".into(),
+        ],
+    })
+}
+
 /// `gc service status` retries the bootstrap of a service whose last
 /// activation or refresh was never confirmed, under the same proofs as the
 /// automatic refresh (marker uuid, verified plan and unit, this repository,
@@ -2429,6 +2650,8 @@ mod tests {
             budget_ms: 250,
             disk_pressured: false,
             legacy_unscoped_state: crate::ArtifactSweepLegacyUnscopedState::UnknownPending,
+            artifact_lane: crate::ArtifactSweepLane::Ran,
+            checkout_trash: crate::CheckoutTrashBacklog::default(),
             auto_cleanup: None,
         };
         write_last_pass(&plan, 2, Some(&report), None).unwrap();
@@ -2438,6 +2661,272 @@ mod tests {
             Some("unknown_pending")
         );
         assert_eq!(receipt.outcome, "sweep_paused");
+    }
+
+    fn empty_pass(
+        lane: crate::ArtifactSweepLane,
+        trash: crate::CheckoutTrashBacklog,
+    ) -> crate::ArtifactSweepReport {
+        crate::ArtifactSweepReport {
+            at_ms: 1,
+            scope: "drain".into(),
+            directories_reclaimed: 0,
+            entries_reclaimed: 0,
+            observed_logical_file_bytes: 0,
+            preparation_cache_bytes_reclaimed: 0,
+            bytes_accounting_complete: true,
+            blockers: crate::ArtifactSweepBlockerSummary::default(),
+            headroom_threshold_bytes: crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            complete: false,
+            budget_ms: 5000,
+            disk_pressured: false,
+            legacy_unscoped_state: crate::ArtifactSweepLegacyUnscopedState::Clear,
+            artifact_lane: lane,
+            checkout_trash: trash,
+            auto_cleanup: None,
+        }
+    }
+
+    /// Every pass says per lane what it found, and a pass that reclaimed
+    /// nothing records the one cause; the run of empty passes survives a
+    /// failed pass and ends at the first pass that reclaims.
+    #[test]
+    fn receipts_explain_empty_passes_and_count_them() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let yielded = empty_pass(
+            crate::ArtifactSweepLane::GcLockHeld,
+            crate::CheckoutTrashBacklog::default(),
+        );
+        write_last_pass(&plan, 10, Some(&yielded), None).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.artifact_lane.as_deref(), Some("gc_lock_held"));
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("artifact_lane_yielded_to_worker")
+        );
+        assert_eq!(receipt.passes_without_reclaim, 1);
+        assert_eq!(receipt.unreclaimed_since_unix_ms, Some(10));
+
+        let stuck = crate::CheckoutTrashBacklog {
+            recorded: 200,
+            pending: 180,
+            stale_pending: 180,
+            deletable: 20,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        write_last_pass(
+            &plan,
+            20,
+            Some(&empty_pass(crate::ArtifactSweepLane::Ran, stuck)),
+            None,
+        )
+        .unwrap();
+        write_last_pass(&plan, 30, None, Some("broker open failed")).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.outcome, "error");
+        assert_eq!(
+            receipt.passes_without_reclaim, 2,
+            "a failed pass keeps the run"
+        );
+        assert_eq!(receipt.unreclaimed_since_unix_ms, Some(10));
+
+        let confirming = crate::CheckoutTrashBacklog {
+            confirmed_this_pass: 180,
+            deletable: 200,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        write_last_pass(
+            &plan,
+            40,
+            Some(&empty_pass(crate::ArtifactSweepLane::Ran, confirming)),
+            None,
+        )
+        .unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.passes_without_reclaim, 0);
+        assert_eq!(receipt.unreclaimed_since_unix_ms, None);
+        assert_eq!(receipt.reclaimed_nothing_because, None);
+        assert_eq!(receipt.trash.unwrap().confirmed_this_pass, 180);
+        assert!(fs::metadata(&plan.receipt_path).unwrap().len() <= MAX_RECEIPT_BYTES as u64);
+    }
+
+    fn trash(deletable: usize, oldest: Option<i64>, stale: usize) -> crate::CheckoutTrashBacklog {
+        crate::CheckoutTrashBacklog {
+            recorded: deletable + stale,
+            deletable,
+            pending: stale,
+            stale_pending: stale,
+            oldest_deletable_created_ms: oldest,
+            ..crate::CheckoutTrashBacklog::default()
+        }
+    }
+
+    /// `broker status` speaks only after the threshold of empty passes, for
+    /// a deleter that is not getting through confirmed trash; that cause
+    /// wins over a lane that yielded to the detached worker.
+    #[test]
+    fn status_advice_names_a_stalled_deleter_after_two_hours_of_empty_passes() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let stalled = trash(20, Some(5), 0);
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            assert!(
+                reclaim_advice(&plan.home, &plan.repository_uuid).is_none(),
+                "no advice before the threshold (pass {pass})"
+            );
+            write_last_pass(
+                &plan,
+                100 + pass,
+                Some(&empty_pass(crate::ArtifactSweepLane::GcLockHeld, stalled)),
+                None,
+            )
+            .unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_not_draining")
+        );
+        assert_eq!(receipt.trash_entries_drained, Some(0));
+        let advice = reclaim_advice(&plan.home, &plan.repository_uuid).expect("advice");
+        assert_eq!(advice.id, "storage.gc-service-reclaiming-nothing");
+        assert_eq!(advice.commands[0], "aethyme broker gc trash drain --json");
+    }
+
+    /// Trash rows the proofs keep (identity changed, session in use) are
+    /// never advised, and do not hide the lane that actually blocked.
+    #[test]
+    fn rows_the_proofs_keep_are_explained_but_never_advised() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let kept = trash(0, None, 30);
+        write_last_pass(
+            &plan,
+            1,
+            Some(&empty_pass(crate::ArtifactSweepLane::GcLockHeld, kept)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .reclaimed_nothing_because
+                .as_deref(),
+            Some("artifact_lane_yielded_to_worker")
+        );
+        let mut finished = empty_pass(crate::ArtifactSweepLane::Ran, kept);
+        finished.complete = true;
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            write_last_pass(&plan, 2 + pass, Some(&finished), None).unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert!(receipt.passes_without_reclaim > UNRECLAIMED_PASSES_ADVICE_THRESHOLD);
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_entries_kept_by_proofs")
+        );
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
+    }
+
+    /// While the paced deleter works through the backlog (fewer deletable
+    /// entries, or the oldest one moving forward), passes count as
+    /// reclaiming and nothing says the deleter is stalled.
+    #[test]
+    fn a_shrinking_backlog_counts_as_reclaim() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let mut deletable = 200;
+        write_last_pass(
+            &plan,
+            1,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                trash(deletable, Some(10), 0),
+            )),
+            None,
+        )
+        .unwrap();
+        for pass in 0..UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            deletable -= 10;
+            write_last_pass(
+                &plan,
+                2 + pass,
+                Some(&empty_pass(
+                    crate::ArtifactSweepLane::GcLockHeld,
+                    trash(deletable, Some(10), 0),
+                )),
+                None,
+            )
+            .unwrap();
+            let receipt = read_last_pass(&plan).unwrap().unwrap();
+            assert_eq!(receipt.passes_without_reclaim, 0, "pass {pass}");
+            assert_eq!(receipt.trash_entries_drained, Some(10));
+            assert_eq!(receipt.reclaimed_nothing_because, None);
+        }
+        // Same count, but the oldest entry moved forward: still draining.
+        write_last_pass(
+            &plan,
+            50,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                trash(deletable, Some(11), 0),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .passes_without_reclaim,
+            0
+        );
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
+    }
+
+    /// A receipt an older binary wrote, without the per-lane fields, still
+    /// reads.
+    #[test]
+    fn receipts_without_per_lane_fields_still_read() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let old = json!({
+            "schema": RECEIPT_SCHEMA,
+            "repository_uuid": plan.repository_uuid,
+            "generation": plan.generation,
+            "started_at_unix_ms": 1,
+            "finished_at_unix_ms": 2,
+            "outcome": "sweep_paused",
+            "directories_reclaimed": 0,
+            "budget_ms": 5000,
+            "disk_pressured": false,
+            "legacy_unscoped_state": "unknown_pending",
+            "error": null
+        });
+        fs::write(&plan.receipt_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(&plan.receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert_eq!(receipt.passes_without_reclaim, 0);
+        assert!(receipt.trash.is_none());
+        write_last_pass(
+            &plan,
+            3,
+            Some(&empty_pass(
+                crate::ArtifactSweepLane::GcLockHeld,
+                crate::CheckoutTrashBacklog::default(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_last_pass(&plan)
+                .unwrap()
+                .unwrap()
+                .passes_without_reclaim,
+            1
+        );
     }
 
     use crate::scheduled_service::launchd::LabelState;

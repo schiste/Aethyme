@@ -402,11 +402,11 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{
-    ArtifactSweepBlockerExample, ArtifactSweepBlockerSummary, ArtifactSweepLastReport,
-    ArtifactSweepLegacyUnscopedState, ArtifactSweepOutcome, ArtifactSweepReport,
-    BackgroundPriority, GC_PLAN_SCHEMA_VERSION, INLINE_ARTIFACT_SWEEP_BUDGET_MS,
-    TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
-    UnattendedPacingSummary,
+    ArtifactSweepBlockerExample, ArtifactSweepBlockerSummary, ArtifactSweepLane,
+    ArtifactSweepLastReport, ArtifactSweepLegacyUnscopedState, ArtifactSweepOutcome,
+    ArtifactSweepReport, BackgroundPriority, CheckoutTrashBacklog, GC_PLAN_SCHEMA_VERSION,
+    INLINE_ARTIFACT_SWEEP_BUDGET_MS, TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV,
+    UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES, UnattendedPacingSummary,
 };
 pub use git::enable_repository_identity_memory;
 pub use git::{
