@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.154] - 2026-11-22
+
+### Fixed
+
+- Commands the broker runs for a session no longer leave their working directories in the system temp folder. The pre-push hook (through `git push`), gate commands, preparation steps and `broker advanced exec` inherited `TMPDIR`, and whatever they left behind was owned by nothing: on the busiest machine that was 18.7 GiB, 14 GiB of it from one day. Each such command now gets `TMPDIR`, `TMP`, `TEMP` and `AETHYME_COMMAND_TEMP_DIR` pointing at a directory the broker creates for that run inside the session scratch, through a short link under `/tmp/ae<uid>/` so that socket paths stay short. When the command ends, an empty run is removed; a non-empty one stays in place, is marked finished, and the retirement run moves it through the trash to the paced deleter once no process holds a file in it. A run the broker never finished goes with the session. Any setup failure, a full pool volume (below the gate headroom) or `[command_temp] enabled = false` keeps the inherited temp folder. Leftovers already in the system temp folder are not touched: nothing records who made them (#1938).
+
+- The MCP HTTP readiness check re-checks a listener snapshot race instead of refusing at once. On macOS `netstat` runs before `lsof`, so a server that binds between the two read as `listener_listing_empty` or `listener_count_mismatch`; both are now re-checked up to five times at 100 ms, and only a later look in which every listener is ours is accepted. An empty `netstat` table (a sandbox), a listener that is not ours and a non-loopback bind still refuse on the first look. The hub's listening watch re-checks the same way (#1934).
+- The shared-cache preparation test pins its install slots, so a runner under memory warning no longer serialises it (#1934).
+- A push that times out records which phase it was in. The timeout journal gains `push_timeout_timing` (`stage`: `remote_ref_listing`, `pre_push_hook`, `transfer` or `unknown`; `process_ms`; and the hook timings when known), read from the stopped push's trace. The push outcome and retry decision are unchanged (#1935).
+
+### Changed
+
+- `clap` 4.6.8 and `notify` 8.2.2, with patch bumps of `proc-macro2`, `quote` and `syn` (#1937). CI actions `taiki-e/install-action` v2.90.5 and `softprops/action-gh-release` v3.0.4, pinned by commit (#1584).
+
+### Added
+
+- Config key `[command_temp] enabled` (default on); `broker status` advice `storage.command-temp-backlog` at 64 finished runs or 4 GiB awaiting removal; spans `command_temp_prepare`, `command_temp_finish`, `command_temp_retire` and `command_temp_backlog_check`; counters including `command_temp_created`, `command_temp_alias_created`, `command_temp_path_too_long`, `command_temp_skipped_pressure` and `command_temp_kept_in_use` (#1938).
+
+### Known issues
+
+- With 64 or more finished runs held open by live processes in one session, later runs of that session wait for the session to end; a run left by a killed broker is reclaimed only with its session. `aethyme env exec` and commands with no session still use the inherited temp folder.
+
+- Spans `mcp_http_listen_wait` and `push_git_timeout_trace`; counter `mcp_http_listen_transient_retry` (#1934, #1935).
+- The broker skill reference documents paging `broker advanced events --json` (JSON Lines, ascending event id, up to 1,000 rows a call, `--since` and `--kind`), and the repo-act skill says to measure queue time in batching comparisons (#1933, #1936).
+
 ## [0.8.153] - 2026-11-21
 
 ### Fixed
