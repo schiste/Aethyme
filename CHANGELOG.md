@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.155] - 2026-11-22
+
+### Added
+
+- Experimental `aethyme content-gate compare-v2 <manifest>`: an offline comparison of two draft v2 verdict envelopes over the same change. It is refused inside a broker gate and always reports `publication_authorized: false` (#1870).
+- `compare-v2` accepts an optional `external_evidence` manifest path, a link-observation snapshot. Its format, change id, source digests and observation values are checked, and a verdict carrying an observed-link marker is accepted only when the evidence is supplied (#1908).
+- Experimental `aethyme content-gate run-v2 <manifest>`: runs the validator as a supervised child in its own process group with a cleared environment and no shell, re-checks the manifest, the executable and every input after the run, then compares. Inputs are bounded (16 MB each, 64 MB in all, 1,024 additional files). Output carries `timings_ms` for parse, validator, input re-check and compare (#1871).
+- `compare-v2` derives from the resolved policy (version 1) which checks each gate must produce and requires them in both verdicts with the same blocking flag; unknown gate kinds, duplicate gate ids and other policy versions fail closed. `--telemetry` adds `coverage` counts; without it the output is unchanged (#1939).
+
+### Changed
+
+- The standalone `content-gate run` (outside a broker gate) now stops the validator's process group when the validator exits late or leaves processes behind; before, it only returned the error (#1871).
+
+### Known issues
+
+- `compare-v2` rejects a genuine verdict for an entry whose media type the validator does not check (it expects gate checks the validator does not emit for such entries).
+- `run-v2` tracks leftover processes by process group only: a descendant that leaves the group is not seen, and interrupting `aethyme` leaves the validator running until its timeout. The group probe runs after the child is reaped, so the safety comments in the supervisor overstate the guarantee against process id reuse.
+- The gate-kind vocabulary of the validator's policy format is listed in code; a kind added upstream is refused until the list is updated.
+
 ## [0.8.154] - 2026-11-22
 
 ### Fixed
