@@ -1736,7 +1736,8 @@ impl Broker {
     /// Confirm pending trash rows nothing else can confirm (their creator's
     /// start time was unreadable) once they are a day old, when the entry
     /// still has its recorded identity and no open session uses the
-    /// session's path: the explicit `gc apply` path. Returns how many.
+    /// session's path: the explicit `gc apply` and `gc sweep` paths (the
+    /// latter is also the scheduled GC service's tick). Returns how many.
     pub(crate) fn confirm_stale_pending_trash_rows(&self) -> usize {
         let now = crate::clock::epoch_ms();
         let mut eligible = Vec::new();
@@ -1796,6 +1797,28 @@ impl Broker {
                 0
             }
         }
+    }
+
+    /// The recorded checkout trash in counts: what the paced deleter can
+    /// delete now, and what still waits for a confirmation. Metadata reads
+    /// only; `confirmed_this_pass` is left to the caller.
+    pub(crate) fn checkout_trash_backlog_summary(&self) -> crate::CheckoutTrashBacklog {
+        let rows = self.checkout_trash_rows();
+        let now = crate::clock::epoch_ms();
+        let mut summary = crate::CheckoutTrashBacklog {
+            deletable: self.checkout_trash_deletable_backlog(&rows).entries,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        for (name, row) in rows.values().flat_map(|entries| entries.iter()) {
+            summary.recorded += 1;
+            if row.pending {
+                summary.pending += 1;
+                if crate::checkout_trash::stale_unconfirmable(name, row, now) {
+                    summary.stale_pending += 1;
+                }
+            }
+        }
+        summary
     }
 
     /// Whether a trash row names `session_id`'s checkout itself (a stripped
@@ -7104,6 +7127,95 @@ mod tests {
         assert_eq!(broker.confirm_stale_pending_trash_rows(), 1);
         let report = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
         assert_eq!(report.entries_removed, 1, "{report:?}");
+    }
+
+    /// Record a stale, unconfirmable trash entry for a new closed session
+    /// (its mover's start time unknown, its name a day old); returns the
+    /// session and the entry name.
+    fn stale_unconfirmable_trash_entry(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, String) {
+        let (session, worktree) = closed(broker, label, |_| {});
+        let pool = worktree.parent().unwrap().to_path_buf();
+        let common = broker.main_git_common_dir().unwrap();
+        let repo = crate::git::GitRepo::discover(broker.main_root()).unwrap();
+        let mut pending = None;
+        let trashed = crate::checkout_trash::move_worktree_to_trash(
+            &repo,
+            &common,
+            &pool,
+            &worktree,
+            session.id,
+            &mut |_, _, row| {
+                pending = Some(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut row = pending.unwrap();
+        row.creator_started_ms = 0;
+        let old = format!("0000000000001-{}-1-1", session.id);
+        std::fs::rename(trashed.path(), trashed.trash_dir.join(&old)).unwrap();
+        broker
+            .record_checkout_trash_row(&trashed.trash_dir, &old, row)
+            .unwrap();
+        (session, old)
+    }
+
+    /// The explicit sweep, which is also the scheduled GC service's tick,
+    /// confirms a stale unconfirmable entry under the same proofs as
+    /// `gc apply`, reports the trash it leaves, and deletes nothing itself:
+    /// the paced deleter removes the entry afterwards.
+    #[test]
+    fn the_explicit_sweep_confirms_a_stale_unconfirmable_trash_row() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, old) = stale_unconfirmable_trash_entry(&mut broker, "sweep-confirms");
+        let before = broker.checkout_trash_backlog_summary();
+        assert_eq!(
+            (
+                before.recorded,
+                before.deletable,
+                before.pending,
+                before.stale_pending
+            ),
+            (1, 0, 1, 1),
+            "{before:?}"
+        );
+
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert_eq!(report.checkout_trash.confirmed_this_pass, 1, "{report:?}");
+        assert_eq!(report.checkout_trash.pending, 0, "{report:?}");
+        assert_eq!(report.checkout_trash.deletable, 1, "{report:?}");
+        let rows = broker.checkout_trash_rows();
+        assert!(
+            rows.values().any(|entries| entries.contains_key(&old)),
+            "the sweep confirms; it does not delete"
+        );
+
+        let drained = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// An entry whose session is open again fails the proofs: the sweep
+    /// leaves it unconfirmed and reports it as stale.
+    #[test]
+    fn the_explicit_sweep_leaves_an_entry_of_an_open_session_unconfirmed() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _old) = stale_unconfirmable_trash_entry(&mut broker, "sweep-keeps");
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET cleanup_state = 'open' WHERE id = ?1",
+                [session.id],
+            )
+            .unwrap();
+
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert_eq!(report.checkout_trash.confirmed_this_pass, 0, "{report:?}");
+        assert_eq!(report.checkout_trash.stale_pending, 1, "{report:?}");
+        assert_eq!(report.checkout_trash.deletable, 0, "{report:?}");
     }
 
     /// A session whose cleaned record was lost after its checkout was

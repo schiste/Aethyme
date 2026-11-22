@@ -1566,7 +1566,8 @@ pub(crate) struct TrashDrainReport {
     /// The first of those names (entry names only).
     pub(crate) unrecognized_names: Vec<String>,
     /// Pending entries older than a day whose creator cannot be identified,
-    /// so only an explicit `gc apply` can confirm them (entry names only).
+    /// so only an explicit `gc apply` or `gc sweep` can confirm them (entry
+    /// names only).
     pub(crate) stale_pending: Vec<String>,
     /// Trash directories that failed verification (left alone).
     pub(crate) invalid_trash_dirs: usize,
