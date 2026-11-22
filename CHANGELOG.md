@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.161] - 2026-11-23
+
+### Fixed
+
+- Every form of `broker status` notices a stale GC service binding. The check added in 0.8.160 was wired only into the full form (`--full`, `--refresh`); the default compact form, the summary and the session view never ran it, so a service left on a previous runtime was neither advised nor repaired by the command agents actually run. All forms except `--read-only-snapshot` now run it once per invocation: it reads only the service's state under the home directory and the managed installation's selector, starts no process to decide, and starts at most the one detached refresh (#1958).
+- `--since-revision` accepts a token for every hashed section. The token length limit was a fixed 1,024 bytes and is now derived from the section count (#1958).
+
+### Added
+
+- One counter per look so the branch taken is visible: `gc_service_status_identity_unavailable`, `_record_unreadable`, `_not_installed`, `_record_incomplete`, `_binding_current`, `_binding_unknown`, and `gc_service_refresh_latched`, `_sandboxed`, `_running_unknown`, `_not_current_router`, `_scheduled`, `_backing_off`, `_contended`, `_lock_unavailable`, `_receipt_unwritable`, `_start_failed` (#1958).
+- Session view field `gc_service_advice` (present only when there is advice) and text line `GC service: <summary>`; the field is a revision section, so an advice that appears or clears changes the revision. Revision tokens issued by an older version reset once to a full snapshot (#1958).
+
+### Changed
+
+- Blocked and unverified tick evidence carries the tick's start time and pid instead of an elapsed-minutes count, and the session view omits the scheduler outcome line, so a revision does not change from one look to the next while nothing changed (#1958).
+
 ## [0.8.160] - 2026-11-22
 
 ### Fixed
