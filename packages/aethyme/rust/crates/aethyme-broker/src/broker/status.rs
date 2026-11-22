@@ -809,7 +809,9 @@ impl Broker {
     /// archived, or a load was meant and never confirmed; or, while it runs,
     /// that its passes reclaimed nothing for two hours with reclaimable
     /// storage in view. A few file reads
-    /// under the user's Library; no launchctl.
+    /// under the user's Library; no launchctl. A binding that is gone or no
+    /// longer current also starts one detached `gc service status`, whose
+    /// automatic refresh asks launchd.
     #[cfg(target_os = "macos")]
     fn push_gc_service_runtime_advice(&self, view: &mut StatusView) {
         let _span = crate::phase_telemetry::span("status_gc_service_runtime");
@@ -826,11 +828,16 @@ impl Broker {
         };
         // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
         let uid = unsafe { libc::geteuid() };
-        // A service silently gone first; then one that runs and keeps
-        // reclaiming nothing while reclaimable storage remains.
-        let Some(advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid)
-            .or_else(|| crate::gc_sweep_service::reclaim_advice(&home, &uuid))
-        else {
+        // One read of the service record: a binding that is gone or no
+        // longer current is rebound in the background (with backoff); then a
+        // service silently gone, and one that runs and keeps reclaiming
+        // nothing while reclaimable storage remains.
+        let Some(advice) = crate::gc_sweep_service::status_service_advice(
+            &home,
+            &uuid,
+            uid,
+            &self.main_root_path(),
+        ) else {
             return;
         };
         view.advice.push(StatusAdvice {

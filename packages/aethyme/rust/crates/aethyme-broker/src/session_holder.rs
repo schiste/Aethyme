@@ -185,6 +185,20 @@ impl ProcessTable {
         Self::observe().into_table()
     }
 
+    /// The host's process table from the native listing only: never a `ps`
+    /// child and never a timeout. `None` when it is denied or fails, and
+    /// always off macOS, where there is no native listing.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn observe_native() -> Option<Self> {
+        native_process_table::snapshot().ok()
+    }
+
+    /// See the macOS form: there is no native listing elsewhere.
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(crate) fn observe_native() -> Option<Self> {
+        None
+    }
+
     /// Snapshot the host's process table. On macOS the table is listed
     /// natively, without spawning a child a sandboxed caller may be refused;
     /// `ps` remains the fallback there and the only source elsewhere.

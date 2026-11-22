@@ -1853,11 +1853,8 @@ fn refresh_gc_services(
     receipt: &InstallReceipt,
     bundle: &Path,
 ) -> (Vec<std::ffi::OsString>, Vec<serde_json::Value>) {
-    let refresh = crate::gc_sweep_service::refresh_for_update(
-        &receipt.managed_root,
-        &selected_bundle_names(receipt),
-        &bundle.join("aethyme"),
-    );
+    let refresh =
+        crate::gc_sweep_service::refresh_for_update(&receipt.managed_root, &bundle.join("aethyme"));
     let outcomes = refresh
         .outcomes
         .iter()

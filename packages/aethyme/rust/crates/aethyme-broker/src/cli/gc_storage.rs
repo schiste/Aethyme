@@ -1677,7 +1677,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     #[cfg(target_os = "macos")]
-    let managed_tick = {
+    let mut managed_tick = {
         if action != "sweep" && crate::gc_sweep_service::managed_tick_requested() {
             return Err(UsageError::Message(
                 "managed GC service markers are valid only for the fixed `gc sweep --json` tick"
@@ -1725,21 +1725,37 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     // journal-recovery commands must operate on the pending journal before
     // any startup maintenance can consume it, so use its read-only DB snapshot
     // while the command itself takes the repository GC lock for file changes.
+    // The open validates the worktree root on the pool volume and can block
+    // there (a privacy consent nobody answers from a launchd job): a managed
+    // tick holds no installer claim across it, so refresh, install and
+    // control stay usable, and takes the claim back before sweeping.
+    #[cfg(target_os = "macos")]
+    if let Some(tick) = managed_tick.as_mut() {
+        tick.release_claim();
+    }
     let broker_result = if matches!(action, "abandon" | "forget-abandoned") {
         open_broker(true)
     } else {
         open_broker(parsed.read_only_snapshot)
     };
+    // A generation changed meanwhile gets `last-error.json` (generation-free),
+    // never a last-pass receipt bound to the plan it no longer is.
+    #[cfg(target_os = "macos")]
+    if let (Ok(_), Some(tick)) = (&broker_result, managed_tick.as_mut())
+        && let Err(error) = tick.reclaim()
+    {
+        let message = format!("managed GC tick refused after the broker opened: {error}");
+        crate::gc_sweep_service::record_tick_failure(&message);
+        return Err(UsageError::Message(message));
+    }
     let mut broker = match broker_result {
         Ok(broker) => broker,
         Err(error) => {
+            // The claim was released for the open: record under it again, or
+            // generation-free when the plan changed meanwhile.
             #[cfg(target_os = "macos")]
-            if let Some(tick) = managed_tick.as_ref() {
-                crate::gc_sweep_service::record_managed_tick(
-                    tick,
-                    None,
-                    Some(&format!("broker open failed: {error:?}")),
-                )?;
+            if let Some(tick) = managed_tick.as_mut() {
+                tick.record_open_failure(&format!("broker open failed: {error:?}"))?;
             }
             return Err(error);
         }
@@ -2660,6 +2676,9 @@ fn preflight_managed_gc_tick(
             "managed GC service accepts only the fixed `broker gc sweep --json` invocation".into(),
         ));
     }
+    // Before the first access to the repository or its pool volumes, so a
+    // tick that blocks there is reported instead of silent.
+    crate::gc_sweep_service::record_tick_started();
     let preflight = (|| -> Result<Option<crate::gc_sweep_service::ManagedTick>, UsageError> {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;

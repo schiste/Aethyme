@@ -998,13 +998,15 @@ Usage:
       Install exact service files without loading launchd.
   aethyme broker gc service status [--json]
       Observe service scheduler state and the bounded last-pass, last-error
-      and last-refresh receipts. A service whose runtime is gone is refreshed
-      by itself when its unit and plan verify for this repository.
+      and last-refresh receipts. A service whose runtime is gone or no longer
+      the installation's current one is refreshed by itself when this command
+      runs from that current runtime and the unit and plan verify for this
+      repository; `broker status` starts that in the background.
   aethyme broker gc service refresh [--json]
       Rebind the service to the running managed runtime: archive the old
       plan and unit, publish new ones, and reload only if launchd confirmed
-      the label loaded; an unknown answer changes nothing. Self-update does
-      this for services bound to a bundle it removes.
+      the label loaded; an unknown answer changes nothing. Updates and
+      installs do this for services bound to any bundle but the new one.
   aethyme broker gc service activate --confirm <installed-plan-sha256> [--json]
   aethyme broker gc service deactivate --confirm <installed-plan-sha256> [--json]
       Load or unload the exact per-repository service. A changed runtime
