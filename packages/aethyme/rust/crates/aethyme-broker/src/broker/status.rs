@@ -71,7 +71,7 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        view.advice.extend(self.gc_service_status_advice());
+        view.advice.extend(self.gc_service_status_advice(true));
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -116,7 +116,7 @@ impl Broker {
         let mut brief = self.build_status_brief(agents, overlaps, now_ms)?;
         // The status agents run by default must notice a stale GC service
         // binding too, not only `--full` (0.8.160 missed it here).
-        brief.advice.extend(self.gc_service_status_advice());
+        brief.advice.extend(self.gc_service_status_advice(true));
         brief.phase_timings_ms.insert("agents".into(), agents_ms);
         brief
             .phase_timings_ms
@@ -819,14 +819,25 @@ impl Broker {
     /// call counts exactly one `gc_service_status_*` or `gc_service_refresh_*`
     /// outcome, so a metrics line always says which branch ran. Off macOS
     /// there is no service and nothing is read or counted.
-    pub(crate) fn gc_service_status_advice(&self) -> Option<StatusAdvice> {
+    ///
+    /// `outcome_evidence` adds what this call did about a stale binding
+    /// (started, backing off, contended) to the advice evidence. That line
+    /// changes from call to call, so the session view, whose sections are
+    /// hashed into `--since-revision` tokens, passes false.
+    ///
+    /// The repository identity is read from the Git common directory the
+    /// open already bound (no `git rev-parse` here) and the UUID marker file.
+    pub(crate) fn gc_service_status_advice(&self, outcome_evidence: bool) -> Option<StatusAdvice> {
         #[cfg(target_os = "macos")]
         {
             let _span = crate::phase_telemetry::span("status_gc_service_runtime");
             let identity = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .and_then(|home| {
-                    let common = self.repo_handle().git_common_dir().ok()?;
+                    let common = match &self.storage_context.git_common_dir {
+                        Some(common) => common.clone(),
+                        None => self.main_git_common_dir().ok()?,
+                    };
                     let uuid =
                         crate::store::repository_identity::read_repository_uuid_marker(&common)
                             .ok()
@@ -844,6 +855,7 @@ impl Broker {
                 &uuid,
                 uid,
                 &self.main_root_path(),
+                outcome_evidence,
             )?;
             Some(StatusAdvice {
                 id: advice.id,
@@ -1065,7 +1077,7 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        view.advice.extend(self.gc_service_status_advice());
+        view.advice.extend(self.gc_service_status_advice(true));
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

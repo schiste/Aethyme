@@ -266,7 +266,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         let gc_service_advice = if parsed.read_only_snapshot {
             None
         } else {
-            broker.gc_service_status_advice()
+            broker.gc_service_status_advice(false)
         };
         // Parent, children, recorded PR states and one next action, when the
         // session is part of a stack.

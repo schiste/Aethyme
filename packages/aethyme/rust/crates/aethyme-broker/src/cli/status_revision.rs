@@ -18,6 +18,10 @@ const SECTIONS: &[&str] = &[
     "coordinated_operations",
     "focus",
     "session",
+    // The session view's GC service advice: its evidence carries no
+    // per-call text, so only an advice that appears, changes or clears
+    // changes the revision.
+    "gc_service_advice",
     "omitted_details",
     "drilldown",
 ];
@@ -151,6 +155,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changed["changed_sections"]["session"]["pr"]["draft"], true);
+    }
+
+    #[test]
+    fn session_revision_tracks_gc_service_advice() {
+        let root = Path::new("/repo");
+        let quiet = render_session(json!({"session": {"id": 7}}), root, Some(7), None).unwrap();
+        let quiet_revision = quiet["revision"].as_str().unwrap().to_string();
+        let advice =
+            json!([{"id": "storage.gc-service-runtime-stale", "evidence": ["bound 0.8.50"]}]);
+        let with =
+            |advice: &serde_json::Value| json!({"session": {"id": 7}, "gc_service_advice": advice});
+        // It appears: a new revision, and the delta carries it.
+        let appeared = render_session(with(&advice), root, Some(7), Some(&quiet_revision)).unwrap();
+        assert_eq!(
+            appeared["changed_sections"]["gc_service_advice"][0]["id"],
+            "storage.gc-service-runtime-stale"
+        );
+        let advised = render_session(with(&advice), root, Some(7), None).unwrap();
+        let advised_revision = advised["revision"].as_str().unwrap().to_string();
+        assert_ne!(advised_revision, quiet_revision);
+        // The same advice on a later look: unchanged.
+        let same = render_session(with(&advice), root, Some(7), Some(&advised_revision)).unwrap();
+        assert!(same["changed_sections"].as_object().unwrap().is_empty());
+        // It clears: the delta says so with a null section.
+        let cleared = render_session(
+            json!({"session": {"id": 7}}),
+            root,
+            Some(7),
+            Some(&advised_revision),
+        )
+        .unwrap();
+        let changed = cleared["changed_sections"].as_object().unwrap();
+        assert_eq!(changed.len(), 1);
+        assert!(changed["gc_service_advice"].is_null());
     }
 
     #[test]

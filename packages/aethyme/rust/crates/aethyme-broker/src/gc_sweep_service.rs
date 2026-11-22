@@ -2389,6 +2389,18 @@ fn runtime_binding(router: &Path, managed_root: &Path) -> RuntimeBinding {
     }
 }
 
+/// The binding of `record`'s recorded router, from its own fields: `gone`
+/// when the router is recorded and missing, `unknown` when a field is
+/// missing or the selector cannot be read. One `stat` and two
+/// `canonicalize` calls at most; a `broker status` look computes it once.
+fn record_binding(record: &InstallationRecord) -> RuntimeBinding {
+    match (record.router.as_deref(), record.managed_root.as_deref()) {
+        (Some(router), Some(root)) => runtime_binding(router, root),
+        (Some(router), None) if !router.exists() => RuntimeBinding::Gone,
+        _ => RuntimeBinding::Unknown,
+    }
+}
+
 /// Whether `running` is the router `managed_root` currently selects: the
 /// only runtime a foreground command may rebind a service to by itself.
 fn running_is_current_selection(running: &Path, managed_root: &Path) -> bool {
@@ -2648,9 +2660,8 @@ fn blocked_tick_advice(
                 summary: "this repository's scheduled GC sweep tick has no receipt since it started, and its process could not be checked from here",
                 evidence: vec![
                     format!(
-                        "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                        "tick started at (ms since epoch) {}, pid {}; no pass or error since",
                         tick.started_at_unix_ms,
-                        now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
                         tick.pid
                             .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
                     ),
@@ -2667,9 +2678,8 @@ fn blocked_tick_advice(
         summary: "this repository's scheduled GC sweep tick has been blocked since it started; a person must answer a prompt",
         evidence: vec![
             format!(
-                "tick started at (ms since epoch) {} ({} minutes ago), pid {}; no pass or error since",
+                "tick started at (ms since epoch) {}, pid {}; no pass or error since",
                 tick.started_at_unix_ms,
-                now_unix_ms.saturating_sub(tick.started_at_unix_ms) / 60_000,
                 tick.pid
                     .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
             ),
@@ -2877,6 +2887,7 @@ impl ServiceCheck {
 /// nothing and counts nothing: the caller counts the returned outcome.
 fn schedule_refresh_with(
     record: &InstallationRecord,
+    binding: RuntimeBinding,
     uid: u32,
     running: impl FnOnce() -> Result<PathBuf, ServiceCheck>,
     now_unix_ms: u64,
@@ -2889,12 +2900,11 @@ fn schedule_refresh_with(
     if record.plan_bytes.is_none() || !record.unit_present {
         return ServiceCheck::RecordIncomplete;
     }
-    let (Some(router), Some(managed_root)) =
-        (record.router.as_deref(), record.managed_root.as_deref())
+    let (Some(_), Some(managed_root)) = (record.router.as_deref(), record.managed_root.as_deref())
     else {
         return ServiceCheck::RecordIncomplete;
     };
-    match runtime_binding(router, managed_root) {
+    match binding {
         RuntimeBinding::Current => return ServiceCheck::BindingCurrent,
         RuntimeBinding::Unknown => return ServiceCheck::BindingUnknown,
         RuntimeBinding::Stale | RuntimeBinding::Gone => {}
@@ -2962,9 +2972,13 @@ fn schedule_refresh_with(
 }
 
 /// One `broker status` look at this repository's service, on any platform:
-/// read the record once, decide ([`schedule_refresh_with`]), count the
-/// outcome, and return it with the advice for the record (files only, no
-/// launchctl). `running` is asked only for a stale or gone binding.
+/// read the record once, classify its binding once, decide
+/// ([`schedule_refresh_with`]), count the outcome, and return it with the
+/// advice for the record (files only, no launchctl; the plan is loaded at
+/// most once). `running` is asked only for a stale or gone binding.
+/// `outcome_evidence` adds what this look did (started, backing off,
+/// contended) to the advice: per-call text, so a revisioned view passes
+/// false.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn status_service_check(
     home: &Path,
@@ -2973,17 +2987,24 @@ pub(crate) fn status_service_check(
     running: impl FnOnce() -> Result<PathBuf, ServiceCheck>,
     now_unix_ms: u64,
     start: impl FnOnce(&Path) -> io::Result<()>,
+    outcome_evidence: bool,
 ) -> (ServiceCheck, Option<RepairAdvice>) {
     let Ok(record) = read_record(home, uuid, uid) else {
         ServiceCheck::RecordUnreadable.count();
         return (ServiceCheck::RecordUnreadable, None);
     };
-    let check = schedule_refresh_with(&record, uid, running, now_unix_ms, start);
+    let binding = record_binding(&record);
+    let check = schedule_refresh_with(&record, binding, uid, running, now_unix_ms, start);
     check.count();
-    let advice = repair_advice_for(&record, home, uuid, uid)
-        .or_else(|| reclaim_advice(home, uuid))
+    let plan = std::cell::OnceCell::new();
+    let plan = || {
+        plan.get_or_init(|| load(home, uuid).ok().map(|(plan, _)| plan))
+            .as_ref()
+    };
+    let advice = repair_advice_for(&record, binding, uid, now_unix_ms, &plan)
+        .or_else(|| plan().and_then(reclaim_advice_for_plan))
         .map(|mut advice| {
-            if let Some(line) = check.evidence() {
+            if outcome_evidence && let Some(line) = check.evidence() {
                 advice.evidence.push(line.into());
             }
             advice
@@ -3011,6 +3032,7 @@ pub(crate) fn status_service_advice(
     uuid: &str,
     uid: u32,
     repository: &Path,
+    outcome_evidence: bool,
 ) -> Option<RepairAdvice> {
     use std::os::unix::process::CommandExt as _;
     use std::sync::atomic::Ordering;
@@ -3043,8 +3065,15 @@ pub(crate) fn status_service_advice(
         });
         Ok(())
     };
-    let (check, advice) =
-        status_service_check(home, uuid, uid, running, now_unix_ms().unwrap_or(0), start);
+    let (check, advice) = status_service_check(
+        home,
+        uuid,
+        uid,
+        running,
+        now_unix_ms().unwrap_or(0),
+        start,
+        outcome_evidence,
+    );
     if matches!(
         check,
         ServiceCheck::Refresh(
@@ -3084,15 +3113,23 @@ fn load_unconfirmed(control: &ControlReceipt) -> bool {
 #[cfg(test)]
 fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairAdvice> {
     let record = read_record(home, uuid, uid).ok()?;
-    repair_advice_for(&record, home, uuid, uid)
+    let plan = load(home, uuid).ok().map(|(plan, _)| plan);
+    repair_advice_for(
+        &record,
+        record_binding(&record),
+        uid,
+        now_unix_ms().unwrap_or(0),
+        &|| plan.as_ref(),
+    )
 }
 
 /// [`repair_advice`] for a record already read.
-fn repair_advice_for(
+fn repair_advice_for<'p>(
     record: &InstallationRecord,
-    home: &Path,
-    uuid: &str,
+    binding: RuntimeBinding,
     uid: u32,
+    now_unix_ms: u64,
+    plan: &dyn Fn() -> Option<&'p Plan>,
 ) -> Option<RepairAdvice> {
     if !record.exists() {
         let archive = interrupted_refresh_archive(&record.directory, uid)?;
@@ -3104,7 +3141,7 @@ fn repair_advice_for(
             commands: vec![REFRESH_COMMAND.into()],
         });
     }
-    if record.plan_bytes.is_some() && record.runtime_present() == Some(false) {
+    if record.plan_bytes.is_some() && binding == RuntimeBinding::Gone {
         let mut evidence = vec![format!(
             "the recorded runtime {} is no longer installed; launchd cannot start the job",
             record.runtime_version.as_deref().unwrap_or("unknown")
@@ -3144,15 +3181,14 @@ fn repair_advice_for(
             ],
         });
     }
-    if let Some(advice) = blocked_tick_advice(record, uid, now_unix_ms().unwrap_or(0), tick_process)
-    {
+    if let Some(advice) = blocked_tick_advice(record, uid, now_unix_ms, tick_process) {
         return Some(advice);
     }
-    if let Some(advice) = refusing_or_stale_advice(record, uid) {
+    if let Some(advice) = refusing_or_stale_advice(record, binding, uid) {
         return Some(advice);
     }
-    let (plan, _) = load(home, uuid).ok()?;
-    let control = read_control(&plan).ok().flatten()?;
+    let plan = plan()?;
+    let control = read_control(plan).ok().flatten()?;
     if !load_unconfirmed(&control) {
         return None;
     }
@@ -3178,12 +3214,12 @@ fn repair_advice_for(
 /// the installation's current selection, or whose ticks refuse (the last
 /// tick error is newer than the last finished pass). Files and selector
 /// links only.
-fn refusing_or_stale_advice(record: &InstallationRecord, uid: u32) -> Option<RepairAdvice> {
+fn refusing_or_stale_advice(
+    record: &InstallationRecord,
+    binding: RuntimeBinding,
+    uid: u32,
+) -> Option<RepairAdvice> {
     record.plan_bytes.as_ref()?;
-    let binding = match (record.router.as_deref(), record.managed_root.as_deref()) {
-        (Some(router), Some(root)) => runtime_binding(router, root),
-        _ => RuntimeBinding::Unknown,
-    };
     let (last_error_at, last_pass_at) = tick_timestamps(&record.directory, uid);
     let refusing = tick_refusing(last_error_at, last_pass_at);
     if binding != RuntimeBinding::Stale && !refusing {
@@ -3249,7 +3285,12 @@ fn refusing_or_stale_advice(record: &InstallationRecord, uid: u32) -> Option<Rep
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reclaim_advice(home: &Path, uuid: &str) -> Option<RepairAdvice> {
     let (plan, _) = load(home, uuid).ok()?;
-    let receipt = read_last_pass(&plan).ok().flatten()?;
+    reclaim_advice_for_plan(&plan)
+}
+
+/// [`reclaim_advice`] for a plan already loaded.
+fn reclaim_advice_for_plan(plan: &Plan) -> Option<RepairAdvice> {
+    let receipt = read_last_pass(plan).ok().flatten()?;
     reclaim_advice_for(&receipt)
 }
 
@@ -5244,12 +5285,26 @@ mod tests {
         // executable is not even asked for.
         let unasked = || -> Result<PathBuf, ServiceCheck> { panic!("current_exe is not needed") };
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                unasked,
+                1,
+                never
+            ),
             ServiceCheck::BindingUnknown
         );
         select_current(&plan, "v0.8.50-test");
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, unasked, 1, never),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                unasked,
+                1,
+                never
+            ),
             ServiceCheck::BindingCurrent
         );
         select_current(&plan, "v0.8.51-test");
@@ -5257,6 +5312,7 @@ mod tests {
         assert_eq!(
             schedule_refresh_with(
                 &record(),
+                record_binding(&record()),
                 plan.uid,
                 || Ok::<_, ServiceCheck>(plan.router.clone()),
                 1,
@@ -5270,15 +5326,29 @@ mod tests {
             let _held = crate::pr_watch_service_install::claim_installer(&plan.directory, plan.uid)
                 .unwrap();
             assert_eq!(
-                schedule_refresh_with(&record(), plan.uid, router, now, never),
+                schedule_refresh_with(
+                    &record(),
+                    record_binding(&record()),
+                    plan.uid,
+                    router,
+                    now,
+                    never
+                ),
                 ServiceCheck::Refresh(ScheduledRefresh::Contended)
             );
         }
         let mut started = Vec::new();
-        let scheduled = schedule_refresh_with(&record(), plan.uid, router, now, |running| {
-            started.push(running.to_path_buf());
-            Ok(())
-        });
+        let scheduled = schedule_refresh_with(
+            &record(),
+            record_binding(&record()),
+            plan.uid,
+            router,
+            now,
+            |running| {
+                started.push(running.to_path_buf());
+                Ok(())
+            },
+        );
         assert_eq!(scheduled, ServiceCheck::Refresh(ScheduledRefresh::Started));
         assert_eq!(started, vec![runtime.router.clone()]);
         let receipt =
@@ -5288,7 +5358,14 @@ mod tests {
         assert_eq!(receipt["current_bundle"], "v0.8.51-test");
         // The callers that lost the race see the receipt under the claim.
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, router, now + 1, never),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                router,
+                now + 1,
+                never
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
         );
         // The first attempt left it stale: the second waits 15 minutes, the
@@ -5296,17 +5373,32 @@ mod tests {
         let interval = SERVICE_INTERVAL_SECONDS * 1000;
         let ok = |_: &Path| -> io::Result<()> { Ok(()) };
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, router, now + interval - 1, never),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                router,
+                now + interval - 1,
+                never
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
         );
         let second = now + interval;
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, router, second, ok),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                router,
+                second,
+                ok
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
         assert_eq!(
             schedule_refresh_with(
                 &record(),
+                record_binding(&record()),
                 plan.uid,
                 router,
                 second + 2 * interval - 1,
@@ -5316,7 +5408,14 @@ mod tests {
         );
         let third = second + 2 * interval;
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, router, third, ok),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                router,
+                third,
+                ok
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
         let receipt =
@@ -5329,9 +5428,14 @@ mod tests {
         select_current(&plan, "v0.8.52-test");
         let newest_router = || -> Result<PathBuf, ServiceCheck> { Ok(newest.join("aethyme")) };
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, newest_router, third + 1, |_| Err(
-                io::Error::other("spawn refused")
-            )),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                newest_router,
+                third + 1,
+                |_| Err(io::Error::other("spawn refused"))
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::StartFailed)
         );
         let receipt =
@@ -5374,6 +5478,7 @@ mod tests {
                     running,
                     10_000_000,
                     start,
+                    true,
                 )
             };
             let counts = counted(&recorder);
@@ -5456,6 +5561,70 @@ mod tests {
         assert_eq!(
             look(&unasked, &never),
             (ServiceCheck::RecordUnreadable, None)
+        );
+    }
+
+    /// The session view hashes its advice into `--since-revision` tokens: a
+    /// tick blocked for hours must not change it every minute, and neither
+    /// may what each look did about the stale binding.
+    #[test]
+    fn advice_for_a_revisioned_view_is_stable_across_looks() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        let now = now_unix_ms().unwrap();
+        write_private(
+            &plan.directory.join(TICK_STARTED_RECEIPT),
+            &serde_json::to_vec(&json!({
+                "schema": STARTED_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "pid": std::process::id(),
+                "started_at_unix_ms": now - TICK_BLOCKED_AFTER_MS - 120_000,
+            }))
+            .unwrap(),
+        );
+        let look = |at: u64, outcome_evidence: bool| {
+            let current = runtime.router.clone();
+            status_service_check(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                move || -> Result<PathBuf, ServiceCheck> { Ok(current) },
+                at,
+                |_: &Path| -> io::Result<()> { Ok(()) },
+                outcome_evidence,
+            )
+        };
+        let (first_check, first) = look(now, false);
+        let (second_check, second) = look(now + 60_000, false);
+        // The looks did different things (started, then backing off) ...
+        assert_eq!(
+            first_check,
+            ServiceCheck::Refresh(ScheduledRefresh::Started)
+        );
+        assert_eq!(
+            second_check,
+            ServiceCheck::Refresh(ScheduledRefresh::BackingOff)
+        );
+        // ... and a minute passed, yet the advice is the same bytes.
+        let first = first.unwrap();
+        assert_eq!(first.id, "storage.gc-service-tick-blocked");
+        assert_eq!(Some(first.clone()), second);
+        assert!(
+            !first
+                .evidence
+                .iter()
+                .any(|line| line.contains("minutes ago"))
+        );
+        // The full form still says what this look did.
+        let (_, full) = look(now + 120_000, true);
+        assert!(
+            full.unwrap()
+                .evidence
+                .iter()
+                .any(|line| line == ScheduledRefresh::BackingOff.describe())
         );
     }
 
@@ -5575,6 +5744,7 @@ mod tests {
         let mut started = Vec::new();
         let check = schedule_refresh_with(
             &record,
+            record_binding(&record),
             plan.uid,
             || Ok::<_, ServiceCheck>(on_path.clone()),
             10_000_000,
@@ -5924,7 +6094,14 @@ mod tests {
             );
         }
         assert_eq!(
-            schedule_refresh_with(&record(), plan.uid, router, now, |_| Ok(())),
+            schedule_refresh_with(
+                &record(),
+                record_binding(&record()),
+                plan.uid,
+                router,
+                now,
+                |_| Ok(())
+            ),
             ServiceCheck::Refresh(ScheduledRefresh::Started)
         );
     }
