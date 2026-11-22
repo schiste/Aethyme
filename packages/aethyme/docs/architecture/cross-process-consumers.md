@@ -4381,7 +4381,7 @@ could not be re-read. Stack notes come from sender
 
 ### Offline content-gate v2 comparison telemetry
 
-The standalone `content-gate compare-v2` command emits `timings_ms` in its JSON result: `input_read_and_parse_ms`, `compare_ms`, and `total_ms`. Failed input parsing can omit phases not reached. These measurements contain no input paths or content. This standalone command is not a broker gate and does not use the broker command recorder.
+The standalone `content-gate compare-v2` command emits `timings_ms` in its JSON result: `input_read_and_parse_ms`, `compare_ms`, and `total_ms`. Failed input parsing can omit phases not reached. These measurements contain no input paths or content. With `--telemetry` after the manifest path, the result also carries `coverage`: on a match, an object with aggregate counts `policy_gate_count` (resolved gates checked) and `policy_check_count` (item and collection checks expected for the candidate); on any failure, null. Without the flag the field is absent. The counts carry no gate IDs, entity IDs or content. This standalone command is not a broker gate and does not use the broker command recorder.
 
 
 ### Supervised content-gate v2 comparison telemetry

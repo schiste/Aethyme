@@ -32,7 +32,12 @@ pub struct Inputs<'a> {
 
 /// Matching experimental evidence only; it confers no publication authority.
 #[derive(Debug, PartialEq, Eq)]
-pub struct ExperimentalMatch(());
+pub struct ExperimentalMatch {
+    /// Number of declared gates whose scope was checked.
+    pub policy_gate_count: usize,
+    /// Number of expected item and collection checks.
+    pub policy_check_count: usize,
+}
 
 fn closed(v: &Value, allowed: &[&str]) -> Result<(), &'static str> {
     if v.as_object()
@@ -248,6 +253,116 @@ fn validate_collection(
     Ok(())
 }
 
+// Keep this scope list aligned with the versioned Aexeo resolved-policy format.
+// Understanding scope does not validate gate parameters or authenticate results.
+fn item_gate_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "editorial_pacing"
+            | "literal_markdown_links"
+            | "list_item_count"
+            | "word_count"
+            | "character_count"
+            | "metadata_length"
+            | "metadata_age"
+            | "paragraph_count"
+            | "paragraph_length"
+            | "repeated_paragraph_openings"
+            | "repeated_sentence_openings"
+            | "sentence_opening_window"
+            | "sentence_opening_terms"
+            | "repeated_punctuation"
+            | "trailing_ing_clause"
+            | "similar_sentence_lengths"
+            | "sentence_length_variance"
+            | "prose_sentence_length_variance"
+            | "inline_triple_candidates"
+            | "duplicate_paragraphs"
+            | "paragraph_character_length"
+            | "link_count"
+            | "link_destinations"
+            | "link_reachability"
+            | "sentence_length"
+            | "sentence_character_length"
+            | "repeated_terms"
+            | "required_terms"
+            | "forbidden_terms"
+            | "required_metadata"
+            | "required_headings"
+            | "heading_length"
+            | "heading_hierarchy"
+            | "duplicate_headings"
+            | "final_newline"
+            | "evidence_anchors"
+            | "structured_fact"
+            | "evidence_review"
+            | "evidence_review_age"
+            | "custom"
+            | "site_group"
+            | "site_audit"
+    )
+}
+
+fn policy_coverage(
+    policy: &Value,
+    change: &Value,
+    has_collection: bool,
+    checks: &BTreeMap<&str, &Value>,
+) -> Result<(usize, usize), &'static str> {
+    closed(policy, &["version", "name", "gates"])?;
+    if policy["version"].as_u64() != Some(1) || policy["name"].as_str().is_none_or(str::is_empty) {
+        return Err("unsupported resolved policy");
+    }
+    let gates = policy["gates"].as_array().ok_or("invalid resolved gates")?;
+    let entries = change["entries"].as_array().ok_or("invalid entries")?;
+    let entities: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.get("after").is_some_and(|v| !v.is_null()))
+        .map(|entry| entry["entity_id"].as_str().ok_or("invalid entity"))
+        .collect::<Result<_, _>>()?;
+    let mut ids = BTreeSet::new();
+    let mut expected = 0usize;
+    for gate in gates {
+        let id = gate["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("invalid gate id")?;
+        let kind = gate["kind"].as_str().ok_or("invalid gate kind")?;
+        let blocking = gate["blocking"].as_bool().ok_or("invalid gate blocking")?;
+        if !ids.insert(id) || (!item_gate_kind(kind) && kind != "unique_collection_metadata") {
+            return Err("unsupported resolved gate");
+        }
+        let collection = has_collection && kind == "unique_collection_metadata";
+        let candidates = if collection { 1 } else { entities.len() };
+        expected = expected
+            .checked_add(candidates)
+            .ok_or("policy coverage exceeds limit")?;
+        if expected > checks.len() {
+            return Err("resolved policy check is missing");
+        }
+        if collection {
+            let check_id = format!("collection:0::{id}");
+            if checks
+                .get(check_id.as_str())
+                .is_none_or(|c| c["blocking"].as_bool() != Some(blocking))
+            {
+                return Err("resolved policy check is missing or has inconsistent blocking");
+            }
+        } else {
+            for entity in &entities {
+                let check_id = format!("gate:{}:{entity}:{id}", entity.len());
+                if checks
+                    .get(check_id.as_str())
+                    .is_none_or(|c| c["blocking"].as_bool() != Some(blocking))
+                {
+                    return Err("resolved policy check is missing or has inconsistent blocking");
+                }
+            }
+        }
+    }
+    Ok((gates.len(), expected))
+}
+
 // Validate the supported snapshot shape, but do not claim to authenticate the
 // host's observations or independently re-extract destinations from prose.
 fn validate_link_evidence(bytes: &[u8], change: &Value) -> Result<(), &'static str> {
@@ -333,6 +448,7 @@ pub fn compare(
     let fresh = envelope(fresh)?;
     let change = parse_change(input.change)?;
     let candidate = overlay(input.base, input.change, input.after)?;
+    let policy = parse_unique(input.resolved_policy)?;
     if let Some(bytes) = input.collection {
         validate_collection(bytes, &candidate, &change)?;
     }
@@ -382,6 +498,7 @@ pub fn compare(
         external: input.external_evidence.map(<[u8]>::to_vec),
         additional: BTreeMap::new(),
     };
+    let mut coverage = None;
     for env in [&previous, &fresh] {
         if env["binding_sha256"] != binding_hex {
             return Err("candidate input binding differs");
@@ -415,6 +532,12 @@ pub fn compare(
             .iter()
             .filter_map(|c| c["id"].as_str().map(|id| (id, c)))
             .collect();
+        coverage = Some(policy_coverage(
+            &policy,
+            &change,
+            input.collection.is_some(),
+            &checks,
+        )?);
         for id in &required {
             if !checks
                 .get(id)
@@ -435,7 +558,11 @@ pub fn compare(
     if old != new {
         return Err("fresh verdict differs");
     }
-    Ok(ExperimentalMatch(()))
+    let (policy_gate_count, policy_check_count) = coverage.ok_or("missing policy coverage")?;
+    Ok(ExperimentalMatch {
+        policy_gate_count,
+        policy_check_count,
+    })
 }
 
 #[cfg(test)]
@@ -486,6 +613,78 @@ mod tests {
         fresh["verdict"]["validator"]["name"] = json!("other");
         assert!(!run(&old, &fresh, &input));
     }
+    #[test]
+    fn rejects_rebound_policy_with_omitted_gate_even_when_required_check_passes() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        let mut extra = policy["gates"][0].clone();
+        extra["id"] = json!("omitted");
+        extra["blocking"] = json!(false);
+        policy["gates"].as_array_mut().unwrap().push(extra);
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy_bytes;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let binding = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] = json!(
+            binding
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("resolved policy check is missing")
+        );
+    }
+
+    #[test]
+    fn policy_coverage_checks_unicode_collection_and_unknown_kinds() {
+        let (v, _, _, verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        let mut change: Value =
+            serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
+        change["entries"][0]["entity_id"] = json!("été");
+        let mut check = verdict["verdict"]["checks"][0].clone();
+        check["id"] = json!("gate:5:été:words");
+        let mut checks = BTreeMap::from([("gate:5:été:words", &check)]);
+        assert_eq!(
+            policy_coverage(&policy, &change, false, &checks),
+            Ok((1, 1))
+        );
+        let mut extra = policy["gates"][0].clone();
+        extra["kind"] = json!("unique_collection_metadata");
+        extra["id"] = json!("unique");
+        policy["gates"].as_array_mut().unwrap().push(extra);
+        let collection = json!({"id":"collection:0::unique","blocking":true});
+        checks.insert("collection:0::unique", &collection);
+        assert_eq!(policy_coverage(&policy, &change, true, &checks), Ok((2, 2)));
+        assert!(policy_coverage(&policy, &change, false, &checks).is_err());
+        policy["gates"][1]["kind"] = json!("unknown_future_gate");
+        assert!(policy_coverage(&policy, &change, true, &checks).is_err());
+        policy["gates"][1]["kind"] = json!("unique_collection_metadata");
+        policy["gates"][1]["id"] = json!("words");
+        assert!(policy_coverage(&policy, &change, true, &checks).is_err());
+        policy["gates"].as_array_mut().unwrap().pop();
+        policy["gates"][0]["blocking"] = json!(false);
+        assert!(policy_coverage(&policy, &change, false, &checks).is_err());
+    }
+
     #[test]
     fn rejects_stale_evidence_missing_checks_and_process_failure() {
         let (v, base, after, old) = fixture();
