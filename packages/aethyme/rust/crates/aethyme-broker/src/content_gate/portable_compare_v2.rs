@@ -1099,6 +1099,10 @@ mod tests {
                     .is_err()
             );
         }
+        let tiny_options = json!({"max_entry_bytes": 3, "max_total_bytes": 12}).to_string();
+        assert!(candidate_evidence(&bytes, &change, tiny_options.as_bytes()).is_err());
+        let duplicate = br#"{"schema":"aexeo.candidate-external-evidence/v1","sources":{"article":{},"article":{}},"links":null}"#;
+        assert!(candidate_evidence(duplicate, &change, input.host_options).is_err());
         let checks: BTreeMap<_, _> = verdict["verdict"]["checks"]
             .as_array()
             .unwrap()
