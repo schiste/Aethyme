@@ -2,7 +2,7 @@
 use super::{optional, read};
 use aethyme_broker::content_gate::{
     candidate_revision_v2::{Item, Snapshot},
-    portable_compare_v2::{Inputs, compare},
+    portable_compare_v2::{ExperimentalMatch, Inputs, compare},
     strict::parse_unique,
 };
 use serde::Deserialize;
@@ -33,7 +33,10 @@ struct Manifest {
     fresh_timed_out: bool,
 }
 
-fn execute(path: &Path, timings: &mut BTreeMap<&'static str, u128>) -> Result<(), String> {
+fn execute(
+    path: &Path,
+    timings: &mut BTreeMap<&'static str, u128>,
+) -> Result<ExperimentalMatch, String> {
     let started = Instant::now();
     let manifest = read(path)?;
     let m: Manifest = serde_json::from_value(parse_unique(&manifest).map_err(str::to_owned)?)
@@ -74,28 +77,39 @@ fn execute(path: &Path, timings: &mut BTreeMap<&'static str, u128>) -> Result<()
     )
     .map_err(str::to_owned);
     timings.insert("compare_ms", started.elapsed().as_millis());
-    result?;
-    Ok(())
+    result
 }
 
 pub(super) fn run(args: &[String]) -> u8 {
     let mut timings = BTreeMap::new();
     let started = Instant::now();
-    let result = if args.len() == 1 {
-        execute(Path::new(&args[0]), &mut timings)
-    } else {
-        Err("expected one comparison manifest".to_owned())
+    let (result, include_coverage) = match args {
+        [path] => (execute(Path::new(path), &mut timings), false),
+        [path, flag] if flag == "--telemetry" => (execute(Path::new(path), &mut timings), true),
+        _ => (
+            Err("expected one comparison manifest and optional --telemetry".to_owned()),
+            false,
+        ),
     };
     timings.insert("total_ms", started.elapsed().as_millis());
-    let (status, code, reason) = match result {
-        Ok(()) => ("match", 0, None),
-        Err(reason) => ("not_matched", 2, Some(reason)),
+    let (status, code, reason, coverage) = match result {
+        Ok(matched) => (
+            "match",
+            0,
+            None,
+            Some(serde_json::json!({
+                "policy_gate_count": matched.policy_gate_count,
+                "policy_check_count": matched.policy_check_count,
+            })),
+        ),
+        Err(reason) => ("not_matched", 2, Some(reason), None),
     };
-    println!(
-        "{}",
-        serde_json::json!({"schema":"aethyme.content-gate-offline-comparison/v1", "status":status,
-        "publication_authorized":false, "reason":reason, "timings_ms":timings})
-    );
+    let mut output = serde_json::json!({"schema":"aethyme.content-gate-offline-comparison/v1", "status":status,
+        "publication_authorized":false, "reason":reason, "timings_ms":timings});
+    if include_coverage {
+        output["coverage"] = serde_json::json!(coverage);
+    }
+    println!("{output}");
     code
 }
 
@@ -129,7 +143,11 @@ mod tests {
             "validator_name":"aexeo","validator_version":"0.0.24","required_checks":["gate:7:article:words"],
             "fresh_exit_code":0,"fresh_timed_out":false});
         let path = file("manifest", manifest.to_string().as_bytes());
-        assert!(execute(&path, &mut BTreeMap::new()).is_ok());
+        let matched = execute(&path, &mut BTreeMap::new()).unwrap();
+        assert_eq!(
+            (matched.policy_gate_count, matched.policy_check_count),
+            (1, 1)
+        );
         fs::write(options, b"changed").unwrap();
         assert!(execute(&path, &mut BTreeMap::new()).is_err());
         fs::write(&path, b"{\"previous\":1,\"previous\":2}").unwrap();

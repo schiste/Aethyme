@@ -35,6 +35,36 @@ fn offline_comparison_reports_match_and_refuses_broker_execution() {
     assert_eq!(result["status"], "match");
     assert_eq!(result["publication_authorized"], false);
     assert!(result["timings_ms"]["compare_ms"].is_number());
+    assert!(result.get("coverage").is_none());
+    let measured = Command::new(env!("CARGO_BIN_EXE_aethyme"))
+        .args(["content-gate", "compare-v2"])
+        .arg(&path)
+        .arg("--telemetry")
+        .env_remove("AETHYME_GATE_WORKER_ID")
+        .output()
+        .unwrap();
+    assert!(measured.status.success());
+    let telemetry: Value = serde_json::from_slice(&measured.stdout).unwrap();
+    assert_eq!(
+        telemetry["coverage"],
+        json!({"policy_gate_count":1,"policy_check_count":1})
+    );
+    let output_text = String::from_utf8_lossy(&measured.stdout);
+    assert!(!output_text.contains("article"));
+    assert!(!output_text.contains(dir.path().to_str().unwrap()));
+    fs::write(&path, b"{}").unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_aethyme"))
+        .args(["content-gate", "compare-v2"])
+        .arg(&path)
+        .arg("--telemetry")
+        .env_remove("AETHYME_GATE_WORKER_ID")
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    let rejected_report: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected_report["coverage"], Value::Null);
+    assert_eq!(rejected_report["publication_authorized"], false);
+    fs::write(&path, manifest.to_string().as_bytes()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_aethyme"))
         .args(["content-gate", "compare-v2"])
         .arg(&path)
