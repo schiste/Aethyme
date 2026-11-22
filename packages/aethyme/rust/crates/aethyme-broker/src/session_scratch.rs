@@ -178,6 +178,30 @@ impl MoveFailure {
     }
 }
 
+/// What a systemic move failure ([`MoveFailure::systemic`]) is confined to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureScope {
+    /// The whole process (out of descriptors): every move would fail.
+    Process,
+    /// One pool: its trash cannot be opened, or its trash row refused.
+    Pool,
+    /// One volume: full, read-only, or without an exclusive rename.
+    Volume,
+}
+
+impl MoveFailure {
+    /// What this failure is confined to, when it is systemic.
+    pub(crate) fn scope(self) -> FailureScope {
+        if self.cause == "too_many_open_files" {
+            FailureScope::Process
+        } else if matches!(self.step, MoveStep::TrashOpen | MoveStep::TrashRecord) {
+            FailureScope::Pool
+        } else {
+            FailureScope::Volume
+        }
+    }
+}
+
 impl Refusal {
     pub(crate) fn code(self) -> &'static str {
         match self {

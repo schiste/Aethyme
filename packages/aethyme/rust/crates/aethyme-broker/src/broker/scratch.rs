@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::retire::RetireRun;
 use crate::Broker;
-use crate::session_scratch::{MoveFailure, Refusal, ScratchRecord, ScratchRecords};
+use crate::session_scratch::{FailureScope, MoveFailure, Refusal, ScratchRecord, ScratchRecords};
 
 /// Broker metadata key holding every recorded scratch directory.
 pub(crate) const SESSION_SCRATCH_RECORDS_KEY: &str = "session_scratch.records";
@@ -40,7 +40,9 @@ const FINISHED_RUNS_COUNTED_MAX: usize = 4096;
 /// stopped ([`ScratchRetireCursor`]).
 pub(crate) const SESSION_SCRATCH_CURSOR_KEY: &str = "session_scratch.retire_cursor";
 /// Failed moves in a row after which a phase stops for this run (a systemic
-/// failure, [`MoveFailure::systemic`], stops it at once): a failing move is
+/// failure, [`MoveFailure::systemic`], stops it at once when it affects the
+/// whole process, and closes only its pool or volume otherwise, see
+/// [`Blocked`]): a failing move is
 /// retried on the next run, never in a loop. In the finished-runs phase it
 /// counts records whose visit ended on a failed move, and also caps the
 /// failed moves in a row within one record, after which the phase passes
@@ -237,11 +239,12 @@ impl Phase {
     }
 
     /// The outcome of one item: a failed move counts toward the stop rule
-    /// (a systemic one stops the phase at once); anything else resets it.
-    fn note(&mut self, failure: Option<MoveFailure>, stop_counter: &'static str) {
+    /// (one whose cause affects the whole process, `stop_now`, stops the
+    /// phase at once); anything else resets it.
+    fn note(&mut self, failure: Option<MoveFailure>, stop_now: bool, stop_counter: &'static str) {
         let before = self.failures_in_a_row;
         self.failures_in_a_row = match failure {
-            Some(failure) if failure.systemic() => MOVE_FAILURES_BEFORE_STOP,
+            Some(_) if stop_now => MOVE_FAILURES_BEFORE_STOP,
             Some(_) => self.failures_in_a_row + 1,
             None => 0,
         };
@@ -259,6 +262,50 @@ impl Phase {
         } else {
             None
         }
+    }
+}
+
+/// The pools and volumes a systemic failure closed for the rest of a pass:
+/// a failure of one pool's trash or its store row
+/// ([`crate::session_scratch::FailureScope::Pool`]) skips that pool's
+/// records, a full, read-only or unsupported volume
+/// ([`crate::session_scratch::FailureScope::Volume`]) skips the records on
+/// that device. Other pools and volumes go on.
+#[derive(Debug, Default)]
+struct Blocked {
+    pools: std::collections::BTreeSet<PathBuf>,
+    devices: std::collections::BTreeSet<u64>,
+}
+
+impl Blocked {
+    /// Close `record`'s pool or volume after the systemic `failure`; false
+    /// when the failure affects the whole process (nothing is closed and
+    /// the caller stops the phase).
+    fn close(&mut self, failure: MoveFailure, record: &ScratchRecord) -> bool {
+        match failure.scope() {
+            FailureScope::Process => false,
+            FailureScope::Pool => {
+                crate::phase_telemetry::add("session_scratch_retire_pool_closed", Duration::ZERO);
+                self.pools.insert(record.pool.clone());
+                true
+            }
+            FailureScope::Volume => {
+                crate::phase_telemetry::add("session_scratch_retire_volume_closed", Duration::ZERO);
+                self.devices.insert(record.device);
+                true
+            }
+        }
+    }
+
+    /// Whether `record` is in a pool or on a volume closed for this pass:
+    /// it is passed (counted, and retried on a later lap).
+    fn skips(&self, record: &ScratchRecord, report: &mut ScratchRetireReport) -> bool {
+        let skip = self.pools.contains(&record.pool) || self.devices.contains(&record.device);
+        if skip {
+            report.skipped_closed_scope += 1;
+            crate::phase_telemetry::add("session_scratch_retire_skipped_closed", Duration::ZERO);
+        }
+        skip
     }
 }
 
@@ -348,6 +395,9 @@ pub(crate) struct ScratchRetireReport {
     pub classify_incomplete: bool,
     /// The run's open-file observation failed: nothing was judged.
     pub process_use_unknown: bool,
+    /// Records passed because a systemic failure closed their pool or
+    /// volume for this pass ([`Blocked`]); retried on a later lap.
+    pub skipped_closed_scope: usize,
     /// Keeps to write into the records, once per pass: key and reason.
     keeps_to_record: Vec<(String, String)>,
 }
@@ -803,9 +853,13 @@ impl Broker {
         // own cursors are left for the next complete classification.
         //
         // Invariant: with R records holding N finished runs, every record is
-        // judged within R + N passes, given passes whose open-file
-        // observation succeeds and whose moves do not fail systemically,
-        // however slow the classification. Each partial pass classifies at
+        // judged (or passed with its pool or volume closed for the pass)
+        // within R + N passes, given passes whose open-file observation
+        // succeeds and whose moves do not fail with a cause that affects
+        // the whole process (out of descriptors), however slow the
+        // classification. A failure confined to one pool's trash or store
+        // row, or to one volume, closes only that pool or volume for the
+        // pass; its records are retried on a later lap. Each partial pass classifies at
         // least one record and judges a prefix of its arc: a phase attempts
         // at least its first record (the finished-runs phase keeps half the
         // budget), a record stops a phase by failing only after it was
@@ -848,14 +902,29 @@ impl Broker {
             let mut closed_unjudged = None;
             let mut pending_unjudged = None;
 
+            // A systemic failure confined to one pool or volume closes it
+            // for the rest of the pass; only one that affects the whole
+            // process stops a phase.
+            let mut blocked = Blocked::default();
+
             let mut phase = Phase::new(closed_deadline);
             for (key, record) in &closed {
+                if blocked.skips(record, &mut report) {
+                    phase.last_done = Some((*key).to_owned());
+                    continue;
+                }
                 if !phase.may_continue(&mut report) {
                     closed_unjudged = Some(*key);
                     break;
                 }
                 let failure = self.retire_closed_scratch(record, run, &mut report);
-                phase.note(failure, "session_scratch_retire_stopped_after_failures");
+                let stop_now = failure
+                    .is_some_and(|failure| failure.systemic() && !blocked.close(failure, record));
+                phase.note(
+                    failure,
+                    stop_now,
+                    "session_scratch_retire_stopped_after_failures",
+                );
                 phase.last_done = Some((*key).to_owned());
             }
             let closed_cursor = phase.cursor(cursor.closed.clone());
@@ -867,6 +936,10 @@ impl Broker {
                 latest,
             ));
             for (key, record) in &pending {
+                if blocked.skips(record, &mut report) {
+                    phase.last_done = Some((*key).to_owned());
+                    continue;
+                }
                 if !phase.may_start(&mut report) {
                     pending_unjudged = Some(*key);
                     break;
@@ -877,6 +950,7 @@ impl Broker {
                     after.as_deref(),
                     run,
                     &mut phase,
+                    &mut blocked,
                     &mut report,
                 );
                 match visit.run_cursor {
@@ -888,8 +962,9 @@ impl Broker {
                     }
                 }
                 // A record left before all its runs were judged (the
-                // deadline, the move cap, or a systemic failure) is not
-                // judged: the next pass starts with it, at its run cursor.
+                // deadline, the move cap, or a failure that affects the
+                // whole process) is not judged: the next pass starts with
+                // it, at its run cursor.
                 if !visit.judged {
                     pending_unjudged = Some(*key);
                     break;
@@ -950,6 +1025,7 @@ impl Broker {
                 "stopped_after_failures": report.stopped_after_failures,
                 "classify_incomplete": report.classify_incomplete,
                 "process_use_unknown": report.process_use_unknown,
+                "skipped_closed_scope": report.skipped_closed_scope,
                 "sessions_with_finished_runs": report.sessions_with_finished_runs,
                 "command_temps_retired": report.command_temps_retired,
                 "command_temps_kept": report.command_temps_kept,
@@ -1097,13 +1173,17 @@ impl Broker {
     /// [`MOVE_FAILURES_BEFORE_STOP`] failed moves in a row pass to the next
     /// record (the record is judged, its run cursor kept past them). A
     /// systemic failure, the deadline or the move cap leaves the record
-    /// unjudged, its run cursor past the runs it judged.
+    /// unjudged, its run cursor past the runs it judged. A systemic failure
+    /// confined to the record's pool or volume closes it for the pass
+    /// (`blocked`) and judges the record, its run cursor before the failing
+    /// run; only one that affects the whole process stops the phase.
     fn retire_finished_command_temps(
         &self,
         record: &ScratchRecord,
         after: Option<&str>,
         run: &mut RetireRun,
         phase: &mut Phase,
+        blocked: &mut Blocked,
         report: &mut ScratchRetireReport,
     ) -> RunsVisit {
         if after.is_some() {
@@ -1195,6 +1275,17 @@ impl Broker {
                 }
             };
             match failure {
+                Some(failure) if failure.systemic() && blocked.close(failure, record) => {
+                    // Confined to this record's pool or volume: the record
+                    // is judged (its run cursor before the failing run, so
+                    // a later lap retries it first) and the phase goes on
+                    // with the other pools.
+                    return RunsVisit {
+                        judged: true,
+                        run_cursor: resume_after(last_judged, after),
+                        ended_failing: true,
+                    };
+                }
                 Some(failure) if failure.systemic() => {
                     phase.stop_systemic(report, "command_temp_retire_stopped_after_failures");
                     return RunsVisit {
@@ -1862,6 +1953,27 @@ mod tests {
         assert!(failure(MoveStep::Rename, "unsupported").systemic());
         assert!(failure(MoveStep::Open, "too_many_open_files").systemic());
         assert!(failure(MoveStep::TrashRecord, "store").systemic());
+        use crate::session_scratch::FailureScope;
+        assert_eq!(
+            failure(MoveStep::Open, "too_many_open_files").scope(),
+            FailureScope::Process
+        );
+        assert_eq!(
+            failure(MoveStep::TrashOpen, "too_many_open_files").scope(),
+            FailureScope::Process
+        );
+        assert_eq!(
+            failure(MoveStep::TrashOpen, "not_private").scope(),
+            FailureScope::Pool
+        );
+        assert_eq!(
+            failure(MoveStep::TrashRecord, "store").scope(),
+            FailureScope::Pool
+        );
+        assert_eq!(
+            failure(MoveStep::Rename, "no_space").scope(),
+            FailureScope::Volume
+        );
         assert!(!failure(MoveStep::Inspect, "io").systemic());
         assert_eq!(failure(MoveStep::Rename, "denied").key(), "rename.denied");
     }
@@ -1910,11 +2022,11 @@ mod tests {
     }
 
     /// A rename the filesystem does not support (no exclusive rename) keeps
-    /// the run, counts it under its step and cause, and stops the phase at
-    /// once instead of failing every run in turn; the next run retires them
-    /// once renames work.
+    /// the run, counts it under its step and cause, and closes its volume
+    /// for the pass instead of failing every run on it in turn; the next
+    /// run retires them once renames work.
     #[test]
-    fn an_unsupported_rename_is_counted_and_stops_the_phase() {
+    fn an_unsupported_rename_is_counted_and_closes_its_volume() {
         let (_owner, _storage, mut broker) = fixture();
         let (first, _) = started(&mut broker, "command temp rename first");
         let (second, _) = started(&mut broker, "command temp rename second");
@@ -1935,7 +2047,8 @@ mod tests {
             "{report:#?}"
         );
         assert_eq!(report.scratch.command_temps_kept, 1, "one attempt only");
-        assert!(report.scratch.stopped_after_failures, "{report:#?}");
+        assert_eq!(report.scratch.skipped_closed_scope, 1, "{report:#?}");
+        assert!(!report.scratch.stopped_after_failures, "{report:#?}");
         assert!(runs.iter().all(|run| run.is_dir()), "nothing moved");
 
         drop(failing);
@@ -2074,15 +2187,16 @@ mod tests {
         );
     }
 
-    /// A systemic failure at a record's first run stops the phase without
-    /// judging the record: the phase cursor stays before it.
+    /// A failure that affects the whole process (out of descriptors) at a
+    /// record's first run stops the phase without judging the record: the
+    /// phase cursor stays before it.
     #[test]
-    fn a_systemic_stop_does_not_judge_the_record() {
+    fn a_process_wide_stop_does_not_judge_the_record() {
         let (_owner, _storage, mut broker) = fixture();
         let sessions = sessions_in_record_order(&mut broker, 2, "command temp systemic");
         let first = finished_run(&broker, &sessions[0]);
         let second = finished_run(&broker, &sessions[1]);
-        let failing = FailingRenames::with(libc::ENOSPC);
+        let failing = FailingRenames::with(libc::EMFILE);
 
         let report = run_retirement(&mut broker);
         assert!(report.scratch.stopped_after_failures, "{report:#?}");
@@ -2098,6 +2212,80 @@ mod tests {
         assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
         assert!(!first.exists(), "the record that stopped comes first");
         assert!(second.is_dir());
+    }
+
+    /// A systemic failure confined to one pool (its trash refused) closes
+    /// that pool for the pass: its other records are passed and counted,
+    /// another pool's finished runs are retired in the same pass, and the
+    /// failing pool's records are retried on a later lap.
+    #[test]
+    fn a_failing_pool_does_not_hold_back_another_pool() {
+        let (owner, _storage, mut broker) = fixture();
+        let pools = std::fs::canonicalize(owner.path()).unwrap().join("pools");
+        let (failing_pool, other_pool) = (pools.join("a-pool"), pools.join("b-pool"));
+        std::fs::create_dir_all(&failing_pool).unwrap();
+        std::fs::create_dir_all(&other_pool).unwrap();
+        let sessions = (0..3)
+            .map(|index| {
+                broker
+                    .start_worktree(&format!("command temp pools {index}"), None)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        // Two sessions' scratch directories in the failing pool (sorting
+        // first), one in the other pool.
+        let records = [&failing_pool, &failing_pool, &other_pool]
+            .iter()
+            .zip(&sessions)
+            .map(|(pool, session)| crate::session_scratch::create(pool, session.id).unwrap())
+            .collect::<Vec<_>>();
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_RECORDS_KEY,
+                |stored: &mut crate::session_scratch::ScratchRecords| {
+                    stored.clear();
+                    for record in &records {
+                        stored.insert(record.key(), record.clone());
+                    }
+                },
+            )
+            .unwrap();
+        let runs = sessions
+            .iter()
+            .map(|session| finished_run(&broker, session))
+            .collect::<Vec<_>>();
+        assert!(runs[0].starts_with(&failing_pool) && runs[2].starts_with(&other_pool));
+        let trash = failing_pool.join(crate::checkout_trash::TRASH_DIR);
+        std::fs::create_dir(&trash).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = run_retirement(&mut broker);
+
+        assert_eq!(
+            report
+                .scratch
+                .command_temps_kept_by_reason
+                .get("move_failed.trash_open.not_private"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(report.scratch.skipped_closed_scope, 1, "{report:#?}");
+        assert!(!report.scratch.stopped_after_failures, "{report:#?}");
+        assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
+        assert!(
+            !runs[2].exists(),
+            "the other pool is reached in the same pass"
+        );
+        assert!(runs[0].is_dir() && runs[1].is_dir());
+
+        std::fs::remove_dir(&trash).unwrap();
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.command_temps_retired, 2, "{report:#?}");
+        assert!(
+            runs.iter().all(|run| !run.exists()),
+            "retried on a later lap"
+        );
     }
 
     /// The finished-runs phase keeps at least half the budget after a
