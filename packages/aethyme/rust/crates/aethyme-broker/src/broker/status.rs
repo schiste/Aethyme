@@ -827,6 +827,7 @@ impl Broker {
     ///
     /// The repository identity is read from the Git common directory the
     /// open already bound (no `git rev-parse` here) and the UUID marker file.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub(crate) fn gc_service_status_advice(&self, outcome_evidence: bool) -> Option<StatusAdvice> {
         #[cfg(target_os = "macos")]
         {
@@ -870,7 +871,6 @@ impl Broker {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = outcome_evidence;
             None
         }
     }
