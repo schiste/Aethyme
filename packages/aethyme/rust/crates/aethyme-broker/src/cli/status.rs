@@ -261,6 +261,13 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             now_ms(),
         );
         drop(main_checkout_span);
+        // This repository's scheduled GC service: the session view is the
+        // status most agents read, so it notices a stale binding as well.
+        let gc_service_advice = if parsed.read_only_snapshot {
+            None
+        } else {
+            broker.gc_service_status_advice(false)
+        };
         // Parent, children, recorded PR states and one next action, when the
         // session is part of a stack.
         let stack = {
@@ -283,6 +290,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             }
             if !main_checkout_advice.is_empty() {
                 snapshot["main_checkout_advice"] = serde_json::to_value(&main_checkout_advice)?;
+            }
+            if let Some(advice) = &gc_service_advice {
+                snapshot["gc_service_advice"] = serde_json::to_value([advice])?;
             }
             let mut value = super::status_revision::render_session(
                 snapshot,
@@ -331,6 +341,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             }
             for advice in &main_checkout_advice {
                 out!("Main checkout: {}", advice.summary);
+            }
+            if let Some(advice) = &gc_service_advice {
+                out!("GC service: {}", advice.summary);
             }
             if let Some(action) = stack
                 .as_ref()
