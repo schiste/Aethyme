@@ -302,6 +302,27 @@ recovery archive) are operator surfaces; `storage.toml` `[budget]` adds
 paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the
 start-of-command check off or on.
 
+Host temp folders (2026-11-22): after each pass the worker reads the per-user
+temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
+`/tmp`, at most every 10 minutes, into
+`<host state>/storage-ledger-host-temp/reading.json` (`updated_at_ms`,
+`roots[]` with `kind` `user_temp`|`system_tmp`, `path`, `entries`,
+`entries_capped`, `bytes`, `unmeasured_entries`, `partial`, `free_bytes`,
+`total_bytes`, `walked_entries`, `measure_ms`; `history[]` hourly samples,
+72 per root) and `sizes.json` (per-entry sizes keyed by a 16-hex-digit hash
+of the name; no names stored), classified `coordination`. The walk lists at
+most 100,000 entries per root and shares a 10-second deadline across roots;
+it never follows a link or leaves the root's device and deletes nothing.
+`aethyme storage status --json` adds `host_temp` (the reading); `broker
+status` adds advice `storage.host-temp-large` (notice; warning when the volume
+is below `host_temp_free_floor_bytes`) from the reading only, skipped when the
+reading is over a day old. `storage.toml` `[budget]` adds
+`host_temp_advice_bytes` (8 GiB), `host_temp_advice_entries` (5,000) and
+`host_temp_free_floor_bytes` (10 GiB); an older binary rejects a file that
+sets them and keeps its defaults. Span `storage_host_temp_measure` times the
+reading; counters `storage_host_temp_root_measured` (one per root, with its
+time) and `storage_host_temp_partial` (a root left partial by the deadline).
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of

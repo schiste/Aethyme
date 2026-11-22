@@ -1270,5 +1270,20 @@ pub fn run_worker_pass() -> Result<Ledger, String> {
         pace: PACE,
         registry: host_state.join("host-resources.db"),
     };
-    run_pass(inputs, Some(&mut lock)).map_err(|error| error.to_string())
+    let ledger = run_pass(inputs, Some(&mut lock)).map_err(|error| error.to_string())?;
+    // Host temp folders are read, never evicted: a separate bounded reading
+    // after the pass, at most every few minutes. Its failure fails nothing.
+    crate::warn_unrecorded(
+        "record the host temp folder reading",
+        super::host_temp::refresh(
+            &host_state,
+            &super::host_temp::default_roots(),
+            super::host_temp::MEASURE_BUDGET,
+            false,
+            &mut || {
+                lock.beat();
+            },
+        ),
+    );
+    Ok(ledger)
 }

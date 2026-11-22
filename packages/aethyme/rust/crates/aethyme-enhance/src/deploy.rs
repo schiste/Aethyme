@@ -1064,6 +1064,7 @@ mod tests {
         for required in [
             "lands through GitHub: push the session branch",
             "aethyme broker push --session <your-session-id> --pr",
+            "Never write to `/tmp`\n   by name",
         ] {
             assert!(
                 codex_broker_reference.contains(required),

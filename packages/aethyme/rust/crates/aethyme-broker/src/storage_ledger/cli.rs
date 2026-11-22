@@ -305,6 +305,9 @@ pub fn status_value(host_state: &Path) -> Value {
             "last_pass_paused": ledger.last_pass.as_ref().and_then(|pass| pass.age_expiry_paused.clone()),
             "last_pass_notices_reset": ledger.last_pass.as_ref().map_or(0, |pass| pass.notices_reset),
         },
+        // Host temp folders: not Aethyme's roots; read by the worker, never
+        // deleted (`storage.host-temp-large`).
+        "host_temp": super::host_temp::Reading::load(host_state),
         "budgets": budgets,
         "budget_error": budget_error,
         "last_pass": ledger.last_pass,
@@ -402,6 +405,25 @@ fn status(json_output: bool) -> u8 {
                 human(entry[2].as_u64().unwrap_or(0))
             );
         }
+    }
+    let host_temp = super::host_temp::Reading::load(&host_state);
+    for root in &host_temp.roots {
+        let growth = host_temp
+            .growth(root.kind, super::now_ms())
+            .map(|(bytes, hours)| {
+                let sign = if bytes < 0 { "-" } else { "+" };
+                format!(", {sign}{} in {hours} h", human(bytes.unsigned_abs()))
+            })
+            .unwrap_or_default();
+        println!(
+            "host temp: {} holds {}{} in {}{} entries{growth}, free {}  (not Aethyme's; never deleted)",
+            root.kind.label(),
+            if root.partial { "at least " } else { "" },
+            human(root.bytes),
+            root.entries,
+            if root.entries_capped { "+" } else { "" },
+            root.free_bytes.map_or_else(|| "unknown".to_string(), human),
+        );
     }
     let expiry = &value["archive_expiry"];
     println!(
@@ -639,6 +661,13 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
                 .chain(["aethyme storage archives".to_string()])
                 .collect(),
         });
+    }
+    if let Some(entry) = super::host_temp::advice(
+        &super::host_temp::Reading::load(host_state),
+        &Budgets::load(host_state).0,
+        super::now_ms(),
+    ) {
+        advice.push(entry);
     }
     let scratch = super::session_scratch_usage(host_state);
     if let Some(entry) = session_scratch_advice(&scratch) {

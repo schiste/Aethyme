@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 pub mod check;
 pub mod cli;
 pub mod evict;
+pub mod host_temp;
 #[cfg(test)]
 mod tests;
 
@@ -215,6 +216,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | CHECKOUTS_DIRECTORY
                 | SESSION_SCRATCH_DIRECTORY
                 | RECOVERY_ARCHIVE_USAGE_DIRECTORY
+                | host_temp::HOST_TEMP_DIRECTORY
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE => Class::Coordination,
@@ -318,6 +320,14 @@ pub struct Budgets {
     /// until its owner dismisses it (`storage keep-archive <id> --dismiss`)
     /// or this is turned on. Fully landed archives expire either way.
     pub expire_unlanded_archives: bool,
+    /// `broker status` advises (`storage.host-temp-large`) when a host temp
+    /// folder (the per-user temp folder, `/tmp`) holds at least this much.
+    /// Those entries are reported, never deleted: they are not Aethyme's.
+    pub host_temp_advice_bytes: u64,
+    /// ... or at least this many top-level entries.
+    pub host_temp_advice_entries: u64,
+    /// ... or a sizeable one sits on a volume with less free space than this.
+    pub host_temp_free_floor_bytes: u64,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -343,6 +353,9 @@ impl Default for Budgets {
             // archives are kept a quarter (was 30 days).
             unlanded_archive_days: 90,
             expire_unlanded_archives: false,
+            host_temp_advice_bytes: 8 * GIB,
+            host_temp_advice_entries: 5_000,
+            host_temp_free_floor_bytes: 10 * GIB,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
