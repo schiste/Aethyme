@@ -486,6 +486,18 @@ impl CommandTemp {
         match write_marker(&self.scratch, &self.name, &marker) {
             Ok(()) => {
                 crate::phase_telemetry::add("command_temp_finished", Duration::ZERO);
+                // After the marker, never before: the retirement pass clears
+                // a signal before it lists the done container.
+                match crate::session_scratch::signal_finished_run(&self.scratch) {
+                    Some(true) => {
+                        crate::phase_telemetry::add("command_temp_finish_signaled", Duration::ZERO);
+                    }
+                    Some(false) => crate::phase_telemetry::add(
+                        "command_temp_finish_signal_failed",
+                        Duration::ZERO,
+                    ),
+                    None => {}
+                }
                 if marker.large() {
                     RETIREMENT_WANTED.store(true, Ordering::Release);
                 }
