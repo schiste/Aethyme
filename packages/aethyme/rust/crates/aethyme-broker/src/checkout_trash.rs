@@ -500,6 +500,63 @@ pub(crate) fn entry_matches(pool: &Path, name: &str, row: &TrashRow) -> bool {
     })
 }
 
+/// What one look at the trash finds for a pending row's entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingEntryState {
+    /// A real directory with the recorded device and inode.
+    Matches,
+    /// The trash exists, already marked as the broker's, on the device the
+    /// row recorded, and holds no entry by that name: the rename never
+    /// happened (or the entry is long gone), so nothing exists to delete.
+    Missing,
+    /// Something else is there: another inode, a file or a link.
+    IdentityChanged,
+    /// The trash cannot be read as it was: absent (an unmounted volume, a
+    /// cleared temporary directory), unmarked, foreign, on another device, or
+    /// the look failed. Nothing is concluded.
+    TrashUnavailable,
+}
+
+/// [`PendingEntryState`] of `name` in the trash of `pool`. Unlike
+/// [`open_trash`] it never creates the trash: a trash created now (on an
+/// empty mount point, say) would make every entry look missing.
+pub(crate) fn pending_entry_state(pool: &Path, name: &str, row: &TrashRow) -> PendingEntryState {
+    let Ok(pool_fd) = open_dir_nofollow(pool) else {
+        return PendingEntryState::TrashUnavailable;
+    };
+    let Ok(trash_fd) = openat_dir_nofollow(pool_fd.as_raw_fd(), TRASH_DIR) else {
+        return PendingEntryState::TrashUnavailable;
+    };
+    let Ok(trash) = fstat(trash_fd.as_raw_fd()) else {
+        return PendingEntryState::TrashUnavailable;
+    };
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    #[allow(clippy::unnecessary_cast)]
+    let trash_device = trash.st_dev as u64;
+    if !is_directory(&trash)
+        || trash.st_uid != uid
+        || trash.st_mode & 0o077 != 0
+        || trash_device != row.device
+        || fstatat_nofollow(trash_fd.as_raw_fd(), TRASH_MARKER).is_err()
+    {
+        return PendingEntryState::TrashUnavailable;
+    }
+    match fstatat_nofollow(trash_fd.as_raw_fd(), name) {
+        Ok(stat) => {
+            #[allow(clippy::unnecessary_cast)]
+            let identity = (stat.st_dev as u64, stat.st_ino as u64);
+            if is_directory(&stat) && identity == (row.device, row.inode) {
+                PendingEntryState::Matches
+            } else {
+                PendingEntryState::IdentityChanged
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingEntryState::Missing,
+        Err(_) => PendingEntryState::TrashUnavailable,
+    }
+}
+
 /// Whether `name` has the shape of an entry the broker names:
 /// `<13-digit ms>-<session>-<pid>-<nonce>`, all decimal.
 pub(crate) fn is_broker_entry_name(name: &str) -> bool {

@@ -1409,6 +1409,21 @@ pub struct CheckoutTrashBacklog {
     pub stale_pending: usize,
     /// Stale entries this pass confirmed under the explicit-apply proofs.
     pub confirmed_this_pass: usize,
+    /// When the oldest deletable entry was moved in; it moves forward as the
+    /// paced deleter (which takes the oldest first) drains the trash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_deletable_created_ms: Option<i64>,
+    /// Stale rows dropped by this pass: no entry by that name exists in a
+    /// trash that is present, so nothing was left to delete.
+    pub dropped_missing_this_pass: usize,
+    /// Unconfirmable rows kept by this pass, by why: not a day old yet ...
+    pub kept_too_young: usize,
+    /// ... something else has the entry's name ...
+    pub kept_identity_changed: usize,
+    /// ... an open session uses the path ...
+    pub kept_session_in_use: usize,
+    /// ... or the trash could not be read as recorded (unmounted volume).
+    pub kept_trash_unavailable: usize,
 }
 
 /// Result of an explicit `gc sweep`.
@@ -7619,18 +7634,26 @@ impl Broker {
         // still has its recorded identity, it is over a day old, and no open
         // session uses its path. Nothing is deleted here; the paced host
         // deleter removes confirmed entries with its own checks.
-        let confirmed = {
+        // A read-only snapshot (`--read-only-snapshot`) writes nothing.
+        let reconcile = if self.store_ref().is_read_only() {
+            crate::broker::StaleTrashReconcile::default()
+        } else {
             let _span = crate::phase_telemetry::span("gc_sweep_confirm_stale_trash");
-            self.confirm_stale_pending_trash_rows()
+            self.reconcile_stale_pending_trash_rows()
         };
-        if confirmed > 0 {
+        if reconcile.confirmed > 0 {
             self.request_checkout_retirement_run();
         }
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
         let artifact_lane = last_artifact_sweep_lane();
         let checkout_trash = CheckoutTrashBacklog {
-            confirmed_this_pass: confirmed,
+            confirmed_this_pass: reconcile.confirmed,
+            dropped_missing_this_pass: reconcile.dropped_missing,
+            kept_too_young: reconcile.too_young,
+            kept_identity_changed: reconcile.identity_changed,
+            kept_session_in_use: reconcile.session_in_use,
+            kept_trash_unavailable: reconcile.trash_unavailable,
             ..self.checkout_trash_backlog_summary()
         };
         crate::phase_telemetry::attach(
@@ -7643,6 +7666,7 @@ impl Broker {
                 "trash_deletable": checkout_trash.deletable,
                 "trash_pending": checkout_trash.pending,
                 "trash_stale_pending": checkout_trash.stale_pending,
+                "trash_dropped_missing": checkout_trash.dropped_missing_this_pass,
             }),
         );
         // The launcher admits artifact, checkout-cleanup and compaction work.

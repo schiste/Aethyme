@@ -158,6 +158,20 @@ fn session_abandonment_snapshot_matches(expected: &Session, current: &Session) -
 }
 
 impl BrokerStore {
+    /// Whether this store cannot write: a read-only snapshot (opened
+    /// read-only or `query_only`). An unreadable answer counts as read-only,
+    /// so a caller skips its write rather than attempt it.
+    pub(crate) fn is_read_only(&self) -> bool {
+        !matches!(
+            self.conn
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0)),
+            Ok(0)
+        ) || self
+            .conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(true)
+    }
+
     /// A controller may outlive a compatible open and then wait behind an
     /// upgrade. Re-read compatibility before changing checkout ownership.
     pub(crate) fn require_live_schema_compatible(&self) -> Result<(), BrokerError> {

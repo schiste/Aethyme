@@ -3923,6 +3923,7 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
+pub(crate) use retire::StaleTrashReconcile;
 #[cfg(test)]
 pub(crate) use retire::TRASH_CATCHUP_LOCK_FILE;
 pub(crate) use retire::{
