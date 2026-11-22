@@ -97,3 +97,6 @@ mod skills_cli;
 mod update_cache_cli;
 #[path = "update_cli.rs"]
 mod update_cli;
+
+#[path = "content_gate_compare_cli.rs"]
+mod content_gate_compare_cli;
