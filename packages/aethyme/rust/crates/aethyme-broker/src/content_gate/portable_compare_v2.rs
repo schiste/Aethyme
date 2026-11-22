@@ -121,11 +121,14 @@ fn closed_verdict(v: &Value) -> Result<(), &'static str> {
             &[
                 "aexeo.offline-input-binding.v1",
                 "aexeo.observed-link-binding.v1",
+                "aexeo.change-evidence-input-binding.v1",
                 "aexeo.html-content-scope.v1",
             ],
         )?;
         let offline = ext.get("aexeo.offline-input-binding.v1");
         let observed = ext.get("aexeo.observed-link-binding.v1");
+        let evidence = ext.get("aexeo.change-evidence-input-binding.v1");
+        let valid_evidence = evidence.and_then(Value::as_str).is_some_and(valid_sha);
         let valid_offline = offline.and_then(Value::as_str).is_some_and(valid_sha);
         let valid_observed = observed.is_some_and(|value| {
             closed(value, &["inputs_sha256", "observations_sha256"]).is_ok()
@@ -134,7 +137,8 @@ fn closed_verdict(v: &Value) -> Result<(), &'static str> {
                     .iter()
                     .all(|key| value[*key].as_str().is_some_and(valid_sha))
         });
-        if (valid_offline as u8 + valid_observed as u8) != 1
+        if (valid_offline as u8 + (valid_observed || valid_evidence) as u8) != 1
+            || evidence.is_some() != valid_evidence
             || offline.is_some() != valid_offline
             || observed.is_some() != valid_observed
             || ext
@@ -440,6 +444,128 @@ fn validate_link_evidence(bytes: &[u8], change: &Value) -> Result<(), &'static s
     Ok(())
 }
 
+// Sources and links are host assertions, not authenticated facts.
+fn candidate_evidence(
+    bytes: &[u8],
+    change: &Value,
+    options: &[u8],
+) -> Result<(Option<Value>, Option<Value>), &'static str> {
+    let artifact = parse_unique(bytes)?;
+    if artifact.get("schema").and_then(Value::as_str)
+        != Some("aexeo.candidate-external-evidence/v1")
+    {
+        validate_link_evidence(bytes, change)?;
+        return Ok((None, Some(artifact)));
+    }
+    closed(&artifact, &["schema", "sources", "links"])?;
+    if artifact.as_object().is_none_or(|map| map.len() != 3) {
+        return Err("invalid candidate evidence artifact");
+    }
+    let sources = artifact["sources"]
+        .as_object()
+        .ok_or("invalid evidence source map")?;
+    let entities: BTreeSet<_> = change["entries"]
+        .as_array()
+        .ok_or("invalid entries")?
+        .iter()
+        .filter(|entry| entry.get("after").is_some_and(|value| !value.is_null()))
+        .map(|entry| entry["entity_id"].as_str().ok_or("invalid entity"))
+        .collect::<Result<_, _>>()?;
+    if sources.len() != entities.len() || sources.keys().any(|key| !entities.contains(key.as_str()))
+    {
+        return Err("evidence inventory must match proposed entity identities");
+    }
+    let options = parse_unique(options)?;
+    let max_entry = options["max_entry_bytes"]
+        .as_u64()
+        .ok_or("invalid evidence limits")?;
+    let max_total = options["max_total_bytes"]
+        .as_u64()
+        .ok_or("invalid evidence limits")?;
+    let mut total = 0u64;
+    for (entity, values) in sources {
+        total = total
+            .checked_add(entity.len() as u64)
+            .ok_or("evidence inventory exceeds byte limit")?;
+        for (name, content) in values.as_object().ok_or("invalid evidence source map")? {
+            let content = content.as_str().ok_or("invalid evidence source")?;
+            if name.is_empty() || content.len() as u64 > max_entry {
+                return Err("invalid evidence source or byte limit");
+            }
+            total = total
+                .checked_add(name.len() as u64)
+                .and_then(|value| value.checked_add(content.len() as u64))
+                .ok_or("evidence inventory exceeds byte limit")?;
+        }
+        if total > max_total {
+            return Err("evidence inventory exceeds byte limit");
+        }
+    }
+    let links = (!artifact["links"].is_null()).then(|| artifact["links"].clone());
+    if let Some(links) = &links {
+        let encoded = serde_json::to_vec(links).map_err(|_| "invalid link observations")?;
+        validate_link_evidence(&encoded, change)?;
+    }
+    Ok((Some(artifact["sources"].clone()), links))
+}
+
+fn evidence_capabilities(
+    policy: &Value,
+    change: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    sources: Option<&Value>,
+    links: Option<&Value>,
+) -> Result<(), &'static str> {
+    let entries = change["entries"].as_array().ok_or("invalid entries")?;
+    let gates = policy["gates"].as_array().ok_or("invalid gates")?;
+    for gate in gates {
+        let kind = gate["kind"].as_str().ok_or("invalid gate kind")?;
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.get("after").is_some_and(|v| !v.is_null()))
+        {
+            let entity = entry["entity_id"].as_str().ok_or("invalid entity")?;
+            let id = gate["id"].as_str().ok_or("invalid gate id")?;
+            let check_id = format!("gate:{}:{entity}:{id}", entity.len());
+            let Some(check) = checks.get(check_id.as_str()) else {
+                continue;
+            };
+            let available = sources
+                .and_then(|items| items.get(entity))
+                .and_then(Value::as_object);
+            let has = |field: &str| {
+                gate[field]
+                    .as_str()
+                    .is_some_and(|key| available.is_some_and(|m| m.contains_key(key)))
+            };
+            let missing = match kind {
+                "evidence_anchors" | "structured_fact" => !has("source"),
+                "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
+                "link_reachability" => links.is_none(),
+                _ => false,
+            };
+            if missing && check["status"] != "not_checked" {
+                return Err("candidate gate cannot execute without required evidence");
+            }
+            if kind == "link_reachability" {
+                if let Some(item) = links.and_then(|v| v["entries"].get(entity)) {
+                    let observations = item["observations"]
+                        .as_array()
+                        .ok_or("invalid link observations")?;
+                    if (observations.iter().any(|v| v == "not_checked")
+                        && check["status"] != "not_checked")
+                        || (observations.iter().any(|v| v == "not_found")
+                            && check["status"] == "passed")
+                    {
+                        return Err("link reachability status contradicts its observations");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compare an earlier and a freshly produced envelope against independently
 /// reconstructed inputs. Passing is never permission to publish. In addition
 /// to caller obligations above, snapshots must be duplicate-safe parsed. This
@@ -471,9 +597,10 @@ pub fn compare(
     if let Some(bytes) = input.collection {
         validate_collection(bytes, &candidate, &change)?;
     }
-    if let Some(bytes) = input.external_evidence {
-        validate_link_evidence(bytes, &change)?;
-    }
+    let (sources, links) = match input.external_evidence {
+        Some(bytes) => candidate_evidence(bytes, &change, input.host_options)?,
+        None => (None, None),
+    };
     let binding = candidate_binding(&CandidateArtifacts {
         change: input.change,
         resolved_policy: input.resolved_policy,
@@ -527,8 +654,12 @@ pub fn compare(
             .get("extensions")
             .and_then(|ext| ext.get("aexeo.observed-link-binding.v1"))
             .is_some();
-        if observed != input.external_evidence.is_some() {
-            return Err("link evidence does not match the verdict profile");
+        let source_bound = verdict
+            .get("extensions")
+            .and_then(|ext| ext.get("aexeo.change-evidence-input-binding.v1"))
+            .is_some();
+        if observed != links.is_some() || source_bound != sources.is_some() {
+            return Err("external evidence does not match the verdict profile");
         }
         if verdict["subject"] != subject
             || verdict["validator"]["name"] != input.expected_validator_name
@@ -557,6 +688,7 @@ pub fn compare(
             input.collection.is_some(),
             &checks,
         )?);
+        evidence_capabilities(&policy, &change, &checks, sources.as_ref(), links.as_ref())?;
         for id in &required {
             if !checks
                 .get(id)
@@ -704,7 +836,10 @@ mod tests {
             serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
         let check = &verdict["verdict"]["checks"][0];
         let checks = BTreeMap::from([("gate:7:article:words", check)]);
-        assert_eq!(policy_coverage(&policy, &change, false, &checks), Ok((1, 1)));
+        assert_eq!(
+            policy_coverage(&policy, &change, false, &checks),
+            Ok((1, 1))
+        );
         policy["gates"] = json!([]);
         assert_eq!(
             policy_coverage(&policy, &change, false, &checks),
@@ -729,7 +864,10 @@ mod tests {
             );
             check["status"] = json!("not_checked");
             let checks = BTreeMap::from([("gate:7:article:words", &check)]);
-            assert_eq!(policy_coverage(&policy, &change, false, &checks), Ok((1, 1)));
+            assert_eq!(
+                policy_coverage(&policy, &change, false, &checks),
+                Ok((1, 1))
+            );
             check["status"] = json!("passed");
         }
         policy["gates"][0]["kind"] = json!("word_count");
@@ -918,6 +1056,67 @@ mod tests {
         input.external_evidence = None;
         assert!(!run(&verdict, &verdict, &input));
     }
+    #[test]
+    fn source_inventory_binds_and_requires_per_entity_gate_inputs() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        policy["gates"][0]["kind"] = json!("evidence_review");
+        policy["gates"][0]["source"] = json!("source");
+        policy["gates"][0]["review"] = json!("review");
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy_bytes;
+        let artifact = json!({"schema":"aexeo.candidate-external-evidence/v1",
+            "sources":{"article":{"source":"text","review":"review"}}, "links":null});
+        let bytes = serde_json::to_vec(&artifact).unwrap();
+        input.external_evidence = Some(&bytes);
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let hash = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: input.external_evidence,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] =
+            json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        verdict["verdict"]["extensions"] =
+            json!({"aexeo.change-evidence-input-binding.v1":"a".repeat(64)});
+        assert!(run(&verdict, &verdict, &input));
+        let change = parse_change(input.change).unwrap();
+        for invalid in [
+            json!({"schema":"aexeo.candidate-external-evidence/v1", "sources":{}, "links":null}),
+            json!({"schema":"aexeo.candidate-external-evidence/v1", "sources":{"article":{"": "x"}}, "links":null}),
+            json!({"schema":"aexeo.candidate-external-evidence/v1", "sources":{"article":{"source": 1}}, "links":null}),
+            json!({"schema":"aexeo.candidate-external-evidence/v1", "sources":{"article":{}}, "links":null, "extra":true}),
+        ] {
+            assert!(
+                candidate_evidence(invalid.to_string().as_bytes(), &change, input.host_options)
+                    .is_err()
+            );
+        }
+        let checks: BTreeMap<_, _> = verdict["verdict"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| (check["id"].as_str().unwrap(), check))
+            .collect();
+        let missing = json!({"article":{"source":"text"}});
+        assert!(evidence_capabilities(&policy, &change, &checks, Some(&missing), None).is_err());
+        assert!(evidence_capabilities(&policy, &change, &checks, None, None).is_err());
+        assert!(
+            evidence_capabilities(&policy, &change, &checks, Some(&artifact["sources"]), None)
+                .is_ok()
+        );
+        verdict["verdict"]["extensions"]["aexeo.change-evidence-input-binding.v1"] =
+            json!("invalid");
+        assert!(!run(&verdict, &verdict, &input));
+    }
+
     #[test]
     fn rejects_unknown_nested_fields_duplicates_and_inconsistent_results() {
         let (v, base, after, old) = fixture();
