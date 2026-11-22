@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.158] - 2026-11-22
+
+### Fixed
+
+- The background GC sweep reclaims the checkout trash it could never confirm. On the busiest repository about 200 of 218 trashed checkouts stayed pending: an entry is confirmed when a process listing proves its mover has exited, a move made from a sandboxed command records no start time, and the only step that confirmed such entries was `gc apply`, which needs a plan that never completed there. `broker gc sweep`, and so the service pass, now runs the same reconcile `gc apply` ran before its digest check, with its proofs unchanged: the entry has its recorded identity, it is over a day old, its session is not open and no open session uses its path. It deletes nothing itself; the paced host deleter removes confirmed entries with its usual checks. A stale pending row whose entry is missing from a present, private, broker-marked trash on the recorded device is dropped. A read-only snapshot skips the reconcile (#1947).
+- The session scratch retirement pass no longer lists every open session's directory on each run. With about 600 open sessions the classification took 2.0 to 3.4 s per pass and never completed. Session states are read in one batched query, and a session's finished-run container is listed only when a finished-run signal names it, when its last listing showed a run, or once an hour in a full listing lap. A listing error keeps the record due. A closed record whose directory is proven missing on a mounted volume is forgotten during classification (#1948).
+
+### Added
+
+- `broker gc sweep --json` reports `artifact_lane` (`ran`, `gc_lock_held`, `disabled`, `paused_by_strict_cleanup`, `spaced`) and `checkout_trash` counts. The service receipt records per-lane counts, `reclaimed_nothing_because`, `passes_without_reclaim`, `unreclaimed_since_unix_ms` and `trash_entries_drained`; a shrinking deletable backlog counts as reclaim. `broker status` advice `storage.gc-service-reclaiming-nothing` after eight passes without reclaim, for a stalled deleter or a cache lane out of budget (#1947).
+- Host temp folders are measured, never cleaned. The storage worker reads the per-user temp folder and `/tmp` at most every ten minutes within a 10 s deadline, counting only this user's entries. `aethyme storage status` shows bytes, entries, free space and the last day's growth per folder; `broker status` advice `storage.host-temp-large` at 8 GiB, 5,000 entries or under 10 GiB free. `storage.toml` `[budget]` keys `host_temp_advice_bytes`, `host_temp_advice_entries` and `host_temp_free_floor_bytes` (#1946).
+- Agent guidance says builds, temp files, logs and checkouts go in the session `scratch_dir`, never `/tmp`; the `broker start` scratch note says the same, and the broker reference now states that broker-run commands get `TMPDIR` inside the scratch (#1946).
+- Finished-run signal files `.aethyme-finished.<entry>` in the scratch container; cursor fields `listing_due` and `full_listing_started_ms`; spans `gc_sweep_confirm_stale_trash`, `session_scratch_retire_session_states`, `session_scratch_retire_signals` and `storage_host_temp_measure`, with their counters (#1946, #1947, #1948).
+
+### Changed
+
+- Set the new `storage.toml` keys only once every Aethyme binary on the host, including a pinned GC service runtime, is at least this version: an older binary rejects a file with keys it does not know and runs with default budgets.
+
+### Known issues
+
+- A sandboxed move still records no start time, so new trash entries wait a day before the sweep confirms them. Trash rows that fail the deleter's identity check on every run stay counted as deletable and can keep `storage.gc-service-reclaiming-nothing` on. `gc plan` does not complete within its deadline on a very large repository, so recovery archives and other reviewed lanes stay unreachable there.
+- A dead network mount inside `/tmp` can block the temp folder reading; a single entry with more than 4,096 nested directories is reported partial.
+
 ## [0.8.157] - 2026-11-22
 
 ### Fixed
