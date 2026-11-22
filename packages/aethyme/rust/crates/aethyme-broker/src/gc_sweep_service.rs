@@ -2461,7 +2461,7 @@ pub(crate) fn schedule_refresh_if_stale(
         let mut child = command.spawn()?;
         // Reap it whenever it ends; a short-lived caller simply exits first.
         std::thread::spawn(move || {
-            let _ = child.wait();
+            crate::warn_unrecorded("reap the background GC service refresh", child.wait());
         });
         Ok(())
     })
