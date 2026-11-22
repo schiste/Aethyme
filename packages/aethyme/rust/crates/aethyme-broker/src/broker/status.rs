@@ -828,25 +828,18 @@ impl Broker {
         };
         // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
         let uid = unsafe { libc::geteuid() };
-        // A service bound to a runtime that is gone or no longer current is
-        // rebound in the background (at most once per service interval);
-        // the advice below stays until that refresh lands.
-        let scheduled = crate::gc_sweep_service::schedule_refresh_if_stale(
+        // One read of the service record: a binding that is gone or no
+        // longer current is rebound in the background (with backoff); then a
+        // service silently gone, and one that runs and keeps reclaiming
+        // nothing while reclaimable storage remains.
+        let Some(advice) = crate::gc_sweep_service::status_service_advice(
             &home,
             &uuid,
             uid,
             &self.main_root_path(),
-        );
-        // A service silently gone first; then one that runs and keeps
-        // reclaiming nothing while reclaimable storage remains.
-        let Some(mut advice) = crate::gc_sweep_service::repair_advice(&home, &uuid, uid)
-            .or_else(|| crate::gc_sweep_service::reclaim_advice(&home, &uuid))
-        else {
+        ) else {
             return;
         };
-        if let Some(scheduled) = scheduled {
-            advice.evidence.push(scheduled.describe().into());
-        }
         view.advice.push(StatusAdvice {
             id: advice.id,
             severity: StatusAdviceSeverity::Warning,

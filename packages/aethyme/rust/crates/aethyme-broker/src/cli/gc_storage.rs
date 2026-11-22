@@ -1751,13 +1751,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = match broker_result {
         Ok(broker) => broker,
         Err(error) => {
+            // The claim was released for the open: record under it again, or
+            // generation-free when the plan changed meanwhile.
             #[cfg(target_os = "macos")]
-            if let Some(tick) = managed_tick.as_ref() {
-                crate::gc_sweep_service::record_managed_tick(
-                    tick,
-                    None,
-                    Some(&format!("broker open failed: {error:?}")),
-                )?;
+            if let Some(tick) = managed_tick.as_mut() {
+                tick.record_open_failure(&format!("broker open failed: {error:?}"))?;
             }
             return Err(error);
         }
