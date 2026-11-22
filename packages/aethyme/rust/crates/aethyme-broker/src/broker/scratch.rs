@@ -47,6 +47,14 @@ const MOVE_FAILURES_BEFORE_STOP: usize = 3;
 const MOVES_PER_PHASE: usize = 256;
 /// The attachment counting failed moves by `<subject>.<step>.<cause>`.
 const MOVE_FAILURES_ATTACHMENT: &str = "scratch_move_failures";
+/// The longest one pass spends classifying records (store lookups and
+/// done-container listings); the rest is classified by the next pass.
+const SCRATCH_CLASSIFY_BUDGET: Duration = Duration::from_secs(2);
+/// How far past the lane's own deadline the scratch pass may start new
+/// work. With an item already in flight (at most one fresh open-file
+/// observation of a replaced directory, 10 s, and one rename), a retirement
+/// run ends at most this plus 10 s plus one move past its deadline.
+pub(crate) const SCRATCH_OVERRUN_MAX: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
 thread_local! {
@@ -67,6 +75,8 @@ fn moves_per_phase() -> usize {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ScratchRetireCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    classify: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     closed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     command_temps: Option<String>,
@@ -83,6 +93,19 @@ fn rotate_after<'a, T>(mut items: Vec<(&'a str, T)>, cursor: Option<&str>) -> Ve
         }
     }
     items
+}
+
+/// The finished-runs phase's deadline: the pass's budget from `started`,
+/// but never less than half of it from `now` (a closed directory's fresh
+/// observation can use the closed share and more), and never past
+/// `latest`.
+fn pending_phase_deadline(
+    started: Instant,
+    budget: Duration,
+    now: Instant,
+    latest: Instant,
+) -> Instant {
+    (started + budget).max(now + budget / 2).min(latest)
 }
 
 /// One phase of a scratch pass: its deadline, its move cap, and its stop
@@ -104,6 +127,11 @@ impl Phase {
             stopped: false,
             last_done: None,
         }
+    }
+
+    /// Whether the phase stopped after failed moves.
+    fn stopped_for_failures(&self) -> bool {
+        self.failures_in_a_row >= MOVE_FAILURES_BEFORE_STOP
     }
 
     /// Whether the phase may go on: no stop for failures, time left, and
@@ -233,6 +261,12 @@ pub(crate) struct ScratchRetireReport {
     pub records: usize,
     /// Open sessions whose done container lists a finished run.
     pub sessions_with_finished_runs: usize,
+    /// The classification stopped at its budget; the next pass goes on.
+    pub classify_incomplete: bool,
+    /// The run's open-file observation failed: nothing was judged.
+    pub process_use_unknown: bool,
+    /// Keeps to write into the records, once per pass: key and reason.
+    keeps_to_record: Vec<(String, String)>,
 }
 
 /// The phase counter of one keep, by reason.
@@ -249,6 +283,7 @@ fn kept_counter(code: &str) -> &'static str {
         "identity_changed" => "session_scratch_kept_identity_changed",
         "crosses_device" => "session_scratch_kept_crosses_device",
         "move_failed" => "session_scratch_kept_move_failed",
+        "pool_unavailable" => "session_scratch_kept_pool_unavailable",
         _ => "session_scratch_kept_other",
     }
 }
@@ -549,15 +584,28 @@ impl Broker {
     ) {
         *report.kept.entry(code.to_string()).or_default() += 1;
         crate::phase_telemetry::add(kept_counter(code), Duration::ZERO);
-        let key = record.key();
+        report
+            .keeps_to_record
+            .push((record.key(), code.to_string()));
+    }
+
+    /// Write the pass's keeps into the records: one rewrite of the records,
+    /// not one per kept directory.
+    fn record_scratch_keeps(&self, report: &mut ScratchRetireReport) {
+        let keeps = std::mem::take(&mut report.keeps_to_record);
+        if keeps.is_empty() {
+            return;
+        }
         crate::warn_unrecorded(
-            "record a kept scratch directory",
+            "record kept scratch directories",
             self.update_meta_json(
                 SESSION_SCRATCH_RECORDS_KEY,
                 |records: &mut ScratchRecords| {
-                    if let Some(stored) = records.get_mut(&key) {
-                        stored.keep = Some(code.to_string());
-                        stored.attempts = stored.attempts.saturating_add(1);
+                    for (key, code) in &keeps {
+                        if let Some(stored) = records.get_mut(key) {
+                            stored.keep = Some(code.clone());
+                            stored.attempts = stored.attempts.saturating_add(1);
+                        }
                     }
                 },
             ),
@@ -582,6 +630,7 @@ impl Broker {
         &self,
         run: &mut RetireRun,
         budget: Duration,
+        latest: Instant,
     ) -> ScratchRetireReport {
         let _span = crate::phase_telemetry::span("session_scratch_retire_pass");
         let records = self.session_scratch_records();
@@ -597,11 +646,34 @@ impl Broker {
                 .or_default()
                 .insert(record.entry.clone());
         }
+        let cursor: ScratchRetireCursor = self.meta_json(SESSION_SCRATCH_CURSOR_KEY);
+        let mut next = ScratchRetireCursor::default();
+        // Classify, from where the last pass's classification stopped, until
+        // its own budget: one store lookup per record, one listing per open
+        // session.
         let (closed, pending) = {
             let _classify = crate::phase_telemetry::span("session_scratch_retire_classify");
+            let classify_deadline = (Instant::now() + SCRATCH_CLASSIFY_BUDGET).min(latest);
+            let ordered = rotate_after(
+                records
+                    .iter()
+                    .map(|(key, record)| (key.as_str(), record))
+                    .collect(),
+                cursor.classify.as_deref(),
+            );
             let mut closed = Vec::new();
             let mut pending = Vec::new();
-            for (key, record) in &records {
+            let mut last_classified = None;
+            for (key, record) in ordered {
+                if Instant::now() >= classify_deadline {
+                    report.classify_incomplete = true;
+                    crate::phase_telemetry::add(
+                        "session_scratch_retire_classify_stopped",
+                        Duration::ZERO,
+                    );
+                    break;
+                }
+                last_classified = Some(key.to_owned());
                 let eligible = record.superseded
                     || match self.store_ref().session(record.session_id) {
                         Ok(session) => session.status.is_closed(),
@@ -612,61 +684,81 @@ impl Broker {
                         }
                     };
                 if eligible {
-                    closed.push((key.as_str(), record));
+                    closed.push((key, record));
                 } else if crate::session_scratch::may_have_finished_runs(record) {
-                    pending.push((key.as_str(), record));
+                    pending.push((key, record));
                 }
             }
+            if report.classify_incomplete {
+                next.classify = last_classified.or_else(|| cursor.classify.clone());
+                report.more_remaining = true;
+            }
+            // Back to key order, so the phases' own cursors apply.
+            closed.sort_by(|left, right| left.0.cmp(right.0));
+            pending.sort_by(|left, right| left.0.cmp(right.0));
             (closed, pending)
         };
         report.sessions_with_finished_runs = pending.len();
-        let cursor: ScratchRetireCursor = self.meta_json(SESSION_SCRATCH_CURSOR_KEY);
         let closed = rotate_after(closed, cursor.closed.as_deref());
         let pending = rotate_after(pending, cursor.command_temps.as_deref());
-        if !closed.is_empty() || !pending.is_empty() {
-            // The run's open-file observation, when this pass is the first
-            // to need it, before the budget starts: `lsof` alone can take
-            // 10 s on the busiest machine.
-            // A failed observation is not lost: each item asks again and
-            // keeps itself as `process_use_unknown`.
-            if run.process_use().is_err() {
-                crate::phase_telemetry::add(
-                    "session_scratch_retire_process_use_unknown",
-                    Duration::ZERO,
-                );
-            }
-        }
-        let started = Instant::now();
-        let deadline = started + budget;
-        let closed_deadline = if pending.is_empty() {
-            deadline
+        // The run's open-file observation, when this pass is the first to
+        // need it, before the budget starts: `lsof` alone can take 10 s on
+        // the busiest machine. The run keeps a failed observation, so when
+        // it failed nothing is judged and the cursors stay where they are.
+        let observed = (closed.is_empty() && pending.is_empty()) || run.process_use().is_ok();
+        if !observed {
+            report.process_use_unknown = true;
+            crate::phase_telemetry::add(
+                "session_scratch_retire_process_use_unknown",
+                Duration::ZERO,
+            );
+            next.closed = cursor.closed.clone();
+            next.command_temps = cursor.command_temps.clone();
         } else {
-            started + budget / 2
-        };
-        let mut next = ScratchRetireCursor::default();
+            let started = Instant::now();
+            let deadline = (started + budget).min(latest);
+            let closed_deadline = if pending.is_empty() {
+                deadline
+            } else {
+                (started + budget / 2).min(latest)
+            };
 
-        let mut phase = Phase::new(closed_deadline);
-        for (key, record) in &closed {
-            if !phase.may_continue(&mut report) {
-                break;
+            let mut phase = Phase::new(closed_deadline);
+            for (key, record) in &closed {
+                if !phase.may_continue(&mut report) {
+                    break;
+                }
+                let failure = self.retire_closed_scratch(record, run, &mut report);
+                phase.note(failure, "session_scratch_retire_stopped_after_failures");
+                phase.last_done = Some((*key).to_owned());
             }
-            let failure = self.retire_closed_scratch(record, run, &mut report);
-            phase.note(failure, "session_scratch_retire_stopped_after_failures");
-            phase.last_done = Some((*key).to_owned());
-        }
-        next.closed = phase.cursor(cursor.closed.clone());
+            next.closed = phase.cursor(cursor.closed.clone());
 
-        let mut phase = Phase::new(deadline);
-        for (key, record) in &pending {
-            if !phase.may_start(&mut report) {
-                break;
+            let mut phase = Phase::new(pending_phase_deadline(
+                started,
+                budget,
+                Instant::now(),
+                latest,
+            ));
+            for (key, record) in &pending {
+                if !phase.may_start(&mut report) {
+                    break;
+                }
+                let finished =
+                    self.retire_finished_command_temps(record, run, &mut phase, &mut report);
+                // A record whose runs stopped the phase by failing is judged:
+                // the next pass starts after it, so a failure that never
+                // clears cannot hold back the sessions behind it.
+                if finished || phase.stopped_for_failures() {
+                    phase.last_done = Some((*key).to_owned());
+                }
+                if !finished {
+                    break;
+                }
             }
-            if !self.retire_finished_command_temps(record, run, &mut phase, &mut report) {
-                break;
-            }
-            phase.last_done = Some((*key).to_owned());
+            next.command_temps = phase.cursor(cursor.command_temps.clone());
         }
-        next.command_temps = phase.cursor(cursor.command_temps.clone());
+        self.record_scratch_keeps(&mut report);
 
         if next != cursor {
             crate::warn_unrecorded(
@@ -679,9 +771,9 @@ impl Broker {
                 ),
             );
         }
-        if report.stopped_after_failures {
-            report.more_remaining = true;
-        }
+        // A stop after failed moves is not "more to do": the next periodic
+        // run retries, and a failure that never clears must not keep the
+        // lane on its busy cadence.
         crate::phase_telemetry::attach(
             "session_scratch_retire",
             serde_json::json!({
@@ -693,6 +785,8 @@ impl Broker {
                 "kept_causes": report.kept_causes,
                 "more_remaining": report.more_remaining,
                 "stopped_after_failures": report.stopped_after_failures,
+                "classify_incomplete": report.classify_incomplete,
+                "process_use_unknown": report.process_use_unknown,
                 "sessions_with_finished_runs": report.sessions_with_finished_runs,
                 "command_temps_retired": report.command_temps_retired,
                 "command_temps_kept": report.command_temps_kept,
@@ -796,6 +890,12 @@ impl Broker {
                 self.forget_scratch_record(record);
                 report.retired += 1;
                 crate::phase_telemetry::add("session_scratch_retired", Duration::ZERO);
+                None
+            }
+            Err(Refusal::Missing) if crate::session_scratch::pool_unavailable(record) => {
+                // The volume is not mounted (or an empty mount point stands
+                // in for it): the directory is not gone, only out of reach.
+                self.remember_scratch_keep(record, "pool_unavailable", report);
                 None
             }
             Err(Refusal::Missing) => {
@@ -1680,6 +1780,189 @@ mod tests {
         let report = run(&mut broker);
         assert_eq!(report.scratch.retired, 1, "{report:#?}");
         assert!(!path.exists());
+    }
+
+    /// The session whose scratch record is judged first, then the others.
+    fn sessions_in_record_order(
+        broker: &mut crate::Broker,
+        count: usize,
+        label: &str,
+    ) -> Vec<crate::Session> {
+        let mut sessions = (0..count)
+            .map(|index| started(broker, &format!("{label} {index}")).0)
+            .collect::<Vec<_>>();
+        let order = broker
+            .session_scratch_records()
+            .into_values()
+            .map(|record| record.session_id)
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| order.iter().position(|id| *id == session.id));
+        sessions
+    }
+
+    /// Three runs of one session failing in a row stop the phase, and that
+    /// session counts as judged: the next run starts after it and reaches
+    /// the session behind it, instead of hitting the same three failures
+    /// forever. The stop is not "more to do", so the lane is not kept on
+    /// its busy cadence by it.
+    #[test]
+    fn a_record_that_stops_the_phase_by_failing_is_passed_next_time() {
+        let (_owner, _storage, mut broker) = fixture();
+        let sessions = sessions_in_record_order(&mut broker, 2, "command temp stuck");
+        let stuck = (0..4)
+            .map(|_| finished_run(&broker, &sessions[0]))
+            .collect::<Vec<_>>();
+        let behind = finished_run(&broker, &sessions[1]);
+        let names = stuck
+            .iter()
+            .map(|run| run.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        crate::session_scratch::fail_renames_of_for_test(libc::EACCES, names);
+        let _clear = FailingRenames;
+
+        let report = run_retirement(&mut broker);
+        assert_eq!(
+            report
+                .scratch
+                .command_temps_kept_by_reason
+                .get("move_failed.rename.denied"),
+            Some(&3),
+            "{report:#?}"
+        );
+        assert!(report.scratch.stopped_after_failures, "{report:#?}");
+        assert!(
+            !report.scratch.more_remaining,
+            "a stop after failures is not busy: {report:#?}"
+        );
+        assert!(behind.is_dir(), "not reached in this run");
+
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
+        assert!(!behind.exists(), "the session behind is reached");
+        assert!(
+            stuck.iter().all(|run| run.is_dir()),
+            "the failing runs stay"
+        );
+    }
+
+    /// The finished-runs phase keeps at least half the budget after a
+    /// closed phase that overran, and never runs past the latest start.
+    #[test]
+    fn the_finished_runs_phase_has_a_floor() {
+        let started = Instant::now();
+        let budget = Duration::from_secs(5);
+        let latest = started + Duration::from_secs(60);
+        assert_eq!(
+            super::pending_phase_deadline(started, budget, started, latest),
+            started + budget
+        );
+        let overran = started + Duration::from_secs(12);
+        assert_eq!(
+            super::pending_phase_deadline(started, budget, overran, latest),
+            overran + budget / 2
+        );
+        let near = started + Duration::from_secs(4);
+        assert_eq!(
+            super::pending_phase_deadline(started, budget, overran, near),
+            near
+        );
+    }
+
+    /// A scratch directory whose pool root is not there (a volume that is
+    /// not mounted) is kept and counted, never forgotten as gone.
+    #[test]
+    fn an_unmounted_pool_keeps_its_records() {
+        let (owner, _storage, mut broker) = fixture();
+        let (session, _path) = started(&mut broker, "scratch unmounted");
+        broker
+            .close_abandoning_unpushed(session.id, "scratch fixture")
+            .unwrap();
+        let absent = crate::session_scratch::ScratchRecord {
+            session_id: session.id,
+            pool: std::fs::canonicalize(owner.path())
+                .unwrap()
+                .join("unmounted-volume")
+                .join("pool"),
+            entry: format!("s{}-abc", session.id),
+            device: 1,
+            inode: 1,
+            created_ms: 1,
+            superseded: false,
+            keep: None,
+            attempts: 0,
+        };
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_RECORDS_KEY,
+                |records: &mut crate::session_scratch::ScratchRecords| {
+                    records.insert(absent.key(), absent.clone());
+                },
+            )
+            .unwrap();
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.scratch.kept.get("pool_unavailable"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(report.scratch.forgotten_missing, 0, "{report:#?}");
+        let records = broker.session_scratch_records();
+        let kept = records.get(&absent.key()).expect("the record stays");
+        assert_eq!(kept.keep.as_deref(), Some("pool_unavailable"));
+        assert_eq!(kept.attempts, 1);
+    }
+
+    /// Opening a directory on a recorded path: only `ENOENT`, `ELOOP` and
+    /// `ENOTDIR` judge the path; anything else (out of descriptors) is a
+    /// failed call, counted by cause and systemic.
+    #[test]
+    fn open_errors_other_than_missing_or_not_a_directory_are_failures() {
+        use crate::session_scratch::{MoveStep, Refusal, open_refusal};
+        let refusal = |errno| open_refusal(&std::io::Error::from_raw_os_error(errno));
+        assert_eq!(refusal(libc::ENOENT), Refusal::Missing);
+        assert_eq!(refusal(libc::ELOOP), Refusal::NotARealDirectory);
+        assert_eq!(refusal(libc::ENOTDIR), Refusal::NotARealDirectory);
+        let Refusal::Failed(failure) = refusal(libc::EMFILE) else {
+            panic!("EMFILE is a failure, not a refusal");
+        };
+        assert_eq!(failure.step, MoveStep::Open);
+        assert_eq!(failure.key(), "open.too_many_open_files");
+        assert!(failure.systemic());
+        assert!(matches!(refusal(libc::EACCES), Refusal::Failed(_)));
+    }
+
+    /// When the run's open-file observation failed, nothing is judged: no
+    /// sweep of every record as `process_use_unknown`, no record rewritten,
+    /// the cursors left alone.
+    #[test]
+    fn a_failed_observation_judges_nothing() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, path) = started(&mut broker, "scratch no observation");
+        broker
+            .close_abandoning_unpushed(session.id, "scratch fixture")
+            .unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Incomplete {
+                reason: "lsof refused".into(),
+                observed: Vec::new(),
+            },
+        ));
+
+        let report = run(&mut broker);
+
+        assert!(report.scratch.process_use_unknown, "{report:#?}");
+        assert_eq!(report.scratch.examined, 0, "{report:#?}");
+        assert!(report.scratch.kept.is_empty(), "{report:#?}");
+        assert!(path.is_dir());
+        let record = broker
+            .session_scratch_records()
+            .into_values()
+            .next()
+            .unwrap();
+        assert_eq!(record.keep, None, "no record rewritten");
+        nobody_using();
     }
 
     #[test]

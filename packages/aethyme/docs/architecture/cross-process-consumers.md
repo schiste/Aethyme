@@ -4354,18 +4354,31 @@ attachment gains `command_temps_retired` and `command_temps_kept`; the
 `finished_run_bytes`.
 
 **Scratch pass order, cursor and failure causes.** The scratch pass first
-classifies every record (one store lookup each; for an open session, one
-listing of its `tmp-done` container by path, a hint that only decides
-whether the verified walk is worth its cost), then takes the run's
-open-file observation outside its 5 s budget, then judges the closed (or
-replaced) directories with half the budget while finished runs wait (all of
-it otherwise) and the finished runs of open sessions with the rest. Each
-phase resumes after the record where the previous pass stopped (broker
-metadata key `session_scratch.retire_cursor`, JSON `closed` and
-`command_temps`, each the last record key judged, absent once a phase went
-round), and attempts at most 256 moves. The pass is not cut short by what
-the strip passes or the open-path resolution used of the lane's window. A
-failed move names its step (`open`, `inspect`, `trash_open`,
+classifies records for at most 2 s (one store lookup each; for an open
+session, one listing of its `tmp-done` container by path, a hint that only
+decides whether the verified walk is worth its cost), resuming where the
+last classification stopped. It then takes the run's open-file observation
+outside its 5 s budget; when that observation failed, nothing is judged and
+the cursors stay. Otherwise it judges the closed (or replaced) directories
+with half the budget while finished runs wait (all of it otherwise), then
+the finished runs of open sessions until the budget's end, but never less
+than half the budget after the closed phase. Each phase resumes after the
+record where the previous pass stopped (broker metadata key
+`session_scratch.retire_cursor`, JSON `classify`, `closed` and
+`command_temps`, each the last record key judged, absent once it went
+round); a record whose runs stopped the phase by failing counts as judged.
+Each phase attempts at most 256 moves. The pass is not cut short by what
+the strip passes or the open-path resolution used of the lane's window, but
+starts no new work later than 20 s past the lane's deadline: with one item
+in flight (a replaced directory's fresh observation, 10 s, and one rename),
+a retirement run ends at most 30 s plus one move past its deadline. Keeps
+are written into `session_scratch.records` once per pass. A closed
+session's directory that looks missing while its pool root is absent (or is
+on another device without the scratch container: an unmounted volume) is
+kept as `pool_unavailable` (counter `session_scratch_kept_pool_unavailable`),
+never forgotten. Opening a directory on the recorded path refuses as
+`not_a_real_directory` only for `ELOOP` and `ENOTDIR`; any other errno but
+`ENOENT` is a failed move at step `open`. A failed move names its step (`open`, `inspect`, `trash_open`,
 `trash_record`, `rename`) and cause (`too_many_open_files`, `no_space`,
 `unsupported` for `ENOTSUP`/`EOPNOTSUPP`/`ENOSYS`/`EINVAL`, `denied`,
 `read_only`, `not_found`, `exists`, `busy`, `io`, `crosses_device`,
@@ -4374,16 +4387,20 @@ failed move names its step (`open`, `inspect`, `trash_open`,
 There is no fallback to a non-exclusive rename. A phase stops after three
 failed moves in a row, or at once when the cause is systemic (the trash or
 its record, `too_many_open_files`, `no_space`, `read_only`, `unsupported`),
-and the next run retries: a failing move is tried at most once per run.
+and the next run retries: a failing move is tried at most once per run. A
+stop after failures does not count as more to do, so it never keeps the
+retirement run on its one-minute busy cadence.
 Counters `session_scratch_retire_cursor_resumed`,
 `session_scratch_retire_process_use_unknown`,
+`session_scratch_retire_classify_stopped`,
 `session_scratch_retire_stopped_after_failures`,
 `command_temp_retire_stopped_after_failures`; span
 `session_scratch_retire_classify`; attachment `scratch_move_failures`,
 keyed `<session_scratch|command_temp>.<step>.<cause>` (`count`,
 `total_ms`, `max_ms`). The `session_scratch_retire` attachment gains
 `records`, `sessions_with_finished_runs`, `kept_causes` (directories kept
-by `<step>.<cause>`), `stopped_after_failures` and
+by `<step>.<cause>`), `stopped_after_failures`, `classify_incomplete`,
+`process_use_unknown` and
 `command_temps_kept_by_reason` (`in_use`, `process_use_unknown`, a refusal
 code, or `move_failed.<step>.<cause>`).
 

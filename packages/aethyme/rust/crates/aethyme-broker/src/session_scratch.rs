@@ -266,15 +266,40 @@ fn open_path_without_links(path: &Path) -> Result<OwnedFd, Refusal> {
             continue;
         };
         let name = name.to_str().ok_or(Refusal::NotARecordedScratch)?;
-        current = openat_dir_nofollow(current.as_raw_fd(), name).map_err(|error| {
-            if error.raw_os_error() == Some(libc::ENOENT) {
-                Refusal::Missing
-            } else {
-                Refusal::NotARealDirectory
-            }
-        })?;
+        current =
+            openat_dir_nofollow(current.as_raw_fd(), name).map_err(|error| open_refusal(&error))?;
     }
     Ok(current)
+}
+
+/// Why opening a directory on a recorded path without following links
+/// failed: gone (`ENOENT`), not a real directory (a link, `ELOOP`, or not a
+/// directory, `ENOTDIR`), or a failed call whose cause is counted (out of
+/// descriptors, denied, I/O, ...). Only the first two are judgements about
+/// the path; the rest say nothing about it and stop or retry like any
+/// failed move.
+pub(crate) fn open_refusal(error: &std::io::Error) -> Refusal {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Refusal::Missing,
+        Some(libc::ELOOP | libc::ENOTDIR) => Refusal::NotARealDirectory,
+        _ => Refusal::Failed(MoveFailure::io(MoveStep::Open, error)),
+    }
+}
+
+/// Whether the pool holding `record` is not there to judge: its root is
+/// missing or not a directory (a volume that is not mounted), or it is on
+/// another device than recorded without the broker's scratch container (an
+/// empty mount-point directory standing in for the volume). A scratch
+/// directory that looks missing then is kept, never forgotten.
+pub(crate) fn pool_unavailable(record: &ScratchRecord) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(&record.pool) {
+        Err(_) => true,
+        Ok(metadata) if !metadata.is_dir() => true,
+        Ok(metadata) => {
+            metadata.dev() != record.device && !record.pool.join(SCRATCH_CONTAINER).is_dir()
+        }
+    }
 }
 
 fn uid() -> libc::uid_t {
@@ -331,13 +356,8 @@ fn private_directory(stat: &libc::stat) -> bool {
 /// The container inside the pool `pool_fd`, verified: a real, private,
 /// marked directory owned by this user, on the pool's device.
 fn open_container(pool_fd: RawFd, pool_device: u64) -> Result<OwnedFd, Refusal> {
-    let container = openat_dir_nofollow(pool_fd, SCRATCH_CONTAINER).map_err(|error| {
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            Refusal::Missing
-        } else {
-            Refusal::NotARealDirectory
-        }
-    })?;
+    let container =
+        openat_dir_nofollow(pool_fd, SCRATCH_CONTAINER).map_err(|error| open_refusal(&error))?;
     let stat = fstat(container.as_raw_fd())
         .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?;
     if !private_directory(&stat) || !marker_matches(container.as_raw_fd()) {
@@ -627,14 +647,22 @@ fn open_trash_for_move(pool: &Path) -> Result<TrashForMove, Refusal> {
 thread_local! {
     /// An errno the next exclusive renames of this thread fail with, as a
     /// filesystem without an exclusive rename would (`ENOTSUP`, `EINVAL`).
-    static RENAME_ERRNO_FOR_TEST: std::cell::Cell<Option<i32>> =
-        const { std::cell::Cell::new(None) };
+    /// With the names of the entries it applies to (empty: every entry).
+    static RENAME_ERRNO_FOR_TEST: std::cell::RefCell<Option<(i32, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Make this thread's exclusive renames fail with `errno` (`None` clears).
 #[cfg(test)]
 pub(crate) fn fail_renames_for_test(errno: Option<i32>) {
-    RENAME_ERRNO_FOR_TEST.with(|cell| cell.set(errno));
+    RENAME_ERRNO_FOR_TEST.with(|cell| *cell.borrow_mut() = errno.map(|errno| (errno, Vec::new())));
+}
+
+/// Make this thread's exclusive renames of the entries named `names` fail
+/// with `errno`; other entries rename normally.
+#[cfg(test)]
+pub(crate) fn fail_renames_of_for_test(errno: i32, names: Vec<String>) {
+    RENAME_ERRNO_FOR_TEST.with(|cell| *cell.borrow_mut() = Some((errno, names)));
 }
 
 /// The exclusive rename into the trash, its failure classified. There is no
@@ -642,7 +670,12 @@ pub(crate) fn fail_renames_for_test(errno: Option<i32>) {
 /// (`ENOTSUP`, `EINVAL`) keeps the entry, counted as `rename.unsupported`.
 fn exclusive_rename(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> Result<(), Refusal> {
     #[cfg(test)]
-    if let Some(errno) = RENAME_ERRNO_FOR_TEST.with(std::cell::Cell::get) {
+    if let Some(errno) = RENAME_ERRNO_FOR_TEST.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(_, names)| names.is_empty() || names.iter().any(|name| name == from))
+            .map(|(errno, _)| *errno)
+    }) {
         return Err(rename_refusal(&std::io::Error::from_raw_os_error(errno)));
     }
     crate::checkout_trash::rename_noreplace(from_dir, from, to_dir, to)
@@ -681,14 +714,9 @@ impl FinishedRun {
 fn open_run_container(record: &ScratchRecord, name: &str) -> Result<OwnedFd, Refusal> {
     let verified = verify(record)?;
     let entry = openat_dir_nofollow(verified.container.as_raw_fd(), &record.entry)
-        .map_err(|_| Refusal::NotARealDirectory)?;
-    let container = openat_dir_nofollow(entry.as_raw_fd(), name).map_err(|error| {
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            Refusal::Missing
-        } else {
-            Refusal::NotARealDirectory
-        }
-    })?;
+        .map_err(|error| open_refusal(&error))?;
+    let container =
+        openat_dir_nofollow(entry.as_raw_fd(), name).map_err(|error| open_refusal(&error))?;
     let stat = fstat(container.as_raw_fd())
         .map_err(|error| Refusal::Failed(MoveFailure::io(MoveStep::Open, &error)))?;
     if !private_directory(&stat) {

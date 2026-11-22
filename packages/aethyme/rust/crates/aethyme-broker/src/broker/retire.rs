@@ -3390,12 +3390,21 @@ impl Broker {
             // open-file observation, when this pass is the first to need it,
             // keeps its full budget outside that one: the later laps reuse
             // it. Neither is cut short by what the phases before used of the
-            // lane's window (a floor, as for the other phases): the pass is
-            // bounded by its own budget.
-            run.deadline =
-                Instant::now() + RETIRE_PROCESS_USE_BUDGET + super::scratch::SCRATCH_RETIRE_BUDGET;
-            report.scratch =
-                self.retire_session_scratch(&mut run, super::scratch::SCRATCH_RETIRE_BUDGET);
+            // lane's window (a floor, as for the other phases), but neither
+            // starts new work later than `SCRATCH_OVERRUN_MAX` past the
+            // lane's deadline: with one item in flight (a replaced
+            // directory's fresh observation, 10 s, and a rename) the run
+            // ends at most that plus 10 s plus one move past it.
+            let scratch_latest = deadline + super::scratch::SCRATCH_OVERRUN_MAX;
+            run.deadline = (Instant::now()
+                + RETIRE_PROCESS_USE_BUDGET
+                + super::scratch::SCRATCH_RETIRE_BUDGET)
+                .min(scratch_latest);
+            report.scratch = self.retire_session_scratch(
+                &mut run,
+                super::scratch::SCRATCH_RETIRE_BUDGET,
+                scratch_latest,
+            );
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other. Before the strip
