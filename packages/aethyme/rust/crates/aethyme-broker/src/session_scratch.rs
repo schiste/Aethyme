@@ -1139,9 +1139,9 @@ pub(crate) fn container_has_entries(container: &Path) -> bool {
         Ok(listing) => listing.flatten().any(|entry| {
             let name = entry.file_name();
             name != SCRATCH_MARKER
-                && !name
+                && name
                     .to_str()
-                    .is_some_and(|name| finished_signal_entry(name).is_some())
+                    .is_none_or(|name| finished_signal_entry(name).is_none())
         }),
         Err(_) => true,
     }
