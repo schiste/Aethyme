@@ -1602,6 +1602,87 @@ impl Broker {
         )
     }
 
+    /// Move a submit verification slot's worktree into the trash of the
+    /// directory holding the slots, with one same-volume rename, and drop its
+    /// Git registration; the paced host deleter unlinks it later. True when
+    /// moved; false leaves it for Git's removal, as before.
+    ///
+    /// The slot is broker-created, holds a merge candidate's tree and the
+    /// gates' output, and no agent work: nothing in it needs proving before
+    /// it goes. Its row is `stripped` (regenerable), recorded for the
+    /// submitting session, so it is never read as that session's checkout
+    /// being in the trash. A lock someone else placed, environments that
+    /// cannot be destroyed, or a refused rename leave it where it is.
+    pub(crate) fn trash_verification_slot(&self, slot: &Path, session_id: i64) -> bool {
+        self.trash_verification_slot_with_temporary_root(
+            slot,
+            session_id,
+            &std::env::temp_dir().join("aethyme-run"),
+        )
+    }
+
+    /// [`Self::trash_verification_slot`] with the temporary-directory slot
+    /// fallback named explicitly (tests place slots there).
+    fn trash_verification_slot_with_temporary_root(
+        &self,
+        slot: &Path,
+        session_id: i64,
+        temporary_root: &Path,
+    ) -> bool {
+        let _span = crate::phase_telemetry::span("verification_slot_trash");
+        // A slot placed in the system temporary directory's fallback
+        // (`<temp>/aethyme-run/`, used when no worktree root can hold it)
+        // keeps Git's removal: a reboot or the system cleaner can empty that
+        // directory, trash and all.
+        if slot_is_under_temporary_root(slot, temporary_root) {
+            crate::phase_telemetry::add(
+                "verification_slot_trash_skipped_temporary",
+                std::time::Duration::ZERO,
+            );
+            return false;
+        }
+        let Some(pool) = slot.parent() else {
+            crate::phase_telemetry::add(
+                "verification_slot_trash_fell_back_to_git",
+                std::time::Duration::ZERO,
+            );
+            return false;
+        };
+        let moved = self
+            .main_git_common_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|common_dir| {
+                crate::checkout_trash::move_verification_worktree_to_trash(
+                    &self.repo,
+                    &common_dir,
+                    pool,
+                    slot,
+                    session_id,
+                    &mut |trash_dir, entry, row| {
+                        self.record_checkout_trash_row(trash_dir, entry, row)
+                    },
+                )
+            });
+        match moved {
+            Ok(trashed) => {
+                crate::warn_unrecorded(
+                    "confirm a verification slot's trash entry",
+                    self.record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, trashed.row),
+                );
+                self.request_checkout_retirement_run();
+                crate::phase_telemetry::add("verification_slot_trashed", std::time::Duration::ZERO);
+                true
+            }
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "verification_slot_trash_fell_back_to_git",
+                    std::time::Duration::ZERO,
+                );
+                false
+            }
+        }
+    }
+
     /// Confirm a checkout just moved into the trash and ask for a run.
     pub(crate) fn note_checkout_trashed(&self, trashed: &crate::checkout_trash::TrashedCheckout) {
         crate::warn_unrecorded(
@@ -4699,6 +4780,18 @@ impl Broker {
 mod lane;
 pub(crate) use lane::{RETIRE_LANE_IDLE_ADVICE_AT, RetirementLaneRecord};
 
+/// Whether `slot` lies under `temporary` (the system temporary directory's
+/// slot fallback), comparing resolved paths where they resolve.
+fn slot_is_under_temporary_root(slot: &Path, temporary: &Path) -> bool {
+    let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let temporary = resolve(temporary);
+    let slot = slot
+        .parent()
+        .map(|parent| resolve(parent).join(slot.file_name().unwrap_or_default()))
+        .unwrap_or_else(|| slot.to_path_buf());
+    slot.starts_with(&temporary)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -6625,6 +6718,7 @@ mod tests {
                     creator_started_ms: 0,
                     stripped: false,
                     scratch: false,
+                    verification: false,
                 },
             )
             .unwrap();
@@ -6661,6 +6755,156 @@ mod tests {
             (0, 1)
         );
         assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// Submit's verification slot goes into the trash with one rename: the
+    /// path is free for the next submit at once, the row is `stripped` (not
+    /// the session's checkout), and the paced deleter removes it.
+    #[test]
+    fn a_verification_slot_is_moved_into_the_trash() {
+        let (owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("submitting", None).unwrap();
+        let main = broker.main_root().to_path_buf();
+        let head = broker.repo_handle().head_commit().unwrap();
+        let mut slot =
+            crate::verification::ExactTreeVerificationSlot::acquire(&main, "merge-sim").unwrap();
+        let checkout = slot.materialize(broker.repo_handle(), &head).unwrap();
+        std::fs::write(checkout.root().join("gate-output.log"), "built\n").unwrap();
+        let path = slot.path().to_path_buf();
+
+        assert!(broker.trash_verification_slot_with_temporary_root(
+            &path,
+            session.id,
+            Path::new("/no-such-temporary-root")
+        ));
+        assert!(!path.exists(), "the slot's path is free at once");
+        let rows = broker
+            .checkout_trash_rows()
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].stripped && !rows[0].pending && rows[0].session_id == session.id);
+        assert!(
+            !broker.checkout_in_trash(session.id),
+            "a verification slot is never the session's checkout"
+        );
+        // The slot materializes again at the same path.
+        slot.cleanup();
+        let again = slot.materialize(broker.repo_handle(), &head).unwrap();
+        assert!(again.root().join("base.txt").exists());
+        slot.cleanup();
+
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker
+            .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// Two submits in a row reuse one slot path, each moving it into the
+    /// trash; a slot directory deleted behind the broker's back (its Git
+    /// registration left) still materializes again; a slot in the
+    /// temporary-directory fallback keeps Git's removal.
+    #[test]
+    fn verification_slots_are_reused_across_trash_moves_and_leftovers() {
+        let (owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("submitting twice", None).unwrap();
+        let main = broker.main_root().to_path_buf();
+        let head = broker.repo_handle().head_commit().unwrap();
+        let mut slot =
+            crate::verification::ExactTreeVerificationSlot::acquire(&main, "merge-sim").unwrap();
+        let path = slot.path().to_path_buf();
+        for _ in 0..2 {
+            slot.materialize(broker.repo_handle(), &head).unwrap();
+            assert!(broker.trash_verification_slot_with_temporary_root(
+                &path,
+                session.id,
+                Path::new("/no-such-temporary-root")
+            ));
+            assert!(!path.exists());
+        }
+        let rows = broker
+            .checkout_trash_rows()
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| row.verification && row.stripped));
+
+        // The leftover after a failed registration removal: the directory
+        // is gone, Git still lists it.
+        slot.materialize(broker.repo_handle(), &head).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        let again = slot.materialize(broker.repo_handle(), &head).unwrap();
+        assert!(again.root().join("base.txt").exists());
+        slot.cleanup();
+
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker
+            .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.entries_removed, 2, "{drained:?}");
+        assert_eq!(drained.verification_entries_removed, 2);
+        assert_eq!(
+            (drained.stripped_entries_removed, drained.stripped_bytes),
+            (0, 0),
+            "verification slots never count as strip"
+        );
+
+        // The slot fixtures here live in the temporary fallback themselves:
+        // the public entry point keeps Git's removal for them.
+        slot.materialize(broker.repo_handle(), &head).unwrap();
+        let in_temporary =
+            slot_is_under_temporary_root(&path, &std::env::temp_dir().join("aethyme-run"));
+        assert_eq!(
+            !broker.trash_verification_slot(&path, session.id),
+            in_temporary
+        );
+        let elsewhere = std::env::temp_dir().join("aethyme-run/key/merge-sim/slot");
+        assert!(!broker.trash_verification_slot(&elsewhere, session.id));
+        slot.cleanup();
+    }
+
+    /// Rows whose trash directory's parent vanished (a temporary directory a
+    /// reboot cleared) are dropped: nothing is left to delete.
+    #[test]
+    fn rows_of_a_vanished_trash_are_dropped() {
+        let (owner, _storage, broker) = fixture();
+        let pool = owner.path().join("vanishing-pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        let trash = crate::checkout_trash::open_trash(&pool).unwrap();
+        let trash_dir = trash.path().to_path_buf();
+        drop(trash);
+        broker
+            .record_checkout_trash_row(
+                &trash_dir,
+                &crate::checkout_trash::new_entry_name(7),
+                crate::checkout_trash::TrashRow {
+                    device: 1,
+                    inode: 2,
+                    session_id: 7,
+                    failures: 0,
+                    pending: false,
+                    creator_pid: 0,
+                    creator_started_ms: 0,
+                    stripped: true,
+                    scratch: false,
+                    verification: true,
+                },
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&pool).unwrap();
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let drained = broker
+            .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
+        assert_eq!(drained.vanished_rows_dropped, 1, "{drained:?}");
+        assert!(
+            broker
+                .checkout_trash_rows()
+                .values()
+                .all(std::collections::BTreeMap::is_empty),
+            "{:?}",
+            broker.checkout_trash_rows()
+        );
     }
 
     /// An automatic close with time left retires the checkout inline.

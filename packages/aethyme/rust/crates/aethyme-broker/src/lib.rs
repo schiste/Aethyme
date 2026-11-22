@@ -258,6 +258,7 @@ pub use representation::{
     plan_digest as representation_plan_digest, session_content, work_landed,
 };
 mod abandonment_safety;
+mod command_temp;
 mod pr_overlap;
 mod repository_contract;
 mod resources;

@@ -176,6 +176,14 @@ a `tcp_port` lease (`repository = "aethyme-mcp-hub"`) in the host resource
 registry, and `status --json` adds `port` per upstream and
 `last_listen_ms` / `http_sessions_ended` per key. Entries gain
 `require_argv`, `http_path`, `http_auth` and `http_unauthenticated`.
+Readiness of a private HTTP server is timed by the phase span
+`mcp_http_listen_wait`; each re-check after the two macOS listener
+snapshots raced (the group held more listeners than `netstat` showed) adds
+one `mcp_http_listen_transient_retry` count (at most five per wait; the
+hub's own watcher re-checks the same way, and its count lands only where a
+phase recorder is installed on that thread). Refusal reasons are unchanged: a race that
+persists still ends as `listener_unverifiable:listener_listing_empty` or
+`listener_unverifiable:listener_count_mismatch`.
 
 Managed servers add two more external consumers. `aethyme mcp intercept
 install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,
@@ -403,6 +411,49 @@ of `command-metrics.jsonl` see these changes:
 
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
+
+## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
+
+- **Peer scans reuse watcher-proven answers.** A lease refresh scans each
+  coordinating session's changed paths. On the busiest repository that is
+  about 31 sessions per submit, each `git diff` plus `ls-files` taking about
+  1.5 s, which is 47 s of summed worker time and 7.4 s of wall time
+  (`implicit_lease_scan_all`).
+  - Only the acting session's answer feeds a decision. Every other session's
+    paths feed overlap reports, which never refuse (`audit_submit_ownership`
+    reports another session's overlapping lease and never refuses it).
+  - Peer scans therefore reuse the worktree watcher's stored answer in any
+    command, `submit` included. That answer is keyed on the watcher counter,
+    the baseline commit and the index identity, and HEAD is not part of
+    `git diff <base>`.
+  - The acting session, and every lease-claim scan, still asks Git.
+  - Counter (introduced): `changed_files_peer_reuse`, counted when a peer scan
+    uses the watcher in a command that does not otherwise allow reuse.
+    Hits and misses keep the existing `changed_files_reused` and
+    `changed_files_miss_<reason>` counters.
+- **The verification slot goes into the trash.** At the end of submit, the
+  merge-simulation slot's worktree is moved into the trash of the directory
+  holding the slots, with one same-volume rename. Its Git registration is
+  dropped, and the paced host deleter unlinks it later. This replaces Git
+  removing the whole tree inline, which took 21 s per submit on the busiest
+  repository.
+  - The trash row is `stripped` and `verification` (a new row field),
+    recorded for the submitting session. It is never read as that session's
+    checkout being in the trash, and its bytes count as neither strip nor
+    scratch. The drain counts them in `verification_entries_removed`, and the
+    counter is `verification_slot_trash_entries_removed`.
+  - A slot placed in the temporary-directory fallback (`<temp>/aethyme-run/`)
+    keeps Git's removal (counter: `verification_slot_trash_skipped_temporary`).
+  - The drain now drops rows whose trash directory's parent no longer exists
+    and is not an unmounted removable volume: nothing is left to delete there.
+    It counts them in `vanished_rows_dropped`, and the counter is
+    `checkout_trash_vanished_rows_dropped`. Such rows used to be kept forever
+    and held the trash "behind".
+  - A lock someone else placed, environments that cannot be destroyed, or a
+    refused rename fall back to Git's removal as before.
+  - Span (introduced): `verification_slot_trash`.
+  - Counters (introduced): `verification_slot_trashed` and
+    `verification_slot_trash_fell_back_to_git`.
 
 ## Early close when nothing can be lost (2026-11-20)
 
@@ -2924,7 +2975,16 @@ missing or hookless: `push_git_trace_without_hook` (the trace showed no
 `pre-push` hook) and `push_git_process_split_unavailable` (the trace was
 requested but had neither a hook nor an end of the remote ref read, e.g. an
 empty trace file). The three spans nest inside `push_git_process`; do not add
-them to it.
+them to it. Timed-out pushes carry `push_timeout_timing` in the operation
+journal when Trace2 was requested. Its `stage` is `remote_ref_listing`,
+`pre_push_hook`, `transfer` or `unknown`; `process_ms` includes the time
+observed until the child stopped. When known, `before_hook_ms` gives the
+first split boundary. `hook_ms` measures a completed hook (zero with no
+hook); `hook_elapsed_ms` reports time observed during an interrupted hook.
+`after_hook_ms` is present only when transfer started and both split
+boundaries are known. Missing fields represent missing evidence. The
+`push_git_timeout_trace` span times the diagnostic read; these fields never
+change the write outcome or its lock scope.
 
 Changed 2026-11-21. A configured or granted duration (a budget, a reserve,
 a retry delay) is no longer recorded as a timing: it is counted in
@@ -2949,6 +3009,20 @@ nests `checkout_strip_backlog_folders` (the folder and tombstone census) and
 Changed 2026-11-21 (worker census and activity waits). The checkout backlog census remembers the folders it found to be retired checkouts' tombstones in meta key `checkout_strip.backlog_tombstones` (JSON: path to `[device, inode, modification time in ns]`) and judges a folder whose identity is unchanged from one `lstat` (count `checkout_strip_backlog_tombstone_remembered`); a census that could list every pool replaces the memory, one that could not keeps what it did not see. Counts are unchanged. The changed-file activity probe remembers, for the rest of the process (one command or one worker run), a checkout whose `git status` ran out of its 2 s, and answers the next probe of it as that timeout did without running Git (count `worktree_status_activity_unavailable_remembered`); a failed call is not remembered.
 
 Changed 2026-11-21 (transcripts cadence). The detached worker's transcripts lane (every repository's worker runs it; its work is host-wide) records each pass in `<host state>/transcripts/last-worker-pass.json` (`at_ms`, `idle`: nothing eligible, within budget, first-run gate open). After an idle pass the next worker pass on the host waits 15 minutes (count `transcripts_worker_pass_not_due` on the skipping worker's line); a pass that found work or ran out of budget, an unreadable record, or a clock that went back runs it at once. Manual `transcripts` commands are unaffected.
+
+Changed 2026-11-21 (staged prunes reclaimed promptly). The storage worker deletes every `.aethyme-storage-evicting-*` entry of each of its roots at the end of each pass as well as at its start (pass phase `sweep_end`), whichever process staged it. A gate whose managed cache prune staged units writes `<staging>.bytes` beside the staging directory (its logical size, swept with it) and starts the storage worker when none runs (counts `storage_staged_deletion_worker_started`, or `storage_staged_deletion_worker_running` when one already runs and will sweep at the end of its pass). A staged entry in the host cache root older than 5 minutes makes any command's start check start a worker when none runs, even while the ledger is fresh, and adds `broker status` advice `storage.staged-deletion-pending` (notice: the recorded bytes awaiting deletion, how many staged entries, the oldest's age). Deletion stays in the background worker.
+
+Changed 2026-11-21 (named lifecycle holders). A background lifecycle claim held 5 s or more (`lifecycle_lock_held_background_long`) is also recorded in the attachment `lifecycle_lock_background_long_holders`: an object keyed `"<lane> <source file>:<line>"` (the claim's lane and the line in Aethyme's source that asked for it; never a user path or id) with `count`, `total_ms` and `max_ms`; `unknown` when the claim did not record one. The merged-branch slice stops starting deletions after 4 s of its claim (was 5 s), so the one in progress ends under 5 s.
+
+Changed 2026-11-21 (abandoned-close claim). The automatic close of an abandoned or landed session (`abandoned_close`) no longer holds the repository lifecycle claim through its evidence. It runs every check (activity, gates, operations, merge queue, preparation, artifact use, process use, leases, landed proof, pull requests, uncommitted content, the work class and early-close rule) under the per-session operation claim, as before, then takes the lifecycle claim only for the close: it re-checks the start reservation and the spawned process, compares a stamp of the checkout's commit state taken before the evidence (HEAD commit, the session branch's tip, the index file's identity) with the same stamp now, and runs the existing compare-and-set (session row, holder binding, leases). Under the lifecycle claim it first keeps the session when another live session is recorded at the same path (`start_reserved`, count `abandoned_close_path_reused_before_close`). The stamp is read from files only (`HEAD`, the branch's loose ref or its `packed-refs` line through the worktree's `gitdir` and `commondir`, the index's metadata), never by running Git; a part that cannot be read keeps the session (`worktree_activity_unavailable`, count `abandoned_close_checkout_stamp_unreadable`). Anything that moved keeps the session for this pass (`changed`, count `abandoned_close_checkout_moved_before_close`); re-checks that took 4 s or more keep it with the new keep reason `close_claim_budget` (counter `session_abandonment_kept_close_claim_budget`, count `abandoned_close_claim_budget`). New spans `abandoned_close_claimed` and `abandoned_close_checkout_stamp`. On the busiest repository the claim was held 9 to 14 s per close before.
+
+Changed 2026-11-21 (GC service recovery). `broker gc service` recognises an installation record that is provably dead. A record is this repository's `gc-sweep-services/<uuid>/plan.json` (with its receipts) and the unit `~/Library/LaunchAgents/com.aethyme.gc-sweep.<uuid>.plist`. It is dead when launchd answers that the label is not loaded (`launchctl print gui/<uid>/<label>` exiting 113; any other answer proves nothing) and either the unit file is missing or the recorded runtime binary is missing. `service status` reports a record without a unit as `installation_state: stale_record` with `record` (`recorded_plan_digest`, `recorded_runtime_version`, `recorded_runtime_present`, `unit_file`, `scheduler_state`: `loaded`/`not_loaded`/`unknown`, `replaceable`, `replaceable_because`) instead of failing. `service plan` adds `existing_installation` (the same object, or `{"same_plan": true}`) to its JSON and two lines to its text. `service install --confirm <new digest>` archives a dead, different record and installs the new plan; it still refuses a loaded one (deactivate first) or one launchd cannot vouch for. `service uninstall --confirm <recorded digest>` finishes removing a dead record without a unit. Archiving renames the record's `plan.json`, `control.json`, `last-pass.json` and, when present, the unit into `gc-sweep-services/<uuid>/archive/<ms>/` (the unit as `unit.plist`, so it never stays where launchd loads units), keeping the newest five archives. Span `gc_service_record_archive`, count `gc_service_record_archived`.
+
+Changed 2026-11-21 (GC service record hardening). `install` and `uninstall` take the service directory's installer claim (`.install.lock`) before reading the record or asking launchd, and decide on the record read under it, so two installs cannot both judge a record dead. Archiving moves the unit first (copy, sync, then remove when the rename fails with `EXDEV` across volumes), so a crash leaves a plan without a unit, never the reverse. A unit with no plan is a stale record too (`replaceable_because: plan_missing_and_label_not_loaded`); `status` reports it with `plan_file: missing` and `recorded_unit_digest`, and `uninstall` takes that unit digest as confirmation when no plan is recorded. Launchd's answer now covers both per-user domains: `launchctl print` of `gui/<uid>/<label>` and `user/<uid>/<label>`; loaded in either is `loaded`, `not_loaded` needs exit 113 from both, anything else is `unknown`. Span `launchd_label_state` wraps both probes.
+
+Changed 2026-11-21 (GC service survives self-update). The service stays pinned to one exact runtime pair, and self-update now rebinds it before that pair can be deleted. After the selector switch and before `cleanup_old_bundles`, `update execute`/`apply` looks at each `gc-sweep-services/<uuid>/plan.json` whose recorded router lies in a bundle of the installation being updated that neither `current` nor `previous` selects (or that is already gone). Under the service's installer claim it loads and verifies the recorded plan (namespace, label `com.aethyme.gc-sweep.<uuid>`, generation, digest, and the unit file's bytes equal to the plan's rendered unit), asks launchd, and then: `unknown` (or a probe that could not run) changes nothing and keeps the old bundle this time; `not_loaded` archives the plan, receipts and unit and publishes a plan and unit built by `Plan::from_runtime` for the new pair from the recorded repository, uuid, home and uid; `loaded` does the same, then `bootout gui/<uid>/<label>` and `bootstrap gui/<uid> <unit>`, with `aethyme.gc-sweep-service-control/v1` receipts (`action: refresh`) before and after. The old bundle is kept unless launchd said not loaded or the bootout was acknowledged, so a failure, a refused bootout or a tick holding the claim never strands a loaded job. Nothing here can fail the update. Each outcome is an `aethyme.gc-sweep-service-refresh/v1` object (`repository_uuid`, `outcome`: `not_installed`/`not_verifiable`/`already_current`/`label_state_unknown`/`refresh_failed`/`refreshed_not_loaded`/`refreshed_and_reloaded`/`refreshed_reload_unconfirmed`/`refreshed_bootstrap_unconfirmed`, `scheduler_state`, `previous_plan_digest`, `previous_runtime_version`, `plan_digest`, `runtime_version`, `archived_to`, `keep_previous_runtime`, `error` (at most 256 characters), `observed_at_unix_ms`), written to `gc-sweep-services/<uuid>/last-refresh.json` and listed in the update's JSON as `gc_service_refresh` (omitted when empty; text output prints one line per service). `broker gc service refresh [--json]` runs the same steps for this repository against the running runtime. `gc service status` runs it by itself only when the recorded runtime is gone, the uuid read from the repository's marker is the service's, the recorded plan and unit verify, and the plan names this repository; it then adds `automatic_refresh`. Status JSON also adds `last_error`, `last_refresh` and `next_action` (the refresh command when the recorded runtime is gone). A managed tick that fails preflight writes `aethyme.gc-sweep-service-last-error/v1` (`repository_uuid`, `generation` when it is a valid digest, `observed_at_unix_ms`, `error` at most 256 characters) to `last-error.json` beside `last-pass.json`, only into an existing private service directory named by a valid uuid; it is archived with the record. `broker status` adds the warning `storage.gc-service-runtime-missing` with `aethyme broker gc service refresh` when this repository's recorded runtime is gone. Spans `gc_service_refresh_for_update`, `gc_service_refresh` and `status_gc_service_runtime`; counts `gc_service_refreshed`, `gc_service_refresh_reload_unconfirmed`, `gc_service_refresh_label_unknown`, `gc_service_refresh_failed` and `gc_service_tick_refused`. The pr-watch service binds its broker binary and digest the same way and is not refreshed yet.
+
+Changed 2026-11-21 (GC service refresh never leaves the service silently gone). If publishing the refreshed plan or unit fails, the archived record is moved back exactly (anything matching the failed new record is dropped first, then the plan, then the unit, then the receipts; the plan and unit refuse a conflict, while a receipt already in the directory, such as a `last-error.json` a tick wrote without the installer claim, is treated as newer and kept, leaving the archived copy in the archive): outcome `refresh_failed_restored`. If that restore fails too, the outcome is `refresh_failed_unrestored`, `last-refresh.json` names the archive, `gc service status` reports `installation_state: refresh_interrupted` with `archived_record`, `last_refresh` and `next_action`, and `gc service refresh` restores the record from that archive (only a numeric child of the service's own `archive/`) before refreshing it. A record whose last control receipt was an `activate` or `refresh` that was not acknowledged (refused, unknown or interrupted) is retried by `gc service status` under the automatic-refresh proofs plus a present runtime: launchd not loaded gets one `bootstrap gui/<uid> <unit>` (receipt `action: activate`), loaded records `operation_result: observed_loaded`, unknown does nothing; the result is `load_retry` in the status JSON. `broker status` reads files only (no launchctl) and warns with one of `storage.gc-service-runtime-missing`, `storage.gc-service-record-interrupted` (command `aethyme broker gc service refresh`), `storage.gc-service-unit-missing` (a plan without its unit file and a present runtime; commands `aethyme broker gc service status --json` and `aethyme broker gc service plan`) or `storage.gc-service-load-unconfirmed` (commands `aethyme broker gc service status --json` and `aethyme broker gc service activate --confirm <plan digest>`). The refresh walk inside one self-update has an overall budget of 30 seconds, checked before each service; a service not reached gets `label_state_unknown` with an error saying the budget was spent, a `last-refresh.json`, and keeps its bundle. Each kept bundle is named in the outcome's `kept_bundle`, and the update's text output prints one line per kept bundle and why. Spans `gc_service_record_restore` and `gc_service_load_retry`; counts `gc_service_record_restored`, `gc_service_load_retried` and `gc_service_refresh_budget_spent`.
 
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
@@ -4013,7 +4087,7 @@ Changed 2026-11-18 (archive re-review). A gc plan keeps an orphaned worktree roo
 
 The detached worker deletes a local `refs/heads/<branch>` when every session that used it is cleaned with no restorable state (`Broker::has_restorable_state`: not open or closed, no recovery archive), its tip is an ancestor of the remote default branch as last fetched (a missing tracking ref skips the slice; a stale one only keeps more), no worktree has it checked out, and the ref still names the judged tip (`update-ref -d <ref> <tip>`). Sessions, restorable state, Git's worktree registrations (`HEAD`, a rebase's `head-name`, a bisect's `BISECT_START`) and the start reservations of the sessions' paths (`start_reserved`) are re-read under the lifecycle claim immediately before each delete. A slice judges at most 200 branches and deletes at most 100, from cursor meta key `merged_branches.cursor`; meta key `merged_branches.summary` records `at`, `cleaned_session_branches`, `deleted`, `deleted_total`, `kept_by_reason` and `skipped`. Status advice `cleanup.merged-session-branches` (severity `notice`) appears while branches of cleaned sessions remain. `[cleanup] delete_merged_session_branches = false` turns it off. No remote branch or remote-tracking ref is deleted and nothing is fetched. Command metrics carry `merged_branches_deleted`, `merged_branches_kept_<reason>` and the `merged_branches` attachment.
 
-Changed 2026-11-21 (shorter claim). A slice judges every branch of its window from facts read without the repository lifecycle claim: ancestry of the judged tip and the fetched default commit, restorable state, sessions and worktree registrations. It takes the claim only when a branch is judged for deletion, judges each such branch again under it just before its delete (unchanged), and holds it at most 5 s; deletions not reached by then resume from that branch on the next slice. A slice that finds nothing to delete never takes the claim, so it no longer yields (`skipped: yielded_to_foreground`) to a foreground holder. On the busiest repository the old slice held the claim for its whole 20 s budget in most worker runs (`lifecycle_lock_held_background_long` 7 to 26 s). New span `merged_branches_judge` (judging, unclaimed) and `merged_branches_claimed` (the claimed part), and count `merged_branches_claim_budget` (the 5 s hold stopped the deletions).
+Changed 2026-11-21 (shorter claim). A slice judges every branch of its window from facts read without the repository lifecycle claim: ancestry of the judged tip and the fetched default commit, restorable state, sessions and worktree registrations. It takes the claim only when a branch is judged for deletion, judges each such branch again under it just before its delete (unchanged), and holds it at most 4 s, then starts no further deletion; deletions not reached by then resume from that branch on the next slice. A slice that finds nothing to delete never takes the claim, so it no longer yields (`skipped: yielded_to_foreground`) to a foreground holder. On the busiest repository the old slice held the claim for its whole 20 s budget in most worker runs (`lifecycle_lock_held_background_long` 7 to 26 s). New span `merged_branches_judge` (judging, unclaimed) and `merged_branches_claimed` (the claimed part), and count `merged_branches_claim_budget` (the 5 s hold stopped the deletions).
 
 ### Background cleanup reads `[cleanup]` from the default branch when the primary checkout is behind
 
@@ -4139,11 +4213,12 @@ New surface consumers may begin to depend on:
 - The environment variable `AETHYME_SESSION_SCRATCH_DIR` is exported to
   `broker advanced exec` commands, preparation steps, and gate commands run
   for a session (an inherited value is removed from gate commands). `TMPDIR`,
-  `TMP` and `TEMP` are deliberately not changed: on the busiest machine a
-  scratch path is about 130 bytes (and holds a space), past the Unix socket
-  path limit (104 bytes on macOS, 108 on Linux), so tools that create sockets
-  under the temp directory (SSH and GPG agents, Python multiprocessing, tmux)
-  would fail there.
+  `TMP` and `TEMP` never name the scratch directory itself: on the busiest
+  machine a scratch path is about 130 bytes (and holds a space), past the
+  Unix socket path limit (104 bytes on macOS, 108 on Linux), so tools that
+  create sockets under the temp directory (SSH and GPG agents, Python
+  multiprocessing, tmux) would fail there. Each command gets a run directory
+  inside it instead (see "Command temp directories" below).
 - `aethyme storage status --json` adds a `session_scratch` class
   (`directories`, `bytes`, `kept`, `partial`, `bytes_freed_total`,
   `repositories`), written by the retirement lane to
@@ -4194,6 +4269,89 @@ a retirement run when the session has a scratch directory. Counters
 `session_scratch_move`, `session_scratch_retire_pass`,
 `session_scratch_measure`; attachments `session_scratch_retire` and
 `session_scratch_usage`; start phase `session_scratch`.
+
+### Command temp directories (introduced 2026-11-21)
+
+Every command the broker runs for a session -- `git push` and its pre-push
+dry run (so the repository's pre-push hook), gate commands (submit and the
+verification slot), preparation steps and `broker advanced exec` -- gets
+`TMPDIR`, `TMP`, `TEMP` and `AETHYME_COMMAND_TEMP_DIR` naming a fresh
+directory the broker created for that one run,
+`<session scratch>/tmp/r<ms hex>-<pid hex>-<n hex>` (mode 0700), on the
+checkout's volume. When the run directory's path is longer than 64 bytes,
+the variables name a short symbolic link to it instead,
+`/tmp/ae<uid>/<6 hex>`, in a private directory owned by the user; when that
+directory is a link, foreign, or open to others, the inherited temp folder
+is tried as the base (`<temp>/ae<uid>/<6 hex>`, 62 bytes for macOS's
+49-byte per-user temp folder and uid 501), and when no alias path fits in
+64 bytes (sized on the actual alias) the command keeps the inherited temp
+folder. Socket paths count only the link's length while every byte lands
+on the scratch volume. A command started with `AETHYME_COMMAND_TEMP_DIR`
+equal to its `TMPDIR`, resolving into the same scratch's run container (a
+gate inside a pushed pre-push hook), inherits that run rather than nesting
+one. When the scratch's volume is below the gate headroom (8 GiB or 100,000
+inodes, the classifier the storage sweeps use, read with one `statvfs`, or
+the gate's own reading for a gate) the command keeps the inherited temp
+folder. Commands with no session (the main checkout), coordinated `gh` and
+`aethyme env exec` are unchanged.
+
+When the command ends, success, failure or timeout alike (the guard drops
+after the supervision reaps the command), an empty run directory (same
+device and inode as created) is removed with one `rmdir`, and its link if
+it is still a link to that run. A non-empty one stays where it is, link
+included, so a process the command left behind keeps a working `TMPDIR`;
+the broker writes a marker for it, `<session scratch>/tmp-done/<run name>`
+(a new 0600 regular file in a private directory beside the runs, never
+inside one, JSON `device`, `inode`, optional `alias`, `bytes` and
+`complete` as measured within 100 ms). Each `checkout_retirement` run,
+inside the scratch pass's budget, takes up to 64 marked runs per open
+session's scratch directory: no process may use the run (the run's
+open-file observation), the scratch directory must verify as for its own
+retirement, the run container must be a private directory on the pool's
+device, and the run must be a real directory (a link there is not followed)
+with the marker's identity; the trash row (`scratch: true`,
+`stripped: true`) is recorded pending first and the identity checked again
+before the rename. Then the link (only if still a link to the run) and the
+marker go. The paced host deleter unlinks the run. A run whose directory is
+gone loses its marker and link. A run the broker never finished (it was
+killed) stays inside the session scratch and goes with it. Links of the
+broker's naming whose target is gone are pruned when a new link is made.
+Nothing in the system temp folder that the broker did not create is ever
+touched.
+
+The retirement run is due every 10 minutes when idle (every minute while
+busy) and starts from any broker command that opens the repository's
+broker. A finished run measured at 1 GiB or more (or not measured
+completely), or a session reaching 16 marked runs or 1 GiB of them, makes
+the next step that can -- the end of an exec, a preparation step or a push,
+or the start of the next command or gate run for the session -- request it
+at once, the same request `finish` and `close` make. `broker status` adds
+advice `storage.command-temp-backlog` (notice) when one repository has 64
+or more marked runs or 4 GiB of them awaiting removal; the storage ledger's
+`session_scratch` usage gains `finished_runs` and `finished_run_bytes`.
+
+`[command_temp] enabled = false` in `.aethyme/config.toml` (default `true`,
+same trust rule as the other repository policies; an unreadable or invalid
+file keeps the default and counts `command_temp_policy_invalid`) opts a
+repository whose tools need the system temp folder out.
+
+Counters `command_temp_created`, `command_temp_alias_created`,
+`command_temp_alias_base_refused`, `command_temp_inherited`,
+`command_temp_path_too_long`, `command_temp_create_failed`,
+`command_temp_opted_out`, `command_temp_no_scratch`,
+`command_temp_skipped_pressure`, `command_temp_alias_removed`,
+`command_temp_alias_pruned`, `command_temp_removed_empty`,
+`command_temp_finished`, `command_temp_finish_failed`,
+`command_temp_kept_changed`, `command_temp_retirement_requested`,
+`command_temp_retired`, `command_temp_missing_forgotten`,
+`command_temp_kept_in_use`, `command_temp_kept_process_use_unknown`,
+`command_temp_kept_move_failed`, `command_temp_kept_refused`; spans
+`command_temp_prepare`, `command_temp_policy`, `command_temp_create`,
+`command_temp_finish`, `command_temp_backlog_check`,
+`command_temp_retire`, `command_temp_move`. The `session_scratch_retire`
+attachment gains `command_temps_retired` and `command_temps_kept`; the
+`session_scratch_usage` attachment gains `finished_runs` and
+`finished_run_bytes`.
 
 **Session stacks and remote session-branch cleanup (schema v66).** All fields
 below are additive and absent when they do not apply. `broker start --stack-on

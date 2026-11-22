@@ -37,7 +37,10 @@ const LIFECYCLE_LANE: &str = "merged_branches";
 /// The longest one slice holds the lifecycle claim: deletions it has not
 /// reached by then wait for the next slice. A background hold past this is
 /// what keeps a foreground `finish` or `start` waiting.
-const CLAIM_HOLD_BUDGET: Duration = Duration::from_secs(5);
+/// It stops starting deletions after 4 s, so the one in progress (a re-judge
+/// and a ref delete) still ends under the 5 s that counts as a long hold: at
+/// 5 s the busiest repository saw a 5.35 s hold.
+const CLAIM_HOLD_BUDGET: Duration = Duration::from_secs(4);
 /// Status advice id.
 pub(crate) const ADVICE_ID: &str = "cleanup.merged-session-branches";
 

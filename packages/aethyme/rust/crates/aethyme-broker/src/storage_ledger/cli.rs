@@ -644,6 +644,9 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
     if let Some(entry) = session_scratch_advice(&scratch) {
         advice.push(entry);
     }
+    if let Some(entry) = command_temp_backlog_advice(&scratch) {
+        advice.push(entry);
+    }
     advice.extend(recovery_archive_bound_advice(
         &super::recovery_archive_usage(host_state),
     ));
@@ -680,6 +683,13 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
             commands: vec!["aethyme storage status --json".into()],
         });
     }
+    if let Some(item) = staged_deletion_advice(
+        crate::host_state::default_host_cache_dir()
+            .map(|cache| check::staged_deletions(&cache))
+            .unwrap_or_default(),
+    ) {
+        advice.push(item);
+    }
     if summary.unclassified_entries > 0 {
         advice.push(crate::StatusAdvice {
             id: "storage.unclassified",
@@ -698,6 +708,58 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
         });
     }
     advice
+}
+
+/// `storage.staged-deletion-pending`: entries moved aside for the storage
+/// worker (a gate cache prune's staging directory, an interrupted eviction)
+/// still present after [`check::STAGED_DELETION_WAIT`]. The next command
+/// starts the worker when none runs; this says the space has not come back.
+pub(super) fn staged_deletion_advice(
+    staged: Vec<check::StagedDeletion>,
+) -> Option<crate::StatusAdvice> {
+    let wait_ms = u64::try_from(check::STAGED_DELETION_WAIT.as_millis()).unwrap_or(u64::MAX);
+    let waiting: Vec<_> = staged
+        .into_iter()
+        .filter(|staged| staged.age_ms >= wait_ms)
+        .collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    let known: u64 = waiting.iter().filter_map(|staged| staged.bytes).sum();
+    let unmeasured = waiting
+        .iter()
+        .filter(|staged| staged.bytes.is_none())
+        .count();
+    let oldest_minutes = waiting
+        .iter()
+        .map(|staged| staged.age_ms)
+        .max()
+        .unwrap_or(0)
+        / 60_000;
+    let mut evidence = vec![format!(
+        "{} staged in the host cache root, the oldest {oldest_minutes} minute(s) ago",
+        waiting.len()
+    )];
+    if unmeasured > 0 {
+        evidence.push(format!("{unmeasured} of them without a recorded size"));
+    }
+    Some(crate::StatusAdvice {
+        id: "storage.staged-deletion-pending",
+        severity: crate::StatusAdviceSeverity::Notice,
+        reason: "space moved aside for deletion has not been reclaimed yet; the storage worker deletes it in the background, never on a command's path",
+        summary: format!(
+            "{} awaiting deletion by the storage worker",
+            if known > 0 {
+                human(known)
+            } else {
+                "staged entries".to_string()
+            }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme storage status --json".into()],
+    })
 }
 
 /// `storage.session-scratch-large`: one repository's session scratch
@@ -732,6 +794,45 @@ pub(super) fn session_scratch_advice(
         reason: "session scratch directories are large; each is removed when its session is finished, closed or cleaned, so finish idle sessions or clean up inside the scratch directory",
         summary: format!(
             "session scratch is large in {} repositor{}",
+            evidence.len(),
+            if evidence.len() == 1 { "y" } else { "ies" }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme storage status --json".into()],
+    })
+}
+
+/// `storage.command-temp-backlog`: one repository's finished command runs
+/// (temp directories of commands the broker ran) await removal past their
+/// advice threshold.
+pub(super) fn command_temp_backlog_advice(
+    usage: &std::collections::BTreeMap<String, super::SessionScratchUsage>,
+) -> Option<crate::StatusAdvice> {
+    let evidence: Vec<String> = usage
+        .values()
+        .filter(|usage| {
+            usage.finished_runs >= super::COMMAND_TEMP_BACKLOG_ADVICE_RUNS
+                || usage.finished_run_bytes >= super::COMMAND_TEMP_BACKLOG_ADVICE_BYTES
+        })
+        .map(|usage| {
+            format!(
+                "{} finished command run(s) holding {} await removal",
+                usage.finished_runs,
+                human(usage.finished_run_bytes)
+            )
+        })
+        .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    Some(crate::StatusAdvice {
+        id: "storage.command-temp-backlog",
+        severity: crate::StatusAdviceSeverity::Notice,
+        reason: "temp directories of finished commands wait for the checkout retirement run, which moves them to the trash for the paced deleter; it runs in the background, never on a command's path",
+        summary: format!(
+            "finished command temp directories are piling up in {} repositor{}",
             evidence.len(),
             if evidence.len() == 1 { "y" } else { "ies" }
         ),

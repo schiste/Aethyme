@@ -798,6 +798,12 @@ pub const SESSION_SCRATCH_DIRECTORY: &str = "storage-ledger-session-scratch";
 pub const SESSION_SCRATCH_ADVICE_BYTES: u64 = 16 * GIB;
 /// Above this much in one scratch directory, `broker status` advises.
 pub const SESSION_SCRATCH_ADVICE_ONE_BYTES: u64 = 8 * GIB;
+/// Finished command runs awaiting removal, in one repository, at or above
+/// which `broker status` advises.
+pub const COMMAND_TEMP_BACKLOG_ADVICE_RUNS: usize = 64;
+/// Bytes of finished command runs awaiting removal, in one repository, at
+/// or above which `broker status` advises.
+pub const COMMAND_TEMP_BACKLOG_ADVICE_BYTES: u64 = 4 * GIB;
 
 /// One repository's session scratch usage.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +826,12 @@ pub struct SessionScratchUsage {
     /// Bytes the deleter freed removing scratch directories, all runs.
     pub bytes_freed_total: u64,
     pub observed_at_ms: i64,
+    /// Finished command runs ([`crate::command_temp`]) awaiting removal by
+    /// the retirement run, and the bytes their finish measured.
+    #[serde(default)]
+    pub finished_runs: usize,
+    #[serde(default)]
+    pub finished_run_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

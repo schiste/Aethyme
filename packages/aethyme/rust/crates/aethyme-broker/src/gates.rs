@@ -2999,18 +2999,18 @@ fn prepare_managed_gate_cache(
     // Pruned units are handed to the storage worker, which removes the
     // host cache root's `.aethyme-storage-evicting-*` leftovers in the
     // background on every pass; with the worker off, they go inline.
-    let deferred_deletion = storage
+    let deferred_to = storage
         .resource_db_path()
         .ok()
         .and_then(|registry| registry.parent().map(Path::to_path_buf))
-        .is_some_and(|host_state| crate::storage_ledger::check::enabled(&host_state));
+        .filter(|host_state| crate::storage_ledger::check::enabled(host_state));
     let mut runtime = prepare_managed_gate_cache_in(
         policy,
         repository,
         progress,
         gate_name,
         &root,
-        deferred_deletion,
+        deferred_to.as_deref(),
     )?;
     if let Some(runtime) = runtime.as_mut() {
         let files = checkout
@@ -3093,8 +3093,9 @@ fn prepare_managed_gate_cache_in(
     progress: &dyn GateProgressSink,
     gate_name: &str,
     root: &Path,
-    deferred_deletion: bool,
+    deferred_to: Option<&Path>,
 ) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
+    let deferred_deletion = deferred_to.is_some();
     let Some(policy) = policy else {
         return Ok(None);
     };
@@ -3186,6 +3187,27 @@ fn prepare_managed_gate_cache_in(
                 "record the pruned units",
                 std::fs::write(&marker, pruned.staged.join("\n")),
             );
+        }
+        if staging.exists()
+            && let Some(host_state) = deferred_to
+        {
+            // The worker reads the size from here for `broker status`, and
+            // is started now so the space comes back within its pass.
+            crate::warn_unrecorded(
+                "record the staged prune's size",
+                std::fs::write(
+                    root.join(format!(
+                        "{}{}",
+                        staging
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        crate::storage_ledger::check::STAGED_BYTES_SUFFIX
+                    )),
+                    pruned.bytes.to_string(),
+                ),
+            );
+            crate::storage_ledger::check::request_staged_deletion(host_state);
         }
         if staging.exists() && !deferred_deletion {
             let _span = crate::phase_telemetry::span("managed_cache_prune_inline_delete");
@@ -5795,6 +5817,33 @@ fn run_gate_command_inner(
         .and_then(crate::session_scratch::remembered_for_commands)
     {
         process.env(crate::session_scratch::SESSION_SCRATCH_ENV, scratch);
+    }
+    // A temp directory of its own inside it, so what the command leaves
+    // under `$TMPDIR` goes with the run rather than staying in the system
+    // temp folder. Dropped when this function returns, after the command
+    // and its process group were reaped, whatever the outcome.
+    // Below the gate headroom (this gate's own reading) it keeps the
+    // inherited temp folder, so temp writes add nothing to a full volume.
+    let command_temp = context
+        .session_id
+        .filter(|session_id| crate::command_temp::remembered_enabled(*session_id))
+        .and_then(crate::session_scratch::remembered_for_commands)
+        .filter(|_| {
+            let pressured = crate::command_temp::pressured_counts(
+                context.available_bytes,
+                context.available_inodes,
+            );
+            if pressured {
+                crate::phase_telemetry::add(
+                    "command_temp_skipped_pressure",
+                    std::time::Duration::ZERO,
+                );
+            }
+            !pressured
+        })
+        .and_then(|scratch| crate::command_temp::CommandTemp::create(&scratch));
+    if let Some(temp) = &command_temp {
+        temp.apply(&mut process);
     }
     // From the same reading the log header records, so a log always shows
     // the capacity the command sized itself on.
@@ -10215,6 +10264,7 @@ end = 55999
     fn managed_cache_over_its_ceiling_prunes_superseded_units_before_rotating() {
         for deferred_deletion in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
+            let host_state = tmp.path().join("state");
             let directory = tmp.path().join("gates/repository/cargo");
             let profile = directory.join("debug");
             write_unit_generations(&profile);
@@ -10229,7 +10279,7 @@ end = 55999
                 &StderrGateProgressSink,
                 "test",
                 tmp.path(),
-                deferred_deletion,
+                deferred_deletion.then_some(host_state.as_path()),
             )
             .unwrap()
             .unwrap();
@@ -10251,7 +10301,18 @@ end = 55999
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .filter(|name| name.starts_with(".aethyme-storage-evicting-"))
                 .collect();
-            assert_eq!(staging.len(), usize::from(deferred_deletion), "{staging:?}");
+            // A deferred prune also records its size beside the staging
+            // directory, for `broker status` and the worker.
+            assert_eq!(
+                staging.len(),
+                2 * usize::from(deferred_deletion),
+                "{staging:?}"
+            );
+            if deferred_deletion {
+                let staged = crate::storage_ledger::check::staged_deletions(tmp.path());
+                assert_eq!(staged.len(), 1, "{staged:?}");
+                assert_eq!(staged[0].bytes, Some(601), "{staged:?}");
+            }
             assert_eq!(
                 std::fs::read_to_string(directory.join(PRUNED_UNITS_MARKER)).unwrap(),
                 "debug/.fingerprint/work-aaaaaaaaaaaaaaaa"
@@ -10309,7 +10370,7 @@ end = 55999
                 &StderrGateProgressSink,
                 "test",
                 tmp.path(),
-                false,
+                None,
             )
             .unwrap()
             .unwrap()
@@ -10353,7 +10414,7 @@ end = 55999
             &StderrGateProgressSink,
             "test",
             tmp.path(),
-            false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -10381,7 +10442,7 @@ end = 55999
             &StderrGateProgressSink,
             "test",
             tmp.path(),
-            false,
+            None,
         )
         .unwrap()
         .unwrap();

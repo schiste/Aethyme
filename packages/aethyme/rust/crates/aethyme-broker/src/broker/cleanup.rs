@@ -1904,6 +1904,7 @@ impl Broker {
     /// `lane` names the background lane asking (`retire`, `gc`, ...): its
     /// yielding to queued waiters is bounded per lane, see
     /// [`crate::file_lock::try_acquire_repository_lifecycle_lock`].
+    #[track_caller]
     pub(crate) fn try_claim_worktree_lifecycle(
         &self,
         lane: &'static str,

@@ -2360,6 +2360,7 @@ pub(crate) fn sweep_token_directories(directory: &Path) {
 fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, port: u16) {
     let started = Instant::now();
     let deadline = started + hub.config.init_timeout;
+    let mut retries = 0;
     loop {
         // The upstream leads its own group (process_group(0) at spawn).
         let (group, has_token) = {
@@ -2367,12 +2368,21 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
             (state.pid, state.token.is_some())
         };
         let verdict = group.map_or(Listeners::None, |group| listen::check(port, group));
+        // The two listener snapshots raced (a listener bound between them):
+        // look again shortly, a bounded number of times, as the private path
+        // does (`http::wait_owned`).
+        if verdict.transient() && retries < http::TRANSIENT_RETRIES && Instant::now() < deadline {
+            retries += 1;
+            crate::phase_telemetry::add("mcp_http_listen_transient_retry", Duration::ZERO);
+            thread::sleep(LISTEN_POLL);
+            continue;
+        }
         // A server that answers without its token would let any local
         // process in: probed once, before anyone is told the URL.
         let mut refusal = verdict.reason();
         // Unverifiable: nothing is proven wrong with the server, so no
         // unhealthy mark and no crash; a later attach tries again.
-        let mut unproven = matches!(verdict, Listeners::Unverifiable(_));
+        let mut unproven = verdict.unproven();
         if verdict == Listeners::Ours
             && has_token
             && let Some(path) = &upstream.spec.http_path

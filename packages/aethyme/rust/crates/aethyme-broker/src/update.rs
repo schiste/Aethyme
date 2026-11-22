@@ -530,6 +530,11 @@ pub struct UpdateExecutionReport {
     /// about the release manifest's signature before anything was installed.
     #[serde(default)]
     pub signature_verification: String,
+    /// What the update did to macOS GC sweep services bound to a runtime
+    /// bundle it removed: each `aethyme.gc-sweep-service-refresh/v1`
+    /// outcome. Empty (and omitted) when no service needed it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gc_service_refresh: Vec<serde_json::Value>,
 }
 
 /// How `update execute`/`apply` treat the release manifest's Sigstore
@@ -1476,7 +1481,7 @@ pub fn bootstrap_install(
     })?;
     let update_lock = acquire_installation_update_lock(&receipt)?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
-    let (active_bundle, rollback_bundle) = activate_payload_with_completion(
+    let (active_bundle, rollback_bundle, gc_service_refresh) = activate_payload_with_completion(
         payload,
         &receipt,
         &manifest.version,
@@ -1495,6 +1500,7 @@ pub fn bootstrap_install(
         quick_test_passed: true,
         repository_next_action: repository_upgrade_next_action(),
         signature_verification: "installer".into(),
+        gc_service_refresh,
     })
 }
 
@@ -1581,7 +1587,7 @@ pub fn execute_confirmed_update_with(
     run_tar(&["-xzf"], &archive_path, Some(&payload))?;
     verify_payload(&payload, &plan.target_version)?;
 
-    let (active_bundle, rollback_bundle) = activate_payload_with_completion(
+    let (active_bundle, rollback_bundle, gc_service_refresh) = activate_payload_with_completion(
         &payload,
         &receipt,
         &plan.target_version,
@@ -1603,6 +1609,7 @@ pub fn execute_confirmed_update_with(
         quick_test_passed: true,
         repository_next_action: repository_upgrade_next_action(),
         signature_verification: signature_verification.into(),
+        gc_service_refresh,
     })
 }
 
@@ -1625,6 +1632,19 @@ fn render_execution(report: &UpdateExecutionReport, json: bool) -> Result<(), St
         }
         println!("  Quick test: passed");
         println!("  Signature: {}", report.signature_verification);
+        for outcome in &report.gc_service_refresh {
+            let uuid = outcome["repository_uuid"].as_str().unwrap_or("unknown");
+            let result = outcome["outcome"].as_str().unwrap_or("unknown");
+            match outcome["error"].as_str() {
+                Some(error) => println!("  Warning: GC service {uuid}: {result}: {error}"),
+                None => println!("  GC service {uuid}: {result}"),
+            }
+            if let Some(bundle) = outcome["kept_bundle"].as_str() {
+                println!(
+                    "  Kept runtime bundle {bundle} for GC service {uuid} ({result}): launchd may still run it; the next update or `aethyme broker gc service refresh` releases it"
+                );
+            }
+        }
         println!("Next: {}", report.repository_next_action);
     }
     Ok(())
@@ -1740,7 +1760,7 @@ fn activate_payload_with_completion(
     manifest_sha256: &str,
     update_lock: &RuntimeUpdateLock,
     completion: impl FnOnce() -> Result<(), String>,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+) -> Result<(PathBuf, Option<PathBuf>, Vec<serde_json::Value>), String> {
     receipt.validate().map_err(|error| error.to_string())?;
     validate_digest(manifest_sha256, "manifest")?;
     verify_payload(payload, version)?;
@@ -1797,10 +1817,15 @@ fn activate_payload_with_completion(
         || atomic_symlink(&relative_target, &receipt.current_link),
     )?;
 
+    let mut gc_service_refresh = Vec::new();
     let post_switch = (|| {
         ensure_public_links(receipt)?;
         verify_public_pair(receipt, version)?;
-        cleanup_old_bundles(receipt)?;
+        // Rebind GC services to the new pair before their old bundle can go;
+        // a service launchd may still run keeps its bundle this time.
+        let (protected, outcomes) = refresh_gc_services(receipt, &final_bundle);
+        gc_service_refresh = outcomes;
+        cleanup_old_bundles_keeping(receipt, &protected)?;
         completion()
     })();
     if let Err(error) = post_switch {
@@ -1818,7 +1843,35 @@ fn activate_payload_with_completion(
     let rollback_bundle = fs::read_link(&receipt.previous_link)
         .ok()
         .map(|path| receipt.managed_root.join(path));
-    Ok((final_bundle, rollback_bundle))
+    Ok((final_bundle, rollback_bundle, gc_service_refresh))
+}
+
+/// Refresh the macOS GC sweep services bound to this installation; never
+/// fails the update. Returns the bundles cleanup must keep and each outcome.
+#[cfg(target_os = "macos")]
+fn refresh_gc_services(
+    receipt: &InstallReceipt,
+    bundle: &Path,
+) -> (Vec<std::ffi::OsString>, Vec<serde_json::Value>) {
+    let refresh = crate::gc_sweep_service::refresh_for_update(
+        &receipt.managed_root,
+        &selected_bundle_names(receipt),
+        &bundle.join("aethyme"),
+    );
+    let outcomes = refresh
+        .outcomes
+        .iter()
+        .filter_map(|outcome| serde_json::to_value(outcome).ok())
+        .collect();
+    (refresh.protected_bundles, outcomes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn refresh_gc_services(
+    _receipt: &InstallReceipt,
+    _bundle: &Path,
+) -> (Vec<std::ffi::OsString>, Vec<serde_json::Value>) {
+    (Vec::new(), Vec::new())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2059,15 +2112,32 @@ fn verify_existing_bundle(payload: &Path, bundle: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
-    let mut keep = Vec::new();
+/// The bundle names `current` and `previous` select.
+fn selected_bundle_names(receipt: &InstallReceipt) -> Vec<std::ffi::OsString> {
+    let mut selected = Vec::new();
     for link in [&receipt.current_link, &receipt.previous_link] {
         if let Ok(target) = fs::read_link(link)
             && let Some(name) = target.file_name()
         {
-            keep.push(name.to_os_string());
+            selected.push(name.to_os_string());
         }
     }
+    selected
+}
+
+#[cfg(test)]
+fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
+    cleanup_old_bundles_keeping(receipt, &[])
+}
+
+/// Remove every unpinned bundle neither selector names, except `protected`
+/// (bundles a scheduled service may still run).
+fn cleanup_old_bundles_keeping(
+    receipt: &InstallReceipt,
+    protected: &[std::ffi::OsString],
+) -> Result<(), String> {
+    let mut keep = selected_bundle_names(receipt);
+    keep.extend(protected.iter().cloned());
     for entry in fs::read_dir(&receipt.versions_dir)
         .map_err(|error| format!("read {}: {error}", receipt.versions_dir.display()))?
     {
@@ -3099,6 +3169,66 @@ mod tests {
                 .exists()
         );
         drop(updater);
+    }
+
+    #[test]
+    fn cleanup_keeps_a_bundle_a_gc_service_may_still_run() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let receipt = create_test_install_receipt(&temp.path().join("bin"));
+        let (current, previous, service, orphan) = (
+            "v0.8.53-current",
+            "v0.8.52-previous",
+            "v0.8.51-service",
+            "v0.8.50-orphan",
+        );
+        for bundle in [current, previous, service, orphan] {
+            fs::create_dir(receipt.versions_dir.join(bundle)).unwrap();
+        }
+        symlink(Path::new("versions").join(current), &receipt.current_link).unwrap();
+        symlink(Path::new("versions").join(previous), &receipt.previous_link).unwrap();
+        assert_eq!(
+            selected_bundle_names(&receipt),
+            vec![std::ffi::OsString::from(current), previous.into()]
+        );
+        let updater = acquire_test_update_lock(&receipt);
+        cleanup_old_bundles_keeping(&receipt, &[service.into()]).unwrap();
+        assert!(receipt.versions_dir.join(service).is_dir());
+        assert!(!receipt.versions_dir.join(orphan).exists());
+        // The next update without that protection reclaims it.
+        cleanup_old_bundles(&receipt).unwrap();
+        assert!(!receipt.versions_dir.join(service).exists());
+        drop(updater);
+    }
+
+    #[test]
+    fn update_report_omits_an_empty_gc_service_refresh() {
+        let mut report = UpdateExecutionReport {
+            manifest_sha256: "0".repeat(64),
+            installed_version: "0.8.53".into(),
+            installed_target: "target".into(),
+            router_path: "/install/aethyme".into(),
+            engine_path: "/install/aethyme-engine-cli".into(),
+            active_bundle: "/install/.aethyme-managed/versions/v0.8.53".into(),
+            rollback_bundle: None,
+            quick_test_passed: true,
+            repository_next_action: String::new(),
+            signature_verification: "verified".into(),
+            gc_service_refresh: Vec::new(),
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("gc_service_refresh").is_none());
+        let decoded: UpdateExecutionReport = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, report);
+        report
+            .gc_service_refresh
+            .push(serde_json::json!({"outcome": "refreshed_and_reloaded"}));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["gc_service_refresh"][0]["outcome"],
+            "refreshed_and_reloaded"
+        );
     }
 
     #[test]

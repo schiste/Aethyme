@@ -1335,7 +1335,12 @@ are not filed automatically. Review retained metadata before sharing.
 When using `broker advanced insights --json` to investigate recurring friction,
 read its window and coverage alongside its counts; absent session activity is
 unknown, not proof of no friction. Report lists, command metrics, and insights
-can have different coverage and retention."#
+can have different coverage and retention.
+
+For recent event audits, `broker advanced events --json` emits JSON Lines in
+ascending event-ID order, with up to 1,000 rows per call. Page using
+`--since <last-id>` and a narrow `--kind <prefix>`. Check the returned event
+timestamps cover the intended window before using event counts."#
         .to_string()
 }
 
