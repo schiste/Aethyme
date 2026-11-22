@@ -2992,6 +2992,49 @@ pub struct StatusAdvice {
     pub commands: Vec<String>,
 }
 
+/// Most entries named in `cleanup.trash-identity-changed`'s evidence.
+const TRASH_IDENTITY_CHANGED_EVIDENCE_MAX: usize = 20;
+
+/// The `status` row for confirmed checkout trash entries present with
+/// another identity than the broker recorded. They are never deleted and
+/// are out of the deletable backlog, so nothing else reports them.
+fn push_trash_identity_changed_advice(
+    view: &mut StatusView,
+    entries: &[(
+        std::path::PathBuf,
+        String,
+        crate::checkout_trash::IdentityMismatch,
+    )],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut evidence = entries
+        .iter()
+        .take(TRASH_IDENTITY_CHANGED_EVIDENCE_MAX)
+        .map(|(dir, name, cause)| format!("{}: {}", dir.join(name).display(), cause.as_str()))
+        .collect::<Vec<_>>();
+    if entries.len() > TRASH_IDENTITY_CHANGED_EVIDENCE_MAX {
+        evidence.push(format!(
+            "... and {} more",
+            entries.len() - TRASH_IDENTITY_CHANGED_EVIDENCE_MAX
+        ));
+    }
+    view.advice.push(StatusAdvice {
+        id: "cleanup.trash-identity-changed",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "these checkout trash entries exist but no longer have the device and inode the broker recorded when it moved them in, so the broker does not delete them and they do not count as a trash backlog. device_changed (the recorded inode on a new device number, as after the volume is mounted again): leave them; they are held until the broker identifies them again on the new device number, or until the volume comes back under its recorded one, and are then deleted with the usual checks. inode_changed or not_a_directory (something else now has the name): the broker will never delete these; look at each one, remove it yourself only if you know what it is, and the next sweep or deleter run drops its record once it is gone",
+        summary: format!(
+            "{} checkout trash entr(y/ies) kept: identity changed since they were moved in",
+            entries.len()
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme broker gc sweep --json".into()],
+    });
+}
+
 /// The `status` rows of checkout retirement, shown only when something needs
 /// a look: checkouts whose recovery archive would exceed the cap (by session
 /// id; paths omitted), and trash or kept checkouts that stopped shrinking.

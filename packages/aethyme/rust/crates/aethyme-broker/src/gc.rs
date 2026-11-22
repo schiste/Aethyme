@@ -1424,6 +1424,38 @@ pub struct CheckoutTrashBacklog {
     pub kept_session_in_use: usize,
     /// ... or the trash could not be read as recorded (unmounted volume).
     pub kept_trash_unavailable: usize,
+    /// Confirmed rows dropped by this pass: no entry by that name in a
+    /// trash that is present, private, marked and on the recorded device.
+    pub confirmed_dropped_missing_this_pass: usize,
+    /// Confirmed entries present with another identity than recorded: never
+    /// deleted and not `deletable`, so they neither keep the trash behind
+    /// nor count as a deleter that is not draining.
+    pub identity_changed: usize,
+    /// Of those, by cause: the recorded inode on another device (the volume
+    /// was mounted again) ...
+    pub identity_changed_device: usize,
+    /// ... another inode ...
+    pub identity_changed_inode: usize,
+    /// ... or not a real directory.
+    pub identity_changed_not_a_directory: usize,
+    /// Confirmed entries out of `deletable` because they failed to delete
+    /// [`crate::checkout_trash::TRASH_FAILURE_REPORT_AFTER`] times.
+    pub failing: usize,
+    /// Confirmed entries out of `deletable` because the last deleter run
+    /// found a process using them.
+    pub in_use: usize,
+}
+
+impl CheckoutTrashBacklog {
+    /// Confirmed entries that are not `deletable` for a reason other than
+    /// their deletion: identity changed, failing or in use. Read by the
+    /// GC service's receipts, which only the macOS service writes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn held_back(&self) -> usize {
+        self.identity_changed
+            .saturating_add(self.failing)
+            .saturating_add(self.in_use)
+    }
 }
 
 /// Result of an explicit `gc sweep`.
@@ -7654,6 +7686,7 @@ impl Broker {
             kept_identity_changed: reconcile.identity_changed,
             kept_session_in_use: reconcile.session_in_use,
             kept_trash_unavailable: reconcile.trash_unavailable,
+            confirmed_dropped_missing_this_pass: reconcile.confirmed_dropped_missing,
             ..self.checkout_trash_backlog_summary()
         };
         crate::phase_telemetry::attach(
@@ -7667,6 +7700,10 @@ impl Broker {
                 "trash_pending": checkout_trash.pending,
                 "trash_stale_pending": checkout_trash.stale_pending,
                 "trash_dropped_missing": checkout_trash.dropped_missing_this_pass,
+                "trash_confirmed_dropped_missing": checkout_trash.confirmed_dropped_missing_this_pass,
+                "trash_identity_changed": checkout_trash.identity_changed,
+                "trash_failing": checkout_trash.failing,
+                "trash_in_use": checkout_trash.in_use,
             }),
         );
         // The launcher admits artifact, checkout-cleanup and compaction work.

@@ -115,6 +115,11 @@ struct LastPassReceipt {
     /// the previous pass (a floor).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trash_entries_drained: Option<usize>,
+    /// Entries that left the deletable backlog since the previous pass
+    /// without being deleted: their identity changed, they reached the
+    /// failure cap, or a process uses them. Never counted as drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash_entries_held_back: Option<usize>,
     /// Set when the pass reclaimed nothing: the one cause that explains it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reclaimed_nothing_because: Option<String>,
@@ -132,13 +137,18 @@ const UNRECLAIMED_PASSES_ADVICE_THRESHOLD: u64 = 8;
 
 /// What the paced host deleter did to the confirmed trash between the
 /// previous pass and this one. It deletes the oldest entries first, so a
-/// backlog that shrank (net of this pass's confirmations) or whose oldest
-/// entry moved forward is draining. `None` without a previous observation.
+/// backlog that shrank (net of this pass's confirmations, and of entries
+/// held back without being deleted) or whose oldest entry moved forward
+/// while nothing was held back is draining. `None` without a previous
+/// observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrashDrain {
-    /// Entries gone from the deletable backlog since the previous pass (a
-    /// floor: entries trashed meanwhile hide some).
+    /// Entries deleted from the deletable backlog since the previous pass
+    /// (a floor: entries trashed meanwhile hide some).
     entries: usize,
+    /// Entries that left the deletable backlog without being deleted
+    /// (identity changed, failure cap, in use) since the previous pass.
+    held_back: usize,
     draining: bool,
 }
 
@@ -147,10 +157,14 @@ fn trash_drain_since(
     current: &crate::CheckoutTrashBacklog,
 ) -> Option<TrashDrain> {
     let previous = previous?;
+    // Entries newly held back left the deletable count too; they are not
+    // the deleter's work. (A floor: one released meanwhile hides one.)
+    let held_back = current.held_back().saturating_sub(previous.held_back());
     let entries = previous
         .deletable
         .saturating_add(current.confirmed_this_pass)
-        .saturating_sub(current.deletable);
+        .saturating_sub(current.deletable)
+        .saturating_sub(held_back);
     let oldest_moved = match (
         previous.oldest_deletable_created_ms,
         current.oldest_deletable_created_ms,
@@ -161,7 +175,9 @@ fn trash_drain_since(
     };
     Some(TrashDrain {
         entries,
-        draining: entries > 0 || oldest_moved,
+        held_back,
+        // The oldest entry may have moved only because it was held back.
+        draining: entries > 0 || (oldest_moved && held_back == 0),
     })
 }
 
@@ -203,6 +219,11 @@ fn reclaimed_nothing_because(
         // Kept by the proofs (identity changed, session in use, trash not
         // readable as recorded): nothing to run, so never advised.
         Some("trash_entries_kept_by_proofs")
+    } else if trash.identity_changed > 0 {
+        // Confirmed entries present with another identity: never deleted;
+        // `broker status` names them (`cleanup.trash-identity-changed`), and
+        // no sweep or drain can act on them, so never advised here.
+        Some("trash_entries_identity_changed")
     } else if trash.pending > 0 {
         Some("trash_entries_awaiting_mover")
     } else {
@@ -812,6 +833,7 @@ fn write_last_pass(
             .map(|report| report.checkout_trash)
             .or(previous_trash),
         trash_entries_drained: drain.map(|drain| drain.entries),
+        trash_entries_held_back: drain.map(|drain| drain.held_back),
         reclaimed_nothing_because: report
             .filter(|report| !pass_reclaimed(report, drain))
             .and_then(|report| reclaimed_nothing_because(report, drain))
@@ -2340,8 +2362,14 @@ fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
     }
     if let Some(trash) = receipt.trash {
         evidence.push(format!(
-            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale)",
-            trash.recorded, trash.deletable, trash.pending, trash.stale_pending
+            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use",
+            trash.recorded,
+            trash.deletable,
+            trash.pending,
+            trash.stale_pending,
+            trash.identity_changed,
+            trash.failing,
+            trash.in_use
         ));
     }
     if let Some(lane) = &receipt.artifact_lane {
@@ -2685,6 +2713,66 @@ mod tests {
             checkout_trash: trash,
             auto_cleanup: None,
         }
+    }
+
+    /// Entries that leave the deletable backlog by changing identity,
+    /// reaching the failure cap or being in use are held back, never counted
+    /// as drained: a backlog that only lost such entries is not draining,
+    /// even when its oldest entry moved forward.
+    #[test]
+    fn entries_held_back_are_not_counted_as_drained() {
+        let previous = trash(20, Some(5), 0);
+        let held = crate::CheckoutTrashBacklog {
+            identity_changed: 3,
+            identity_changed_device: 3,
+            failing: 2,
+            in_use: 1,
+            ..trash(14, Some(9), 0)
+        };
+        let drain = trash_drain_since(Some(&previous), &held).unwrap();
+        assert_eq!(drain.entries, 0, "{drain:?}");
+        assert_eq!(drain.held_back, 6, "{drain:?}");
+        assert!(!drain.draining, "{drain:?}");
+
+        let deleted_too = crate::CheckoutTrashBacklog {
+            deletable: 10,
+            ..held
+        };
+        let drain = trash_drain_since(Some(&previous), &deleted_too).unwrap();
+        assert_eq!(drain.entries, 4, "{drain:?}");
+        assert!(drain.draining);
+
+        // Entries already held back at the previous pass are not new.
+        let drain = trash_drain_since(Some(&held), &held).unwrap();
+        assert_eq!((drain.entries, drain.held_back), (0, 0));
+    }
+
+    /// Confirmed entries whose identity changed neither count as deletable
+    /// nor raise the stalled-deleter advice once everything else drained:
+    /// the receipt names them as the cause and stays silent.
+    #[test]
+    fn identity_changed_entries_are_explained_but_never_advised() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let kept = crate::CheckoutTrashBacklog {
+            recorded: 18,
+            identity_changed: 18,
+            identity_changed_device: 18,
+            ..crate::CheckoutTrashBacklog::default()
+        };
+        let mut finished = empty_pass(crate::ArtifactSweepLane::Ran, kept);
+        finished.complete = true;
+        for pass in 0..=UNRECLAIMED_PASSES_ADVICE_THRESHOLD {
+            write_last_pass(&plan, 1 + pass, Some(&finished), None).unwrap();
+        }
+        let receipt = read_last_pass(&plan).unwrap().unwrap();
+        assert!(receipt.passes_without_reclaim > UNRECLAIMED_PASSES_ADVICE_THRESHOLD);
+        assert_eq!(
+            receipt.reclaimed_nothing_because.as_deref(),
+            Some("trash_entries_identity_changed")
+        );
+        assert_eq!(receipt.trash.unwrap().identity_changed, 18);
+        assert!(reclaim_advice(&plan.home, &plan.repository_uuid).is_none());
     }
 
     /// Every pass says per lane what it found, and a pass that reclaimed
