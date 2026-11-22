@@ -2363,7 +2363,7 @@ fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
     }
     if let Some(trash) = receipt.trash {
         evidence.push(format!(
-            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use; after a remount: {} rebound, {} refused ({} for more than one old device)",
+            "checkout trash: {} entries recorded, {} deletable, {} unconfirmed ({} stale); held back: {} identity changed, {} failing, {} in use; after a remount: {} rebound, {} refused, {} trash(es) whose rebound rows spanned more than one old device",
             trash.recorded,
             trash.deletable,
             trash.pending,
@@ -2373,7 +2373,7 @@ fn reclaim_advice_for(receipt: &LastPassReceipt) -> Option<RepairAdvice> {
             trash.in_use,
             trash.rebound_this_pass,
             trash.rebind_refused_this_pass,
-            trash.rebind_refused_mixed_old_devices_this_pass
+            trash.rebind_proven_old_devices_mixed_this_pass
         ));
     }
     if let Some(lane) = &receipt.artifact_lane {

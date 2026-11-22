@@ -2851,10 +2851,10 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
     }
     if trash.rebound_this_pass > 0 || trash.rebind_refused_this_pass > 0 {
         out!(
-            "  checkout trash after a remount: {} entr(y/ies) rebound to the volume's new device number (deleted later with the usual checks); {} refused ({} because the trash's rows record more than one old device)",
+            "  checkout trash after a remount: {} entr(y/ies) rebound to the volume's new device number (deleted later with the usual checks); {} refused (each failed its own proof; `rebind_refused` counters name why); {} trash(es) whose rebound rows spanned more than one old device",
             trash.rebound_this_pass,
             trash.rebind_refused_this_pass,
-            trash.rebind_refused_mixed_old_devices_this_pass
+            trash.rebind_proven_old_devices_mixed_this_pass
         );
     }
     out!(

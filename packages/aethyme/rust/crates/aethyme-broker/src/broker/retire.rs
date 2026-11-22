@@ -239,15 +239,16 @@ pub(crate) struct StaleTrashReconcile {
     /// present, private, marked and on the recorded device.
     pub(crate) confirmed_dropped_missing: usize,
     /// Rows (confirmed or pending) rebound to the device their trash is on
-    /// now after a remount ([`crate::checkout_trash::RemountRebind`]).
+    /// now after a remount ([`crate::checkout_trash::rebind_rows`]).
     pub(crate) rebound: usize,
-    /// Rows recording another device than their trash's current one that
-    /// were not rebound (each cause is counted as
-    /// `checkout_trash_rebind_refused_<cause>`) ...
+    /// Rows recording another device than their verified trash's current
+    /// one that failed their own proof (each cause is counted as
+    /// `checkout_trash_rebind_refused_<cause>`).
     pub(crate) rebind_refused: usize,
-    /// ... of which because their trash's rows record more than one old
-    /// device.
-    pub(crate) rebind_refused_mixed_old_devices: usize,
+    /// Trash directories whose proven rows recorded more than one old
+    /// device (several remounts since they were written): an observation;
+    /// each row was rebound on its own proof.
+    pub(crate) rebind_proven_old_devices_mixed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1802,7 +1803,7 @@ impl Broker {
     /// unrecognized and leaves alone.
     ///
     /// First, rows whose trash was mounted again under a new device number
-    /// are rebound to it ([`crate::checkout_trash::RemountRebind`]):
+    /// are rebound to it ([`crate::checkout_trash::rebind_rows`]):
     /// confirmed and pending rows alike, only the device changes (a pending
     /// row stays pending), written by the same compare-and-set onto a
     /// stored row unchanged since the look. Nothing is deleted here.
@@ -1816,30 +1817,18 @@ impl Broker {
         let all_rows = self.checkout_trash_rows();
         // A remount renumbers a trash's device: rows found again on the new
         // device by name, session and inode are rebound, confirmed and
-        // pending alike, judged over every row of that trash.
+        // pending alike, each on its own proof.
         let mut rebinds = Vec::new();
         let mut tally = crate::checkout_trash::RebindTally::default();
         for (dir, entries) in &all_rows {
-            match crate::checkout_trash::RemountRebind::read(dir, entries) {
-                Ok(None) => {}
-                Ok(Some(view)) => {
-                    let _span = crate::phase_telemetry::span("checkout_trash_rebind");
-                    for (name, row) in entries.iter().filter(|(_, row)| view.applies(row)) {
-                        match view.check(name, row) {
-                            Ok(device) => rebinds.push((dir.clone(), name.clone(), *row, device)),
-                            Err(cause) => tally.refuse(cause),
-                        }
-                    }
+            for (name, device) in crate::checkout_trash::rebind_rows(dir, entries, &mut tally) {
+                if let Some(row) = entries.get(&name) {
+                    rebinds.push((dir.clone(), name, *row, device));
                 }
-                Err(cause) => tally.refuse(cause),
             }
         }
         outcome.rebind_refused = tally.refused_total();
-        outcome.rebind_refused_mixed_old_devices = tally
-            .refused
-            .get(crate::checkout_trash::RebindRefusal::MixedOldDevices.as_str())
-            .copied()
-            .unwrap_or(0);
+        outcome.rebind_proven_old_devices_mixed = tally.proven_old_devices_mixed;
         let rebinding = rebinds
             .iter()
             .map(|(dir, name, _, _)| (dir.clone(), name.clone()))
@@ -1930,8 +1919,8 @@ impl Broker {
                 confirmed_dropped = 0;
                 marked = 0;
                 rebound = 0;
-                // Only onto a stored row unchanged since the look, under
-                // the single-old-device rule re-read from the stored rows.
+                // Only onto a stored row unchanged since the proof, with
+                // the device that proof was taken against.
                 for (dir, name, row, device) in &rebinds {
                     if let Some(entries) = rows.get_mut(dir)
                         && crate::checkout_trash::apply_rebind(entries, name, row, *device)
@@ -2038,7 +2027,9 @@ impl Broker {
         };
         for (name, row) in rows.values().flat_map(|entries| entries.iter()) {
             summary.recorded += 1;
-            if row.pending {
+            // A pending row held with a changed identity counts as identity
+            // changed, as `broker status` and the drain report count it.
+            if row.pending && row.identity_mismatch.is_none() {
                 summary.pending += 1;
                 if crate::checkout_trash::stale_unconfirmable(name, row, now) {
                     summary.stale_pending += 1;
@@ -2048,8 +2039,9 @@ impl Broker {
             if !crate::checkout_trash::is_broker_entry_name(name) {
                 continue;
             }
-            // Confirmed entries out of the deletable backlog, each counted
-            // once: identity changed, then failing, then in use.
+            // Entries out of the deletable backlog, each counted once:
+            // identity changed, then failing, then in use (the last two
+            // only for confirmed entries).
             if let Some(cause) = row.identity_mismatch {
                 summary.identity_changed += 1;
                 match cause {
@@ -7572,7 +7564,13 @@ mod tests {
     fn the_sweep_concludes_nothing_under_another_directory_name() {
         let (_owner, _storage, mut broker) = fixture();
         let (_session, old, trash) = stale_unconfirmable_trash_entry(&mut broker, "renamed-dir");
-        let row = row_of(&broker, &old).unwrap();
+        // Recorded on another device too, as after a remount: a directory
+        // not named as the trash still concludes nothing and counts no
+        // rebind refusal.
+        let row = crate::checkout_trash::TrashRow {
+            device: row_of(&broker, &old).unwrap().device.wrapping_add(1000),
+            ..row_of(&broker, &old).unwrap()
+        };
         let elsewhere = trash.with_file_name("not-the-trash");
         broker
             .update_meta_json(
@@ -7589,7 +7587,12 @@ mod tests {
         assert_eq!(reconcile.confirmed, 0, "{reconcile:?}");
         assert_eq!(reconcile.dropped_missing, 0, "{reconcile:?}");
         assert_eq!(reconcile.trash_unavailable, 1, "{reconcile:?}");
-        assert!(row_of(&broker, &old).is_some_and(|row| row.pending));
+        assert_eq!(
+            (reconcile.rebound, reconcile.rebind_refused),
+            (0, 0),
+            "{reconcile:?}"
+        );
+        assert_eq!(row_of(&broker, &old), Some(row), "untouched");
     }
 
     /// Record a pending trash entry for a new closed session, named as moved

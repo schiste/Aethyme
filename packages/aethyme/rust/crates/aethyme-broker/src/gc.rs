@@ -1402,7 +1402,8 @@ pub struct CheckoutTrashBacklog {
     pub recorded: usize,
     /// Confirmed entries the paced deleter can delete now.
     pub deletable: usize,
-    /// Entries still unconfirmed: their mover is not proven gone.
+    /// Entries still unconfirmed: their mover is not proven gone (a pending
+    /// entry held with a changed identity counts in `identity_changed`).
     pub pending: usize,
     /// Of `pending`, entries over a day old whose mover's start time was
     /// unreadable, so no process table can ever prove it gone.
@@ -1430,14 +1431,16 @@ pub struct CheckoutTrashBacklog {
     /// Rows this pass rebound to the device their trash is on now after a
     /// remount (confirmed and pending; a pending row stays pending) ...
     pub rebound_this_pass: usize,
-    /// ... rows recording another device that it refused to rebind ...
+    /// ... rows recording another device that failed their own proof ...
     pub rebind_refused_this_pass: usize,
-    /// ... of which because their trash's rows record more than one old
-    /// device (not one remount).
-    pub rebind_refused_mixed_old_devices_this_pass: usize,
-    /// Confirmed entries present with another identity than recorded: never
-    /// deleted and not `deletable`, so they neither keep the trash behind
-    /// nor count as a deleter that is not draining.
+    /// ... and trash directories whose proven rows recorded more than one
+    /// old device (several remounts; an observation, each row was still
+    /// rebound on its own proof).
+    pub rebind_proven_old_devices_mixed_this_pass: usize,
+    /// Entries present with another identity than recorded (confirmed ones,
+    /// and pending ones held on another device): never deleted and not
+    /// `deletable`, so they neither keep the trash behind nor count as a
+    /// deleter that is not draining.
     pub identity_changed: usize,
     /// Of those, by cause: the recorded inode on another device (the volume
     /// was mounted again) ...
@@ -7699,7 +7702,7 @@ impl Broker {
             confirmed_dropped_missing_this_pass: reconcile.confirmed_dropped_missing,
             rebound_this_pass: reconcile.rebound,
             rebind_refused_this_pass: reconcile.rebind_refused,
-            rebind_refused_mixed_old_devices_this_pass: reconcile.rebind_refused_mixed_old_devices,
+            rebind_proven_old_devices_mixed_this_pass: reconcile.rebind_proven_old_devices_mixed,
             ..self.checkout_trash_backlog_summary()
         };
         crate::phase_telemetry::attach(
@@ -7717,8 +7720,8 @@ impl Broker {
                 "trash_identity_changed": checkout_trash.identity_changed,
                 "trash_rebound": checkout_trash.rebound_this_pass,
                 "trash_rebind_refused": checkout_trash.rebind_refused_this_pass,
-                "trash_rebind_refused_mixed_old_devices": checkout_trash
-                    .rebind_refused_mixed_old_devices_this_pass,
+                "trash_rebind_proven_old_devices_mixed": checkout_trash
+                    .rebind_proven_old_devices_mixed_this_pass,
                 "trash_failing": checkout_trash.failing,
                 "trash_in_use": checkout_trash.in_use,
             }),
