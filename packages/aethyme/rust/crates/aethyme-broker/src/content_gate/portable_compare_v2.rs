@@ -547,18 +547,18 @@ fn evidence_capabilities(
             if missing && check["status"] != "not_checked" {
                 return Err("candidate gate cannot execute without required evidence");
             }
-            if kind == "link_reachability" {
-                if let Some(item) = links.and_then(|v| v["entries"].get(entity)) {
-                    let observations = item["observations"]
-                        .as_array()
-                        .ok_or("invalid link observations")?;
-                    if (observations.iter().any(|v| v == "not_checked")
-                        && check["status"] != "not_checked")
-                        || (observations.iter().any(|v| v == "not_found")
-                            && check["status"] == "passed")
-                    {
-                        return Err("link reachability status contradicts its observations");
-                    }
+            if kind == "link_reachability"
+                && let Some(item) = links.and_then(|v| v["entries"].get(entity))
+            {
+                let observations = item["observations"]
+                    .as_array()
+                    .ok_or("invalid link observations")?;
+                if (observations.iter().any(|v| v == "not_checked")
+                    && check["status"] != "not_checked")
+                    || (observations.iter().any(|v| v == "not_found")
+                        && check["status"] == "passed")
+                {
+                    return Err("link reachability status contradicts its observations");
                 }
             }
         }
