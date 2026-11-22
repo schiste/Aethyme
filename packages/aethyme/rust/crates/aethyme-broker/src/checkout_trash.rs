@@ -3599,6 +3599,47 @@ mod tests {
         assert!(!trashed.path().exists());
     }
 
+    /// An identity mark survives a binary that does not know the field: an
+    /// older reader ignores it and writes the row back without it (the next
+    /// look sets it again), and a row without it reads as unmarked.
+    #[test]
+    fn an_identity_mark_round_trips_through_a_reader_without_the_field() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OlderTrashRow {
+            device: u64,
+            inode: u64,
+            session_id: i64,
+            #[serde(default)]
+            failures: u32,
+            #[serde(default)]
+            pending: bool,
+            #[serde(default)]
+            creator_pid: i64,
+            #[serde(default)]
+            creator_started_ms: i64,
+            #[serde(default)]
+            stripped: bool,
+        }
+        let marked = TrashRow {
+            identity_mismatch: Some(IdentityMismatch::DeviceChanged),
+            ..row_for_backlog(0, false)
+        };
+        let text = serde_json::to_string(&marked).unwrap();
+        assert!(
+            text.contains("\"identity_mismatch\":\"device_changed\""),
+            "{text}"
+        );
+        let back: TrashRow = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, marked);
+        let older: OlderTrashRow = serde_json::from_str(&text).unwrap();
+        let rewritten = serde_json::to_string(&older).unwrap();
+        let reread: TrashRow = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(reread.identity_mismatch, None);
+        assert_eq!((reread.device, reread.inode), (marked.device, marked.inode));
+        let unmarked = serde_json::to_string(&row_for_backlog(0, false)).unwrap();
+        assert!(!unmarked.contains("identity_mismatch"), "{unmarked}");
+    }
+
     /// A process table proves a creator gone only when it lists no process
     /// with the pid, or one that provably started at another time: a listed
     /// start it cannot read (a localized `ps` text) proves nothing.
@@ -3609,7 +3650,7 @@ mod tests {
             "    7     1 Mon Jan 1 00:00:00 2024 creator\n    8     1 lun. 16 nov. 14:09:50 2026 creator\n",
         );
         assert!(!table.proves_gone(7, started), "same pid, same start");
-        assert!(table.proves_gone(7, started + 1_000), "the pid was reused");
+        assert!(table.proves_gone(7, started + 10_000), "the pid was reused");
         assert!(!table.proves_gone(8, started), "an unreadable start");
         assert!(table.proves_gone(9, started), "no such pid");
         assert!(!table.proves_gone(9, 0), "an unknown start proves nothing");

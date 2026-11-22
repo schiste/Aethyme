@@ -318,6 +318,12 @@ impl ProcessTable {
     /// pid, or the one that has it provably started at another time. An
     /// unknown record (pid or start not positive) or a listed process whose
     /// start cannot be read proves nothing.
+    ///
+    /// Two readings of one start can disagree a little: the Linux direct
+    /// read (`btime` plus ticks) and `ps` by up to a second, and a `ps`
+    /// text read back in the repeated daylight-saving hour by exactly one
+    /// hour. Neither is another process: only a start more than
+    /// [`START_MATCH_TOLERANCE_MS`] away, and not exactly an hour away, is.
     pub(crate) fn proves_gone(&self, pid: i64, started_ms: i64) -> bool {
         if pid <= 0 || started_ms <= 0 {
             return false;
@@ -326,7 +332,7 @@ impl ProcessTable {
             return true;
         }
         self.start_epoch_ms(pid)
-            .is_some_and(|listed| listed != started_ms)
+            .is_some_and(|listed| starts_differ(listed, started_ms))
     }
 
     /// Whether `process` is still running: same pid and same start time.
@@ -463,6 +469,21 @@ fn is_agent_runtime(args: &str) -> bool {
     }
     let first_name = first.rsplit('/').next().unwrap_or(first);
     first_name == "node" && words.next().is_some_and(is_agent)
+}
+
+/// How far apart two readings of one process's start may be and still name
+/// the same process (see [`ProcessTable::proves_gone`]).
+pub(crate) const START_MATCH_TOLERANCE_MS: i64 = 2_000;
+/// A `ps` start text read back in the repeated daylight-saving hour is off
+/// by exactly this much.
+const DST_SHIFT_MS: i64 = 3_600_000;
+
+/// Whether two start readings provably name different processes: more than
+/// [`START_MATCH_TOLERANCE_MS`] apart, and not exactly one daylight-saving
+/// shift apart.
+pub(crate) fn starts_differ(listed_ms: i64, recorded_ms: i64) -> bool {
+    let difference = listed_ms.saturating_sub(recorded_ms).saturating_abs();
+    difference > START_MATCH_TOLERANCE_MS && difference != DST_SHIFT_MS
 }
 
 /// This process's start in epoch milliseconds (whole seconds, the value
@@ -2940,11 +2961,39 @@ mod tests {
         let own = own_start_epoch_ms().expect("this process's start is readable");
         assert!(own > 0 && own % 1_000 == 0, "{own}");
         if let Some(table) = ProcessTable::snapshot() {
-            assert_eq!(
-                table.start_epoch_ms(i64::from(std::process::id())),
-                Some(own)
+            let pid = i64::from(std::process::id());
+            let listed = table.start_epoch_ms(pid).expect("the table reads it");
+            assert!(
+                (listed - own).abs() <= START_MATCH_TOLERANCE_MS,
+                "{listed} vs {own}"
             );
+            assert!(!table.proves_gone(pid, own));
         }
+    }
+
+    /// Readings of one start a second apart, or exactly a daylight-saving
+    /// hour apart, are the same process; more than two seconds (other than
+    /// that hour) is another one.
+    #[test]
+    fn near_equal_or_dst_shifted_starts_name_the_same_process() {
+        let start = 1_700_000_000_000;
+        assert!(!starts_differ(start, start));
+        assert!(!starts_differ(start + 1_000, start));
+        assert!(!starts_differ(start - 2_000, start));
+        assert!(starts_differ(start + 3_000, start));
+        assert!(!starts_differ(start + 3_600_000, start));
+        assert!(!starts_differ(start - 3_600_000, start));
+        assert!(starts_differ(start + 3_601_000, start));
+        assert!(starts_differ(start + 7_200_000, start));
+        let table = ProcessTable::parse("    7     1 Mon Jan 1 00:00:00 2024 creator\n");
+        let listed = table.start_epoch_ms(7).unwrap();
+        assert!(!table.proves_gone(7, listed - 1_000), "a second apart");
+        assert!(
+            !table.proves_gone(7, listed - 3_600_000),
+            "the repeated hour"
+        );
+        assert!(table.proves_gone(7, listed - 5_000), "another process");
+        assert!(table.proves_gone(8, listed), "no process has the pid");
     }
 
     /// Only an exact C-locale `lstart` text is read as a clock time.

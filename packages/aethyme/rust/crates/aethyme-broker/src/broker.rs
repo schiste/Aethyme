@@ -3023,7 +3023,7 @@ fn push_trash_identity_changed_advice(
     view.advice.push(StatusAdvice {
         id: "cleanup.trash-identity-changed",
         severity: StatusAdviceSeverity::Notice,
-        reason: "these checkout trash entries exist but no longer have the device and inode the broker recorded when it moved them in (device_changed: the same inode on a new device number, as when the volume is mounted again; inode_changed or not_a_directory: something else has the name). The broker never deletes them and they do not count as a trash backlog. If you recognize an entry as a directory the broker moved in, remove it yourself; the next sweep or deleter run drops its record once the entry is gone (or clears the mark if the volume comes back under its recorded device number). Otherwise leave it",
+        reason: "these checkout trash entries exist but no longer have the device and inode the broker recorded when it moved them in, so the broker does not delete them and they do not count as a trash backlog. device_changed (the recorded inode on a new device number, as after the volume is mounted again): leave them; they are held until the broker identifies them again on the new device number, or until the volume comes back under its recorded one, and are then deleted with the usual checks. inode_changed or not_a_directory (something else now has the name): the broker will never delete these; look at each one, remove it yourself only if you know what it is, and the next sweep or deleter run drops its record once it is gone",
         summary: format!(
             "{} checkout trash entr(y/ies) kept: identity changed since they were moved in",
             entries.len()

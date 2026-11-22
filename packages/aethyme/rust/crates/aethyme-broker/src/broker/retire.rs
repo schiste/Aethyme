@@ -238,9 +238,6 @@ pub(crate) struct StaleTrashReconcile {
     /// Confirmed rows dropped: no entry by that name in a trash that is
     /// present, private, marked and on the recorded device.
     pub(crate) confirmed_dropped_missing: usize,
-    /// Confirmed rows whose entry this pass found with another identity
-    /// (marked; never deleted).
-    pub(crate) confirmed_identity_changed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1812,7 +1809,8 @@ impl Broker {
                             missing.push((dir.clone(), name, row));
                         }
                         TrashEntryState::Mismatch(cause) => {
-                            outcome.confirmed_identity_changed += 1;
+                            // Counted from the stored marks by the backlog
+                            // summary (`identity_changed`).
                             if row.identity_mismatch != Some(cause) {
                                 marks.push((dir.clone(), name, row, Some(cause)));
                             }
