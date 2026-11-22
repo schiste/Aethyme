@@ -163,18 +163,20 @@ fn duration_ms(duration: Duration) -> u64 {
 /// (macOS) and `/tmp`. Never `$TMPDIR`: a broker-run command's is its own
 /// run directory.
 pub fn default_roots() -> Vec<TempRoot> {
-    let mut candidates = Vec::new();
     #[cfg(target_os = "macos")]
-    if let Some(path) = darwin_user_temp_dir() {
-        candidates.push(TempRoot {
+    let user_temp = darwin_user_temp_dir();
+    #[cfg(not(target_os = "macos"))]
+    let user_temp: Option<PathBuf> = None;
+    let candidates = user_temp
+        .map(|path| TempRoot {
             kind: TempKind::UserTemp,
             path,
-        });
-    }
-    candidates.push(TempRoot {
-        kind: TempKind::SystemTmp,
-        path: PathBuf::from("/tmp"),
-    });
+        })
+        .into_iter()
+        .chain(std::iter::once(TempRoot {
+            kind: TempKind::SystemTmp,
+            path: PathBuf::from("/tmp"),
+        }));
     let mut seen = BTreeSet::new();
     candidates
         .into_iter()
