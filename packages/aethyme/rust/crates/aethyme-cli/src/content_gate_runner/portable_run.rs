@@ -26,6 +26,8 @@ struct Manifest {
     host_options: PathBuf,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     collection: Option<PathBuf>,
+    #[serde(default)]
+    external_evidence: Option<PathBuf>,
     evaluator_identity: PathBuf,
     validator_name: String,
     validator_version: String,
@@ -47,6 +49,7 @@ struct SnapshotInputs {
     policy: Vec<u8>,
     options: Vec<u8>,
     collection: Option<Vec<u8>>,
+    external_evidence: Option<Vec<u8>>,
     evaluator: Vec<u8>,
     executable: [u8; 32],
     additional: BTreeMap<String, Vec<u8>>,
@@ -96,6 +99,7 @@ fn snapshot(path: &Path, m: &Manifest) -> Result<SnapshotInputs, String> {
         policy: read(&m.resolved_policy)?,
         options: read(&m.host_options)?,
         collection: optional(&m.collection)?,
+        external_evidence: optional(&m.external_evidence)?,
         evaluator: read(&m.evaluator_identity)?,
         executable: executable_digest(Path::new(m.validator.first().ok_or("missing validator")?))?,
         additional,
@@ -109,6 +113,7 @@ fn snapshot(path: &Path, m: &Manifest) -> Result<SnapshotInputs, String> {
         captured.policy.len(),
         captured.options.len(),
         captured.collection.as_ref().map_or(0, Vec::len),
+        captured.external_evidence.as_ref().map_or(0, Vec::len),
         captured.evaluator.len(),
         total,
     ];
@@ -193,6 +198,7 @@ fn execute(path: &Path, timings: &mut BTreeMap<&'static str, u128>) -> Result<()
             resolved_policy: &before.policy,
             host_options: &before.options,
             collection: before.collection.as_deref(),
+            external_evidence: before.external_evidence.as_deref(),
             evaluator_identity: &before.evaluator,
             expected_validator_name: &m.validator_name,
             expected_validator_version: &m.validator_version,
@@ -272,6 +278,21 @@ mod tests {
             "validator_sha256":shell_hash,"env":{"SOURCE":fresh,"OPTIONS":options},
             "timeout_seconds":5,"additional":{"source":fresh}});
         let path = file("manifest", manifest.to_string().as_bytes());
+        assert!(execute(&path, &mut BTreeMap::new()).is_ok());
+        // Link evidence the fresh verdict does not bind is never accepted.
+        let change_json: Value =
+            serde_json::from_str(fixture["artifacts"]["change"].as_str().unwrap()).unwrap();
+        let evidence = file(
+            "evidence",
+            json!({"version":1,"change_id":change_json["change_id"],"entries":{}})
+                .to_string()
+                .as_bytes(),
+        );
+        manifest["external_evidence"] = json!(evidence);
+        fs::write(&path, manifest.to_string()).unwrap();
+        assert!(execute(&path, &mut BTreeMap::new()).is_err());
+        manifest["external_evidence"] = Value::Null;
+        fs::write(&path, manifest.to_string()).unwrap();
         assert!(execute(&path, &mut BTreeMap::new()).is_ok());
         manifest["validator_sha256"] = json!("0".repeat(64));
         fs::write(&path, manifest.to_string()).unwrap();
