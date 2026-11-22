@@ -936,7 +936,8 @@ pub(crate) fn control(
 ) -> io::Result<Value> {
     if action == "status"
         && let Ok((repository, marker_uuid)) = current_repository()
-        && automatic_refresh_proof(home, uuid, &marker_uuid, &repository).is_ok()
+        && let Ok(running) = std::env::current_exe()
+        && automatic_refresh_proof(home, uuid, &marker_uuid, &repository, &running).is_ok()
     {
         let refreshed = refresh_current(home, uuid);
         // A refresh that stopped part-way leaves no loadable plan: report
@@ -1026,7 +1027,13 @@ fn control_with(
         let last_pass = read_last_pass(&plan)?;
         let last_error = read_bounded_json(&plan.directory.join("last-error.json"), plan.uid);
         let last_refresh = read_bounded_json(&plan.directory.join("last-refresh.json"), plan.uid);
-        let next_action = (!plan.router.exists()).then_some(REFRESH_COMMAND);
+        let binding = runtime_binding(&plan.router, &plan.managed_root);
+        let (last_error_at, last_pass_at) = tick_timestamps(&plan.directory, plan.uid);
+        // Until the service runs a verified current pair again, say how.
+        let next_action = (runtime_state != "verified"
+            || binding.needs_refresh()
+            || tick_refusing(last_error_at, last_pass_at))
+        .then_some(REFRESH_COMMAND);
         return Ok(json!({
             "schema": CONTROL_SCHEMA,
             "action": "status",
@@ -1035,6 +1042,7 @@ fn control_with(
             "scheduler_state": if observation == Observation::Success { "loaded" } else { "unknown" },
             "scheduler_observation": observation_name(&observation),
             "runtime_state": runtime_state,
+            "runtime_binding": binding.as_str(),
             "control": control,
             "last_pass": last_pass,
             "last_error": last_error,
@@ -1184,6 +1192,9 @@ pub(crate) struct InstallationRecord {
     pub(crate) plan_digest: Option<String>,
     pub(crate) runtime_version: Option<String>,
     pub(crate) router: Option<PathBuf>,
+    /// The recorded installation root, whose `current` selector says
+    /// whether the recorded runtime is still the selected one.
+    pub(crate) managed_root: Option<PathBuf>,
     pub(crate) unit_present: bool,
     /// SHA-256 of the unit file when it is a readable private owned file:
     /// what `uninstall` takes as confirmation when no plan is recorded.
@@ -1302,6 +1313,7 @@ pub(crate) fn read_record(home: &Path, uuid: &str, uid: u32) -> io::Result<Insta
         plan_digest: field("digest"),
         runtime_version: field("runtime_version"),
         router: field("router").map(PathBuf::from),
+        managed_root: field("managed_root").map(PathBuf::from),
         plan_bytes,
         unit_present,
         unit_digest,
@@ -2034,16 +2046,20 @@ pub(crate) struct UpdateRefresh {
 }
 
 /// Refresh every service whose recorded runtime lies in a bundle of
-/// `managed_root` that this update is about to remove (one not `selected`
-/// by `current` or `previous`) or that is already gone. Called after the
-/// selector switch and before cleanup; it never fails the update.
+/// `managed_root` other than the one this update or install just selected
+/// as `current` (the bundle of `new_router`), or that is already gone.
+///
+/// A bundle kept as `previous` counts: it still exists, but a managed tick
+/// verifies its runtime against the installation's current selection, so a
+/// service bound to it refuses every tick until something rebinds it.
+/// Called after the selector switch and before cleanup; it never fails the
+/// update.
 #[cfg(target_os = "macos")]
-pub(crate) fn refresh_for_update(
-    managed_root: &Path,
-    selected: &[std::ffi::OsString],
-    new_router: &Path,
-) -> UpdateRefresh {
+pub(crate) fn refresh_for_update(managed_root: &Path, new_router: &Path) -> UpdateRefresh {
     let _span = crate::phase_telemetry::span("gc_service_refresh_for_update");
+    let Some(active) = new_router.parent().and_then(Path::file_name) else {
+        return UpdateRefresh::default();
+    };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return UpdateRefresh::default();
     };
@@ -2059,7 +2075,7 @@ pub(crate) fn refresh_for_update(
         &home,
         uid,
         managed_root,
-        selected,
+        active,
         || runtime_pair(new_router),
         crate::scheduled_service::launchd::label_state,
         launchctl,
@@ -2074,7 +2090,7 @@ fn refresh_for_update_with(
     home: &Path,
     uid: u32,
     managed_root: &Path,
-    selected: &[std::ffi::OsString],
+    active: &std::ffi::OsStr,
     runtime: impl FnOnce() -> io::Result<RuntimePair>,
     label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
     run: impl FnMut(&[String]) -> io::Result<crate::scheduled_service::launchd::Observation>,
@@ -2083,7 +2099,7 @@ fn refresh_for_update_with(
         home,
         uid,
         managed_root,
-        selected,
+        active,
         std::time::Instant::now() + UPDATE_REFRESH_BUDGET,
         runtime,
         label_state,
@@ -2096,7 +2112,7 @@ fn refresh_for_update_within(
     home: &Path,
     uid: u32,
     managed_root: &Path,
-    selected: &[std::ffi::OsString],
+    active: &std::ffi::OsStr,
     deadline: std::time::Instant,
     runtime: impl FnOnce() -> io::Result<RuntimePair>,
     mut label_state: impl FnMut(u32, &str) -> io::Result<crate::scheduled_service::launchd::LabelState>,
@@ -2133,8 +2149,7 @@ fn refresh_for_update_within(
         let Some(bundle) = version_directory.file_name() else {
             continue;
         };
-        let doomed = !selected.iter().any(|name| name == bundle) || !router.exists();
-        if !doomed {
+        if !needs_update_refresh(bundle, active, router.exists()) {
             continue;
         }
         if std::time::Instant::now() >= deadline {
@@ -2194,16 +2209,120 @@ pub(crate) fn refresh_current(home: &Path, uuid: &str) -> RefreshOutcome {
     )
 }
 
+/// Whether an update that just selected bundle `active` must rebind a
+/// service whose recorded router lies in `bundle`: every other bundle,
+/// including the one kept as `previous`, and any bundle whose router is gone.
+fn needs_update_refresh(
+    bundle: &std::ffi::OsStr,
+    active: &std::ffi::OsStr,
+    router_present: bool,
+) -> bool {
+    bundle != active || !router_present
+}
+
+/// How a recorded service's runtime relates to its installation's current
+/// selection. A managed tick only runs the pair `current` selects (its
+/// preflight verifies the recorded router as the installer receipt's
+/// router), so a present runtime that is no longer current refuses every
+/// tick just as a removed one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBinding {
+    /// The recorded router is the one `current` selects.
+    Current,
+    /// The recorded router exists but `current` selects another one.
+    Stale,
+    /// The recorded router is gone.
+    Gone,
+    /// The installation's `current` selector cannot be read: proves nothing.
+    Unknown,
+}
+
+impl RuntimeBinding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Gone => "gone",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether a refresh to the current runtime is what this binding needs.
+    fn needs_refresh(self) -> bool {
+        matches!(self, Self::Stale | Self::Gone)
+    }
+}
+
+/// The router the installation rooted at `managed_root` currently selects,
+/// resolved through its `current` selector. A few `lstat`/`readlink` calls:
+/// no process, no launchd, no hashing.
+fn current_selection(managed_root: &Path) -> Option<PathBuf> {
+    fs::canonicalize(managed_root.join("current").join("aethyme")).ok()
+}
+
+/// Classify `router` against the selection of `managed_root`.
+fn runtime_binding(router: &Path, managed_root: &Path) -> RuntimeBinding {
+    if !router.exists() {
+        return RuntimeBinding::Gone;
+    }
+    let Ok(router) = fs::canonicalize(router) else {
+        return RuntimeBinding::Unknown;
+    };
+    match current_selection(managed_root) {
+        Some(current) if current == router => RuntimeBinding::Current,
+        Some(_) => RuntimeBinding::Stale,
+        None => RuntimeBinding::Unknown,
+    }
+}
+
+/// Whether `running` is the router `managed_root` currently selects: the
+/// only runtime a foreground command may rebind a service to by itself.
+fn running_is_current_selection(running: &Path, managed_root: &Path) -> bool {
+    match (fs::canonicalize(running), current_selection(managed_root)) {
+        (Ok(running), Some(current)) => running == current,
+        _ => false,
+    }
+}
+
+/// Whether the service's ticks are refusing: its last recorded tick error
+/// is newer than its last finished pass (or there is no pass at all).
+fn tick_refusing(
+    last_error_at_unix_ms: Option<u64>,
+    last_pass_finished_unix_ms: Option<u64>,
+) -> bool {
+    match (last_error_at_unix_ms, last_pass_finished_unix_ms) {
+        (Some(error), Some(pass)) => error > pass,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// When the service last recorded a tick error and finished a pass, read
+/// from its receipts without requiring the plan to verify.
+fn tick_timestamps(directory: &Path, uid: u32) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str, key: &str| {
+        read_bounded_json(&directory.join(name), uid)
+            .and_then(|value| value.get(key).and_then(Value::as_u64))
+    };
+    (
+        field("last-error.json", "observed_at_unix_ms"),
+        field("last-pass.json", "finished_at_unix_ms"),
+    )
+}
+
 /// Whether a foreground command may refresh this repository's service by
-/// itself: the recorded runtime is gone, the uuid read from the
-/// repository's marker is the service's, the recorded plan verifies (its
-/// label is exactly `com.aethyme.gc-sweep.<uuid>` and the unit file's bytes
-/// equal its rendered unit), and it names this repository.
+/// itself: the recorded runtime is gone or no longer the installation's
+/// current selection, the command runs from exactly that current selection
+/// (the runtime the refresh binds), the uuid read from the repository's
+/// marker is the service's, the recorded plan verifies (its label is
+/// exactly `com.aethyme.gc-sweep.<uuid>` and the unit file's bytes equal
+/// its rendered unit), and it names this repository.
 fn automatic_refresh_proof(
     home: &Path,
     uuid: &str,
     marker_uuid: &str,
     repository: &Path,
+    running: &Path,
 ) -> Result<(), &'static str> {
     if uuid != marker_uuid {
         return Err("service_uuid_differs_from_repository_marker");
@@ -2215,10 +2334,137 @@ fn automatic_refresh_proof(
     if plan.repository != repository {
         return Err("plan_names_another_repository");
     }
-    if plan.router.exists() {
-        return Err("recorded_runtime_present");
+    match runtime_binding(&plan.router, &plan.managed_root) {
+        RuntimeBinding::Stale | RuntimeBinding::Gone => {}
+        RuntimeBinding::Current => return Err("recorded_runtime_current"),
+        RuntimeBinding::Unknown => return Err("installation_selection_unreadable"),
+    }
+    if !running_is_current_selection(running, &plan.managed_root) {
+        return Err("running_runtime_is_not_the_current_selection");
     }
     Ok(())
+}
+
+/// What `broker status` did about a stale or gone service binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledRefresh {
+    /// A detached `gc service status` was started to refresh the service.
+    Started,
+    /// One was started (or a refresh was attempted) within the last
+    /// interval: nothing is started again until it passes.
+    RecentlyAttempted,
+}
+
+impl ScheduledRefresh {
+    /// The evidence line `broker status` adds to the service's advice.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Started => {
+                "a background `aethyme broker gc service status --json` was started to rebind the service to the current runtime"
+            }
+            Self::RecentlyAttempted => {
+                "a refresh was started or attempted within the last 15 minutes; the next one waits for that interval"
+            }
+        }
+    }
+}
+
+/// The receipt `broker status` writes before it starts a background refresh,
+/// so at most one is started per service interval.
+const SCHEDULED_REFRESH_RECEIPT: &str = "refresh-scheduled.json";
+const SCHEDULED_REFRESH_SCHEMA: &str = "aethyme.gc-sweep-service-refresh-scheduled/v1";
+
+/// `broker status` noticing a stale binding: when this repository's
+/// recorded service names a runtime that is gone or no longer current, and
+/// the command runs from the installation's current selection, write a
+/// bounded receipt and `start` a background refresh, at most once per
+/// [`SERVICE_INTERVAL_SECONDS`] (counting refreshes attempted by any path).
+/// Files and selector links only; launchd is asked by the refresh itself,
+/// which repeats every proof under the service's installer claim. `None`
+/// when the binding needs nothing or nothing could be proven.
+fn schedule_refresh_with(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    running: &Path,
+    now_unix_ms: u64,
+    start: impl FnOnce() -> io::Result<()>,
+) -> Option<ScheduledRefresh> {
+    let _span = crate::phase_telemetry::span("gc_service_refresh_schedule");
+    let record = read_record(home, uuid, uid).ok()?;
+    if record.plan_bytes.is_none() || !record.unit_present {
+        return None;
+    }
+    let router = record.router.as_deref()?;
+    let managed_root = record.managed_root.as_deref()?;
+    if !runtime_binding(router, managed_root).needs_refresh()
+        || !running_is_current_selection(running, managed_root)
+    {
+        return None;
+    }
+    let attempted = |name: &str| {
+        read_bounded_json(&record.directory.join(name), uid)
+            .and_then(|value| value.get("observed_at_unix_ms").and_then(Value::as_u64))
+    };
+    let last = attempted(SCHEDULED_REFRESH_RECEIPT).max(attempted("last-refresh.json"));
+    if last.is_some_and(|at| now_unix_ms.saturating_sub(at) < SERVICE_INTERVAL_SECONDS * 1000) {
+        return Some(ScheduledRefresh::RecentlyAttempted);
+    }
+    // The receipt goes first: without it nothing bounds the next start.
+    let receipt = json!({
+        "schema": SCHEDULED_REFRESH_SCHEMA,
+        "repository_uuid": uuid,
+        "observed_at_unix_ms": now_unix_ms,
+    });
+    let bytes = serde_json::to_vec(&receipt).ok()?;
+    write_bounded_receipt(&record.directory, SCHEDULED_REFRESH_RECEIPT, &bytes).ok()?;
+    match start() {
+        Ok(()) => {
+            crate::phase_telemetry::add("gc_service_refresh_scheduled", Duration::ZERO);
+            Some(ScheduledRefresh::Started)
+        }
+        Err(error) => {
+            crate::warn_unrecorded(
+                "start the background GC service refresh",
+                Err::<(), _>(error),
+            );
+            None
+        }
+    }
+}
+
+/// `broker status` on macOS: see [`schedule_refresh_with`]. The background
+/// refresh is `<running> broker gc service status --json` in `repository`,
+/// detached from the caller's process group with no stdio, whose automatic
+/// refresh repeats every proof before it touches launchd.
+#[cfg(target_os = "macos")]
+pub(crate) fn schedule_refresh_if_stale(
+    home: &Path,
+    uuid: &str,
+    uid: u32,
+    repository: &Path,
+) -> Option<ScheduledRefresh> {
+    use std::os::unix::process::CommandExt as _;
+    let running = std::env::current_exe().ok()?;
+    let now = now_unix_ms().ok()?;
+    schedule_refresh_with(home, uuid, uid, &running, now, || {
+        let mut command = std::process::Command::new(&running);
+        command
+            .args(["broker", "gc", "service", "status", "--json"])
+            .current_dir(repository)
+            .env_remove(SERVICE_ENV_UUID)
+            .env_remove(SERVICE_ENV_GENERATION)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn()?;
+        // Reap it whenever it ends; a short-lived caller simply exits first.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    })
 }
 
 /// A `broker status` advice row about this repository's scheduled GC
@@ -2298,6 +2544,9 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
             ],
         });
     }
+    if let Some(advice) = refusing_or_stale_advice(&record, uid) {
+        return Some(advice);
+    }
     let (plan, _) = load(home, uuid).ok()?;
     let control = read_control(&plan).ok().flatten()?;
     if !load_unconfirmed(&control) {
@@ -2318,6 +2567,74 @@ pub(crate) fn repair_advice(home: &Path, uuid: &str, uid: u32) -> Option<RepairA
                 plan.digest
             ),
         ],
+    })
+}
+
+/// The advice for a recorded service whose runtime is present but no longer
+/// the installation's current selection, or whose ticks refuse (the last
+/// tick error is newer than the last finished pass). Files and selector
+/// links only.
+fn refusing_or_stale_advice(record: &InstallationRecord, uid: u32) -> Option<RepairAdvice> {
+    record.plan_bytes.as_ref()?;
+    let binding = match (record.router.as_deref(), record.managed_root.as_deref()) {
+        (Some(router), Some(root)) => runtime_binding(router, root),
+        _ => RuntimeBinding::Unknown,
+    };
+    let (last_error_at, last_pass_at) = tick_timestamps(&record.directory, uid);
+    let refusing = tick_refusing(last_error_at, last_pass_at);
+    if binding != RuntimeBinding::Stale && !refusing {
+        return None;
+    }
+    let mut evidence = Vec::new();
+    if binding == RuntimeBinding::Stale {
+        evidence.push(format!(
+            "the recorded runtime {} is installed but no longer the installation's current one; managed ticks refuse it",
+            record.runtime_version.as_deref().unwrap_or("unknown")
+        ));
+    }
+    if refusing
+        && let Some(error) = read_bounded_json(&record.directory.join("last-error.json"), uid)
+    {
+        evidence.push(format!(
+            "last tick refused at (ms since epoch) {}: {}",
+            last_error_at.unwrap_or(0),
+            error
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        evidence.push(match last_pass_at {
+            Some(at) => format!("last finished pass at (ms since epoch): {at}"),
+            None => "no finished pass is recorded for this plan".into(),
+        });
+    }
+    if let Some(refresh) = read_bounded_json(&record.directory.join("last-refresh.json"), uid)
+        && let Some(outcome) = refresh.get("outcome").and_then(Value::as_str)
+    {
+        evidence.push(format!("last refresh attempt: {outcome}"));
+    }
+    Some(if binding == RuntimeBinding::Stale {
+        RepairAdvice {
+            id: "storage.gc-service-runtime-stale",
+            reason: "the scheduled GC sweep service is pinned to one exact runtime, and an update selected another one; each tick verifies its runtime as the installation's current one and refuses, so scheduled sweeps have stopped",
+            summary: "this repository's scheduled GC sweep service is bound to a runtime that is no longer the current one",
+            evidence,
+            commands: vec![
+                REFRESH_COMMAND.into(),
+                "aethyme broker gc service status --json".into(),
+            ],
+        }
+    } else {
+        RepairAdvice {
+            id: "storage.gc-service-ticks-refusing",
+            reason: "the scheduled GC sweep service's last tick refused before sweeping and no pass has finished since, so scheduled sweeps have stopped",
+            summary: "this repository's scheduled GC sweep service refuses its ticks",
+            evidence,
+            commands: vec![
+                REFRESH_COMMAND.into(),
+                "aethyme broker gc service status --json".into(),
+            ],
+        }
     })
 }
 
@@ -3508,12 +3825,11 @@ mod tests {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
         let runtime = newer_runtime(&plan);
-        let selected = [std::ffi::OsString::from("v0.8.51-test")];
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            std::ffi::OsStr::new("v0.8.51-test"),
             || Ok(runtime.clone()),
             |_, _| Ok(LabelState::Unknown),
             |_| panic!("nothing is run without launchd's answer"),
@@ -3532,18 +3848,15 @@ mod tests {
     }
 
     #[test]
-    fn update_refresh_skips_services_whose_bundle_stays() {
+    fn update_refresh_skips_services_bound_to_the_bundle_it_selected() {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
-        let selected = [
-            std::ffi::OsString::from("v0.8.51-test"),
-            std::ffi::OsString::from("v0.8.50-test"),
-        ];
+        // Reinstalling the bundle the service already runs: nothing to do.
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            std::ffi::OsStr::new("v0.8.50-test"),
             || panic!("no runtime is resolved when no service needs it"),
             |_, _| panic!("launchd is not asked"),
             |_| panic!("launchctl is not run"),
@@ -3555,7 +3868,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.home.join("other-install/.aethyme-managed"),
-            &[],
+            std::ffi::OsStr::new("v0.8.51-test"),
             || panic!("no runtime is resolved for another installation"),
             |_, _| panic!("launchd is not asked"),
             |_| panic!("launchctl is not run"),
@@ -3568,14 +3881,14 @@ mod tests {
     fn a_refresh_failure_is_reported_and_never_fails_the_update() {
         let (_temp, plan) = fixture();
         install_fixture(&plan);
-        let selected = [std::ffi::OsString::from("v0.8.51-test")];
+        let active = std::ffi::OsStr::new("v0.8.51-test");
         // The new pair cannot be verified and launchd says the job is loaded:
         // nothing changes, the error is reported, the old bundle is kept.
         let report = refresh_for_update_with(
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Err(io::Error::other("new runtime pair is not verifiable")),
             |_, _| Ok(LabelState::Loaded),
             |_| panic!("launchctl is not run when the refresh failed"),
@@ -3598,7 +3911,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Err(io::Error::other("new runtime pair is not verifiable")),
             |_, _| Ok(LabelState::NotLoaded),
             |_| panic!("launchctl is not run"),
@@ -3611,7 +3924,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &selected,
+            active,
             || Ok(runtime.clone()),
             |_, _| Err(io::Error::other("launchctl unavailable")),
             |_| panic!("launchctl is not run"),
@@ -3637,7 +3950,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &[std::ffi::OsString::from("v0.8.51-test")],
+            std::ffi::OsStr::new("v0.8.51-test"),
             || Ok(runtime.clone()),
             |_, _| panic!("launchd is not asked without the claim"),
             |_| panic!("launchctl is not run without the claim"),
@@ -3896,7 +4209,7 @@ mod tests {
             &plan.home,
             plan.uid,
             &plan.managed_root,
-            &[std::ffi::OsString::from("v0.8.51-test")],
+            std::ffi::OsStr::new("v0.8.51-test"),
             std::time::Instant::now(),
             || panic!("no runtime is resolved past the budget"),
             |_, _| panic!("launchd is not asked past the budget"),
@@ -3960,20 +4273,34 @@ mod tests {
         fs::remove_file(plan.directory.join("plan.json")).unwrap();
         fs::remove_file(&plan.unit_path).unwrap();
         install_fixture(&stale_plan);
+        select_current(&plan, "v0.8.51-test");
         automatic_refresh_proof(
             &plan.home,
             &plan.repository_uuid,
             &plan.repository_uuid,
             &plan.repository,
+            &runtime.router,
         )
         .unwrap();
+        // Only the current selection may rebind it by itself.
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("running_runtime_is_not_the_current_selection")
+        );
         // Another repository's marker, or another repository: advice only.
         assert!(
             automatic_refresh_proof(
                 &plan.home,
                 &plan.repository_uuid,
                 "00000000-0000-4000-8000-000000000000",
-                &plan.repository
+                &plan.repository,
+                &runtime.router,
             )
             .is_err()
         );
@@ -3982,7 +4309,8 @@ mod tests {
                 &plan.home,
                 &plan.repository_uuid,
                 &plan.repository_uuid,
-                &missing
+                &missing,
+                &runtime.router,
             )
             .is_err()
         );
@@ -4002,7 +4330,8 @@ mod tests {
                 &plan.home,
                 &plan.repository_uuid,
                 &plan.repository_uuid,
-                &plan.repository
+                &plan.repository,
+                &runtime.router,
             ),
             Err("recorded_plan_or_unit_not_verified")
         );
@@ -4020,6 +4349,335 @@ mod tests {
             b"<plist>edited</plist>"
         );
         assert!(archived_plans(&plan).is_empty());
+    }
+
+    /// Point the fixture installation's `current` selector at `bundle`.
+    fn select_current(plan: &Plan, bundle: &str) {
+        let link = plan.managed_root.join("current");
+        match fs::symlink_metadata(&link) {
+            Ok(_) => fs::remove_file(&link).unwrap(),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+        }
+        std::os::unix::fs::symlink(PathBuf::from("versions").join(bundle), &link).unwrap();
+    }
+
+    #[test]
+    fn update_refresh_rebinds_a_service_bound_to_the_bundle_kept_as_previous() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let fresh = refreshed_plan(&plan, &runtime);
+        // The update selected v0.8.51 as `current` and kept v0.8.50 as
+        // `previous`: the bundle stays, but ticks refuse a runtime that is
+        // not the current selection, so the service is rebound now.
+        let report = refresh_for_update_with(
+            &plan.home,
+            plan.uid,
+            &plan.managed_root,
+            std::ffi::OsStr::new("v0.8.51-test"),
+            || Ok(runtime.clone()),
+            |_, _| Ok(LabelState::NotLoaded),
+            |_| panic!("an unloaded service is never bootstrapped by a refresh"),
+        );
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].outcome, "refreshed_not_loaded");
+        assert!(report.protected_bundles.is_empty());
+        assert_eq!(
+            fs::read(plan.directory.join("plan.json")).unwrap(),
+            serde_json::to_vec(&fresh).unwrap()
+        );
+        assert!(
+            plan.router.exists(),
+            "the previous bundle itself is untouched"
+        );
+    }
+
+    #[test]
+    fn update_refresh_candidates_are_every_other_or_missing_bundle() {
+        let a = std::ffi::OsStr::new("v0.8.51-a");
+        let b = std::ffi::OsStr::new("v0.8.50-b");
+        assert!(!needs_update_refresh(a, a, true));
+        assert!(needs_update_refresh(a, a, false));
+        assert!(needs_update_refresh(b, a, true));
+        assert!(needs_update_refresh(b, a, false));
+    }
+
+    #[test]
+    fn runtime_binding_follows_the_current_selector() {
+        let (_temp, plan) = fixture();
+        // No selector: nothing is proven either way.
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Unknown
+        );
+        select_current(&plan, "v0.8.50-test");
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Current
+        );
+        assert!(running_is_current_selection(
+            &plan.router,
+            &plan.managed_root
+        ));
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.51-test");
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Stale
+        );
+        assert!(!running_is_current_selection(
+            &plan.router,
+            &plan.managed_root
+        ));
+        assert!(running_is_current_selection(
+            &runtime.router,
+            &plan.managed_root
+        ));
+        fs::remove_file(&plan.router).unwrap();
+        assert_eq!(
+            runtime_binding(&plan.router, &plan.managed_root),
+            RuntimeBinding::Gone
+        );
+        assert!(RuntimeBinding::Gone.needs_refresh());
+        assert!(RuntimeBinding::Stale.needs_refresh());
+        assert!(!RuntimeBinding::Current.needs_refresh());
+        assert!(!RuntimeBinding::Unknown.needs_refresh());
+    }
+
+    #[test]
+    fn a_stale_binding_is_advised_and_refreshed_only_from_the_current_runtime() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        select_current(&plan, "v0.8.50-test");
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("recorded_runtime_current")
+        );
+        // The update selected a newer pair; the bound one stays installed.
+        select_current(&plan, "v0.8.51-test");
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-runtime-stale");
+        assert_eq!(advice.commands[0], REFRESH_COMMAND);
+        assert!(advice.evidence[0].contains("0.8.50"));
+        automatic_refresh_proof(
+            &plan.home,
+            &plan.repository_uuid,
+            &plan.repository_uuid,
+            &plan.repository,
+            &runtime.router,
+        )
+        .unwrap();
+        assert_eq!(
+            automatic_refresh_proof(
+                &plan.home,
+                &plan.repository_uuid,
+                &plan.repository_uuid,
+                &plan.repository,
+                &plan.router,
+            ),
+            Err("running_runtime_is_not_the_current_selection")
+        );
+        // `gc service status` names the refresh until it lands.
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Unknown)
+        })
+        .unwrap();
+        assert_eq!(status["runtime_binding"], "stale");
+        assert_eq!(status["next_action"], REFRESH_COMMAND);
+        // An unknown launchd answer changes nothing and the advice stays.
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Unknown),
+            |_| panic!("nothing is run without launchd's answer"),
+        );
+        assert_eq!(outcome.outcome, "label_state_unknown");
+        assert_unchanged(&plan);
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_some());
+        let outcome = refresh_record_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            Ok(&runtime),
+            |_, _| Ok(LabelState::Loaded),
+            |_| Ok(Observation::Success),
+        );
+        assert_eq!(outcome.outcome, "refreshed_and_reloaded");
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+        let fresh = refreshed_plan(&plan, &runtime);
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["plan_digest"], fresh.digest);
+        assert_eq!(status["runtime_binding"], "current");
+    }
+
+    #[test]
+    fn refusing_ticks_are_advised_until_a_pass_finishes() {
+        assert!(tick_refusing(Some(2), Some(1)));
+        assert!(tick_refusing(Some(2), None));
+        assert!(!tick_refusing(Some(1), Some(1)));
+        assert!(!tick_refusing(Some(1), Some(2)));
+        assert!(!tick_refusing(None, Some(2)));
+        assert!(!tick_refusing(None, None));
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        write_private(
+            &plan.directory.join("last-error.json"),
+            &serde_json::to_vec(&json!({
+                "schema": ERROR_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "observed_at_unix_ms": 2_000,
+                "error": "managed GC tick preflight refused: fixture",
+            }))
+            .unwrap(),
+        );
+        let advice = repair_advice(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
+        assert_eq!(advice.id, "storage.gc-service-ticks-refusing");
+        assert_eq!(advice.commands[0], REFRESH_COMMAND);
+        assert!(advice.evidence.iter().any(|line| line.contains("fixture")));
+        let status = control_with(&plan.home, &plan.repository_uuid, "status", None, |_| {
+            Ok(Observation::Success)
+        })
+        .unwrap();
+        assert_eq!(status["next_action"], REFRESH_COMMAND);
+        // A pass that finished after the error clears it.
+        write_private(
+            &plan.receipt_path,
+            &serde_json::to_vec(&json!({
+                "schema": RECEIPT_SCHEMA,
+                "repository_uuid": plan.repository_uuid,
+                "generation": plan.generation,
+                "started_at_unix_ms": 2_500,
+                "finished_at_unix_ms": 3_000,
+                "outcome": "sweep_complete",
+                "directories_reclaimed": 0,
+                "budget_ms": 1,
+                "disk_pressured": false,
+                "legacy_unscoped_state": "clear",
+                "error": null,
+            }))
+            .unwrap(),
+        );
+        assert!(repair_advice(&plan.home, &plan.repository_uuid, plan.uid).is_none());
+    }
+
+    #[test]
+    fn status_starts_one_background_refresh_per_interval_from_the_current_runtime() {
+        let (_temp, plan) = fixture();
+        install_fixture(&plan);
+        let runtime = newer_runtime(&plan);
+        let never = || -> io::Result<()> { panic!("no refresh is started") };
+        // No selector, or a current binding: nothing is started.
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &runtime.router,
+                1,
+                never
+            ),
+            None
+        );
+        select_current(&plan, "v0.8.50-test");
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &plan.router,
+                1,
+                never
+            ),
+            None
+        );
+        select_current(&plan, "v0.8.51-test");
+        // Stale, but the caller is not the current runtime: nothing.
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &plan.router,
+                1,
+                never
+            ),
+            None
+        );
+        let now = 10_000_000;
+        let mut started = 0;
+        let scheduled = schedule_refresh_with(
+            &plan.home,
+            &plan.repository_uuid,
+            plan.uid,
+            &runtime.router,
+            now,
+            || {
+                started += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(scheduled, Some(ScheduledRefresh::Started));
+        assert_eq!(started, 1);
+        assert!(!ScheduledRefresh::Started.describe().is_empty());
+        let receipt =
+            read_bounded_json(&plan.directory.join(SCHEDULED_REFRESH_RECEIPT), plan.uid).unwrap();
+        assert_eq!(receipt["observed_at_unix_ms"], now);
+        // Within the interval: not again.
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &runtime.router,
+                now + 60_000,
+                never
+            ),
+            Some(ScheduledRefresh::RecentlyAttempted)
+        );
+        assert!(!ScheduledRefresh::RecentlyAttempted.describe().is_empty());
+        // A refresh attempted by any path counts too.
+        let mut attempt = RefreshOutcome::new(&plan.repository_uuid);
+        attempt.outcome = "label_state_unknown";
+        attempt.observed_at_unix_ms = now + 800_000;
+        write_refresh_receipt(&plan.home, &plan.repository_uuid, &attempt).unwrap();
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &runtime.router,
+                now + 1_000_000,
+                never
+            ),
+            Some(ScheduledRefresh::RecentlyAttempted)
+        );
+        // After a full interval it starts again; a failed start is not one.
+        assert_eq!(
+            schedule_refresh_with(
+                &plan.home,
+                &plan.repository_uuid,
+                plan.uid,
+                &runtime.router,
+                now + 2_000_000,
+                || Err(io::Error::other("spawn refused"))
+            ),
+            None
+        );
+        assert_unchanged(&plan);
     }
 
     #[test]
