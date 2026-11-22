@@ -4367,7 +4367,9 @@ container of each open record due for a listing is listed by path (a hint
 that only decides whether the verified walk is worth its cost), at least one
 per pass, resuming after the last record listed. A record is due when a
 finished-run signal names it, when its last listing showed a finished run
-(it leaves only after a listing, or the verified walk, showed none), and,
+(it leaves only after a listing, or the verified walk, showed none; a
+container that cannot be read, other than one that does not exist, keeps it
+due, counter `session_scratch_retire_listing_unknown`), and,
 once an hour, every open record (the full listing lap, counter
 `session_scratch_retire_full_listing`: the backstop for a marker whose signal
 is missing). A finished-run signal is the empty file
@@ -4376,8 +4378,10 @@ following a link) right after the marker by whichever process finished the
 run (counters `command_temp_finish_signaled`,
 `command_temp_finish_signal_failed`); the pass reads the signals with the one
 listing of each pool's container it already takes for unrecorded entries,
-stores what they made due, then clears them through the container opened
-without links, before any listing (when storing fails they stay, counter
+stores what they made due, then clears, through the container opened
+without links and before any listing, the signals of records stored as due,
+of records it retires, and of entries no longer in the container (a signal
+of a record it did not read or could not classify stays for the next pass) (when storing fails they stay, counter
 `session_scratch_retire_signals_kept`). Signals are broker bookkeeping like
 the container's marker: never unrecorded entries, never content that keeps a
 container or a worktree root, and removed with an emptied container. It then
@@ -4392,7 +4396,9 @@ record where the previous pass stopped (broker metadata key
 `command_temps`, each the last record key judged, absent once it went
 round; `classify`, the last record listed; `listing_due`, the record keys
 due for a listing; `full_listing_started_ms`, when the last full listing lap
-started; and `command_temp_runs`, an object from record key to the name of
+started; the pass merges `listing_due` into the stored value rather than
+replacing it, removing only the keys it proved need no listing and the
+keys whose record is gone; and `command_temp_runs`, an object from record key to the name of
 the last finished run judged when that record's visit ended before it
 went through its runs). Every closed record is classified on every pass; a
 finished run's record is due from the pass after its marker (within the
@@ -4475,7 +4481,7 @@ by `<step>.<cause>`), `stopped_after_failures`, `classify_incomplete`
 (records still due for a listing when the budget ended), `listed` (done
 containers listed), `probed` (closed records probed for a gone directory),
 `signals` (finished-run signals read), `listing_due` (records due after the
-pass), `full_listing` (the pass started a full listing lap),
+pass), `listing_unknown` (due records whose container could not be read), `full_listing` (the pass started a full listing lap),
 `process_use_unknown` and
 `command_temps_kept_by_reason` (`in_use`, `process_use_unknown`, a refusal
 code, or `move_failed.<step>.<cause>`).

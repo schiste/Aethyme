@@ -878,23 +878,42 @@ pub(crate) fn finished_runs_after(
     FinishedRunsListing { runs, complete }
 }
 
+/// What one by-path listing of a record's done container says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunsHint {
+    /// It lists a finished-run marker name.
+    Runs,
+    /// It lists none, or there is no done container (`ENOENT`).
+    NoRuns,
+    /// It could not be read (out of descriptors, denied, not a directory,
+    /// an I/O error): nothing is known.
+    Unknown,
+}
+
 /// Whether `record`'s done container lists a finished-run marker. A hint
 /// read by path, never acted on: it only decides whether the verified
 /// [`finished_runs`] (a descriptor walk from `/`) is worth its cost for an
-/// open session, most of which have no finished run.
-pub(crate) fn may_have_finished_runs(record: &ScratchRecord) -> bool {
-    std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER)).is_ok_and(
-        |mut listing| {
-            listing.any(|entry| {
-                entry.ok().is_some_and(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(crate::command_temp::is_run_name)
-                })
-            })
-        },
-    )
+/// open session, most of which have no finished run. Only a listing that
+/// was read through, or a container that does not exist, says `NoRuns`.
+pub(crate) fn finished_runs_hint(record: &ScratchRecord) -> RunsHint {
+    let listing = match std::fs::read_dir(record.path().join(crate::command_temp::DONE_CONTAINER)) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return RunsHint::NoRuns,
+        Err(_) => return RunsHint::Unknown,
+    };
+    for entry in listing {
+        let Ok(entry) = entry else {
+            return RunsHint::Unknown;
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::command_temp::is_run_name)
+        {
+            return RunsHint::Runs;
+        }
+    }
+    RunsHint::NoRuns
 }
 
 /// The scratch entry a finished-run signal named `name` stands for.
@@ -1531,5 +1550,49 @@ mod tests {
         forget_finished_run(&record, &runs[0]);
         move_to_trash(&record, &mut record_pending).unwrap();
         assert!(!container.exists(), "the emptied container is removed");
+    }
+
+    /// The listing hint: no container or an empty one says no runs, a
+    /// marker name says runs, a container that cannot be read says nothing.
+    #[test]
+    fn the_finished_runs_hint_tells_unreadable_from_empty() {
+        let (_owner, pool) = pool();
+        let record = create(&pool, 41).unwrap();
+        let done = record.path().join(crate::command_temp::DONE_CONTAINER);
+        assert_eq!(finished_runs_hint(&record), RunsHint::NoRuns);
+        std::fs::write(&done, b"").unwrap();
+        assert_eq!(finished_runs_hint(&record), RunsHint::Unknown);
+        std::fs::remove_file(&done).unwrap();
+        std::fs::create_dir(&done).unwrap();
+        assert_eq!(finished_runs_hint(&record), RunsHint::NoRuns);
+        std::fs::write(done.join("r1-2-3"), b"{}").unwrap();
+        assert_eq!(finished_runs_hint(&record), RunsHint::Runs);
+    }
+
+    /// Clearing signals never removes a directory named like one, never
+    /// follows a link named like one to its target, and never touches a
+    /// name that is not a signal.
+    #[test]
+    fn clearing_signals_touches_nothing_else() {
+        let (_owner, pool) = pool();
+        let _record = create(&pool, 42).unwrap();
+        let container = pool.join(SCRATCH_CONTAINER);
+        let directory = container.join(format!("{FINISHED_SIGNAL_PREFIX}s43-abc"));
+        std::fs::create_dir(&directory).unwrap();
+        let target = pool.join("target.txt");
+        std::fs::write(&target, b"not a signal").unwrap();
+        let link = container.join(format!("{FINISHED_SIGNAL_PREFIX}s44-abc"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let other = container.join("notes.txt");
+        std::fs::write(&other, b"mine").unwrap();
+
+        clear_finished_signals(
+            &pool,
+            &["s43-abc".into(), "s44-abc".into(), "notes.txt".into()],
+        );
+
+        assert!(directory.is_dir(), "a directory is never unlinked");
+        assert!(target.is_file(), "a link's target is never touched");
+        assert!(other.is_file(), "a non-signal is never touched");
     }
 }

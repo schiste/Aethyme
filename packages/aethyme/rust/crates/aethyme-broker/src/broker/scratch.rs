@@ -176,6 +176,57 @@ fn record_class(
     }
 }
 
+/// The cursor to store after a pass: this pass's `next`, with the due set
+/// merged into the one stored now (`stored`, which a concurrent pass may
+/// have extended since this pass read it) rather than replacing it: the
+/// union, minus the keys this pass proved need no listing (`dropped`) and
+/// the keys whose record no longer `exists`.
+fn merged_cursor(
+    stored: &ScratchRetireCursor,
+    next: &ScratchRetireCursor,
+    dropped: &std::collections::BTreeSet<String>,
+    exists: impl Fn(&str) -> bool,
+) -> ScratchRetireCursor {
+    let listing_due = stored
+        .listing_due
+        .union(&next.listing_due)
+        .filter(|key| !dropped.contains(*key) && exists(key))
+        .cloned()
+        .collect();
+    ScratchRetireCursor {
+        listing_due,
+        ..next.clone()
+    }
+}
+
+/// The finished-run signals of one pool's container a pass may clear: a
+/// signal whose record was stored as due, or whose record this pass knows is
+/// not open (retired), or one whose scratch entry is not in the container at
+/// all (an orphan). A signal of a record this pass did not read (created
+/// since) or could not classify stays for the next pass.
+fn signals_to_clear(
+    pool: &Path,
+    listing: &crate::session_scratch::ContainerListing,
+    due: &std::collections::BTreeSet<String>,
+    class_of: impl Fn(&str) -> Option<RecordClass>,
+) -> Vec<String> {
+    listing
+        .signals
+        .iter()
+        .filter(|entry| {
+            let key = pool
+                .join(crate::session_scratch::SCRATCH_CONTAINER)
+                .join(entry)
+                .to_string_lossy()
+                .into_owned();
+            due.contains(&key)
+                || class_of(&key) == Some(RecordClass::Retire)
+                || (class_of(&key).is_none() && !listing.entries.contains(*entry))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Whether a full listing lap is due at `now_ms`, the last one having
 /// started at `started_ms` (a clock that went back starts one too).
 fn full_listing_due(started_ms: Option<i64>, now_ms: i64) -> bool {
@@ -433,6 +484,8 @@ pub(crate) struct ScratchRetireReport {
     pub signals: usize,
     /// Records still due for a listing after the pass.
     pub listing_due: usize,
+    /// Due records whose done container could not be read: kept due.
+    pub listing_unknown: usize,
     /// This pass started a full listing lap (every open record due).
     pub full_listing: bool,
     /// The run's open-file observation failed: nothing was judged.
@@ -897,6 +950,11 @@ impl Broker {
         // can be work, within the classification budget: closed records
         // whose directory may be gone, and the done containers of the open
         // records due for a listing (always at least one listing).
+        // Keys this pass proved need no listing: records it classified as
+        // retired, and records whose listing showed no finished run. The
+        // final cursor write removes them from the stored due set, and keeps
+        // every other key a concurrent pass stored.
+        let mut dropped = std::collections::BTreeSet::<String>::new();
         let (mut closed, mut pending, mut due, containers) = {
             let _classify = crate::phase_telemetry::span("session_scratch_retire_classify");
             let classes = self.scratch_record_classes(&records);
@@ -904,7 +962,10 @@ impl Broker {
             let mut open = std::collections::BTreeSet::<&str>::new();
             for (key, record) in &records {
                 match classes.get(key.as_str()) {
-                    Some(RecordClass::Retire) => closed.push((key.as_str(), record)),
+                    Some(RecordClass::Retire) => {
+                        dropped.insert(key.clone());
+                        closed.push((key.as_str(), record));
+                    }
                     Some(RecordClass::Open) => {
                         open.insert(key.as_str());
                     }
@@ -952,6 +1013,15 @@ impl Broker {
                     }
                 }
             }
+            let to_clear = containers
+                .iter()
+                .map(|(pool, listing)| {
+                    let clear =
+                        signals_to_clear(pool, listing, &due, |key| classes.get(key).copied());
+                    (pool, clear)
+                })
+                .filter(|(_, clear)| !clear.is_empty())
+                .collect::<Vec<_>>();
             // A signal is cleared only once what it made due is stored, and
             // before any listing: a marker written after its container was
             // listed signals again (its writer writes the signal after the
@@ -964,10 +1034,8 @@ impl Broker {
                     },
                 );
                 if stored.is_ok() {
-                    for (pool, listing) in &containers {
-                        if !listing.signals.is_empty() {
-                            crate::session_scratch::clear_finished_signals(pool, &listing.signals);
-                        }
+                    for (pool, clear) in &to_clear {
+                        crate::session_scratch::clear_finished_signals(pool, clear);
                     }
                 } else {
                     crate::phase_telemetry::add(
@@ -1026,14 +1094,23 @@ impl Broker {
                 };
                 report.listed += 1;
                 last_listed = Some(key.clone());
-                if crate::session_scratch::may_have_finished_runs(record) {
-                    pending.push((key.as_str(), record));
-                } else {
-                    without_runs.push(key.as_str());
+                match crate::session_scratch::finished_runs_hint(record) {
+                    crate::session_scratch::RunsHint::Runs => pending.push((key.as_str(), record)),
+                    crate::session_scratch::RunsHint::NoRuns => without_runs.push(key.as_str()),
+                    // Unreadable (out of descriptors, denied, an I/O error):
+                    // it says nothing, so the record stays due.
+                    crate::session_scratch::RunsHint::Unknown => {
+                        report.listing_unknown += 1;
+                        crate::phase_telemetry::add(
+                            "session_scratch_retire_listing_unknown",
+                            Duration::ZERO,
+                        );
+                    }
                 }
             }
             for key in without_runs {
                 due.remove(key);
+                dropped.insert(key.to_owned());
             }
             next.classify = last_listed.or_else(|| cursor.classify.clone());
             (closed, pending, due, containers)
@@ -1153,6 +1230,7 @@ impl Broker {
                 // due set: a new marker signals again.
                 if visit.found_none {
                     due.remove(*key);
+                    dropped.insert((*key).to_owned());
                 }
                 phase.note_record(
                     visit.ended_failing,
@@ -1178,12 +1256,17 @@ impl Broker {
         self.record_scratch_keeps(&mut report);
 
         if next != cursor {
+            // Another pass may have stored due keys since this one read the
+            // cursor: merge, never replace, the due set. A key whose record
+            // is gone by now is dropped too, so the set cannot grow forever.
+            let current = self.session_scratch_records();
             crate::warn_unrecorded(
                 "record where the scratch retirement pass stopped",
                 self.update_meta_json(
                     SESSION_SCRATCH_CURSOR_KEY,
                     |stored: &mut ScratchRetireCursor| {
-                        *stored = next.clone();
+                        *stored =
+                            merged_cursor(stored, &next, &dropped, |key| current.contains_key(key));
                     },
                 ),
             );
@@ -1213,6 +1296,7 @@ impl Broker {
                 "probed": report.probed,
                 "signals": report.signals,
                 "listing_due": report.listing_due,
+                "listing_unknown": report.listing_unknown,
                 "full_listing": report.full_listing,
             }),
         );
@@ -2884,6 +2968,132 @@ mod tests {
         assert!(report.scratch.full_listing, "{report:#?}");
         assert_eq!(report.scratch.command_temps_retired, 1, "{report:#?}");
         assert!(!run.exists());
+    }
+
+    /// The final cursor write merges the due set: a key another pass stored
+    /// since this one read the cursor survives; keys this pass proved need
+    /// no listing, and keys whose record is gone, leave.
+    #[test]
+    fn the_final_cursor_write_merges_the_due_set() {
+        let set = |keys: &[&str]| {
+            keys.iter()
+                .map(|key| (*key).to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let stored = super::ScratchRetireCursor {
+            listing_due: set(&["a", "gained", "emptied", "gone"]),
+            classify: Some("old".into()),
+            ..super::ScratchRetireCursor::default()
+        };
+        let next = super::ScratchRetireCursor {
+            listing_due: set(&["a", "d"]),
+            classify: Some("d".into()),
+            full_listing_started_ms: Some(7),
+            ..super::ScratchRetireCursor::default()
+        };
+        let merged = super::merged_cursor(&stored, &next, &set(&["emptied"]), |key| key != "gone");
+        assert_eq!(merged.listing_due, set(&["a", "d", "gained"]));
+        assert_eq!(merged.classify.as_deref(), Some("d"));
+        assert_eq!(merged.full_listing_started_ms, Some(7));
+    }
+
+    /// Which signals a pass clears: those of records stored as due, of
+    /// records it retires, and orphans whose entry is gone; never one of a
+    /// record it did not read (created since) or could not classify.
+    #[test]
+    fn only_signals_this_pass_accounted_for_are_cleared() {
+        let pool = PathBuf::from("/pools/p");
+        let key = |entry: &str| {
+            pool.join(crate::session_scratch::SCRATCH_CONTAINER)
+                .join(entry)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let listing = crate::session_scratch::ContainerListing {
+            entries: names(&["s1-a", "s2-b", "s4-d", "s5-e"]),
+            signals: names(&["s1-a", "s2-b", "s3-c", "s4-d", "s5-e"]),
+        };
+        let due = std::collections::BTreeSet::from([key("s1-a")]);
+        let classes = std::collections::BTreeMap::from([
+            (key("s1-a"), super::RecordClass::Open),
+            (key("s2-b"), super::RecordClass::Retire),
+            (key("s5-e"), super::RecordClass::Unknown),
+        ]);
+        let clear = super::signals_to_clear(&pool, &listing, &due, |k| classes.get(k).copied());
+        assert_eq!(clear, names(&["s1-a", "s2-b", "s3-c"]));
+    }
+
+    /// A signal of a record created after the pass read the records stays
+    /// for the next pass, which lists that record and clears it.
+    #[test]
+    fn a_signal_of_a_newer_record_survives_the_pass() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, scratch) = started(&mut broker, "scratch newer signal");
+        let pool = scratch.parent().unwrap().parent().unwrap().to_path_buf();
+        run_retirement(&mut broker);
+        let newer = crate::session_scratch::create(&pool, session.id).unwrap();
+        assert_eq!(
+            crate::session_scratch::signal_finished_run(&newer.path()),
+            Some(true)
+        );
+
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.listed, 0, "{report:#?}");
+        assert_eq!(
+            crate::session_scratch::list_container(&pool).signals,
+            vec![newer.entry.clone()],
+            "not cleared: its record was not read"
+        );
+
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_RECORDS_KEY,
+                |records: &mut crate::session_scratch::ScratchRecords| {
+                    records.insert(newer.key(), newer.clone());
+                },
+            )
+            .unwrap();
+        let report = run_retirement(&mut broker);
+        assert_eq!(report.scratch.signals, 1, "{report:#?}");
+        assert_eq!(report.scratch.listed, 1, "{report:#?}");
+        assert!(
+            crate::session_scratch::list_container(&pool)
+                .signals
+                .is_empty()
+        );
+    }
+
+    /// A done container that cannot be read says nothing: the record stays
+    /// due and is listed again, counted.
+    #[test]
+    fn an_unreadable_done_container_keeps_its_record_due() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, scratch) = started(&mut broker, "scratch unreadable done");
+        std::fs::write(scratch.join(crate::command_temp::DONE_CONTAINER), b"").unwrap();
+        for _ in 0..2 {
+            let report = run_retirement(&mut broker);
+            assert_eq!(report.scratch.listed, 1, "{report:#?}");
+            assert_eq!(report.scratch.listing_unknown, 1, "{report:#?}");
+            assert_eq!(report.scratch.listing_due, 1, "{report:#?}");
+        }
+    }
+
+    /// A cursor written before these fields existed starts a full listing.
+    #[test]
+    fn a_cursor_from_an_older_broker_starts_a_full_listing() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, _) = started(&mut broker, "scratch old cursor");
+        broker
+            .store_ref()
+            .meta_set(
+                super::SESSION_SCRATCH_CURSOR_KEY,
+                r#"{"classify":"x","closed":"y"}"#,
+            )
+            .unwrap();
+        let report = run_retirement(&mut broker);
+        assert!(report.scratch.full_listing, "{report:#?}");
+        assert_eq!(report.scratch.listed, 1, "{report:#?}");
     }
 
     #[test]
