@@ -487,19 +487,6 @@ pub(crate) fn stale_unconfirmable(name: &str, row: &TrashRow, now_ms: i64) -> bo
             .is_some_and(|created| now_ms.saturating_sub(created) > STALE_PENDING_AFTER_MS)
 }
 
-/// Whether the entry `name` in the trash of `pool` is a real directory with
-/// the identity `row` recorded.
-pub(crate) fn entry_matches(pool: &Path, name: &str, row: &TrashRow) -> bool {
-    let Ok(trash) = open_trash(pool) else {
-        return false;
-    };
-    fstatat_nofollow(trash.trash.as_raw_fd(), name).is_ok_and(|stat| {
-        #[allow(clippy::unnecessary_cast)]
-        let identity = (stat.st_dev as u64, stat.st_ino as u64);
-        is_directory(&stat) && identity == (row.device, row.inode)
-    })
-}
-
 /// What one look at the trash finds for a pending row's entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingEntryState {
@@ -3334,7 +3321,10 @@ mod tests {
         assert_eq!(report.stale_pending, vec![old.clone()]);
         assert_eq!(report.entries_removed, 0);
         assert!(trashed.trash_dir.join(&old).join("base.txt").exists());
-        assert!(entry_matches(&fixture.pool, &old, &row));
+        assert_eq!(
+            pending_entry_state(&fixture.pool, &old, &row),
+            PendingEntryState::Matches
+        );
     }
 
     /// The rename never replaces an existing destination, so a failed move
