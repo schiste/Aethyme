@@ -890,6 +890,22 @@ pub struct PassInputs<'a> {
     pub registry: PathBuf,
 }
 
+/// This pass's landing decisions: the shared prover's counts since `before`.
+fn landing_delta(
+    before: &super::landing::LandingStats,
+    after: &super::landing::LandingStats,
+) -> BTreeMap<String, u64> {
+    let before = before.as_map();
+    after
+        .as_map()
+        .into_iter()
+        .map(|(name, count)| {
+            let earlier = before.get(&name).copied().unwrap_or(0);
+            (name, count.saturating_sub(earlier))
+        })
+        .collect()
+}
+
 /// One worker pass: volumes, discovery, measurement, eviction, persistence.
 pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Result<Ledger> {
     let started = Instant::now();
@@ -994,6 +1010,15 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     phase = Instant::now();
     let now = now_ms();
     let candidates = evict::plan(&ledger, &inputs.budgets, now, &aggressive);
+    // What earlier passes proved not landed, so an unchanged archive costs
+    // no Git read; saved again after eviction.
+    let landing_before = {
+        let mut prover = super::landing::shared();
+        prover.load(inputs.host_state);
+        // Each pass reads every default tip afresh, then reuses it.
+        prover.expire_tips();
+        prover.stats().clone()
+    };
     let leases = evict::leased_gate_caches(&inputs.registry);
     let mut class_bytes = ledger.class_bytes();
     let mut gate_bytes = evict::gate_cache_by_repository(&ledger);
@@ -1045,6 +1070,10 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             break;
         }
         if let Some(why) = evict::refuse(&candidate, leases.as_ref(), now) {
+            if candidate.class == Class::RecoveryArchives && why.starts_with(evict::UNPROVEN_PREFIX)
+            {
+                report.unproven_archives.push(candidate.relative.clone());
+            }
             if candidate.class == Class::RecoveryArchives && why.starts_with("unlanded") {
                 report.unlanded_archives.push(candidate.relative.clone());
                 if why.starts_with("unlanded at its retention age") {
@@ -1098,6 +1127,14 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         }
     }
     report.phases_ms.insert("evict".into(), elapsed(phase));
+    {
+        let prover = super::landing::shared();
+        report.landing = landing_delta(&landing_before, prover.stats());
+        crate::warn_unrecorded(
+            "save the storage landing cache",
+            prover.save(inputs.host_state),
+        );
+    }
     // Again at the end: a pass runs for minutes, and what a gate staged
     // after its start would otherwise wait for the next pass.
     let phase = Instant::now();

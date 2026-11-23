@@ -31,6 +31,7 @@ pub mod check;
 pub mod cli;
 pub mod evict;
 pub mod host_temp;
+pub mod landing;
 #[cfg(test)]
 mod tests;
 
@@ -217,6 +218,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | SESSION_SCRATCH_DIRECTORY
                 | RECOVERY_ARCHIVE_USAGE_DIRECTORY
                 | host_temp::HOST_TEMP_DIRECTORY
+                | landing::CACHE_FILE
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE => Class::Coordination,
@@ -590,6 +592,16 @@ pub struct PassReport {
     #[serde(default)]
     pub notices_reset: u64,
     pub pressure: bool,
+    /// How this pass proved recovery archives landed: each decision's
+    /// count, from [`landing::LandingStats`] (tip reads, cached answers,
+    /// probes, timeouts, forward moves and resets).
+    #[serde(default)]
+    pub landing: BTreeMap<String, u64>,
+    /// Recovery archives kept because their landing could not be proven
+    /// either way this pass (a budget, a deadline, a Git failure): not
+    /// counted as unlanded.
+    #[serde(default)]
+    pub unproven_archives: Vec<String>,
 }
 
 /// The persisted ledger.

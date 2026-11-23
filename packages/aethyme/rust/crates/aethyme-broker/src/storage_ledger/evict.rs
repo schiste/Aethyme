@@ -24,11 +24,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::landing::Refusal;
 use super::{Budgets, Child, Class, Item, Ledger, Policy, RootKind, policy};
 
 /// Why something is proposed.
@@ -289,7 +289,38 @@ pub fn leased_gate_caches(registry: &Path) -> Option<BTreeSet<(String, String)>>
 
 /// Whether an archive's content is proven landed: no uncommitted content,
 /// and every commit it records is in its repository's default branch.
+/// Commits are proven by this process's shared [`super::landing`] prover.
 pub fn archive_landed(archive: &Path) -> Result<(), String> {
+    archive_landing(archive).map_err(|refusal| refusal.to_string())
+}
+
+/// [`archive_landed`], saying whether a refusal is an answer (not landed)
+/// or the lack of one (unproven).
+pub fn archive_landing(archive: &Path) -> Result<(), Refusal> {
+    archive_landing_with(archive, &mut super::landing::shared())
+}
+
+/// [`archive_landed`] with an explicit prover.
+pub fn archive_landed_with(
+    archive: &Path,
+    prover: &mut super::landing::LandingProver,
+) -> Result<(), String> {
+    archive_landing_with(archive, prover).map_err(|refusal| refusal.to_string())
+}
+
+/// [`archive_landing`] with an explicit prover.
+pub fn archive_landing_with(
+    archive: &Path,
+    prover: &mut super::landing::LandingProver,
+) -> Result<(), Refusal> {
+    archive_content_and_commits(archive)
+        .map_err(Refusal::NotLanded)
+        .and_then(|(repository, commits)| prover.prove(&repository, &commits))
+}
+
+/// The archive's repository and recorded commits, once its manifest says it
+/// holds nothing outside them.
+fn archive_content_and_commits(archive: &Path) -> Result<(PathBuf, Vec<String>), String> {
     let manifest_path = archive.join("manifest.json");
     let size = fs::metadata(&manifest_path)
         .map_err(|error| format!("manifest unreadable: {error}"))?
@@ -342,69 +373,18 @@ pub fn archive_landed(archive: &Path) -> Result<(), String> {
     if commits.is_empty() {
         return Err("it records no commit".into());
     }
-    let default = default_branch(&repository).ok_or("no default branch")?;
-    for commit in commits {
-        if !commit.chars().all(|c| c.is_ascii_hexdigit()) || commit.len() < 40 {
-            return Err("an invalid commit id".into());
-        }
-        let contained = git(
-            &repository,
-            &["merge-base", "--is-ancestor", &commit, &default],
-        )
-        .is_some();
-        if !contained {
-            return Err(format!("commit {} is not in {default}", &commit[..12]));
-        }
+    if commits
+        .iter()
+        .any(|commit| !commit.chars().all(|c| c.is_ascii_hexdigit()) || commit.len() < 40)
+    {
+        return Err("an invalid commit id".into());
     }
-    Ok(())
+    Ok((repository, commits))
 }
 
-fn git(repository: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// The commit the repository's default branch points at, preferring the
-/// remote's view.
-fn default_branch(repository: &Path) -> Option<String> {
-    let remote_head = git(
-        repository,
-        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-    );
-    let mut names: Vec<String> = remote_head.into_iter().collect();
-    names.extend(
-        [
-            "refs/remotes/origin/main",
-            "refs/remotes/origin/master",
-            "refs/heads/main",
-            "refs/heads/master",
-        ]
-        .map(str::to_string),
-    );
-    names.into_iter().find_map(|name| {
-        git(
-            repository,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{name}^{{commit}}"),
-            ],
-        )
-    })
-}
+/// How [`refuse`] begins the reason for an archive whose landing could not
+/// be proven either way (never counted as unlanded).
+pub const UNPROVEN_PREFIX: &str = "landing not proven";
 
 /// Whether `relative` under `root` is a plain path with no symbolic link in
 /// it (the root itself is trusted: it is an exact configured path).
@@ -493,15 +473,22 @@ pub fn refuse(
             // setting allows it.
             if !candidate.allow_unlanded
                 && !super::dismiss_marker(&path).exists()
-                && let Err(why) = archive_landed(&path)
+                && let Err(refusal) = archive_landing(&path)
             {
-                crate::phase_telemetry::add(
-                    "storage_archive_kept_unlanded_at_age",
-                    std::time::Duration::ZERO,
-                );
-                return Some(format!(
-                    "unlanded at its retention age, kept until its owner dismisses it: {why}"
-                ));
+                return Some(match refusal {
+                    Refusal::NotLanded(why) => {
+                        crate::phase_telemetry::add(
+                            "storage_archive_kept_unlanded_at_age",
+                            std::time::Duration::ZERO,
+                        );
+                        format!(
+                            "unlanded at its retention age, kept until its owner dismisses it: {why}"
+                        )
+                    }
+                    Refusal::Unproven(why) => {
+                        format!("{UNPROVEN_PREFIX} at its retention age, kept: {why}")
+                    }
+                });
             }
             let meta = super::archive_meta(&path);
             let Some(created) = meta.created_ms else {
@@ -519,8 +506,10 @@ pub fn refuse(
             }
         }
         Policy::RecoveryArchives => {
-            if let Err(why) = archive_landed(&path) {
-                return Some(format!("unlanded: {why}"));
+            match archive_landing(&path) {
+                Ok(()) => {}
+                Err(Refusal::NotLanded(why)) => return Some(format!("unlanded: {why}")),
+                Err(Refusal::Unproven(why)) => return Some(format!("{UNPROVEN_PREFIX}: {why}")),
             }
             let meta = super::archive_meta(&path);
             let retention = meta
