@@ -2252,6 +2252,12 @@ retired stores without a lease. A preparation refused for storage tries the
 same rotation first. Telemetry phases: `package_store_rotated_pressure`,
 `package_store_rotated_over_cap`, `package_store_rotation_busy`,
 `package_store_retired_removal`, `runtime_probe`, `runtime_probe_unverified`.
+Since 2026-11-23 a preparation never removes the retired store itself: it
+renames it, persists a storage-recovery request and starts the storage worker,
+whose sweep removes it (span `package_store_retired_handoff`, counters
+`package_store_retired_handed_to_worker` and
+`package_store_retired_handoff_failed`). `package_store_retired_removal` is
+now recorded only by sweeps.
 
 Mixed versions: binaries before this change compute different digests, so
 they never open a digest directory holding the new links; their unlink-based
@@ -3042,6 +3048,25 @@ the budget inventory `bytes_observed` and `outcome` (one of `absent`,
 `preparation_step`, and one counter per inventory outcome
 (`shared_cache_inventory_absent`, `_within_budget`, `_over_budget`,
 `_inconclusive_time_limit`, `_inconclusive_entry_limit`).
+
+Since 2026-11-23 a sharing preparation (`max_concurrent` above 1) that takes
+the cache alone holds it alone only for recovery, the budget check and a
+rotation. Before its steps it releases the exclusive grant and takes a share
+through the same wait queue and unfinished-rotation probe as any sharing
+preparation; if the probe cannot rule out a rotation left unfinished in that
+gap, it takes the cache alone again and recovers before any step runs.
+`shared_cache_mode` still reports the mode the cache was taken in, and
+`shared_cache_wait_ms` includes the wait for the share. Metrics add the spans
+`shared_cache_exclusive_section` (from the exclusive grant to the share, or to
+release when the preparation never shares), `shared_cache_downgrade` and
+`shared_cache_downgrade_wait`, and the counters
+`shared_cache_downgraded_to_shared` and
+`shared_cache_downgrade_found_rotation`. A due (not overdue) budget check
+whose store already has a queued, running or backing-off background
+measurement, and no fresh result, no longer takes the cache alone for a
+foreground inventory; it shares the cache and counts
+`shared_cache_budget_check_deferred_to_background`. The overdue check still
+waits for the cache alone.
 
 While it waits for or holds the cache, `submit prepare` keeps one live record
 per repository and session under `<host state>/preparation-cache-activity/`

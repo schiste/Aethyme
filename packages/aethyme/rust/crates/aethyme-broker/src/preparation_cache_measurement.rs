@@ -548,6 +548,21 @@ impl Broker {
             .is_some_and(|request| request.due(now))
     }
 
+    /// Whether a measurement of `repository`'s store under `cache_root` is
+    /// queued, running or backing off: a due foreground budget check then
+    /// leaves the answer to it instead of taking the cache alone.
+    pub(crate) fn shared_cache_measurement_pending(
+        &self,
+        repository: &str,
+        cache_root: &Path,
+    ) -> bool {
+        self.shared_cache_measurement_request()
+            .is_some_and(|request| {
+                request.repository == repository
+                    && request.cache_root_key == cache_root_key(cache_root)
+            })
+    }
+
     /// The status view, or `None` when nothing was ever queued or measured.
     pub(crate) fn shared_cache_measurement_status(&self) -> Option<SharedCacheMeasurementStatus> {
         let request = self.shared_cache_measurement_request();
@@ -1820,6 +1835,37 @@ mod tests {
         let status = fixture.broker.shared_cache_measurement_status().unwrap();
         assert!(status.request.is_some() && status.result.is_none());
         assert!(!status.result_fresh && !status.running);
+    }
+
+    /// A due budget check defers to a pending measurement of the same store
+    /// only: another repository's or another root's request decides nothing.
+    #[test]
+    fn a_pending_measurement_is_matched_by_repository_and_cache_root() {
+        let mut fixture = fixture(1, 10);
+        let cache_root = fixture.cache_root.clone();
+        assert!(
+            !fixture
+                .broker
+                .shared_cache_measurement_pending(REPOSITORY, &cache_root)
+        );
+        fixture.queue(1_000);
+        assert!(
+            fixture
+                .broker
+                .shared_cache_measurement_pending(REPOSITORY, &cache_root)
+        );
+        let other_repository = "0".repeat(64);
+        assert!(
+            !fixture
+                .broker
+                .shared_cache_measurement_pending(&other_repository, &cache_root)
+        );
+        let other_root = fixture.host.path().to_path_buf();
+        assert!(
+            !fixture
+                .broker
+                .shared_cache_measurement_pending(REPOSITORY, &other_root)
+        );
     }
 
     #[test]

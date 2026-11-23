@@ -719,6 +719,90 @@ fn acquire_preparation_cache_once(
     ))
 }
 
+/// Trade a preparation's exclusive hold of a sharing repository's cache for
+/// a share, once the work that needed it alone (recovery, the budget check, a
+/// rotation) is done and before any step runs.
+///
+/// Until 2026-11-23 a preparation that took the cache alone for the hourly
+/// budget check kept it alone through its own install steps, which are what
+/// every sharing preparation runs anyway. On the busiest repository those
+/// steps were 85-90% of each exclusive hold (40-270 s), and every preparation
+/// that arrived meanwhile waited for them.
+///
+/// The coordinator has no atomic downgrade, so the exclusive grant is
+/// released and a share requested like any sharing preparation's: through
+/// the wait queue, then the unfinished-rotation probe under the share. Nothing
+/// has linked from or written to the store yet, so the gap between the two
+/// grants is harmless. If the probe cannot rule out a rotation another holder
+/// left unfinished in that gap, the share is traded back for the cache alone,
+/// exactly as a sharing preparation's first acquisition does, and the caller
+/// recovers before any step runs. Returns the wait spent and the mode held.
+fn downgrade_preparation_cache(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut Option<crate::HostResourceGrant>,
+    request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
+    wait: Duration,
+    rotation_unsettled: &mut dyn FnMut() -> bool,
+    holder_activity: &dyn Fn() -> Option<String>,
+) -> Result<(Duration, SharedCacheMode), PreparationError> {
+    let _span = crate::phase_telemetry::span("shared_cache_downgrade");
+    let started = Instant::now();
+    let deadline = started + wait;
+    if let Some(exclusive) = grant.as_ref() {
+        coordinator.release(
+            &exclusive.lease.lease_id,
+            exclusive.lease.generation,
+            &exclusive.ownership_token,
+        )?;
+        grant.take();
+    }
+    let mut next_notice = Instant::now();
+    let mut notice = |message: &str| {
+        cache_activity::tick();
+        let now = Instant::now();
+        if now >= next_notice {
+            eprintln!(
+                "{}",
+                shared_cache_wait_notice(wait, message, holder_activity())
+            );
+            next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
+        }
+    };
+    let share = {
+        let _span = crate::phase_telemetry::span("shared_cache_downgrade_wait");
+        coordinator
+            .acquire_with_wait(&request_for(SharedCacheMode::Shared)?, wait, &mut notice)
+            .map_err(|error| shared_cache_wait_exhausted(error, wait))?
+    };
+    let unsettled = {
+        let _span = crate::phase_telemetry::span("shared_cache_rotation_probe");
+        rotation_unsettled()
+    };
+    if !unsettled {
+        crate::phase_telemetry::add("shared_cache_downgraded_to_shared", Duration::ZERO);
+        *grant = Some(share);
+        return Ok((started.elapsed(), SharedCacheMode::Shared));
+    }
+    crate::phase_telemetry::add("shared_cache_downgrade_found_rotation", Duration::ZERO);
+    coordinator.release(
+        &share.lease.lease_id,
+        share.lease.generation,
+        &share.ownership_token,
+    )?;
+    let alone = {
+        let _span = crate::phase_telemetry::span("shared_cache_downgrade_wait");
+        coordinator
+            .acquire_with_wait(
+                &request_for(SharedCacheMode::Exclusive)?,
+                deadline.saturating_duration_since(Instant::now()),
+                &mut notice,
+            )
+            .map_err(|error| shared_cache_wait_exhausted(error, wait))?
+    };
+    *grant = Some(alone);
+    Ok((started.elapsed(), SharedCacheMode::Exclusive))
+}
+
 /// The line a waiting prepare repeats: what it waits for and, when the
 /// holder reports it, what the holder is doing.
 fn shared_cache_wait_notice(wait: Duration, conflict: &str, holder: Option<String>) -> String {
@@ -1708,17 +1792,22 @@ impl Broker {
             .as_ref()
             .map(|binding| shared_cache_budget_checked_key(&binding.path));
         let mut cache_mode = SharedCacheMode::Exclusive;
+        // The mode the cache was taken in, which the report states; steps of
+        // a sharing preparation that took it alone run under a share.
+        let mut acquired_mode = SharedCacheMode::Exclusive;
         // Reports what runs while the shared cache is held: stderr progress,
         // the live record other sessions read, and the report's summaries.
         let mut cache_activity_guard = None;
         let mut lease_held_span = None;
+        // Open only while the cache is held alone.
+        let mut exclusive_section_span = None;
+        let sharing = max_concurrent > 1;
         // Whether this preparation measures the store against its budget. A
         // repository that shares the cache measures only when it holds it
         // alone; one that never shares measures at most once an hour, like a
         // sharing one, instead of on every preparation.
         let mut measure_budget = true;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
-            let sharing = max_concurrent > 1;
             let budget_need = if config
                 .shared_cache
                 .as_ref()
@@ -1733,13 +1822,40 @@ impl Broker {
             } else {
                 None
             };
-            let budget_check = if sharing { budget_need } else { None };
+            let mut budget_check = if sharing { budget_need } else { None };
             if !sharing {
                 measure_budget = budget_need.is_some();
             }
             let binding = cache_root_binding
                 .as_ref()
                 .expect("shared cache has a binding");
+            // A due (not overdue) check whose answer a queued or running
+            // background measurement will give does not take the cache alone
+            // for a foreground inventory: that inventory is the one that
+            // stopped at its time limit and queued the measurement (30 s
+            // under the exclusive lease on the busiest repository, every
+            // hour). The overdue check still waits for the cache alone.
+            if matches!(budget_check, Some(ExclusiveNeed::BudgetCheckDue))
+                && let Some(cache) = config.shared_cache.as_ref()
+            {
+                let repository = repository_identity(self);
+                if self
+                    .fresh_shared_cache_measurement(
+                        &repository,
+                        &binding.path,
+                        cache.max_bytes,
+                        now_ms(),
+                    )
+                    .is_none()
+                    && self.shared_cache_measurement_pending(&repository, &binding.path)
+                {
+                    crate::phase_telemetry::add(
+                        "shared_cache_budget_check_deferred_to_background",
+                        Duration::ZERO,
+                    );
+                    budget_check = None;
+                }
+            }
             let probe_db = resource_db_path
                 .as_deref()
                 .expect("shared cache has a host resource database");
@@ -1787,7 +1903,13 @@ impl Broker {
             cache_activity::lease_acquired();
             cache_activity::leave();
             lease_held_span = Some(crate::phase_telemetry::span("shared_cache_lease_held"));
+            if mode == SharedCacheMode::Exclusive {
+                exclusive_section_span = Some(crate::phase_telemetry::span(
+                    "shared_cache_exclusive_section",
+                ));
+            }
             cache_mode = mode;
+            acquired_mode = mode;
             crate::phase_telemetry::add(
                 match mode {
                     SharedCacheMode::Shared => "shared_cache_held_shared",
@@ -1802,7 +1924,7 @@ impl Broker {
         } else {
             None
         };
-        let shared_cache_wait_ms = if shared {
+        let mut shared_cache_wait_ms = if shared {
             cache_wait_started.elapsed().as_millis() as u64
         } else {
             0
@@ -1936,6 +2058,96 @@ impl Broker {
                     cache.max_bytes,
                     background_measurement.as_ref(),
                 );
+            }
+        }
+        // The work that needed the cache alone is done: steps run under a
+        // share, like every other sharing preparation's, so preparations
+        // arriving now wait for none of this one's install.
+        if shared
+            && sharing
+            && cache_mode == SharedCacheMode::Exclusive
+            && let (Some(coordinator_ref), Some(binding), Some(probe_db)) = (
+                coordinator.as_mut(),
+                cache_root_binding.as_ref(),
+                resource_db_path.as_deref(),
+            )
+        {
+            let repository = repository_identity(self);
+            cache_activity::enter(
+                cache_activity::PreparationCacheOperation::WaitingForCache,
+                None,
+                false,
+            );
+            let downgraded = downgrade_preparation_cache(
+                coordinator_ref,
+                &mut grant,
+                &|mode| {
+                    preparation_resource_request(
+                        self,
+                        session_id,
+                        &root,
+                        &digest,
+                        mode,
+                        max_concurrent,
+                    )
+                },
+                wait.saturating_sub(Duration::from_millis(shared_cache_wait_ms)),
+                &mut || {
+                    probe_rotation_recovery(
+                        &binding.path,
+                        binding.identity.as_deref(),
+                        probe_db,
+                        SHARED_CACHE_ROTATION_PROBE_MAX_ENTRIES,
+                        Instant::now() + SHARED_CACHE_ROTATION_PROBE_BUDGET,
+                    ) != rotation_debt::DebtProbe::NoDebt
+                },
+                &|| {
+                    let now = now_ms();
+                    current_cache_holder(probe_db, &repository, session_id, now)
+                        .map(|record| cache_activity::describe_holder(&record, now))
+                },
+            );
+            cache_activity::leave();
+            let (downgrade_wait, held) = downgraded?;
+            shared_cache_wait_ms =
+                shared_cache_wait_ms.saturating_add(downgrade_wait.as_millis() as u64);
+            if held == SharedCacheMode::Shared {
+                drop(exclusive_section_span.take());
+            } else {
+                // Back alone because a rotation may be unfinished: recover it
+                // (no budget check, that ran already) before any step runs.
+                let mut next_renewal = Instant::now();
+                let mut progress = |force: bool| -> Result<(), PreparationError> {
+                    cache_activity::tick();
+                    if force || Instant::now() >= next_renewal {
+                        let (Some(coordinator), Some(grant)) =
+                            (coordinator.as_mut(), grant.as_mut())
+                        else {
+                            return Err(PreparationError::LivenessIncomplete {
+                                reason: "shared-cache lease is unavailable during recovery".into(),
+                            });
+                        };
+                        grant.lease = coordinator.renew(
+                            &grant.lease.lease_id,
+                            grant.lease.generation,
+                            &grant.ownership_token,
+                            PREPARATION_LEASE_TTL_SECONDS,
+                        )?;
+                        next_renewal =
+                            Instant::now() + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+                    }
+                    Ok(())
+                };
+                let recovered =
+                    shared_cache_budget(None, &digest, self, binding, None, &mut progress);
+                cache_activity::leave();
+                self.release_grant_after_error(recovered, &mut coordinator, &mut grant, || {
+                    require_preparation_storage_with_cache_root(
+                        &storage_root,
+                        &storage_paths,
+                        cache_root_binding.as_ref(),
+                    )
+                })?;
             }
         }
         if let Some(cache_dir) = &cache_dir {
@@ -2340,6 +2552,7 @@ impl Broker {
             report.output_share = Some(share);
         }
         release_grant(&mut coordinator, &mut grant)?;
+        drop(exclusive_section_span);
         drop(lease_held_span);
         let shared_cache_operations = cache_activity_guard
             .take()
@@ -2387,7 +2600,7 @@ impl Broker {
             offline,
             shared_cache_coordinated: shared,
             shared_cache_wait_ms,
-            shared_cache_mode: shared.then_some(cache_mode),
+            shared_cache_mode: shared.then_some(acquired_mode),
             shared_cache_rotation: rotation,
             shared_cache_operations,
             shared_cache_background_measurement,
@@ -5331,16 +5544,12 @@ impl Broker {
     }
 }
 
-/// How long a preparation under storage pressure may spend removing a
-/// retired shared package store before it decides whether to refuse.
-const PRESSURE_RECLAIM_BUDGET: Duration = Duration::from_secs(30);
-
 impl Broker {
     /// Under storage pressure, rotate this repository's shared package store
     /// (only if no preparation holds the cache, alone or shared: the
-    /// exclusive request is granted at once or not at all) and remove the
-    /// retired tree within [`PRESSURE_RECLAIM_BUDGET`], before a preparation
-    /// refuses. Returns whether a store was retired.
+    /// exclusive request is granted at once or not at all) and hand the
+    /// retired tree to the storage worker, before a preparation refuses.
+    /// Returns whether a store was retired.
     fn reclaim_package_store_under_pressure(
         &mut self,
         binding: Option<&crate::broker::PreparationCacheRootBinding>,
@@ -5395,31 +5604,32 @@ impl Broker {
                 &grant.ownership_token,
             ),
         );
-        let Some(retired) = retired else {
+        if retired.is_none() {
             return false;
-        };
-        crate::phase_telemetry::add("package_store_rotated_pressure", Duration::ZERO);
-        eprintln!(
-            "preparation cache: storage is under pressure; rotated this repository's shared package store and removing it"
-        );
-        let started = Instant::now();
-        let removal = crate::gc::remove_condemned_tree_with_progress_and_guard(
-            &retired,
-            None,
-            Some(started + PRESSURE_RECLAIM_BUDGET),
-            || {
-                binding
-                    .validate()
-                    .map_err(|error| std::io::Error::other(error.to_string()))
-            },
-        );
-        crate::phase_telemetry::add("package_store_retired_removal", started.elapsed());
-        if let Err(error) = removal {
-            eprintln!(
-                "warning: aethyme could not finish removing the retired package store: {}",
-                error.source
-            );
         }
+        crate::phase_telemetry::add("package_store_rotated_pressure", Duration::ZERO);
+        // The rename freed nothing yet; the removal is the storage worker's
+        // (its sweep removes every retired store, paced, outside any
+        // command). Until 2026-11-23 this preparation removed it inline for
+        // up to 30 s and on the busiest repository still refused after.
+        let handed_off = {
+            let _span = crate::phase_telemetry::span("package_store_retired_handoff");
+            self.persist_storage_recovery_request()
+        };
+        crate::phase_telemetry::add(
+            if handed_off {
+                "package_store_retired_handed_to_worker"
+            } else {
+                "package_store_retired_handoff_failed"
+            },
+            Duration::ZERO,
+        );
+        if handed_off {
+            self.start_storage_recovery_worker();
+        }
+        eprintln!(
+            "preparation cache: storage is under pressure; rotated this repository's shared package store and handed it to the storage worker for removal"
+        );
         true
     }
 
