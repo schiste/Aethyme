@@ -2823,9 +2823,8 @@ pub(crate) enum ServiceCheck {
     Sandboxed,
     /// This process could not name its own executable.
     RunningUnknown,
-    /// The status form may not write (an explicit `--read-only-snapshot` or
-    /// a compatibility read-only open): the binding is classified, counted
-    /// and advised, and nothing is scheduled.
+    /// The status may not write (a compatibility read-only open): the
+    /// binding is classified, counted and advised, and nothing is scheduled.
     ReadOnly,
     /// The binding is stale or gone, but this process does not run the
     /// router the installation's `current` selector names (canonical paths

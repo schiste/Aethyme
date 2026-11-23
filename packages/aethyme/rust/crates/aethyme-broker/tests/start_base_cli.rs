@@ -386,7 +386,8 @@ fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
 /// 0.8.161 measured on a real host: the default `broker status --json` opens
 /// a read-only snapshot by design and skipped the scheduled GC service check,
 /// so the repair it exists for never ran. Every form must run it and say in
-/// which mode; only an explicit `--read-only-snapshot` is read-only.
+/// which mode. (The strictly read-only mode, a compatibility read-only open,
+/// is covered by the `ServiceCheck::ReadOnly` unit tests.)
 #[test]
 fn every_status_form_runs_the_gc_service_check_and_names_its_mode() {
     let tmp = fixture();
@@ -407,11 +408,6 @@ fn every_status_form_runs_the_gc_service_check_and_names_its_mode() {
             read_only,
         ),
         (vec!["status", "--full", "--json"], may_repair, read_only),
-        (
-            vec!["status", "--read-only-snapshot", "--json"],
-            read_only,
-            may_repair,
-        ),
     ] {
         stdout(&run(tmp.path(), &args));
         let metrics =

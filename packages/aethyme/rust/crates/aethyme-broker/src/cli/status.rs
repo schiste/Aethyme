@@ -201,8 +201,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Routine status opens a read-only snapshot by design (it must not touch
     // broker storage or mark advisories delivered), and it is the form agents
     // run, so it still checks the scheduled GC service and may start its one
-    // background rebind; that writes only the service's own receipt. Only an
-    // explicit `--read-only-snapshot` (or a compatibility read-only open)
+    // background rebind; that writes only the service's own receipt. A
+    // read-only snapshot that is not merely routine (a compatibility
+    // read-only open, when the broker database is newer than this binary)
     // keeps the check strictly read-only: classify, count and advise.
     let gc_service_may_repair = !parsed.read_only_snapshot || parsed.routine_status_snapshot;
     let mut broker = if routine {

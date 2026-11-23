@@ -1544,8 +1544,8 @@ impl<E: std::fmt::Display + 'static> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
-    /// `read_only_snapshot` was set only because this is routine status (no
-    /// explicit `--read-only-snapshot`, no compatibility mode): such a status
+    /// `read_only_snapshot` was set only because this is routine status (not
+    /// by a compatibility read-only open): such a status
     /// still keeps broker storage untouched, but may start the scheduled GC
     /// service's background rebind.
     routine_status_snapshot: bool,

@@ -812,8 +812,9 @@ impl Broker {
     /// launchctl. A binding that is gone or no longer current also starts one
     /// detached `gc service status`, whose automatic refresh asks launchd.
     ///
-    /// Every form of `broker status` that may write runs this (full, compact,
-    /// summary and the session view); `--read-only-snapshot` does not. Each
+    /// Every form of `broker status` runs this (full, compact, summary and the
+    /// session view); `may_repair` is false only for a read-only snapshot
+    /// that is not merely routine (a compatibility read-only open). Each
     /// call counts exactly one `gc_service_status_*` or `gc_service_refresh_*`
     /// outcome, so a metrics line always says which branch ran. Off macOS
     /// there is no service and nothing is read or counted.
