@@ -4,6 +4,34 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.163] - 2026-11-23
+
+### Fixed
+
+- A session push no longer runs the repository's pre-push hook inside its 60 s budget or while holding shared lanes. On the busiest repository 51 of 52 push timeouts in one day stopped inside the hook, each recorded `outcome_unknown` and blocking every repository-wide and GitHub write until a person reconciled it (56 manual reconciles that day), and pushes queued behind other sessions' hooks. For a strict push of the caller's own session branch with an executable `pre-push` hook, the hook now runs once, in `git push --dry-run` against the pinned commits, with the arguments and stdin the real push would give it, under its own budget and before any shared lane; the push is then re-planned under the lanes, refused if any ref or the remote's old value moved, and sent with `--no-verify`. A failing or timed-out hook refuses the push with its output and blocks nobody. Two pushes of one branch still serialise through a per-branch lane (#1971).
+- A timed-out push settles itself when the evidence proves it: recorded `failed` when Git's trace shows the hook still running, the trace is live, and a verified read of the push endpoint finds every destination at its old value; `succeeded` when every destination holds the proposed commit; otherwise unknown. A later write re-reads an unknown push of a session's own branch and settles it `reconciled_succeeded`, or `reconciled_failed` when the branch is still at its old value 10 minutes after the push ended. Reads go through the verified push endpoint of the operation's recorded repository; an unverifiable endpoint stays unknown (#1971).
+- An unknown push of a session's own branch blocks only that session and branch. Writes that name that branch (merging its pull request, pushing to or deleting it, `--all`, `--mirror`, `--prune`, `--tags`) and unknown writes to shared branches (the default and integration branches, tags, any repository-wide write) still block everything. A settle error on another session's row no longer fails an unrelated write (#1971).
+- The storage worker proves a recovery archive landed once per default-branch tip, bounded. It ran one unbounded `git merge-base` per recorded commit on every pass at the worker's throttled disk priority (one call took 50 s; eviction took 125 s of a 211 s pass with nothing evicted). Answers are now kept per tip and updated by one `rev-list` when the tip moves forward; only "not landed" answers persist between passes, so a damaged cache can only keep an archive; "landed" is re-proven against a freshly read tip before removal. Reads run at ordinary disk priority, ignore replace refs and grafts, never fetch lazily, and share a 120 s per-process budget with 20 s per read. Archives whose landing could not be proven are reported as unproven, not unlanded (#1972).
+- A timed-out brokered Git or GitHub command is stopped with every process it started. The broker killed only the direct child, so `pack-objects`, remote helpers, `ssh`, `index-pack` and hook children could keep sending after a timeout, and orphaned `git remote-https` processes were seen on the host. On unix these commands, and the broker's own `fetch`, `push`, `pull`, `ls-remote` and `clone`, now run in their own process group; at the deadline the group gets SIGTERM, up to 500 ms, then SIGKILL, and a group is signalled only while its leader or the leader's unreaped exit still holds the group id. When the broker is the foreground process group of a terminal no group is made, so credential prompts keep working, and a timeout there still stops only the provider (#1973).
+- An unknown own-branch push settles `reconciled_failed` only when its recorded provider process is proven gone (pid absent or reused by start time, and its group empty), checked before the remote read. Rows written before this change stay unknown until settled as succeeded or by an operator (#1973).
+- Content-gate comparison rejects impossible literal link verdicts, plain-text structural verdicts, collection verdicts with an unavailable candidate collection, link snapshots for unsupported media, verdicts claiming unavailable metadata, and paragraph-dependent checks evaluated without paragraph projection (#1964, #1965, #1966, #1967, #1968, #1969).
+
+### Added
+
+- `[coordination] pre_push_hook_budget_seconds` (default 1200); `hooks_outside_lock` now has three states (absent: on for own-branch session pushes; `true`: every eligible push; `false`: hooks inside the push as before) (#1971).
+- Spans `push_git_hook_lane_wait`, `push_timeout_remote_read`, `unknown_push_auto_reconcile`; counters for timeout proofs, auto-reconcile outcomes and scoped blocks; journal outcome values `not_sent` and `succeeded`; settle state `reconciled_failed` (#1971).
+- Journal field `details.provider_process`; span `deadline_group_stop`; counters `deadline_group_kill_*`, `deadline_group_exit_probe_failed`, `deadline_group_signal_failed`, `deadline_child_kill_failed`, `deadline_group_kept_foreground_terminal`, `unknown_push_auto_reconcile_provider_not_proven_gone` (#1973).
+- Storage pass report `last_pass.landing` (per-decision counts, `live_tip_checks`, `live_tip_moved`) and `last_pass.unproven_archives`; host cache file `storage-landing-cache.json`; spans and counters `storage_landing_*` (#1972).
+
+### Upgrade notes
+
+- A pre-push hook whose verdict depends on running inside the real transfer, or on the broker operation id or progress variables (the dry run does not set them), needs `[coordination] hooks_outside_lock = false`.
+- Older binaries keep blocking on an unknown push and never settle one themselves.
+
+### Known issues
+
+- A broker that crashes leaves its command's process group running; the push it was running stays unknown until those processes exit. Group handling on macOS (`waitid` and `killpg` on a group holding only a zombie) is compiled by the macOS release build but not tested by CI; the same calls already run in production on macOS elsewhere in the broker.
+
 ## [0.8.162] - 2026-11-23
 
 ### Fixed
