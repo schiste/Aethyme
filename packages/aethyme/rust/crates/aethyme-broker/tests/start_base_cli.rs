@@ -383,6 +383,82 @@ fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
     assert!(lines.iter().any(|line| line["command"] != "start"));
 }
 
+/// 0.8.161 measured on a real host: the default `broker status --json` opens
+/// a read-only snapshot by design and skipped the scheduled GC service check,
+/// so the repair it exists for never ran. Every form must run it and say in
+/// which mode. (The strictly read-only mode, a compatibility read-only open,
+/// is covered by the `ServiceCheck::ReadOnly` unit tests and by the CLI unit
+/// test of `gc_service_may_repair`.)
+#[test]
+fn every_status_form_runs_the_gc_service_check_and_names_its_mode() {
+    let tmp = fixture();
+    let session = json(&run(
+        tmp.path(),
+        &["start", "--task", "gc service status check", "--json"],
+    ));
+    let id = session["id"].as_i64().unwrap().to_string();
+    let may_repair = "status_gc_service_check_may_repair";
+    let read_only = "status_gc_service_check_read_only";
+    for (args, mode, other) in [
+        (vec!["status", "--json"], may_repair, read_only),
+        (vec!["status"], may_repair, read_only),
+        (vec!["status", "--compact", "--json"], may_repair, read_only),
+        (
+            vec!["status", "--since-revision", "unknown", "--json"],
+            may_repair,
+            read_only,
+        ),
+        (vec!["status", "--summary", "--json"], may_repair, read_only),
+        (
+            vec!["status", "--session", id.as_str(), "--json"],
+            may_repair,
+            read_only,
+        ),
+        (
+            vec!["status", "--session", id.as_str()],
+            may_repair,
+            read_only,
+        ),
+        (
+            vec![
+                "status",
+                "--session",
+                id.as_str(),
+                "--since-revision",
+                "unknown",
+                "--json",
+            ],
+            may_repair,
+            read_only,
+        ),
+        (vec!["status", "--full", "--json"], may_repair, read_only),
+    ] {
+        stdout(&run(tmp.path(), &args));
+        let metrics =
+            std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl"))
+                .unwrap();
+        let status = metrics
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|line| line["command"] == "status")
+            .unwrap();
+        assert_eq!(
+            status["phase_counts"]["status_gc_service_runtime"].as_u64(),
+            Some(1),
+            "{args:?}: {status}"
+        );
+        assert_eq!(
+            status["phase_counts"][mode].as_u64(),
+            Some(1),
+            "{args:?}: {status}"
+        );
+        assert!(
+            status["phase_counts"][other].is_null(),
+            "{args:?}: {status}"
+        );
+    }
+}
+
 /// A session's status view named only `open` and `command_total`, so about
 /// half of its time had no name on the metric line.
 #[test]

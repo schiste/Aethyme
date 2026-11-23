@@ -490,3 +490,66 @@ fn session_commands_surface_notices_without_corrupting_json() {
     assert!(quiet.status.success());
     assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Aethyme advisory"));
 }
+
+/// A routine `broker status` may start `gc service status` in a detached
+/// child from the main checkout, with stderr discarded. That child must not
+/// mark a session's advisories delivered (nobody reads them) or append state
+/// for it: a session registered on the main checkout keeps its advisory
+/// undelivered, while an ordinary command from the same checkout still
+/// surfaces it.
+#[test]
+fn gc_service_status_from_the_main_checkout_delivers_no_advisory() {
+    let tmp = fixture();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let session = broker
+        .adopt(tmp.path(), Some("main checkout session"))
+        .unwrap();
+    let advisory = broker
+        .persist_advisory(sample("gc-service-child", Some(session.id), None))
+        .unwrap();
+    let session_events = |broker: &mut Broker| {
+        broker
+            .store()
+            .events_after(0, i64::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|event| !event.kind.starts_with("broker.command."))
+            .count()
+    };
+    let events_before = session_events(&mut broker);
+    assert_eq!(
+        broker.advisory_delivery_summary().unwrap().shown_advisories,
+        0
+    );
+
+    // The exact command the routine status child runs. Off macOS the handler
+    // refuses; the dispatch around it still runs. (The other `gc service`
+    // actions share the exclusion: see the CLI unit test.)
+    let child = run(&tmp, &["gc", "service", "status", "--json"]);
+    assert!(
+        !String::from_utf8_lossy(&child.stderr).contains("Aethyme advisory"),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_eq!(
+        broker.advisory_delivery_summary().unwrap().shown_advisories,
+        0,
+        "gc service status recorded advisory delivery for the main checkout session"
+    );
+    assert_eq!(
+        session_events(&mut broker),
+        events_before,
+        "gc service status appended broker events beyond its own outcome"
+    );
+
+    // The same checkout still resolves the session for ordinary commands.
+    let ordinary = run(&tmp, &["gc", "plan", "--json"]);
+    assert!(
+        String::from_utf8_lossy(&ordinary.stderr)
+            .contains(&format!("Aethyme advisory {}", advisory.id)),
+        "{}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+}
