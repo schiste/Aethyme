@@ -539,7 +539,7 @@ fn evidence_capabilities(
                     .is_some_and(|key| available.is_some_and(|m| m.contains_key(key)))
             };
             let missing = match kind {
-                "evidence_anchors" | "structured_fact" => !has("source"),
+                "editorial_pacing" | "evidence_anchors" | "structured_fact" => !has("source"),
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
                 "link_reachability" => links.is_none(),
                 _ => false,
@@ -1056,6 +1056,78 @@ mod tests {
         input.external_evidence = None;
         assert!(!run(&verdict, &verdict, &input));
     }
+    #[test]
+    fn portable_comparator_rejects_forged_pacing_without_source() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        assert!(run(&verdict, &verdict, &input));
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        policy["gates"][0]["kind"] = json!("editorial_pacing");
+        policy["gates"][0]["source"] = json!("composition");
+        policy["gates"][0]["profile"] =
+            json!({"version":1,"name":"short","fields":[{"name":"hook","max_characters":3}]});
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy_bytes;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let hash = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] =
+            json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("candidate gate cannot execute without required evidence")
+        );
+    }
+
+    #[test]
+    fn pacing_requires_its_own_composition_source() {
+        let (v, _, _, verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        let change: Value =
+            serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
+        policy["gates"][0]["kind"] = json!("editorial_pacing");
+        policy["gates"][0]["source"] = json!("composition");
+        let mut check = verdict["verdict"]["checks"][0].clone();
+        for blocking in [false, true] {
+            check["blocking"] = json!(blocking);
+            for status in ["passed", "failed"] {
+                check["status"] = json!(status);
+                let checks = BTreeMap::from([("gate:7:article:words", &check)]);
+                for sources in [
+                    None,
+                    Some(json!({"article":{}})),
+                    Some(json!({"other":{"composition":"{}"}})),
+                ] {
+                    assert_eq!(
+                        evidence_capabilities(&policy, &change, &checks, sources.as_ref(), None),
+                        Err("candidate gate cannot execute without required evidence")
+                    );
+                }
+                let sources = json!({"article":{"composition":"{}"}});
+                assert!(
+                    evidence_capabilities(&policy, &change, &checks, Some(&sources), None).is_ok()
+                );
+            }
+            check["status"] = json!("not_checked");
+            let checks = BTreeMap::from([("gate:7:article:words", &check)]);
+            assert!(evidence_capabilities(&policy, &change, &checks, None, None).is_ok());
+        }
+    }
+
     #[test]
     fn source_inventory_binds_and_requires_per_entity_gate_inputs() {
         let (v, base, after, mut verdict) = fixture();
