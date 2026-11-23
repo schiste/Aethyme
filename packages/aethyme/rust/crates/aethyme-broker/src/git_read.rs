@@ -23,6 +23,8 @@
 //!   ref as missing.
 //! - A missing object is a fallback, never "absent" or "not contained": the
 //!   build has no network features, so a partial clone is never fetched.
+//!   The ancestry walk records every object it cannot find (gitoxide alone
+//!   would skip it) and falls back, and never runs in a promisor repository.
 //! - Grafts, replace refs, shallow history (for ancestry), SHA-256, non-file
 //!   ref storage, unknown repository extensions, reduced trust, inherited
 //!   `GIT_*` routing or history variables, an expired Git deadline, and (for
@@ -499,14 +501,63 @@ impl GitRead for InProcess {
         if ancestor == descendant {
             return Ok(true);
         }
-        // An ancestor of `descendant` is their only best merge base. Missing
-        // parents are errors in gitoxide's walk, so `false` is only returned
-        // after a complete one.
-        let bases = self
+        // A promisor repository may lack commits Git would fetch.
+        if self
             .repo
-            .merge_bases_many(ancestor, &[descendant])
+            .config_snapshot()
+            .string("extensions.partialClone")
+            .is_some()
+        {
+            return Err(Fallback::ObjectMissing);
+        }
+        // gitoxide's walk skips a parent it cannot find, which would truncate
+        // it into a wrong "no"; the finder records every miss instead, and
+        // any miss leaves the answer to Git.
+        let missing = std::cell::Cell::new(false);
+        let finder = MissIsRecorded {
+            objects: &self.repo.objects,
+            missing: &missing,
+        };
+        let cache = self
+            .repo
+            .commit_graph_if_enabled()
             .map_err(|_| Fallback::Gix)?;
-        Ok(bases.iter().any(|base| *base == ancestor))
+        let mut graph: gix::revwalk::Graph<
+            '_,
+            '_,
+            gix::revwalk::graph::Commit<gix::revision::plumbing::merge_base::Flags>,
+        > = gix::revwalk::Graph::new(finder, cache.as_ref());
+        // An ancestor of `descendant` is their only best merge base.
+        let bases = gix::revision::plumbing::merge_base(ancestor, &[descendant], &mut graph)
+            .map_err(|_| Fallback::Gix)?;
+        if missing.get() {
+            return Err(Fallback::ObjectMissing);
+        }
+        Ok(bases.is_some_and(|bases| bases.iter().any(|base| *base == ancestor)))
+    }
+}
+
+/// An object finder for the ancestry walk that records a missing object, or
+/// one that is not a commit, instead of letting the walk skip it silently.
+struct MissIsRecorded<'a> {
+    objects: &'a gix::OdbHandle,
+    missing: &'a std::cell::Cell<bool>,
+}
+
+impl gix::objs::Find for MissIsRecorded<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> gix::error::Result<Option<gix::objs::Data<'a>>> {
+        let found = gix::objs::Find::try_find(self.objects, id, buffer)?;
+        if found
+            .as_ref()
+            .is_none_or(|data| data.kind != gix::objs::Kind::Commit)
+        {
+            self.missing.set(true);
+        }
+        Ok(found)
     }
 }
 
@@ -672,7 +723,8 @@ fn configured_off(common_dir: &Path) -> bool {
 /// A loose ref Git reads: an object id followed by nothing or whitespace, or
 /// `ref:` with a target.
 fn well_formed_loose_ref(contents: &[u8]) -> bool {
-    if let Some(target) = contents.strip_prefix(b"ref:") {
+    // gitoxide reads only `ref: <target>`; Git's other spellings fall back.
+    if let Some(target) = contents.strip_prefix(b"ref: ") {
         return !target.trim_ascii().is_empty();
     }
     contents.len() >= 40

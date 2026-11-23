@@ -693,3 +693,38 @@ fn only_known_extensions_are_read_in_process() {
     assert!(!check("[extensions]\n\tnoop = a \\\n"));
     assert!(!known_extensions_only(&dir.path().join("missing")));
 }
+
+#[test]
+fn a_missing_parent_never_truncates_ancestry_into_a_no() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    // Fresh commits are loose: remove c1, the parent of both c2 and f1.
+    let object = dir
+        .path()
+        .join(".git/objects")
+        .join(&shape.c1[..2])
+        .join(&shape.c1[2..]);
+    std::fs::remove_file(object).unwrap();
+    let ancestry = |ancestor: &str, descendant: &str| {
+        in_process_only(dir.path(), ReadKind::IsAncestor, |git| {
+            git.is_ancestor(ancestor, descendant)
+        })
+    };
+    assert_eq!(ancestry("feature", "main"), Err(Fallback::ObjectMissing));
+    assert_eq!(ancestry(&shape.f1, &shape.c2), Err(Fallback::ObjectMissing));
+    assert_eq!(ancestry(&shape.c2, &shape.c2), Ok(true));
+}
+
+#[test]
+fn ancestry_in_a_promisor_repository_is_left_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    git(dir.path(), &["config", "core.repositoryformatversion", "1"]);
+    git(dir.path(), &["config", "extensions.partialClone", "origin"]);
+    assert_eq!(
+        in_process_only(dir.path(), ReadKind::IsAncestor, |git| git
+            .is_ancestor(&shape.c1, &shape.c2)),
+        Err(Fallback::ObjectMissing)
+    );
+    assert_eq!(resolved(dir.path(), "main"), Ok(shape.c2.clone()));
+}

@@ -509,7 +509,9 @@ before; an in-process failure is never an answer.
   `refStorage`, reduced trust, inherited `GIT_*` routing or history
   variables, isolated graph-verification Git or an expired Git deadline; for
   ancestry, under any active Git deadline or a shortened
-  `AETHYME_GIT_TIMEOUT_SECS` (the walk cannot be interrupted); and on any
+  `AETHYME_GIT_TIMEOUT_SECS` (the walk cannot be interrupted), in a promisor
+  (`extensions.partialClone`) repository, or when the walk meets a missing or
+  non-commit object (gitoxide would skip it); and on any
   gitoxide error or panic.
 - **Kill switch.** `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`,
   `on` or `yes`, or `[git] in_process = false` in the main checkout's
