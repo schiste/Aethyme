@@ -542,6 +542,7 @@ fn evidence_capabilities(
                 "editorial_pacing" | "evidence_anchors" | "structured_fact" => !has("source"),
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
                 "link_reachability" => links.and_then(|v| v["entries"].get(entity)).is_none(),
+                "literal_markdown_links" => entry["media_type"] != "text/html",
                 _ => false,
             };
             if missing && check["status"] != "not_checked" {
@@ -988,6 +989,23 @@ mod tests {
             .remove("aexeo.offline-input-binding.v1");
         assert!(closed_verdict(&verdict["verdict"]).is_err());
     }
+    #[test]
+    fn literal_markdown_links_require_html_observation() {
+        let policy = json!({"gates":[{"id":"literal","kind":"literal_markdown_links"}]});
+        for media in ["text/plain", "text/markdown", "text/html"] {
+            let change = json!({"entries":[{"entity_id":"article","media_type":media,"after":{}}]});
+            for status in ["passed", "failed", "not_checked"] {
+                let check = json!({"status":status});
+                let checks = BTreeMap::from([("gate:7:article:literal", &check)]);
+                assert_eq!(
+                    evidence_capabilities(&policy, &change, &checks, None, None).is_ok(),
+                    media == "text/html" || status == "not_checked",
+                    "{media} {status}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn link_evidence_is_required_for_each_completed_entity_check() {
         let policy = json!({"gates":[{"id":"links","kind":"link_reachability"}]});
