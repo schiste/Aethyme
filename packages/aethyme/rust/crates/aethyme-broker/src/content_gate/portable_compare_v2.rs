@@ -555,6 +555,9 @@ fn evidence_capabilities(
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
                 "link_reachability" => links.and_then(|v| v["entries"].get(entity)).is_none(),
                 "literal_markdown_links" => entry["media_type"] != "text/html",
+                "required_metadata" | "metadata_length" | "metadata_age" => {
+                    entry.get("metadata").is_none_or(Value::is_null)
+                }
                 "list_item_count"
                 | "link_count"
                 | "link_destinations"
@@ -1025,6 +1028,28 @@ mod tests {
         assert!(closed_verdict(&verdict["verdict"]).is_err());
     }
     #[test]
+    fn missing_metadata_cannot_be_reported_as_checked() {
+        for kind in ["required_metadata", "metadata_length", "metadata_age"] {
+            let policy = json!({"gates":[{"id":"meta","kind":kind}]});
+            for metadata in [None, Some(json!({}))] {
+                let mut change = json!({"entries":[{"entity_id":"article","after":{}}]});
+                if let Some(value) = &metadata {
+                    change["entries"][0]["metadata"] = value.clone();
+                }
+                for status in ["passed", "failed", "not_checked"] {
+                    let check = json!({"status":status});
+                    let checks = BTreeMap::from([("gate:7:article:meta", &check)]);
+                    assert_eq!(
+                        evidence_capabilities(&policy, &change, &checks, None, None).is_ok(),
+                        metadata.is_some() || status == "not_checked",
+                        "{kind} {metadata:?} {status}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn literal_markdown_links_require_html_observation() {
         let policy = json!({"gates":[{"id":"literal","kind":"literal_markdown_links"}]});
         for media in ["text/plain", "text/markdown", "text/html"] {
@@ -1259,6 +1284,52 @@ mod tests {
             ),
             Err("candidate gate cannot execute without required evidence")
         );
+    }
+
+    #[test]
+    fn portable_comparator_rejects_forged_metadata_without_projection() {
+        for (kind, extra) in [
+            ("required_metadata", json!({"fields":["title"]})),
+            ("metadata_length", json!({"field":"title","min":1})),
+            (
+                "metadata_age",
+                json!({"field":"date","as_of":"2026-01-01","max_days":30}),
+            ),
+        ] {
+            let (v, base, after, mut verdict) = fixture();
+            let mut input = inputs(&v, &base, &after);
+            assert!(run(&verdict, &verdict, &input));
+            let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+            let gate = policy["gates"][0].as_object_mut().unwrap();
+            gate.remove("min");
+            gate.remove("max");
+            gate.insert("kind".into(), json!(kind));
+            gate.extend(extra.as_object().unwrap().clone());
+            let policy_bytes = serde_json::to_vec(&policy).unwrap();
+            input.resolved_policy = &policy_bytes;
+            let candidate = overlay(&base, input.change, &after).unwrap();
+            let hash = candidate_binding(&CandidateArtifacts {
+                change: input.change,
+                resolved_policy: input.resolved_policy,
+                host_options: input.host_options,
+                evaluator: input.evaluator_identity,
+                collection: None,
+                external_evidence: None,
+                base_revision_sha256: snapshot_digest(&base).unwrap(),
+                candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+            })
+            .unwrap();
+            verdict["binding_sha256"] =
+                json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            assert_eq!(
+                compare(
+                    verdict.to_string().as_bytes(),
+                    verdict.to_string().as_bytes(),
+                    &input
+                ),
+                Err("candidate gate cannot execute without required evidence")
+            );
+        }
     }
 
     #[test]
