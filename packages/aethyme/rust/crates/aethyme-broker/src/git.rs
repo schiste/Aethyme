@@ -1,6 +1,8 @@
 //! Git service layer: every git operation the broker performs, in one
-//! module, shelling out to the `git` binary (no libgit2/gix until a
-//! measured need appears — see docs/aethyme-local-agent-broker.md).
+//! module, shelling out to the `git` binary. The measured need appeared
+//! (323,258 Git processes in 13 hours on the busiest repository): a few
+//! read-only queries are answered in-process by `git_read`, with the program
+//! here as their fallback.
 //!
 //! No other broker code may run git directly. Keeping the surface here
 //! makes the broker's git contract auditable and testable against real
@@ -18,6 +20,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::git_read::{GitRead, ReadKind};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -662,6 +666,11 @@ fn git_timeout_from(value: Option<&str>) -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_GIT_TIMEOUT)
+}
+
+/// The per-call Git limit when `AETHYME_GIT_TIMEOUT_SECS` does not shorten it.
+pub(crate) fn default_git_timeout() -> Duration {
+    DEFAULT_GIT_TIMEOUT
 }
 
 pub(crate) fn git_timeout() -> Duration {
@@ -2177,6 +2186,24 @@ fn unsafe_session_commit_git_environment_key(key: &std::ffi::OsStr) -> bool {
         || normalized == "GIT_EXEC_PATH"
         || normalized == "GIT_CONFIG"
         || normalized.starts_with("GIT_CONFIG_")
+}
+
+/// In-process reads (`git_read`) leave every query to the program while
+/// inherited Git environment could make the program answer for another
+/// repository or another history, or while graph verification runs Git with
+/// isolated configuration. Configuration variables (`GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_COUNT`, ...) are allowed: no configuration changes what these
+/// queries answer once grafts, replace refs and reduced trust fall back, and
+/// the test harness sets them for every run.
+pub(crate) fn in_process_git_environment_refused() -> bool {
+    graph_verification_git_enabled()
+        || std::env::vars_os().any(|(key, _)| {
+            unsafe_graph_git_environment_key(&key)
+                || matches!(
+                    key.to_string_lossy().to_ascii_uppercase().as_str(),
+                    "GIT_NO_REPLACE_OBJECTS" | "GIT_DEFAULT_HASH" | "GIT_DEFAULT_REF_FORMAT"
+                )
+        })
 }
 
 /// Refuse commit commands when inherited Git environment can redirect
@@ -3986,6 +4013,55 @@ pub(crate) struct WorkingTreeHashObservation {
     pub(crate) writers_quiescent: bool,
 }
 
+/// The `git` program's answers to the queries `git_read` can also answer
+/// in-process: the exact commands the broker ran before, kept as the
+/// fallback and as the parity oracle.
+pub(crate) struct ProgramRead<'a> {
+    pub(crate) root: &'a Path,
+}
+
+impl GitRead for ProgramRead<'_> {
+    type Error = GitError;
+
+    fn resolve_commit(&self, spec: &str) -> Result<String, GitError> {
+        run_git(
+            self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{spec}^{{commit}}"),
+            ],
+        )
+    }
+
+    fn head_commit(&self) -> Result<String, GitError> {
+        run_git(self.root, &["rev-parse", "HEAD"])
+    }
+
+    fn commit_tree(&self, spec: &str) -> Result<String, GitError> {
+        run_git(self.root, &["rev-parse", &format!("{spec}^{{tree}}")])
+    }
+
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+}
+
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
 pub struct GitRepo {
@@ -4816,7 +4892,13 @@ impl GitRepo {
     }
 
     pub fn head_commit(&self) -> Result<String, GitError> {
-        run_git(&self.root, &["rev-parse", "HEAD"])
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::HeadCommit,
+            |git| git.head_commit(),
+            || program.head_commit(),
+        )
     }
 
     /// Whether one repository-relative path exists in a local commit/ref.
@@ -5367,14 +5449,12 @@ impl GitRepo {
     }
 
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
-        run_git(
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
             &self.root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{name}^{{commit}}"),
-            ],
+            ReadKind::ResolveCommit,
+            |git| git.resolve_commit(name),
+            || program.resolve_commit(name),
         )
         .ok()
     }
@@ -5813,21 +5893,13 @@ impl GitRepo {
     /// that failed or exhausted its enclosing deadline. Interactive status
     /// must not turn the latter into a divergence verdict.
     pub fn is_ancestor_checked(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
-        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
-        let mut command = git_command();
-        command
-            .args(args)
-            .current_dir(&self.root)
-            .env("GIT_OPTIONAL_LOCKS", "0");
-        let output = run_git_process_output(command, &args, git_timeout())?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(GitError::Git {
-                args: args.join(" "),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            }),
-        }
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::IsAncestor,
+            |git| git.is_ancestor(ancestor, descendant),
+            || program.is_ancestor(ancestor, descendant),
+        )
     }
 
     /// Fast-forward the checked-out branch and worktree to an exact commit.
@@ -7231,7 +7303,13 @@ impl GitRepo {
     }
 
     pub fn commit_tree_id(&self, commit: &str) -> Result<String, GitError> {
-        run_git(&self.root, &["rev-parse", &format!("{commit}^{{tree}}")])
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::CommitTree,
+            |git| git.commit_tree(commit),
+            || program.commit_tree(commit),
+        )
     }
 
     /// First-parent commits reachable from `to` but not `from`, oldest

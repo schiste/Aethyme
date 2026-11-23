@@ -669,6 +669,8 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         &["mode", "port", "port_end", "pool_limit", "ttl_seconds"],
     ),
     ("watch", &["prompts"]),
+    // `git_read`: `in_process = false` forces the `git` program everywhere.
+    ("git", &["in_process"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {

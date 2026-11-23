@@ -1009,6 +1009,9 @@ exec "$(dirname "$0")/git.real" "$@"
     let traced_plan = isolation::command(CLI, tmp.path(), &args)
         .env("PATH", search_path)
         .env("AETHYME_TEST_MERGE_BASE_LOG", &invocation_log)
+        // The memo is observed through the `git` program's invocations, so
+        // keep ancestry checks off the in-process path.
+        .env("AETHYME_GIT_IN_PROCESS", "0")
         .output()
         .unwrap();
     let plan = json(&traced_plan);

@@ -1334,6 +1334,9 @@ mod timeout_tests {
                 .env(HIT_PATH, &hit_path)
                 .env(SLEEP_SECONDS, sleep_seconds)
                 .env("AETHYME_GIT_TIMEOUT_SECS", git_timeout_seconds)
+                // The fault is injected into the `git` program; in-process
+                // reads would answer before reaching it.
+                .env(crate::git_read::IN_PROCESS_ENV, "0")
                 .env("PATH", child_path);
             let output = match crate::bounded_output::output_limited(
                 &mut child,

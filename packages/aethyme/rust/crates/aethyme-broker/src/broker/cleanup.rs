@@ -9140,6 +9140,9 @@ exec "$AETHYME_CLEANUP_TARGET_REAL_GIT" "$@"
             .env(FAIL_HEAD_ROOT_ENV, &primary)
             .env(FAIL_HEAD_MARKER_ENV, &marker)
             .env(REAL_GIT_ENV, &real_git)
+            // The failure is injected into the `git` program; in-process
+            // reads would answer before reaching it.
+            .env(crate::git_read::IN_PROCESS_ENV, "0")
             .env("PATH", path)
             .output()
             .unwrap();
