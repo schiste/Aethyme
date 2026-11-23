@@ -1753,7 +1753,24 @@ fn doctor_reads_committed_configuration_in_process() {
         &["update-ref", "refs/heads/aethyme/integration", &base],
     );
     git(root, &["update-ref", "refs/remotes/origin/main", &base]);
+    // The fetched default branch, which policy is read from.
+    git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
     git(root, &["config", "remote.origin.url", "."]);
+    git(
+        root,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
     git(root, &["config", "branch.main.remote", "origin"]);
     git(root, &["config", "branch.main.merge", "refs/heads/main"]);
     let mut broker = crate::Broker::open(root).unwrap();
