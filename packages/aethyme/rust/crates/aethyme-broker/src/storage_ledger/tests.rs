@@ -425,7 +425,12 @@ fn archives_go_only_when_landed_and_past_their_promised_retention() {
     let cache: serde_json::Value =
         serde_json::from_slice(&fs::read(host_state.join(super::landing::CACHE_FILE)).unwrap())
             .unwrap();
-    let facts = &cache["repositories"][&*repository.to_string_lossy()];
+    let facts = cache["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["repository"] == serde_json::json!(repository))
+        .unwrap_or_else(|| panic!("{cache}"));
     assert_eq!(facts["tip"], serde_json::json!(landed), "{cache}");
     assert_eq!(
         facts["not_contained"],
@@ -1587,6 +1592,10 @@ fn landing_repository(repository: &Path) -> (String, String) {
     (a, b)
 }
 
+fn refusal(result: Result<(), super::landing::Refusal>) -> super::landing::Refusal {
+    result.expect_err("expected a refusal")
+}
+
 /// The worker re-proved every archive on every pass, one `merge-base` per
 /// recorded commit (head and branch tip are usually the same commit). A
 /// commit is now probed once per tip; a forward move of the tip carries the
@@ -1604,15 +1613,18 @@ fn a_landing_answer_is_probed_once_per_tip_and_carried_along_a_forward_move() {
     assert_eq!(prover.stats().probes, 1);
     assert_eq!(prover.stats().duplicate_commits, 2);
     assert_eq!(prover.stats().probe_contained, 1);
+    assert_eq!(prover.stats().live_tip_checks, 1);
 
-    let why = prover
-        .prove(&repository, std::slice::from_ref(&b))
-        .unwrap_err();
-    assert!(why.contains("is not in"), "{why}");
+    let why = refusal(prover.prove(&repository, std::slice::from_ref(&b)));
+    assert!(
+        matches!(&why, super::landing::Refusal::NotLanded(text) if text.contains("is not in")),
+        "{why:?}"
+    );
     assert_eq!(prover.stats().probes, 2);
     assert_eq!(prover.stats().probe_not_contained, 1);
 
-    // Asked again with the tip unchanged: no Git read at all.
+    // Asked again with the tip unchanged: no probe, no tip read (only the
+    // live check before an `Ok`).
     assert!(prover.prove(&repository, std::slice::from_ref(&b)).is_err());
     assert!(prover.prove(&repository, std::slice::from_ref(&a)).is_ok());
     assert_eq!(prover.stats().probes, 2);
@@ -1640,8 +1652,30 @@ fn a_landing_answer_is_probed_once_per_tip_and_carried_along_a_forward_move() {
     assert_eq!(prover.stats().probe_not_contained, 2);
 }
 
-/// Only "not landed" crosses processes: a cache file can make the worker
-/// keep an archive, never remove one.
+/// A remembered tip never lends "contained" to a removal: rewound inside
+/// the memo's lifetime, the next answer is checked against the live tip.
+#[test]
+fn a_rewound_default_branch_refuses_within_the_tip_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let (a, b) = landing_repository(&repository);
+    git(&repository, &["update-ref", "refs/remotes/origin/main", &b]);
+    let mut prover = super::landing::LandingProver::default();
+    prover.prove(&repository, std::slice::from_ref(&b)).unwrap();
+
+    // Rewound with the memo still fresh (no `expire_tips`).
+    git(&repository, &["update-ref", "refs/remotes/origin/main", &a]);
+    let why = refusal(prover.prove(&repository, std::slice::from_ref(&b)));
+    assert!(
+        matches!(why, super::landing::Refusal::NotLanded(_)),
+        "{why:?}"
+    );
+    assert_eq!(prover.stats().live_tip_moved, 1);
+    assert_eq!(prover.stats().tip_reset, 1);
+}
+
+/// Only "not landed" crosses processes, and an archive with one known
+/// unlanded commit costs no probe, whichever commit comes first.
 #[test]
 fn only_not_landed_answers_are_kept_across_processes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1650,17 +1684,28 @@ fn only_not_landed_answers_are_kept_across_processes() {
     let repository = dir.path().join("repository");
     let (a, b) = landing_repository(&repository);
     let mut first = super::landing::LandingProver::default();
-    first.prove(&repository, std::slice::from_ref(&a)).unwrap();
-    assert!(first.prove(&repository, std::slice::from_ref(&b)).is_err());
+    // Head contained, branch tip not.
+    assert!(first.prove(&repository, &[a.clone(), b.clone()]).is_err());
+    assert_eq!(first.stats().probes, 2);
     first.save(&host_state).unwrap();
 
     let mut next = super::landing::LandingProver::default();
     next.load(&host_state);
-    assert!(next.prove(&repository, std::slice::from_ref(&b)).is_err());
+    assert!(next.prove(&repository, &[a.clone(), b.clone()]).is_err());
     assert_eq!(next.stats().probes, 0, "B is known not landed");
     assert_eq!(next.stats().cached_not_contained, 1);
     next.prove(&repository, std::slice::from_ref(&a)).unwrap();
     assert_eq!(next.stats().probes, 1, "A is proven again, never read back");
+
+    // A commit nobody asks about any more drops out of the file.
+    let mut quiet = super::landing::LandingProver::default();
+    quiet.load(&host_state);
+    quiet.prove(&repository, std::slice::from_ref(&a)).unwrap();
+    quiet.save(&host_state).unwrap();
+    let mut after = super::landing::LandingProver::default();
+    after.load(&host_state);
+    assert!(after.prove(&repository, std::slice::from_ref(&b)).is_err());
+    assert_eq!(after.stats().probes, 1, "B was dropped, so it is probed");
 
     // A damaged file is ignored, never trusted.
     fs::write(host_state.join(super::landing::CACHE_FILE), b"{not json").unwrap();
@@ -1674,8 +1719,9 @@ fn only_not_landed_answers_are_kept_across_processes() {
     assert_eq!(damaged.stats().probes, 1);
 }
 
-/// A probe that outlives its budget proves nothing and is not remembered;
-/// once the process budget is spent, nothing more is probed.
+/// A probe that outlives its budget proves nothing, is not remembered, and
+/// is unproven rather than unlanded; once the process budget is spent, no
+/// Git read runs at all, tip reads included.
 #[test]
 fn landing_probes_are_bounded_and_an_unfinished_one_keeps_the_archive() {
     let dir = tempfile::tempdir().unwrap();
@@ -1684,10 +1730,11 @@ fn landing_probes_are_bounded_and_an_unfinished_one_keeps_the_archive() {
     let mut prover =
         super::landing::LandingProver::with_budgets(Duration::ZERO, Duration::from_secs(600));
     for attempt in 1..=2 {
-        let why = prover
-            .prove(&repository, std::slice::from_ref(&a))
-            .unwrap_err();
-        assert!(why.contains("not proven landed within"), "{why}");
+        let why = refusal(prover.prove(&repository, std::slice::from_ref(&a)));
+        assert!(
+            matches!(&why, super::landing::Refusal::Unproven(text) if text.contains("time budget")),
+            "{why:?}"
+        );
         assert_eq!(prover.stats().probe_timeouts, attempt);
         assert_eq!(prover.stats().cached_contained, 0);
         assert_eq!(prover.stats().cached_not_contained, 0);
@@ -1695,12 +1742,32 @@ fn landing_probes_are_bounded_and_an_unfinished_one_keeps_the_archive() {
 
     let mut spent =
         super::landing::LandingProver::with_budgets(Duration::from_secs(20), Duration::ZERO);
-    let why = spent
-        .prove(&repository, std::slice::from_ref(&a))
-        .unwrap_err();
-    assert!(why.contains("proof budget is spent"), "{why}");
+    let why = refusal(spent.prove(&repository, std::slice::from_ref(&a)));
+    assert!(
+        matches!(&why, super::landing::Refusal::Unproven(text) if text.contains("proof budget is spent")),
+        "{why:?}"
+    );
     assert_eq!(spent.stats().probes, 0);
     assert_eq!(spent.stats().budget_spent, 1);
+}
+
+/// Replace refs and grafts can make a commit look like an ancestor of the
+/// default branch; the proof reads the real commits only.
+#[test]
+fn a_replace_ref_faking_ancestry_does_not_prove_landing() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let (a, b) = landing_repository(&repository);
+    // With the replacement, A's parent is B: B looks contained in main.
+    git(&repository, &["replace", "--graft", &a, &b]);
+    // Plain Git is fooled (the helper asserts success).
+    git(&repository, &["merge-base", "--is-ancestor", &b, &a]);
+    let mut prover = super::landing::LandingProver::default();
+    let why = refusal(prover.prove(&repository, std::slice::from_ref(&b)));
+    assert!(
+        matches!(why, super::landing::Refusal::NotLanded(_)),
+        "{why:?}"
+    );
 }
 
 /// An archive whose head and branch tip are one commit costs one probe,

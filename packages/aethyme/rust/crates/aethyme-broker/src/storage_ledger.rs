@@ -597,6 +597,11 @@ pub struct PassReport {
     /// probes, timeouts, forward moves and resets).
     #[serde(default)]
     pub landing: BTreeMap<String, u64>,
+    /// Recovery archives kept because their landing could not be proven
+    /// either way this pass (a budget, a deadline, a Git failure): not
+    /// counted as unlanded.
+    #[serde(default)]
+    pub unproven_archives: Vec<String>,
 }
 
 /// The persisted ledger.

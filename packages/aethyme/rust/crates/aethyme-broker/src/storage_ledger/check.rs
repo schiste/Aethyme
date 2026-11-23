@@ -1070,6 +1070,10 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             break;
         }
         if let Some(why) = evict::refuse(&candidate, leases.as_ref(), now) {
+            if candidate.class == Class::RecoveryArchives && why.starts_with(evict::UNPROVEN_PREFIX)
+            {
+                report.unproven_archives.push(candidate.relative.clone());
+            }
             if candidate.class == Class::RecoveryArchives && why.starts_with("unlanded") {
                 report.unlanded_archives.push(candidate.relative.clone());
                 if why.starts_with("unlanded at its retention age") {
