@@ -1051,6 +1051,67 @@ fn push_fixture() -> (tempfile::TempDir, crate::ResolvedRemoteTarget) {
     (tmp, target)
 }
 
+/// A timed-out push is proven succeeded only through the verified push
+/// endpoint of the repository it recorded. Once the remote's URL points at
+/// another repository, even one that holds the same commit, the read proves
+/// nothing and the outcome stays unknown.
+#[test]
+fn a_timed_out_push_is_proven_only_against_its_recorded_repository() {
+    let (tmp, target) = push_fixture();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["push", "-q", "origin", "main"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let planning = PushPlanning::Planned(ExactPushPlan {
+        remote: "origin".into(),
+        destinations: vec![ExactPushDestination {
+            destination_ref: "refs/heads/main".into(),
+            pre_push_sha: None,
+            proposed_sha: head,
+        }],
+    });
+    let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+    let (outcome, proof) = observe_timed_out_push(&repo, &target.coordination_key, &planning)
+        .expect("the recorded endpoint answers");
+    assert_eq!(outcome, Some("succeeded"));
+    assert_eq!(proof["evidence"]["source"], "post_timeout_remote_read");
+
+    let elsewhere = tmp.path().join("elsewhere.git");
+    git(&["init", "-q", "--bare", elsewhere.to_str().unwrap()]);
+    git(&["push", "-q", elsewhere.to_str().unwrap(), "main"]);
+    git(&["remote", "set-url", "origin", elsewhere.to_str().unwrap()]);
+    let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+    assert!(
+        observe_timed_out_push(&repo, &target.coordination_key, &planning).is_none(),
+        "a remote that no longer resolves to the recorded repository proves nothing"
+    );
+}
+
+/// A timeout is `failed` only when the verified read finds the old value
+/// *and* the trace shows Git still inside its hook; `succeeded` needs only the
+/// proposed commit; anything else stays unknown.
+#[test]
+fn a_timed_out_push_settles_only_on_combined_evidence() {
+    assert_eq!(
+        settle_timed_out_push(Some(Some("succeeded")), false),
+        Some(OperationStatus::Succeeded)
+    );
+    assert_eq!(
+        settle_timed_out_push(Some(Some("failed")), true),
+        Some(OperationStatus::Failed)
+    );
+    assert_eq!(settle_timed_out_push(Some(Some("failed")), false), None);
+    assert_eq!(settle_timed_out_push(None, true), None);
+    assert_eq!(settle_timed_out_push(Some(None), true), None);
+}
+
 #[test]
 fn only_head_relative_push_sources_are_worktree_relative() {
     let argv = |items: &[&str]| {
@@ -2063,6 +2124,47 @@ fn push_timeout_attributes_an_interrupted_hook_and_preserves_unknowns() {
     let timing = push_timeout_timing(&GitTransferTrace::default(), elapsed);
     assert_eq!(timing["stage"], "unknown");
     assert!(timing.get("hook_ms").is_none());
+}
+
+/// A push stopped while its own pre-push hook ran never sent a ref update,
+/// so its timeout is a plain failure. A finished hook, a started transfer or
+/// a trace with no hook proves nothing of the kind.
+#[test]
+fn only_a_push_stopped_inside_its_hook_is_proven_unsent() {
+    let prefix = PUSH_TRACE_WITH_PRE_PUSH_HOOK
+        .lines()
+        .take_while(|line| !line.contains("git\",\"rev-parse"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_git_transfer_trace(&prefix).killed_in_pre_push_hook());
+    assert!(!parse_git_transfer_trace(PUSH_TRACE_WITH_PRE_PUSH_HOOK).killed_in_pre_push_hook());
+    assert!(!parse_git_transfer_trace(PUSH_TRACE_WITHOUT_HOOK).killed_in_pre_push_hook());
+    assert!(!GitTransferTrace::default().killed_in_pre_push_hook());
+
+    // A trace that stops before the ref listing ends (Git stops writing
+    // Trace2 on a write error) proves nothing, even with a hook in it.
+    let truncated = PUSH_TRACE_WITH_PRE_PUSH_HOOK
+        .lines()
+        .filter(|line| {
+            !line.contains(r#""label":"get_refs_list""#) || line.contains("region_enter")
+        })
+        .take_while(|line| !line.contains("git\",\"rev-parse"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!parse_git_transfer_trace(&truncated).killed_in_pre_push_hook());
+
+    // A child whose command line merely mentions `pre-push` (here a remote
+    // URL) is not the hook.
+    let url_only = prefix
+        .replace(
+            r#""child_class":"hook","hook_name":"pre-push","#,
+            r#""child_class":"transport","#,
+        )
+        .replace(
+            ".git/hooks/pre-push",
+            "git-remote-https\",\"https://h/pre-push.git",
+        );
+    assert!(!parse_git_transfer_trace(&url_only).killed_in_pre_push_hook());
 }
 
 /// A real `git push https://host.invalid/o/r.git HEAD:refs/heads/x` (Git

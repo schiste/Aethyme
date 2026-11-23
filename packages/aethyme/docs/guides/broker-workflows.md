@@ -474,33 +474,38 @@ than saying nothing.
 ### Running push hooks outside the coordination lock
 
 The repository lock orders remote mutations, but `git push` runs `pre-push`
-inside its own process, so the lock is held across that hook too. Where the hook
-is a legitimately long full suite, every other session's coordinated operation
-on that repository waits for it, and the fleet serialises on whoever is pushing
-the largest change.
+inside its own process, so a lock held across the push is held across that
+hook too. Where the hook is a legitimately long suite, every coordinated write
+that needs the repository-wide lane waits for it, and while such a write waits
+no new session push may start, so the fleet serialises on whoever is pushing
+the largest change. Inside the push the hook also spends the push's deadline,
+and a slow one cut the transfer off as `outcome_unknown`.
 
-A repository can opt out of that coupling:
+A push of a session's own branch on its branch lane therefore runs the hook
+first, by default, whenever the repository has an executable `pre-push` hook:
+it runs `git push --dry-run` against exactly the commits the real push will
+send. Git gives the hook the same arguments and stdin as for the real push, so
+it runs once, with identical inputs; its environment lacks only the
+operation id and progress variables, so a hook that needs those fails closed. A hook that refuses stops the push there,
+with its output, before anything is sent. The hook has its own budget
+(`pre_push_hook_budget_seconds`, default 20 minutes), and the push's queue and
+transfer deadline starts only after it. The broker then takes its lanes,
+re-plans the push, refuses if any destination or proposed commit changed, and
+pushes with `--no-verify`, refusing if the remote's old value changed too. Two pushes of one branch still serialise: the first
+holds a branch-only lane from before its hook to its end.
 
 ```toml
 # .aethyme/config.toml
 [coordination]
-hooks_outside_lock = true
+hooks_outside_lock = true    # every eligible push, not only session pushes
+# hooks_outside_lock = false # no push: the hook runs inside the push again
+pre_push_hook_budget_seconds = 1200
 ```
 
-With it enabled, a coordinated push first runs `git push --dry-run`, which
-executes `pre-push` against exactly the commits the real push will send, before
-queueing for the lock. A hook that refuses stops the operation there, without
-ever taking the lock. The broker then acquires the lock, re-plans the push, and
-refuses if any destination or proposed commit changed while it waited -- the
-hook's verification would no longer describe what is being sent. Only then does
-it push, with `--no-verify`, because re-running the hook would double the cost
-the setting exists to avoid.
-
-This is off by default and is a deliberate trade. `--no-verify` skips every
-`pre-push` protection, not only the slow gate, so a repository using that hook
-for secret scanning or signing checks is choosing to run those in the dry run
-alone. Enable it when the hook's cost is the constraint and its checks are
-deterministic over the same commits.
+`--no-verify` skips the hook only in the real push, after the same hook passed
+against the same commits. A hook whose verdict depends on running inside the
+real transfer (rather than on the commits and refs it is given) needs
+`hooks_outside_lock = false`.
 
 ### Session-branch lanes
 
@@ -522,9 +527,8 @@ slow hook in one session no longer stalls every other session's push:
   command or shallow clone). Such a push also locks the one tracking ref it
   updates, `refs/remotes/<remote>/<branch>`. A repository that fails the check,
   or sets `push.followTags` (the strict spelling passes `--no-follow-tags`),
-  keeps the old spelling and the repository-wide lane. The `pre-push` hook is
-  handled exactly as before, inside the push, or before the lock with
-  `hooks_outside_lock`. Any strict fetch or push spelling typed explicitly
+  keeps the old spelling and the repository-wide lane. Its `pre-push` hook
+  runs before the lanes (see above) unless `hooks_outside_lock = false`. Any strict fetch or push spelling typed explicitly
   through `broker advanced git` narrows only when that check passes;
   otherwise it runs repository-wide and is journaled with scope `repository`.
 
@@ -539,9 +543,23 @@ which every new narrow Git writer must pass, so no new narrow writer starts
 while a wide one waits. The wait is recorded as `wide_intent_wait_ms` in the
 operation's `coordination_timing`. An
 operation left `outcome_unknown` blocks the operations it would have serialised
-with: a session-branch commit or push blocks that branch's lane and every
-repository-wide write, but not another session's branch. A repository-wide
-unknown write blocks everything, as before.
+with. A session-branch commit or push blocks that branch's lane, every write
+of its own session, and any write that names the branch (merging its pull
+request, a tag or push naming it); another session's other writes,
+repository-wide and GitHub ones included, go ahead, because only that session's
+lanes write its branch. A shared default or integration branch is never treated
+as a session's own. A
+repository-wide unknown write (the default branch, `aethyme/integration`, tags)
+blocks everything, as before.
+
+A push cut off by its deadline settles itself when the evidence allows. With
+every destination already at the pushed commit, it is `succeeded`. With every
+destination still at its old commit *and* Git's Trace2 showing it was still
+inside its own `pre-push` hook, it sent nothing and is `failed`. An unknown push
+of a session's own branch is read again by the next write it would block: it
+becomes `reconciled_succeeded` once the branch holds exactly the pushed commit,
+or `reconciled_failed` once it is still at its old commit ten minutes after the
+push ended. Anything else stays unknown.
 
 A write that provably sent nothing to the remote is recorded `failed`, never
 `outcome_unknown`, so it blocks nothing and can simply be retried. For a

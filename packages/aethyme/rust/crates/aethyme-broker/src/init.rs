@@ -659,6 +659,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         "coordination",
         &[
             "hooks_outside_lock",
+            "pre_push_hook_budget_seconds",
             "session_hooks_hold_repository_lock",
             "measure_pr_merge_ref",
         ],
@@ -2054,7 +2055,7 @@ mod config_key_tests {
                 "[main_checkout]\nauto_sync = true\nallow_filters = false\n\
                  sync_interval_minutes = 5\nbehind_threshold_commits = 10\n\
                  behind_threshold_hours = 2\n\
-                 [coordination]\nhooks_outside_lock = true\n\
+                 [coordination]\nhooks_outside_lock = true\npre_push_hook_budget_seconds = 600\n\
                  session_hooks_hold_repository_lock = false\nmeasure_pr_merge_ref = false\n\
                  [console]\nmode = \"off\"\nport = 1\nport_end = 2\npool_limit = 3\nttl_seconds = 4\n\
                  [watch.prompts.review]\nbody = \"x\"\n"

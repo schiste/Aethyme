@@ -588,32 +588,7 @@ fn refuse_hooks(
     deadline: AdmissionDeadline,
     repository: &str,
 ) -> Result<(), BrokerOpError> {
-    let hook_config = probe(
-        cwd,
-        &["config", "--path", "--null", "--get", "core.hooksPath"],
-        deadline,
-        repository,
-    )?;
-    let hook_directory = if hook_config.status.success() {
-        let text = std::str::from_utf8(&hook_config.stdout)
-            .map_err(|_| unavailable("non-UTF-8 hook directory"))?;
-        let Some(value) = text.strip_suffix('\0') else {
-            return Err(unavailable("incomplete hook directory"));
-        };
-        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
-            return Err(unavailable("ambiguous hook directory"));
-        }
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        }
-    } else if hook_config.status.code() == Some(1) {
-        common.join("hooks")
-    } else {
-        return Err(unavailable("hook directory inventory failed"));
-    };
+    let hook_directory = hook_directory(cwd, common, deadline, repository)?;
     for hook in hooks {
         if hook_directory
             .join(hook)
@@ -626,6 +601,65 @@ fn refuse_hooks(
         }
     }
     Ok(())
+}
+
+/// The directory Git runs hooks from in `cwd`: `core.hooksPath` (relative to
+/// the worktree, as Git resolves it) or the common directory's `hooks`.
+fn hook_directory(
+    cwd: &Path,
+    common: &Path,
+    deadline: AdmissionDeadline,
+    repository: &str,
+) -> Result<PathBuf, BrokerOpError> {
+    let hook_config = probe(
+        cwd,
+        &["config", "--path", "--null", "--get", "core.hooksPath"],
+        deadline,
+        repository,
+    )?;
+    if hook_config.status.success() {
+        let text = std::str::from_utf8(&hook_config.stdout)
+            .map_err(|_| unavailable("non-UTF-8 hook directory"))?;
+        let Some(value) = text.strip_suffix('\0') else {
+            return Err(unavailable("incomplete hook directory"));
+        };
+        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+            return Err(unavailable("ambiguous hook directory"));
+        }
+        let path = PathBuf::from(value);
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            // Git resolves a relative hooks path against the worktree's top,
+            // not the directory the command runs in.
+            crate::GitRepo::discover(cwd)?.root().join(path)
+        })
+    } else if hook_config.status.code() == Some(1) {
+        Ok(common.join("hooks"))
+    } else {
+        Err(unavailable("hook directory inventory failed"))
+    }
+}
+
+/// Whether a push from `cwd` would run a `pre-push` hook: an executable file
+/// named `pre-push` in the directory Git runs hooks from. Git skips a hook
+/// that is not executable, so such a file is not one. `None` when the hook
+/// directory cannot be determined; the caller then keeps the hook inside the
+/// push, exactly as Git would run it.
+pub(super) fn pre_push_hook_installed(
+    cwd: &Path,
+    deadline: AdmissionDeadline,
+    repository: &str,
+) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let common = common_directory(cwd).ok()?;
+    let directory = hook_directory(cwd, &common, deadline, repository).ok()?;
+    let metadata = match std::fs::metadata(directory.join("pre-push")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    Some(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// Whether Git would follow tags on a push from `cwd` (`push.followTags`).

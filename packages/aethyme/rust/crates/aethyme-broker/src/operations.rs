@@ -481,6 +481,11 @@ impl AdmissionDeadline {
             QueueWait::Refuse => Some(NO_WAIT_ADMISSION_BUDGET),
             QueueWait::Seconds(seconds) => Some(std::time::Duration::from_secs(seconds)),
         };
+        Self::start_with_budget(budget)
+    }
+
+    /// A deadline of exactly `budget` from now; `None` is unbounded.
+    fn start_with_budget(budget: Option<std::time::Duration>) -> Self {
         let started = std::time::Instant::now();
         Self {
             started,
@@ -1084,8 +1089,10 @@ enum PushPlanning {
 impl PushPlanning {
     /// Whether this plan sends exactly what an earlier plan described.
     ///
-    /// Compared by destination and proposed commit, which is precisely what the
-    /// pre-push hook inspected during the dry run. Anything the planner cannot
+    /// Compared by destination, proposed commit and the remote's old value,
+    /// which is precisely what the pre-push hook was given on stdin during the
+    /// dry run. A remote that moved in between gets a push the hook never
+    /// judged, so it is not covered either. Anything the planner cannot
     /// describe exactly is treated as not covered, so an unplannable push never
     /// reaches the remote with its hook skipped.
     fn matches_prechecked(&self, earlier: &PushPlanning) -> bool {
@@ -1097,6 +1104,7 @@ impl PushPlanning {
                         |(current, earlier)| {
                             current.destination_ref == earlier.destination_ref
                                 && current.proposed_sha == earlier.proposed_sha
+                                && current.pre_push_sha == earlier.pre_push_sha
                         },
                     )
             }
@@ -1887,7 +1895,7 @@ pub(crate) fn process_is_gone(pid: i64) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Opt-in: run a push's local hooks before taking the repository lock.
+/// Run a push's local hooks before taking any coordination lock.
 ///
 /// The lock exists to order remote mutations, but `git push` runs the
 /// repository's `pre-push` hook inside its own process, so holding the lock
@@ -1895,26 +1903,43 @@ pub(crate) fn process_is_gone(pid: i64) -> bool {
 /// pre-push gate is legitimately long, the fleet then serialises on whoever is
 /// pushing the largest change (issues #138, #146).
 ///
-/// Off by default because it changes what the push verifies: the hook runs
-/// against the same commits in a dry run, and the real push is then made with
-/// `--no-verify`. That is sound only because the broker re-plans under the lock
-/// and refuses if any local ref moved in between -- but it does skip any *other*
-/// pre-push protection the repository relies on, which is the repository
-/// owner's decision to make, not ours.
-fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
+/// The hook then runs in a `git push --dry-run` against the same pinned
+/// commits, so Git hands it the same arguments and stdin it would hand the real
+/// push, and the real push is made with `--no-verify`. That is sound only
+/// because the broker re-plans under the lock and refuses if any destination or
+/// proposed commit moved in between.
+///
+/// `Some(true)` turns it on for every eligible push, `Some(false)` turns it off
+/// for every push, and `None` (the key is absent) leaves it on only for a strict
+/// push of the caller's own session branch (see
+/// `session_push_hook_outside_lock_default`).
+fn hooks_outside_lock_setting(main_root: &Path) -> Option<bool> {
+    coordination_setting(main_root, "hooks_outside_lock").and_then(|value| value.as_bool())
+}
+
+/// The budget of the pre-push hook run before the lock, separate from the
+/// queue and transfer deadline. A hook that runs outside every lock blocks no
+/// other session, so it gets a generous bound of its own instead of the push's
+/// 60 s queue budget; the transfer still gets that whole budget afterwards.
+/// `[coordination] pre_push_hook_budget_seconds` overrides it.
+const PRE_PUSH_HOOK_BUDGET: Duration = Duration::from_secs(20 * 60);
+
+fn pre_push_hook_budget(main_root: &Path) -> Duration {
+    coordination_setting(main_root, "pre_push_hook_budget_seconds")
+        .and_then(|value| value.as_integer())
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(PRE_PUSH_HOOK_BUDGET, Duration::from_secs)
+}
+
+fn coordination_setting(main_root: &Path, key: &str) -> Option<toml::Value> {
     let Ok(Some((_, text))) =
         aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
     else {
-        return false;
+        return None;
     };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return false;
-    };
-    value
-        .get("coordination")
-        .and_then(|section| section.get("hooks_outside_lock"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false)
+    let value = text.parse::<toml::Value>().ok()?;
+    value.get("coordination")?.get(key).cloned()
 }
 
 /// Opt-out: give session-branch commits and pushes the repository-wide lane

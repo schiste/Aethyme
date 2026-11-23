@@ -394,6 +394,248 @@ fn reconcile_failed_push(
     Some((status, value))
 }
 
+/// How long a remote read that settles an unknown push may take. It runs
+/// after a timeout or under another write's lanes, so it is short: a remote
+/// too slow to answer leaves the outcome unknown, as before.
+const UNKNOWN_PUSH_REMOTE_READ_BUDGET: Duration = Duration::from_secs(15);
+
+/// The bound on the remote read that plans a push before its hook runs.
+const PRE_LANE_REMOTE_READ_BUDGET: Duration = Duration::from_secs(60);
+
+/// After a push whose transfer was cut off, read the destinations once,
+/// through the verified push endpoint bound to the operation's recorded
+/// `repository` (a remote whose push URL no longer resolves to it proves
+/// nothing). Returns the observed outcome (`succeeded` when every destination
+/// holds the proposed commit, `failed` when every one is still at its old
+/// value, `None` otherwise or when the read fails) with the journal value.
+///
+/// Only `succeeded` is proof on its own: a late server-side update can only
+/// set the same value. `failed` proves nothing alone (a cut-off transfer may
+/// still land); the caller pairs it with trace evidence that nothing was sent.
+fn observe_timed_out_push(
+    repo: &crate::GitRepo,
+    repository: &str,
+    planning: &PushPlanning,
+) -> Option<(Option<&'static str>, serde_json::Value)> {
+    let PushPlanning::Planned(plan) = planning else {
+        return None;
+    };
+    let _span = crate::phase_telemetry::span("push_timeout_remote_read");
+    let destination_refs = plan
+        .destinations
+        .iter()
+        .map(|destination| destination.destination_ref.clone())
+        .collect::<Vec<_>>();
+    let observed = crate::git::with_git_deadline(UNKNOWN_PUSH_REMOTE_READ_BUDGET, || {
+        repo.checked_push_remote_ref_oids(&plan.remote, repository, &destination_refs)
+    });
+    let Ok(observed) = observed else {
+        crate::phase_telemetry::add("push_timeout_remote_unverified", Duration::ZERO);
+        return None;
+    };
+    let observation = classify_exact_push_observation(plan, &observed);
+    let mut value = planning.journal_value().expect("planned push");
+    value["evidence"] = json!({
+        "classification": observation.classification,
+        "source": "post_timeout_remote_read",
+        "destinations": observation.destinations,
+    });
+    Some((observation.outcome, value))
+}
+
+/// The settled status of a push stopped at its deadline, from the verified
+/// remote read and the trace: every destination at the proposed commit is
+/// `succeeded`; every one still at its old value *and* a trace showing Git
+/// was still inside its own `pre-push` hook is `failed` (nothing sent);
+/// anything else stays `None` (unknown).
+fn settle_timed_out_push(
+    observed: Option<Option<&'static str>>,
+    killed_in_hook: bool,
+) -> Option<OperationStatus> {
+    match observed {
+        Some(Some("succeeded")) => Some(OperationStatus::Succeeded),
+        Some(Some("failed")) if killed_in_hook => Some(OperationStatus::Failed),
+        _ => None,
+    }
+}
+
+/// The branch an unknown-outcome operation wrote when that branch is its own
+/// session's branch: the lane a session push or session commit holds.
+/// `None` for every other scope, which keeps blocking as before.
+fn own_session_branch_scope(
+    broker: &mut Broker,
+    operation: &CoordinatedOperation,
+) -> Option<String> {
+    let scope = stored_resource_scope(operation)?;
+    let branch = scope.strip_prefix("git-ref/refs/heads/")?;
+    // A shared branch (the default branch, the integration branch) is never
+    // a session's own, whatever a session record says: its ambiguity always
+    // blocks everything.
+    if broker
+        .shared_branches()
+        .iter()
+        .any(|shared| shared == branch)
+    {
+        return None;
+    }
+    let session = broker.store().session(operation.session_id).ok()?;
+    (session.branch == branch).then_some(scope)
+}
+
+/// Whether `request` names `branch`: a GitHub command whose ref targets
+/// include it (a merge of its pull request, a branch delete,
+/// `update-branch`), or a Git command any of whose arguments mentions it or
+/// that addresses refs wholesale (`--all`, `--mirror`, `--prune`, `--tags`
+/// widen to every branch). Conservative: naming it keeps the block.
+fn request_names_branch(
+    provider: OperationProvider,
+    args: &[String],
+    gh_named: &[String],
+    branch: &str,
+) -> bool {
+    match provider {
+        OperationProvider::Github => gh_named.iter().any(|named| named == branch),
+        OperationProvider::Git => args.iter().any(|arg| {
+            arg.contains(branch)
+                || matches!(arg.as_str(), "--all" | "--mirror" | "--prune" | "--tags")
+        }),
+    }
+}
+
+/// Settle an unknown push of a session's own branch from the remote, without
+/// an operator. Its one destination must be the session's branch, read through
+/// the verified push endpoint of the recorded repository. At exactly the
+/// proposed commit it succeeded; still at the plan's old value
+/// [`UNKNOWN_PUSH_SETTLE_AGE_MS`] after it ended, it did not happen. Only the
+/// session's own lanes write that branch, so the observation cannot be another
+/// session's write. Anything else (a third value, a deleted branch, the old
+/// value too soon, a remote that does not answer) leaves it unknown.
+fn try_reconcile_session_push(
+    broker: &mut Broker,
+    operation: &CoordinatedOperation,
+    deadline: AdmissionDeadline,
+) -> Result<bool, BrokerOpError> {
+    // A failure to settle someone else's row must not fail this writer: the
+    // row simply stays unknown and blocks as it did.
+    Ok(
+        try_reconcile_session_push_inner(broker, operation, deadline).unwrap_or_else(|_| {
+            crate::phase_telemetry::add("unknown_push_auto_reconcile_error", Duration::ZERO);
+            false
+        }),
+    )
+}
+
+/// How long after an unknown push ended a remote still at the push's old
+/// value counts as "it did not happen". A server applies the commands of a
+/// fully received push within seconds; a transfer cut off this long ago that
+/// has still not landed never will.
+const UNKNOWN_PUSH_SETTLE_AGE_MS: i64 = 10 * 60 * 1000;
+
+fn try_reconcile_session_push_inner(
+    broker: &mut Broker,
+    operation: &CoordinatedOperation,
+    deadline: AdmissionDeadline,
+) -> Result<bool, BrokerOpError> {
+    if operation.provider != OperationProvider::Git
+        || operation.status != OperationStatus::OutcomeUnknown
+        || operation.effect == OperationEffect::Read
+    {
+        return Ok(false);
+    }
+    let Some(scope) = own_session_branch_scope(broker, operation) else {
+        return Ok(false);
+    };
+    let mut details = operation
+        .details_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(plan) = details
+        .get("push_reconciliation")
+        .filter(|push| push["planning"].as_str() == Some("planned"))
+        .and_then(|push| serde_json::from_value::<ExactPushPlan>(push["plan"].clone()).ok())
+    else {
+        return Ok(false);
+    };
+    let branch_ref = scope.trim_start_matches("git-ref/");
+    let [destination] = plan.destinations.as_slice() else {
+        return Ok(false);
+    };
+    if destination.destination_ref != branch_ref
+        || destination.proposed_sha.len() != 40
+        || !destination
+            .proposed_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    let _span = crate::phase_telemetry::span("unknown_push_auto_reconcile");
+    let budget = deadline
+        .remaining()
+        .map_or(UNKNOWN_PUSH_REMOTE_READ_BUDGET, |left| {
+            left.min(UNKNOWN_PUSH_REMOTE_READ_BUDGET)
+        });
+    let refs = vec![destination.destination_ref.clone()];
+    let observed = crate::git::with_git_deadline(budget, || {
+        broker.repo_handle().checked_push_remote_ref_oids(
+            &plan.remote,
+            &operation.repository,
+            &refs,
+        )
+    });
+    let Ok(observed) = observed else {
+        crate::phase_telemetry::add("unknown_push_auto_reconcile_unavailable", Duration::ZERO);
+        return Ok(false);
+    };
+    let observation = classify_exact_push_observation(&plan, &observed);
+    // At the proposed commit: succeeded. At the old value long after the
+    // push ended: it did not happen. A missing branch whose old value was a
+    // commit, a third value, or the old value too soon after: unknown.
+    let ended_at = operation.finished_at.unwrap_or(operation.updated_at);
+    let status = match observation.outcome {
+        Some("succeeded") => OperationStatus::ReconciledSucceeded,
+        Some("failed") if unix_now_ms().saturating_sub(ended_at) >= UNKNOWN_PUSH_SETTLE_AGE_MS => {
+            OperationStatus::ReconciledFailed
+        }
+        _ => {
+            crate::phase_telemetry::add("unknown_push_auto_reconcile_left_unknown", Duration::ZERO);
+            return Ok(false);
+        }
+    };
+    let succeeded = status == OperationStatus::ReconciledSucceeded;
+    if let Some(host_id) = &operation.host_operation_id {
+        crate::host_operations::reconcile_host_operation_with_deadline(
+            &broker.host_operation_database_path()?,
+            host_id,
+            succeeded,
+            deadline.at,
+        )?;
+    }
+    details["reconciliation"] = json!({
+        "source": "session_push_remote_read",
+        "outcome": status.as_str(),
+        "remote": plan.remote,
+        "destinations": observation.destinations,
+        "observed_at": unix_now_ms(),
+    });
+    let settled = broker
+        .store()
+        .reconcile_observed_operation(operation, &details.to_string(), status, operation.exit_code)?
+        .is_some();
+    if settled {
+        crate::phase_telemetry::add(
+            if succeeded {
+                "unknown_push_auto_reconcile_succeeded"
+            } else {
+                "unknown_push_auto_reconcile_failed"
+            },
+            Duration::ZERO,
+        );
+    }
+    Ok(settled)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RemoteContactEvidence {
     remote_contact: &'static str,
@@ -415,6 +657,11 @@ struct GitTransferTrace {
     pre_push_hook_started_ms: Option<u64>,
     /// How long that hook ran, in ms. Telemetry only.
     pre_push_hook_ms: Option<u64>,
+    /// The top-level `git push` started a child Git itself classes as the
+    /// `pre-push` hook (`child_class` `hook` with `hook_name` `pre-push`, or
+    /// an `argv[0]` whose file name is `pre-push`), not merely a child whose
+    /// command line mentions it (a remote URL can).
+    top_level_pre_push_hook_child: bool,
     /// The top-level `git push` entered its `transport_push/get_refs_list`
     /// region: it began asking a remote for its refs.
     remote_refs_list_started: bool,
@@ -513,6 +760,25 @@ fn push_timeout_timing(trace: &GitTransferTrace, elapsed: Duration) -> serde_jso
 }
 
 impl GitTransferTrace {
+    /// Whether a push stopped at its deadline was still inside its own
+    /// `pre-push` hook: the hook started, never ended, and Git never entered
+    /// `push_refs`, the one region that sends ref updates (it runs only after
+    /// the hook exits zero). Nothing that can change a remote ref was sent,
+    /// so the timeout is a plain failure, not an unknown outcome.
+    ///
+    /// Trace events alone cannot prove absence: Git stops writing Trace2 on a
+    /// write error and keeps pushing. So this also requires a live trace with
+    /// regions (the ref listing finished) and a child Git itself classes as
+    /// the hook, and the caller acts on it only when a verified remote read
+    /// also finds every destination still at its old value.
+    fn killed_in_pre_push_hook(&self) -> bool {
+        !self.push_refs_started
+            && self.remote_refs_list_finished
+            && self.top_level_pre_push_hook_child
+            && self.pre_push_hook_started_ms.is_some()
+            && self.pre_push_hook_ms.is_none()
+    }
+
     /// Whether the push provably ended before it could send any ref update.
     ///
     /// `git push` asks each remote URL for its refs inside
@@ -640,6 +906,18 @@ fn parse_git_transfer_trace(contents: &str) -> GitTransferTrace {
                     .collect::<Vec<_>>()
                     .join(" ")
                     .to_ascii_lowercase();
+                let is_hook_child = (event.get("child_class").and_then(serde_json::Value::as_str)
+                    == Some("hook")
+                    && event.get("hook_name").and_then(serde_json::Value::as_str)
+                        == Some("pre-push"))
+                    || arguments
+                        .first()
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|program| Path::new(program).file_name())
+                        .is_some_and(|name| name == "pre-push");
+                if top_level && is_hook_child {
+                    trace.top_level_pre_push_hook_child = true;
+                }
                 if command.contains("pre-push") {
                     trace.pre_push_hook = true;
                     if let Some(child_id) =
@@ -3078,7 +3356,7 @@ impl Broker {
             OperationProvider::Github => classify_gh(&request.args),
         };
         let (effect, classification) = resolve_effect(inferred, request.declared_effect)?;
-        let admission = admission.bounded_for(
+        let mut admission = admission.bounded_for(
             effect,
             is_long_running_read(request.provider, &request.args),
             request.provider,
@@ -3117,6 +3395,14 @@ impl Broker {
         } else {
             GhRefTargets::default()
         };
+        // Branches this GitHub command deletes, rewrites or advances, kept
+        // for the write-block check below.
+        let gh_named: Vec<String> = gh_targets
+            .rewrite
+            .iter()
+            .chain(&gh_targets.advance)
+            .cloned()
+            .collect();
         if let Some(owner) = self.refuse_foreign_session_branches(&request, effect, gh_targets)? {
             // Recorded with the authorization, so the journal says which
             // session's branch this operation was allowed to touch.
@@ -3439,14 +3725,30 @@ impl Broker {
             && is_push(&request.args))
         .then(|| self.command_temp_for_session(request.session_id))
         .flatten();
-        let hooks_ran_outside_lock = effect != OperationEffect::Read
+        let hooks_eligible = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
             && !push_sets_upstream(&request.args)
             && push_shape
                 .as_ref()
-                .is_none_or(|shape| shape.kind != PushKind::DeleteOnly)
-            && hooks_outside_lock_enabled(self.main_root());
+                .is_none_or(|shape| shape.kind != PushKind::DeleteOnly);
+        // A strict push of the caller's own session branch runs its hook
+        // before every lock unless the repository said otherwise. Inside the
+        // push, the hook held the shared repository lane for its whole run: a
+        // repository-wide writer then waited for it while holding its
+        // wide-intent lock, and every later session push queued behind both
+        // (the busiest repository: 60 s refusals behind a 219 s hook). Inside
+        // the push it also spent the push's 60 s deadline, and a slow hook
+        // timed the transfer out as `outcome_unknown`.
+        let session_push_hook_default = hooks_eligible
+            && session_branch_hooks
+            && resource_scope.is_some()
+            && git_scopes::pre_push_hook_installed(cwd, admission, &repository) == Some(true);
+        let hooks_ran_outside_lock = hooks_eligible
+            && match hooks_outside_lock_setting(self.main_root()) {
+                Some(setting) => setting,
+                None => session_push_hook_default,
+            };
 
         // Two identical commands from one session cannot both be intended: the
         // second would fire against state the first already changed. Now that a
@@ -3509,11 +3811,64 @@ impl Broker {
         // the lock and the fleet no longer serialises on the slowest gate
         // (issues #138, #146).
         let mut pinned_push_args = None;
+        // Two pushes of one branch must not interleave between one's hook and
+        // its transfer. A narrow push whose hook runs before the lanes holds
+        // this branch-only lane from before the hook to the end: it is taken
+        // first, while nothing else is held, so it cannot join a lock cycle.
+        let mut _push_hook_lane = None;
         let prechecked_plan = if hooks_ran_outside_lock {
+            // The hook gets its own generous budget: it holds no shared lane,
+            // so a slow one delays only this push. The queue and transfer
+            // deadline starts afresh once it has passed.
+            let hook_deadline = match queue_wait {
+                QueueWait::Forever => AdmissionDeadline::start_with_budget(None),
+                QueueWait::Refuse | QueueWait::Seconds(_) => AdmissionDeadline::start_with_budget(
+                    Some(pre_push_hook_budget(self.main_root())),
+                ),
+            };
+            if session_push_hook_default {
+                crate::phase_telemetry::add("push_hook_outside_lock_default", Duration::ZERO);
+            }
+            if resource_scope.is_some() {
+                let _lane_span = push_stage_span(push_stages, "push_git_hook_lane_wait");
+                let key = format!("{lock_key}::pre-push");
+                match RepositoryWriteLock::acquire(
+                    &main_root,
+                    &key,
+                    queued_operation_id,
+                    Some(request.session_id),
+                    || Ok("another push of this branch running its pre-push hook".to_string()),
+                    hook_deadline.remaining_queue_wait(queue_wait),
+                    |holder, elapsed| {
+                        eprintln!(
+                            "[coordination] waiting behind {holder} ({})",
+                            humanize_duration(elapsed.as_secs())
+                        )
+                    },
+                ) {
+                    Ok(guard) => _push_hook_lane = Some(guard),
+                    Err(error) => {
+                        self.resolve_lane_refusal(
+                            queued_operation_id,
+                            "push_hook_lane_unavailable",
+                            &key,
+                            unidentified_lock_holder(),
+                            None,
+                            &lanes,
+                        );
+                        return Err(error);
+                    }
+                }
+            }
             let _hook_span = push_stage_span(push_stages, "push_git_hook_dry_run");
             let plan = {
                 let _read_span = push_stage_span(push_stages, "push_git_remote_read_before_lock");
-                plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+                // Bounded: it now runs by default. A remote that does not
+                // answer leaves the plan unavailable and refuses the push
+                // before anything is queued or sent.
+                crate::git::with_git_deadline(PRE_LANE_REMOTE_READ_BUDGET, || {
+                    plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+                })
             };
             let pinned = match &plan {
                 PushPlanning::Planned(exact) => pin_push_sources(&request.args, exact),
@@ -3536,13 +3891,17 @@ impl Broker {
             dry_run.arg("push").arg("--dry-run");
             dry_run.args(&pinned[command_index + 1..]);
             dry_run.current_dir(cwd);
+            // The same environment the push's own hook run would see, short
+            // of an operation id: the operation is not running yet, so a hook
+            // cannot vouch for a protected-branch write from here.
+            dry_run.env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string());
             export_push_shape(&mut dry_run, push_shape.as_ref());
             if let Some(temp) = &command_temp {
                 temp.apply(&mut dry_run);
             }
             match output_within(
                 dry_run,
-                admission,
+                hook_deadline,
                 &repository,
                 "running the pre-push dry run",
                 None,
@@ -3587,6 +3946,8 @@ impl Broker {
                 }
             }
             pinned_push_args = Some(pinned);
+            // The queue and transfer budget the caller asked for starts now.
+            admission = AdmissionDeadline::start_with_budget(admission.budget);
             Some(plan)
         } else {
             None
@@ -3988,6 +4349,32 @@ impl Broker {
                 ) {
                     continue;
                 }
+                // A session's own branch is written only by that session's
+                // lanes, so an ambiguous write there leaves only that branch
+                // in doubt. It blocks that session's writes and every write on
+                // that branch's lane; another session's writes elsewhere,
+                // repository-wide and GitHub ones included, go ahead. An
+                // ambiguous write anywhere else still blocks everything.
+                if operation.session_id != request.session_id
+                    && matches!(
+                        operation.status,
+                        OperationStatus::Running | OperationStatus::OutcomeUnknown
+                    )
+                    && let Some(branch_scope) = own_session_branch_scope(self, &operation)
+                    && resource_scope.as_deref() != Some(branch_scope.as_str())
+                    && !request_names_branch(
+                        request.provider,
+                        &request.args,
+                        &gh_named,
+                        branch_scope.trim_start_matches("git-ref/refs/heads/"),
+                    )
+                {
+                    crate::phase_telemetry::add(
+                        "unknown_session_branch_write_not_blocking",
+                        Duration::ZERO,
+                    );
+                    continue;
+                }
                 // A row whose run left a journal with a definite outcome is
                 // decided even when the replay above could not write it yet
                 // (its owner may still be retrying after releasing its
@@ -4021,6 +4408,7 @@ impl Broker {
                             Some(r#"{"reason":"process_ended_without_outcome"}"#),
                         )?;
                         if git_scopes::try_reconcile(self, &blocking, cwd, admission)?
+                            || try_reconcile_session_push(self, &blocking, admission)?
                             || self.auto_resolve_repeatable_fetch(&blocking, admission.at)
                         {
                             continue;
@@ -4034,6 +4422,7 @@ impl Broker {
                     }
                     OperationStatus::OutcomeUnknown => {
                         if git_scopes::try_reconcile(self, &operation, cwd, admission)?
+                            || try_reconcile_session_push(self, &operation, admission)?
                             || self.auto_resolve_repeatable_fetch(&operation, admission.at)
                         {
                             continue;
@@ -4315,17 +4704,62 @@ impl Broker {
             }) => {
                 let operation_liveness =
                     operation_heartbeat.as_mut().map(OperationHeartbeat::finish);
-                let status = if remote_outcome_uncertain {
+                // A cut-off push whose destinations already hold what it
+                // proposed has succeeded; recording it unknown would block
+                // writes until an operator read the same remote by hand.
+                let timeout_trace = git_trace
+                    .as_ref()
+                    .map(|trace| inspect_git_transfer_trace(trace.path()));
+                // Killed while its own pre-push hook still ran, Git never
+                // reached `push_refs`, the one place a ref update is sent.
+                let killed_in_hook = remote_outcome_uncertain
+                    && push_stages
+                    && timeout_trace
+                        .as_ref()
+                        .is_some_and(GitTransferTrace::killed_in_pre_push_hook);
+                let observed_push = (remote_outcome_uncertain
+                    && request.provider == OperationProvider::Git)
+                    .then(|| {
+                        observe_timed_out_push(self.repo_handle(), &repository, &push_planning)
+                    })
+                    .flatten();
+                let settled = settle_timed_out_push(
+                    observed_push.as_ref().map(|(outcome, _)| *outcome),
+                    killed_in_hook,
+                );
+                if remote_outcome_uncertain && request.provider == OperationProvider::Git {
+                    crate::phase_telemetry::add(
+                        match (observed_push.is_some(), settled) {
+                            (_, Some(OperationStatus::Succeeded)) => {
+                                "push_timeout_proven_succeeded"
+                            }
+                            (_, Some(_)) => "push_timeout_proven_not_sent",
+                            (true, None) => "push_timeout_left_unknown",
+                            (false, None) => "push_timeout_not_observed",
+                        },
+                        Duration::ZERO,
+                    );
+                }
+                let proven_push = settled.and(observed_push).map(|(_, value)| value);
+                let killed_in_hook = settled == Some(OperationStatus::Failed);
+                let status = if settled == Some(OperationStatus::Succeeded) {
+                    OperationStatus::Succeeded
+                } else if killed_in_hook {
+                    OperationStatus::Failed
+                } else if remote_outcome_uncertain {
                     OperationStatus::OutcomeUnknown
                 } else {
                     OperationStatus::Failed
                 };
                 if is_remote_write {
                     crate::phase_telemetry::add(
-                        if status == OperationStatus::OutcomeUnknown {
-                            "remote_write_outcome_unknown_timeout"
-                        } else {
-                            "remote_write_failed_timeout"
+                        match status {
+                            OperationStatus::OutcomeUnknown => {
+                                "remote_write_outcome_unknown_timeout"
+                            }
+                            OperationStatus::Succeeded => "remote_write_succeeded_timeout",
+                            _ if killed_in_hook => "remote_write_failed_timeout_in_pre_push_hook",
+                            _ => "remote_write_failed_timeout",
                         },
                         Duration::ZERO,
                     );
@@ -4339,7 +4773,11 @@ impl Broker {
                             "failure_class": "coordinated_operation_timeout",
                             "stage": stage,
                             "budget": budget,
-                            "remote_outcome": if remote_outcome_uncertain {
+                            "remote_outcome": if status == OperationStatus::Succeeded {
+                                "succeeded"
+                            } else if killed_in_hook {
+                                "not_sent"
+                            } else if remote_outcome_uncertain {
                                 "unknown"
                             } else {
                                 "not_applicable"
@@ -4350,12 +4788,12 @@ impl Broker {
                         &push_planning,
                     ),
                 );
-                if push_stages && let Some(trace) = &git_trace {
+                if let Some(proof) = proven_push {
+                    details["push_reconciliation"] = proof;
+                }
+                if push_stages && let Some(trace) = &timeout_trace {
                     let _span = crate::phase_telemetry::span("push_git_timeout_trace");
-                    details["push_timeout_timing"] = push_timeout_timing(
-                        &inspect_git_transfer_trace(trace.path()),
-                        process_elapsed,
-                    );
+                    details["push_timeout_timing"] = push_timeout_timing(trace, process_elapsed);
                 }
                 if let Some(liveness) = operation_liveness {
                     add_operation_liveness(&mut details, liveness);
