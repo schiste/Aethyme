@@ -973,6 +973,8 @@ pub fn keep_archive(host_state: &Path, id: &str, keep: bool) -> Result<std::path
 pub fn archives_value(host_state: &Path) -> Value {
     let ledger = Ledger::load(host_state);
     let (budgets, _) = Budgets::load(host_state);
+    // Live answers: every default tip is read afresh for this listing.
+    super::landing::shared().expire_tips();
     let mut rows = Vec::new();
     for item in ledger
         .items

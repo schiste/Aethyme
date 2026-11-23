@@ -419,6 +419,24 @@ fn archives_go_only_when_landed_and_past_their_promised_retention() {
             .join("recovery-archives/example-0123/young-landed")
             .exists()
     );
+    // The pass reports its landing decisions and keeps, for the next pass,
+    // only what it proved not landed.
+    assert!(report.landing.contains_key("probes"), "{report:?}");
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(host_state.join(super::landing::CACHE_FILE)).unwrap())
+            .unwrap();
+    let facts = &cache["repositories"][&*repository.to_string_lossy()];
+    assert_eq!(facts["tip"], serde_json::json!(landed), "{cache}");
+    assert_eq!(
+        facts["not_contained"],
+        serde_json::json!([unlanded]),
+        "{cache}"
+    );
+    assert!(facts.get("contained").is_none(), "{cache}");
+    assert_eq!(
+        classify(RootKind::HostState, super::landing::CACHE_FILE),
+        Class::Coordination
+    );
     // Within budget, nothing goes at all, however old.
     archive(&host_state, "ancient-landed", &repository, &landed, 400);
     let ledger = pass(
@@ -1549,4 +1567,157 @@ fn a_staged_prune_is_advised_starts_the_worker_and_is_swept() {
     assert!(check::staged_deletions(&cache).is_empty());
     assert!(!cache.join(format!("{name}.bytes")).exists());
     assert!(cache.join("gates").is_dir(), "only staged entries go");
+}
+
+/// A repository with `main` at commit A (also `origin/main`) and a branch
+/// `work` one commit ahead (B): `(A, B)`.
+fn landing_repository(repository: &Path) -> (String, String) {
+    fs::create_dir_all(repository).unwrap();
+    git(repository, &["init", "-q", "-b", "main"]);
+    fs::write(repository.join("a"), "a").unwrap();
+    git(repository, &["add", "a"]);
+    git(repository, &["commit", "-q", "-m", "a"]);
+    let a = git(repository, &["rev-parse", "HEAD"]);
+    git(repository, &["update-ref", "refs/remotes/origin/main", &a]);
+    git(repository, &["checkout", "-q", "-b", "work"]);
+    fs::write(repository.join("b"), "b").unwrap();
+    git(repository, &["add", "b"]);
+    git(repository, &["commit", "-q", "-m", "b"]);
+    let b = git(repository, &["rev-parse", "HEAD"]);
+    (a, b)
+}
+
+/// The worker re-proved every archive on every pass, one `merge-base` per
+/// recorded commit (head and branch tip are usually the same commit). A
+/// commit is now probed once per tip; a forward move of the tip carries the
+/// answer with one `rev-list`, and any other move drops what was known.
+#[test]
+fn a_landing_answer_is_probed_once_per_tip_and_carried_along_a_forward_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let (a, b) = landing_repository(&repository);
+    let mut prover = super::landing::LandingProver::default();
+
+    prover
+        .prove(&repository, &[a.clone(), a.clone(), a.clone()])
+        .unwrap();
+    assert_eq!(prover.stats().probes, 1);
+    assert_eq!(prover.stats().duplicate_commits, 2);
+    assert_eq!(prover.stats().probe_contained, 1);
+
+    let why = prover
+        .prove(&repository, std::slice::from_ref(&b))
+        .unwrap_err();
+    assert!(why.contains("is not in"), "{why}");
+    assert_eq!(prover.stats().probes, 2);
+    assert_eq!(prover.stats().probe_not_contained, 1);
+
+    // Asked again with the tip unchanged: no Git read at all.
+    assert!(prover.prove(&repository, std::slice::from_ref(&b)).is_err());
+    assert!(prover.prove(&repository, std::slice::from_ref(&a)).is_ok());
+    assert_eq!(prover.stats().probes, 2);
+    assert_eq!(prover.stats().tip_reads, 1);
+    assert_eq!(prover.stats().tip_memo_hits, 3);
+    assert_eq!(prover.stats().cached_not_contained, 1);
+    assert_eq!(prover.stats().cached_contained, 1);
+
+    // The default branch moves forward onto B: B has landed, learned from
+    // the range between the tips, with no new probe.
+    git(&repository, &["update-ref", "refs/remotes/origin/main", &b]);
+    prover.expire_tips();
+    prover.prove(&repository, std::slice::from_ref(&b)).unwrap();
+    assert_eq!(prover.stats().tip_advanced, 1);
+    assert_eq!(prover.stats().tip_reset, 0);
+    assert_eq!(prover.stats().probes, 2);
+    assert_eq!(prover.stats().cached_contained, 2);
+
+    // It moves back to A: nothing known survives, and B is probed again.
+    git(&repository, &["update-ref", "refs/remotes/origin/main", &a]);
+    prover.expire_tips();
+    assert!(prover.prove(&repository, std::slice::from_ref(&b)).is_err());
+    assert_eq!(prover.stats().tip_reset, 1);
+    assert_eq!(prover.stats().probes, 3);
+    assert_eq!(prover.stats().probe_not_contained, 2);
+}
+
+/// Only "not landed" crosses processes: a cache file can make the worker
+/// keep an archive, never remove one.
+#[test]
+fn only_not_landed_answers_are_kept_across_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    fs::create_dir_all(&host_state).unwrap();
+    let repository = dir.path().join("repository");
+    let (a, b) = landing_repository(&repository);
+    let mut first = super::landing::LandingProver::default();
+    first.prove(&repository, std::slice::from_ref(&a)).unwrap();
+    assert!(first.prove(&repository, std::slice::from_ref(&b)).is_err());
+    first.save(&host_state).unwrap();
+
+    let mut next = super::landing::LandingProver::default();
+    next.load(&host_state);
+    assert!(next.prove(&repository, std::slice::from_ref(&b)).is_err());
+    assert_eq!(next.stats().probes, 0, "B is known not landed");
+    assert_eq!(next.stats().cached_not_contained, 1);
+    next.prove(&repository, std::slice::from_ref(&a)).unwrap();
+    assert_eq!(next.stats().probes, 1, "A is proven again, never read back");
+
+    // A damaged file is ignored, never trusted.
+    fs::write(host_state.join(super::landing::CACHE_FILE), b"{not json").unwrap();
+    let mut damaged = super::landing::LandingProver::default();
+    damaged.load(&host_state);
+    assert!(
+        damaged
+            .prove(&repository, std::slice::from_ref(&b))
+            .is_err()
+    );
+    assert_eq!(damaged.stats().probes, 1);
+}
+
+/// A probe that outlives its budget proves nothing and is not remembered;
+/// once the process budget is spent, nothing more is probed.
+#[test]
+fn landing_probes_are_bounded_and_an_unfinished_one_keeps_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let (a, _) = landing_repository(&repository);
+    let mut prover =
+        super::landing::LandingProver::with_budgets(Duration::ZERO, Duration::from_secs(600));
+    for attempt in 1..=2 {
+        let why = prover
+            .prove(&repository, std::slice::from_ref(&a))
+            .unwrap_err();
+        assert!(why.contains("not proven landed within"), "{why}");
+        assert_eq!(prover.stats().probe_timeouts, attempt);
+        assert_eq!(prover.stats().cached_contained, 0);
+        assert_eq!(prover.stats().cached_not_contained, 0);
+    }
+
+    let mut spent =
+        super::landing::LandingProver::with_budgets(Duration::from_secs(20), Duration::ZERO);
+    let why = spent
+        .prove(&repository, std::slice::from_ref(&a))
+        .unwrap_err();
+    assert!(why.contains("proof budget is spent"), "{why}");
+    assert_eq!(spent.stats().probes, 0);
+    assert_eq!(spent.stats().budget_spent, 1);
+}
+
+/// An archive whose head and branch tip are one commit costs one probe,
+/// not two, and still lands.
+#[test]
+fn an_archive_repeating_one_commit_is_probed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let repository = dir.path().join("repository");
+    let (a, _) = landing_repository(&repository);
+    archive(&host_state, "landed", &repository, &a, 40);
+    let mut prover = super::landing::LandingProver::default();
+    evict::archive_landed_with(
+        &host_state.join("recovery-archives/example-0123/landed"),
+        &mut prover,
+    )
+    .unwrap();
+    assert_eq!(prover.stats().probes, 1);
+    assert_eq!(prover.stats().duplicate_commits, 1);
 }

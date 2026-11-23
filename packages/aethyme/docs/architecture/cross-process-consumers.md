@@ -336,6 +336,31 @@ reading; counters `storage_host_temp_root_measured` (one per root, with its
 time), `storage_host_temp_partial` (a root left partial by the deadline) and
 `storage_host_temp_lock_lost` (a reading stopped by a lost worker lock).
 
+Recovery archive landing proofs (2026-11-23): whether an archive's commits
+are in its repository's default branch is answered by one prover per process
+(`storage_ledger::landing`). Each default tip is read once per pass and then
+reused for 30 s; each commit is probed (`merge-base --is-ancestor`, at an
+ordinary disk priority, 20 s per read, 120 s per process) once per tip; a
+forward move of the tip carries known answers with one `rev-list <new>
+^<old>`, any other move drops them. `<host state>/storage-landing-cache.json`
+(`schema` 1, `repositories.<repository path>.tip`, `.not_contained[]`;
+written by the worker after eviction, classified `coordination`) keeps only
+commits proven not contained, so a damaged or stale file can keep an archive,
+never remove one; a repository no pass asks about drops out. The pass report
+(`storage-ledger.json` `last_pass`, and `storage status --json`) adds
+`landing`: per-pass counts `tip_reads`, `tip_memo_hits`,
+`duplicate_commits`, `cached_contained`, `cached_not_contained`, `probes`,
+`probe_contained`, `probe_not_contained`, `probe_unproven`,
+`probe_timeouts`, `budget_spent`, `tip_advanced` and `tip_reset`. Spans
+`storage_landing_default_tip`, `storage_landing_probe`,
+`storage_landing_tip_advance`, `storage_landing_cache_load` and
+`storage_landing_cache_save`; counters `storage_landing_tip_memo_hit`,
+`storage_landing_duplicate_commit`, `storage_landing_cached_contained`,
+`storage_landing_cached_not_contained`, `storage_landing_probe_contained`,
+`storage_landing_probe_not_contained`, `storage_landing_probe_unproven`,
+`storage_landing_probe_timeout`, `storage_landing_budget_spent`,
+`storage_landing_tip_advanced` and `storage_landing_tip_reset`.
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
