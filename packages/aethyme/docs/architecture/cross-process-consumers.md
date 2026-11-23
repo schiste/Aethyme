@@ -2256,8 +2256,11 @@ Since 2026-11-23 a preparation never removes the retired store itself: it
 renames it, persists a storage-recovery request and starts the storage worker,
 whose sweep removes it (span `package_store_retired_handoff`, counters
 `package_store_retired_handed_to_worker` and
-`package_store_retired_handoff_failed`). `package_store_retired_removal` is
-now recorded only by sweeps.
+`package_store_retired_handoff_failed`), starting the worker once for the
+handed-off store and any refusal. A refusal after a handoff prints a `next:`
+line: rerun `aethyme broker submit prepare --session <id>` once the worker has
+freed space (`aethyme broker status --json` reports storage advice).
+`package_store_retired_removal` is now recorded only by sweeps.
 
 Mixed versions: binaries before this change compute different digests, so
 they never open a digest directory holding the new links; their unlink-based
@@ -3054,16 +3057,22 @@ the cache alone holds it alone only for recovery, the budget check and a
 rotation. Before its steps it releases the exclusive grant and takes a share
 through the same wait queue and unfinished-rotation probe as any sharing
 preparation; if the probe cannot rule out a rotation left unfinished in that
-gap, it takes the cache alone again and recovers before any step runs.
-`shared_cache_mode` still reports the mode the cache was taken in, and
+gap, it takes the cache alone again and recovers before any step runs (and
+forgets the background measurement, as after a rotation). Each of these
+acquisitions reclaims dead holders like the first one and waits at least
+10 s whatever is left of `--wait`, so a preparation that already checked the
+cache is not failed by a holder slipping into the gap (counter
+`shared_cache_downgrade_wait_floor` when the floor applied). On error the
+grant it holds is released best effort. `shared_cache_mode` still reports the mode the cache was taken in, and
 `shared_cache_wait_ms` includes the wait for the share. Metrics add the spans
 `shared_cache_exclusive_section` (from the exclusive grant to the share, or to
 release when the preparation never shares), `shared_cache_downgrade` and
 `shared_cache_downgrade_wait`, and the counters
 `shared_cache_downgraded_to_shared` and
 `shared_cache_downgrade_found_rotation`. A due (not overdue) budget check
-whose store already has a queued, running or backing-off background
-measurement, and no fresh result, no longer takes the cache alone for a
+whose store already has a background measurement queued or running, with
+no failed walks, no back-off ending more than 15 minutes out and queued less
+than 3 hours ago, and no fresh result, no longer takes the cache alone for a
 foreground inventory; it shares the cache and counts
 `shared_cache_budget_check_deferred_to_background`. The overdue check still
 waits for the cache alone.
@@ -4658,7 +4667,9 @@ It is never set when the caller's environment already has a non-empty
 `NODE_COMPILE_CACHE`, and a declared step environment still overrides it.
 The storage ledger classifies `node-compile-cache` in the host cache root as
 `tool_caches`: its daily children are evicted least recently used first under
-that class's budget once idle for its idle time (7 days). Deleting any of it
+that class's budget once idle for its idle time (7 days), and any daily
+directory unchanged for 14 days expires whatever the budget (Node.js never
+prunes it). Deleting any of it
 is safe; Node.js recreates and refills it. `[node] compile_cache = false` in
 `.aethyme/config.toml` (default `true`, same trust rule as the other
 repository policies, read once per process; an unreadable or invalid file

@@ -1789,3 +1789,55 @@ fn an_archive_repeating_one_commit_is_probed_once() {
     assert_eq!(prover.stats().probes, 1);
     assert_eq!(prover.stats().duplicate_commits, 1);
 }
+
+/// The Node.js compile cache's daily directories expire by age even while
+/// tool caches are under budget; other tool caches still go only when over.
+#[test]
+fn old_node_compile_cache_days_expire_while_tool_caches_are_under_budget() {
+    let now = super::now_ms();
+    let child = |name: &str, age_days: u64| super::Child {
+        name: name.into(),
+        bytes: 1024,
+        newest_ms: now - age_days * DAY_MS,
+        ctime_ms: 0,
+        created_ms: None,
+        min_retention_ms: None,
+        session_id: None,
+        kept: false,
+    };
+    let item = |name: &str, children: Vec<super::Child>| super::Item {
+        root: PathBuf::from("/host-cache"),
+        root_kind: RootKind::HostCache,
+        name: name.into(),
+        class: classify(RootKind::HostCache, name),
+        device: 0,
+        bytes: 2048,
+        measured: true,
+        entries: 2,
+        oldest_ms: 0,
+        newest_ms: now,
+        measured_at_ms: now,
+        children,
+        walk: None,
+    };
+    let ledger = super::Ledger {
+        items: vec![
+            item(
+                "node-compile-cache",
+                vec![child("d20400", 20), child("d20418", 1)],
+            ),
+            item("cargo", vec![child("registry", 20)]),
+        ],
+        ..super::Ledger::default()
+    };
+    let plan = evict::plan(&ledger, &Budgets::default(), now, &Default::default());
+    let planned: Vec<(&str, Reason)> = plan
+        .iter()
+        .map(|candidate| (candidate.relative.as_str(), candidate.reason))
+        .collect();
+    assert_eq!(
+        planned,
+        vec![("node-compile-cache/d20400", Reason::Expired)],
+        "{plan:?}"
+    );
+}

@@ -129,7 +129,7 @@ pub fn plan(
     let class_bytes = ledger.class_bytes();
     for item in ledger.items.iter().filter(|item| item.measured) {
         let pressing = aggressive.contains(&item.root_kind);
-        match policy(item.class) {
+        match super::entry_policy(item.class, &item.name) {
             Policy::ReportOnly(_) => {}
             Policy::ExpireEntry { age } => {
                 if item.newest_ms > 0 && now.saturating_sub(item.newest_ms) > duration_ms(age) {

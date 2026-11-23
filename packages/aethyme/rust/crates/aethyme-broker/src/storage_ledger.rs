@@ -294,6 +294,28 @@ pub fn policy(class: Class) -> Policy {
     }
 }
 
+/// How long a daily directory of the Node.js compile cache is kept, used or
+/// not: Node.js never prunes it, and a day's directory stops being written
+/// once the day is over.
+pub const NODE_COMPILE_CACHE_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How the top-level entry `name` of `class` is enforced: its class's
+/// policy, except that the Node.js compile cache's daily directories also
+/// expire by age, whatever the tool-cache budget.
+pub fn entry_policy(class: Class, name: &str) -> Policy {
+    match policy(class) {
+        Policy::LruChildren { idle, .. }
+            if class == Class::ToolCaches && name == crate::node_compile_cache::CACHE_DIRECTORY =>
+        {
+            Policy::LruChildren {
+                idle,
+                expire: Some(NODE_COMPILE_CACHE_EXPIRY),
+            }
+        }
+        policy => policy,
+    }
+}
+
 /// The budgets, from defaults and `<host state>/storage.toml` `[budget]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

@@ -1139,7 +1139,8 @@ max_concurrent = 2
     let second_id = second["id"].as_i64().unwrap().to_string();
 
     // The cache's budget was never checked, so the holder takes it alone to
-    // check it, then holds its step open.
+    // check it, then holds its step open. `--wait 0s`: trading the cache
+    // for a share must not spend a wait budget the holder does not have.
     std::fs::write(temp.path().join("hold"), "").unwrap();
     let holding = {
         let (repo, state, holder_id) = (temp.path().to_path_buf(), state.clone(), holder_id);
@@ -1147,7 +1148,15 @@ max_concurrent = 2
             run(
                 &repo,
                 &state,
-                &["submit", "prepare", "--session", &holder_id, "--json"],
+                &[
+                    "submit",
+                    "prepare",
+                    "--session",
+                    &holder_id,
+                    "--wait",
+                    "0s",
+                    "--json",
+                ],
             )
         })
     };
@@ -1188,6 +1197,9 @@ max_concurrent = 2
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|value| value["command"] == "prepare")
-        .any(|value| value["phase_counts"]["shared_cache_downgraded_to_shared"] == 1);
+        .any(|value| {
+            value["phase_counts"]["shared_cache_downgraded_to_shared"] == 1
+                && value["phase_counts"]["shared_cache_downgrade_wait_floor"] == 1
+        });
     assert!(downgraded, "{metrics}");
 }
