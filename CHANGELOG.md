@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.162] - 2026-11-23
+
+### Fixed
+
+- Routine `broker status` runs the GC service check. Routine status (the default compact form, `--summary`, `--session <id>`, `--since-revision`) is a read-only snapshot by design, and the check added in 0.8.160 and 0.8.161 was wired only into the writable route, so on a real host the command agents run never noticed a stale service binding. The check now runs after every form builds its view. A routine status itself still writes nothing to broker storage and delivers no advisory; on macOS, when the binding is stale or gone and the command is the installation's current router, it may start the one detached `broker gc service status`, bounded by the service's install lock and its backoff. A compatibility read-only open (a broker database newer than the binary) only classifies, counts and advises (#1961).
+- `broker gc service` commands are service administration, not session work: they no longer surface a session's advisories or unread notes, open the broker store writable for them, record a delivery, or downgrade a task lease. This keeps the background rebind started by a routine status from migrating broker storage or marking advisories delivered (#1961).
+
+### Added
+
+- Span `status_gc_service_runtime` and one mode count per status, `status_gc_service_check_may_repair` or `status_gc_service_check_read_only`, on every platform; outcome `gc_service_refresh_read_only`. The two read-only counts are not written to `command-metrics.jsonl`, because metric lines are recorded only in normal mode (#1961).
+
+### Upgrade notes
+
+- Running `broker gc service ...` by hand from a session worktree no longer prints that session's unread notes or advisories; `broker status` does.
+
+### Known issues
+
+- On macOS each release's runtime binary is a new code identity, so the scheduled GC service's first run after an update can wait on a privacy consent for a removable or protected volume. `broker gc service status` and `broker status` report it as a blocked tick with the action to take; scheduled sweeps stay stopped until the consent is given.
+
 ## [0.8.161] - 2026-11-23
 
 ### Fixed
