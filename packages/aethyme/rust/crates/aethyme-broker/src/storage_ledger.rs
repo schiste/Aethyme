@@ -229,7 +229,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
             "gates" => Class::GateCache,
             "symbol-index" => Class::SymbolIndex,
             "graph-stores" => Class::GraphStores,
-            "cargo" | "git-probe" | "update-manifests" => Class::ToolCaches,
+            "cargo"
+            | "git-probe"
+            | "update-manifests"
+            | crate::node_compile_cache::CACHE_DIRECTORY => Class::ToolCaches,
             "worktrees" => Class::Worktrees,
             _ => Class::Unclassified,
         },

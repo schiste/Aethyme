@@ -850,6 +850,7 @@ impl Broker {
     pub(crate) fn remember_command_temp_policy(&self, session_id: i64) -> bool {
         let enabled = crate::command_temp::CommandTempPolicy::load(self.main_root()).enabled;
         crate::command_temp::remember_enabled(session_id, enabled);
+        crate::node_compile_cache::remember_for_session(session_id, self.main_root());
         self.request_retirement_for_command_temps(session_id);
         enabled
     }

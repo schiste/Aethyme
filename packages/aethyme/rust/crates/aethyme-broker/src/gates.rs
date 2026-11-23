@@ -5845,6 +5845,13 @@ fn run_gate_command_inner(
     if let Some(temp) = &command_temp {
         temp.apply(&mut process);
     }
+    // One host-wide Node.js compile cache (`crate::node_compile_cache`).
+    if let Some((key, value)) = context
+        .session_id
+        .and_then(crate::node_compile_cache::environment_for_session)
+    {
+        process.env(key, value);
+    }
     // From the same reading the log header records, so a log always shows
     // the capacity the command sized itself on.
     match crate::gate_admission::idle_cpus(

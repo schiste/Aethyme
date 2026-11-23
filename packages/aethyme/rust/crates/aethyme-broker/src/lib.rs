@@ -156,6 +156,7 @@ pub mod mcp;
 mod measurement;
 mod merge;
 mod merge_chain;
+mod node_compile_cache;
 mod object_store;
 mod operation_stats;
 mod operations;

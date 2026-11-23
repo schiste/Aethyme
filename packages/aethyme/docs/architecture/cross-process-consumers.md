@@ -4649,6 +4649,26 @@ attachment gains `command_temps_retired` and `command_temps_kept`; the
 `session_scratch_usage` attachment gains `finished_runs` and
 `finished_run_bytes`.
 
+Since 2026-11-23 every gate, preparation step and guarded exec command the
+broker runs for a session also gets `NODE_COMPILE_CACHE` set to one host-wide
+directory, `<host cache>/node-compile-cache/d<days since the Unix epoch>`
+(created 0700; a new subdirectory each UTC day), so Node.js (22.1 and later)
+reuses V8 code cache across runs instead of compiling every module again.
+It is never set when the caller's environment already has a non-empty
+`NODE_COMPILE_CACHE`, and a declared step environment still overrides it.
+The storage ledger classifies `node-compile-cache` in the host cache root as
+`tool_caches`: its daily children are evicted least recently used first under
+that class's budget once idle for its idle time (7 days). Deleting any of it
+is safe; Node.js recreates and refills it. `[node] compile_cache = false` in
+`.aethyme/config.toml` (default `true`, same trust rule as the other
+repository policies, read once per process; an unreadable or invalid file
+keeps the default and counts `node_compile_cache_policy_invalid`) turns it
+off. Counters `node_compile_cache_set` (commands that got the variable),
+`node_compile_cache_caller_set`, `node_compile_cache_opted_out`,
+`node_compile_cache_unresolved`, `node_compile_cache_no_host_cache` and
+`node_compile_cache_create_failed`; spans `node_compile_cache_policy` and
+`node_compile_cache_prepare`. Brokered push hooks do not get it yet.
+
 **Scratch pass order, cursor and failure causes.** The scratch pass first
 classifies every record from its session's state, read for all records in
 one store query (`SELECT id, status, cleanup_state FROM sessions WHERE id IN

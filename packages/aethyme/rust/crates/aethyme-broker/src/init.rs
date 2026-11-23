@@ -638,6 +638,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("worktree_freshness", &["max_age_seconds"]),
     ("command_temp", &["enabled"]),
+    ("node", &["compile_cache"]),
     ("session", &["guidance"]),
     (
         "remote_branches",

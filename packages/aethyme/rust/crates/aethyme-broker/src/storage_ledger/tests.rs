@@ -110,6 +110,7 @@ fn only_exact_aethyme_names_are_classified_in_their_own_root() {
         ),
         (HostCache, "gates", GateCache),
         (HostCache, "symbol-index", SymbolIndex),
+        (HostCache, "node-compile-cache", ToolCaches),
         (
             WorktreeRoot,
             "aethyme-broker-quick-test-49725-17924098-4f64122b85fd1c82",
