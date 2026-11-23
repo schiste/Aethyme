@@ -1022,6 +1022,15 @@ const PATHS: [&str; 18] = [
     "a/b/c.txt/",
 ];
 
+/// What [`assert_tree_parity`] answers in-process for each valid revision of
+/// a [`tree_shaped`] commit: 4 of the 7 stems (the tree, the submodule and,
+/// on Unix, the symlink fall back), 9 of the 18 files and 12 of the 18
+/// existence checks.
+const ANSWERED_PER_REVISION: usize = if cfg!(unix) { 25 } else { 26 };
+/// What it answers for the configuration blob: every limit but the one a
+/// byte short of its size.
+const ANSWERED_PER_CONFIG_BLOB: usize = 3;
+
 /// Compare every committed-configuration read on `root` at each revision;
 /// return how many were answered in-process.
 fn assert_tree_parity(root: &Path, revisions: &[&str], blobs: &[&str]) -> usize {
@@ -1065,7 +1074,9 @@ fn assert_tree_parity(root: &Path, revisions: &[&str], blobs: &[&str]) -> usize 
         }
     }
     for blob in blobs {
-        for limit in [64, 4 * 1024 * 1024] {
+        // The configuration blob is 24 bytes: Git accepts output of exactly
+        // the limit and refuses one byte more.
+        for limit in [23, 24, 64, 4 * 1024 * 1024] {
             if let Ok(value) =
                 in_process_only(root, ReadKind::BlobBytes, |git| git.blob_bytes(blob, limit))
             {
@@ -1096,7 +1107,11 @@ fn tree_entries_files_and_blobs_match_the_program() {
         missing,
         "HEAD:.aethyme/config.toml",
     ];
-    assert!(assert_tree_parity(root, &revisions, &blobs) > 0);
+    assert_eq!(
+        assert_tree_parity(root, &revisions, &blobs),
+        3 * ANSWERED_PER_REVISION + ANSWERED_PER_CONFIG_BLOB,
+        "only the documented cases fall back"
+    );
 
     let entries = |stem: &str| {
         let paths = aethyme_config::candidate_relpaths(stem).to_vec();
@@ -1183,6 +1198,12 @@ fn tree_entries_files_and_blobs_match_the_program() {
         Ok(b"[git]\nin_process = true\n".to_vec())
     );
     assert_eq!(
+        blob(&tree.config_blob, 24),
+        Ok(b"[git]\nin_process = true\n".to_vec()),
+        "a blob of exactly the limit is read"
+    );
+    assert_eq!(blob(&tree.config_blob, 23), Err(Fallback::TooLarge));
+    assert_eq!(
         blob(&tree.big_blob, 4 * 1024 * 1024),
         Err(Fallback::TooLarge)
     );
@@ -1222,7 +1243,10 @@ fn committed_configuration_reads_in_linked_worktrees_and_alternates() {
             &tree.commit,
         ],
     );
-    assert!(assert_tree_parity(&linked, &revisions, &blobs) > 0);
+    assert_eq!(
+        assert_tree_parity(&linked, &revisions, &blobs),
+        2 * ANSWERED_PER_REVISION + ANSWERED_PER_CONFIG_BLOB
+    );
     assert_eq!(symbolic(&linked, "HEAD"), Ok(None));
     assert_origin_parity(&linked);
 
@@ -1238,7 +1262,10 @@ fn committed_configuration_reads_in_linked_worktrees_and_alternates() {
         ],
     );
     assert!(shared.join(".git/objects/info/alternates").is_file());
-    assert!(assert_tree_parity(&shared, &revisions, &blobs) > 0);
+    assert_eq!(
+        assert_tree_parity(&shared, &revisions, &blobs),
+        2 * ANSWERED_PER_REVISION + ANSWERED_PER_CONFIG_BLOB
+    );
     // The clone's own `origin/HEAD` names the source's `main`.
     assert_eq!(
         origin_default(&shared),
@@ -1493,5 +1520,255 @@ fn non_utf8_names_beside_configuration_are_skipped_like_git() {
     git(root, &["add", ".aethyme"]);
     git(root, &["commit", "-qm", "odd name"]);
     let blobs = [tree.config_blob.as_str()];
-    assert!(assert_tree_parity(root, &["HEAD"], &blobs) > 0);
+    // Adding the directory stages the submodule's removal (it has no
+    // checkout): the `environments` stem, its file and its existence check,
+    // and the path below it, are then answered as absent.
+    let submodule = git(
+        root,
+        &["ls-tree", "HEAD", "--", ".aethyme/environments.toml"],
+    );
+    let per_revision = if submodule.is_empty() {
+        ANSWERED_PER_REVISION + 5
+    } else {
+        ANSWERED_PER_REVISION
+    };
+    assert_eq!(
+        assert_tree_parity(root, &["HEAD"], &blobs),
+        per_revision + ANSWERED_PER_CONFIG_BLOB
+    );
+}
+
+#[test]
+fn non_ascii_paths_are_left_to_git() {
+    // Git may compose a decomposed argument (`core.precomposeUnicode`) before
+    // the lookup, so neither spelling is compared byte for byte here.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let tree = tree_shaped(root);
+    let composed = "caf\u{e9}.toml";
+    let decomposed = "cafe\u{301}.toml";
+    std::fs::write(root.join(".aethyme").join(composed), "composed\n").unwrap();
+    git(root, &["add", &format!(".aethyme/{composed}")]);
+    git(root, &["commit", "-qm", "non-ASCII name"]);
+    let program = ProgramRead { root };
+    let repo = GitRepo::discover(root).unwrap();
+    for name in [composed, decomposed] {
+        let path = format!(".aethyme/{name}");
+        assert_eq!(
+            in_process_only(root, ReadKind::FileAtRevision, |git| git
+                .file_at_revision("HEAD", &path)),
+            Err(Fallback::NonAsciiPath),
+            "{path}"
+        );
+        assert_eq!(
+            in_process_only(root, ReadKind::PathExistsAt, |git| git
+                .path_exists_at("HEAD", &path)),
+            Err(Fallback::NonAsciiPath),
+            "{path}"
+        );
+        let paths = vec![path.clone()];
+        assert_eq!(
+            in_process_only(root, ReadKind::ConfigTreeEntries, |git| git
+                .config_tree_entries("HEAD", &paths)),
+            Err(Fallback::NonAsciiPath),
+            "{path}"
+        );
+        // Through the seam, Git answers exactly as before.
+        let head = git(root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            repo.file_at_commit(&head, &path).unwrap(),
+            program.file_at_revision(&head, &path).unwrap(),
+            "{path}"
+        );
+        assert_eq!(
+            repo.path_exists_at("HEAD", &path).unwrap(),
+            program.path_exists_at("HEAD", &path).unwrap(),
+            "{path}"
+        );
+    }
+    // An ASCII path in the same tree is still answered.
+    assert_eq!(
+        in_process_only(root, ReadKind::FileAtRevision, |git| git
+            .file_at_revision(&tree.commit, ".aethyme/config.toml")),
+        Ok(Some("[git]\nin_process = true".into()))
+    );
+}
+
+/// The `git_read` count of `key`, zero when absent.
+fn read_count(reads: &serde_json::Value, key: &str) -> u64 {
+    reads[key]["count"].as_u64().unwrap_or(0)
+}
+
+/// Every `<kind>.fallback.*` key recorded for `kind`.
+fn fallbacks(reads: &serde_json::Value, kind: &str) -> Vec<String> {
+    let prefix = format!("{kind}.fallback.");
+    reads
+        .as_object()
+        .map(|reads| {
+            reads
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The program-path tests (`promote_mode`, `broker`, `integration_drift`,
+/// `status_observation`) bound these loads through Git's trace; the same
+/// loads answered in-process are bounded here through the counters.
+#[test]
+fn promotion_policy_loads_read_committed_configuration_once_each_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::create_dir(root.join(".aethyme")).unwrap();
+    let config = root.join(".aethyme/config.toml");
+    std::fs::write(&config, "[promote]\nmode = \"manual\"\n").unwrap();
+    git(root, &["add", ".aethyme/config.toml"]);
+    git(root, &["commit", "-qm", "manual policy"]);
+    let first = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(&config, "[promote]\nmode = \"verify-only\"\n").unwrap();
+    git(root, &["add", ".aethyme/config.toml"]);
+    git(root, &["commit", "-qm", "verify policy"]);
+    let next = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["update-ref", "refs/remotes/origin/main", &first]);
+    git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        assert_eq!(
+            crate::PromoteConfig::load(root)
+                .ignored_promotion_setting
+                .as_deref(),
+            Some("mode = \"manual\"")
+        );
+        git(root, &["update-ref", "refs/remotes/origin/main", &next]);
+        assert_eq!(
+            crate::PromoteConfig::load(root).ignored_promotion_setting,
+            None
+        );
+        std::fs::write(&config, "[promote]\nmode = \"auto\"\n").unwrap();
+        assert_eq!(
+            crate::PromoteConfig::load(root).ignored_promotion_setting,
+            None
+        );
+    }
+    let reads = recorder.attachments().remove("git_read").unwrap();
+    assert_eq!(
+        (
+            read_count(&reads, "config_tree_entries.answered"),
+            read_count(&reads, "blob_bytes.answered"),
+            read_count(&reads, "origin_head_default.answered"),
+        ),
+        (3, 3, 3),
+        "each policy load resolves the current default and reads committed content once: {reads}"
+    );
+    for kind in ["config_tree_entries", "blob_bytes", "origin_head_default"] {
+        assert!(fallbacks(&reads, kind).is_empty(), "{kind}: {reads}");
+    }
+}
+
+#[test]
+fn a_status_summary_reads_committed_configuration_once_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    let config = root.join(".aethyme/config.toml");
+    std::fs::create_dir(root.join(".aethyme")).unwrap();
+    std::fs::write(
+        &config,
+        "[promote]\nmode = \"verify-only\"\nbranch = \"review/integration\"\n",
+    )
+    .unwrap();
+    git(root, &["add", "-f", ".aethyme/config.toml"]);
+    git(root, &["commit", "-qm", "committed promote policy"]);
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(root, &["config", "remote.origin.url", "."]);
+    git(
+        root,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(root, &["config", "branch.main.remote", "origin"]);
+    git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+    // The working copy conflicts; the summary must use the committed policy.
+    std::fs::write(
+        &config,
+        "[promote]\nmode = \"auto\"\nbranch = \"working/integration\"\n",
+    )
+    .unwrap();
+    let mut broker = crate::Broker::open(root).unwrap();
+    broker.adopt(root, Some("summary config task")).unwrap();
+    let recorder = crate::phase_telemetry::Recorder::default();
+    let brief = {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        broker.status_brief(now).unwrap()
+    };
+    assert!(
+        brief
+            .summary
+            .message
+            .contains("verify-only: submit does not move integration"),
+        "{}",
+        brief.summary.message
+    );
+    let reads = recorder.attachments().remove("git_read").unwrap();
+    assert_eq!(
+        (
+            read_count(&reads, "config_tree_entries.answered"),
+            read_count(&reads, "blob_bytes.answered"),
+        ),
+        (1, 1),
+        "one summary performs one committed-config tree and blob read: {reads}"
+    );
+    for kind in ["config_tree_entries", "blob_bytes"] {
+        assert!(fallbacks(&reads, kind).is_empty(), "{kind}: {reads}");
+    }
+}
+
+#[test]
+fn doctor_reads_committed_configuration_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
+    let base = commit(root, "README.md", "fixture");
+    git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", &base],
+    );
+    git(root, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(root, &["config", "remote.origin.url", "."]);
+    git(root, &["config", "branch.main.remote", "origin"]);
+    git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+    let mut broker = crate::Broker::open(root).unwrap();
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        broker.doctor().unwrap();
+    }
+    let reads = recorder.attachments().remove("git_read").unwrap();
+    assert!(
+        read_count(&reads, "config_tree_entries.answered") >= 1,
+        "doctor inspects committed configuration: {reads}"
+    );
+    assert!(
+        fallbacks(&reads, "config_tree_entries").is_empty(),
+        "{reads}"
+    );
 }

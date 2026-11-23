@@ -39,7 +39,10 @@
 //!   tree, a submodule, an unusual mode), and a tree Git could read
 //!   differently (entries out of order, a repeated name, a name with a slash)
 //!   fall back. A blob larger than the caller's limit falls back, so Git
-//!   reports the limit as before.
+//!   reports the limit as before. A path with any non-ASCII byte falls back:
+//!   with `core.precomposeUnicode` (the macOS default) Git rewrites a
+//!   decomposed argument to its composed form before the lookup, which a
+//!   byte comparison would not match.
 //!
 //! `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`, `on` or `yes`,
 //! and `[git] in_process = false` in the main checkout's
@@ -168,6 +171,9 @@ pub(crate) enum Fallback {
     /// A path with empty, `.` or `..` components, or other syntax this module
     /// does not look up.
     UnsupportedPath,
+    /// A path with a non-ASCII byte: Git may rewrite it to another Unicode
+    /// normalization (`core.precomposeUnicode`) before looking it up.
+    NonAsciiPath,
     /// A leading path component exists but is not a tree.
     PathThroughNonTree,
     /// The entry is a tree, a submodule, or has a mode the caller does not
@@ -207,6 +213,7 @@ impl Fallback {
             Self::BrokenRef => "broken_ref",
             Self::TagTypeMismatch => "tag_type_mismatch",
             Self::UnsupportedPath => "unsupported_path",
+            Self::NonAsciiPath => "non_ascii_path",
             Self::PathThroughNonTree => "path_through_non_tree",
             Self::NotARegularFile => "not_a_regular_file",
             Self::MalformedTree => "malformed_tree",
@@ -242,7 +249,8 @@ pub(crate) trait GitRead {
         commit: &str,
         paths: &[String],
     ) -> Result<BTreeMap<String, String>, Self::Error>;
-    /// `git cat-file blob <object>`, at most `limit` bytes.
+    /// `git cat-file blob <object>`: a blob of more than `limit` bytes is
+    /// Git's to refuse.
     fn blob_bytes(&self, object: &str, limit: usize) -> Result<Vec<u8>, Self::Error>;
     /// `git cat-file -e <rev>:<path>`, then `git show <rev>:<path>` as lossy
     /// UTF-8 without trailing whitespace; `None` when the first fails.
@@ -581,6 +589,16 @@ impl InProcess {
         Err(Fallback::UnsupportedPath)
     }
 
+    /// The kind of a local object, without reading it.
+    fn object_kind(&self, id: gix::ObjectId) -> Result<gix::objs::Kind, Fallback> {
+        Ok(self
+            .repo
+            .try_find_header(id)
+            .map_err(|_| Fallback::Gix)?
+            .ok_or(Fallback::ObjectMissing)?
+            .kind())
+    }
+
     /// Kind and size of a local blob, without reading it.
     fn blob_size(&self, id: gix::ObjectId) -> Result<u64, Fallback> {
         let header = self
@@ -711,7 +729,7 @@ impl GitRead for InProcess {
             gix::refs::TargetRef::Object(id) => id.to_owned(),
             gix::refs::TargetRef::Symbolic(_) => return Err(Fallback::Unresolved),
         };
-        if self.object(id)?.kind != gix::objs::Kind::Commit {
+        if self.object_kind(id)? != gix::objs::Kind::Commit {
             return Err(Fallback::NotACommit);
         }
         Ok(Some((short, id.to_string())))
@@ -744,7 +762,7 @@ impl GitRead for InProcess {
         let Spec::Id(id) = classify(object)? else {
             return Err(Fallback::UnsupportedSpec);
         };
-        if self.blob_size(id)? >= limit as u64 {
+        if self.blob_size(id)? > limit as u64 {
             return Err(Fallback::TooLarge);
         }
         Ok(self.object(id)?.detach().data)
@@ -876,11 +894,14 @@ fn symbolic_target_name(target: &[u8]) -> Result<String, Fallback> {
     }
 }
 
-/// The components of a repository-relative path, each non-empty and neither
-/// `.` nor `..`.
+/// The components of a repository-relative ASCII path, each non-empty and
+/// neither `.` nor `..`.
 fn path_components(path: &str) -> Result<Vec<&str>, Fallback> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains(['\\', ':', '\0']) {
         return Err(Fallback::UnsupportedPath);
+    }
+    if !path.is_ascii() {
+        return Err(Fallback::NonAsciiPath);
     }
     let components = path.split('/').collect::<Vec<_>>();
     if components

@@ -533,7 +533,9 @@ and `cat-file blob` of the selected file
   exists but is not a tree, a final entry that is a tree, a submodule or (for
   the tree listing) any mode but `100644` and `100755`, a tree whose entries
   are out of Git's order or repeat a name, a path with empty, `.` or `..`
-  components, a blob larger than the caller reads (4 MiB for configuration,
+  components, a path with any non-ASCII byte (Git composes a decomposed
+  argument under `core.precomposeUnicode`, the macOS default, before the
+  lookup), a blob larger than the caller reads (4 MiB for configuration,
   64 MiB for a whole file) and a missing blob or tree (a partial clone) go to
   `git`. Inherited `GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
   `GIT_NOGLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` send every query to `git`.
@@ -552,6 +554,7 @@ and `cat-file blob` of the selected file
   `history_override`, `unsupported_spec`, `not_found`, `root_file_shadow`,
   `unresolved`, `object_missing`, `not_a_commit`, `concurrent_ref_update`,
   `gix`, `panic`, `broken_ref`, `tag_type_mismatch`, `unsupported_path`,
+  `non_ascii_path`,
   `path_through_non_tree`, `not_a_regular_file`, `malformed_tree`,
   `not_a_blob`, `too_large`, `unexpected_target`. Each answered query is one
   `subprocess_git` fewer (`file_at_revision` two: `cat-file -e` and `show`).
