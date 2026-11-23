@@ -530,11 +530,14 @@ fn change_time(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// The config files' stamps when last read, and whether they switch off.
+type ConfigSwitch = (Vec<FileStamp>, bool);
+
 /// `[git] in_process = false` in the main checkout's `.aethyme/config.toml`
 /// (or its YAML twin). Re-read whenever one of the files changes; an
 /// unreadable or invalid file leaves every query to Git.
 fn configured_off(common_dir: &Path) -> bool {
-    static SWITCHES: Mutex<Option<HashMap<PathBuf, (Vec<FileStamp>, bool)>>> = Mutex::new(None);
+    static SWITCHES: Mutex<Option<HashMap<PathBuf, ConfigSwitch>>> = Mutex::new(None);
     // A linked worktree names its common directory relatively (`../..`).
     let Ok(common_dir) = std::fs::canonicalize(common_dir) else {
         return true;

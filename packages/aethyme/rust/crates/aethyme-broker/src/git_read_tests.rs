@@ -309,6 +309,8 @@ fn shallow_and_partial_clones_never_answer_from_missing_history() {
     );
     assert_parity(&shallow, &specs(&shape));
 
+    // The source's `treetag` names a tree directly, which a tree-less clone
+    // must send; clone only `main`, without tags.
     let treeless = dir.path().join("treeless");
     git(
         dir.path(),
@@ -317,6 +319,8 @@ fn shallow_and_partial_clones_never_answer_from_missing_history() {
             "-q",
             "--no-checkout",
             "--filter=tree:0",
+            "--single-branch",
+            "--no-tags",
             &url,
             treeless.to_str().unwrap(),
         ],
@@ -335,6 +339,8 @@ fn shallow_and_partial_clones_never_answer_from_missing_history() {
             "-q",
             "--no-checkout",
             "--filter=blob:none",
+            "--single-branch",
+            "--no-tags",
             &url,
             blobless.to_str().unwrap(),
         ],
@@ -421,7 +427,7 @@ fn a_ref_rewritten_during_reads_is_never_absent() {
                     &root,
                     &["update-ref", "refs/heads/race", &values[round % 2]],
                 );
-                if round % 3 == 0 {
+                if round.is_multiple_of(3) {
                     git(&root, &["pack-refs", "--all", "--prune"]);
                 }
                 round += 1;
