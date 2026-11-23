@@ -521,12 +521,24 @@ fn candidate_evidence(
     Ok((Some(artifact["sources"].clone()), links))
 }
 
+#[cfg(test)]
 fn evidence_capabilities(
     policy: &Value,
     change: &Value,
     checks: &BTreeMap<&str, &Value>,
     sources: Option<&Value>,
     links: Option<&Value>,
+) -> Result<(), &'static str> {
+    evidence_capabilities_with_mode(policy, change, checks, sources, links, false)
+}
+
+fn evidence_capabilities_with_mode(
+    policy: &Value,
+    change: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    sources: Option<&Value>,
+    links: Option<&Value>,
+    plain_text_paragraphs: bool,
 ) -> Result<(), &'static str> {
     let entries = change["entries"].as_array().ok_or("invalid entries")?;
     let gates = policy["gates"].as_array().ok_or("invalid gates")?;
@@ -555,6 +567,26 @@ fn evidence_capabilities(
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
                 "link_reachability" => links.and_then(|v| v["entries"].get(entity)).is_none(),
                 "literal_markdown_links" => entry["media_type"] != "text/html",
+                "paragraph_count"
+                | "paragraph_length"
+                | "paragraph_character_length"
+                | "repeated_paragraph_openings"
+                | "repeated_sentence_openings"
+                | "sentence_opening_window"
+                | "sentence_opening_terms"
+                | "repeated_punctuation"
+                | "trailing_ing_clause"
+                | "similar_sentence_lengths"
+                | "sentence_length_variance"
+                | "inline_triple_candidates"
+                | "duplicate_paragraphs" => {
+                    entry["media_type"] == "text/plain" && !plain_text_paragraphs
+                }
+                "sentence_length" | "sentence_character_length" => {
+                    gate["paragraphs_only"] == true
+                        && entry["media_type"] == "text/plain"
+                        && !plain_text_paragraphs
+                }
                 "required_metadata" | "metadata_length" | "metadata_age" => {
                     entry.get("metadata").is_none_or(Value::is_null)
                 }
@@ -618,6 +650,10 @@ pub fn compare(
     let change = parse_change(input.change)?;
     let candidate = overlay(input.base, input.change, input.after)?;
     let policy = parse_unique(input.resolved_policy)?;
+    let options = parse_unique(input.host_options)?;
+    let plain_text_paragraphs = options["plain_text_paragraphs"]
+        .as_bool()
+        .ok_or("invalid host paragraph option")?;
     if let Some(bytes) = input.collection {
         validate_collection(bytes, &candidate, &change)?;
     }
@@ -712,7 +748,14 @@ pub fn compare(
             input.collection.is_some(),
             &checks,
         )?);
-        evidence_capabilities(&policy, &change, &checks, sources.as_ref(), links.as_ref())?;
+        evidence_capabilities_with_mode(
+            &policy,
+            &change,
+            &checks,
+            sources.as_ref(),
+            links.as_ref(),
+            plain_text_paragraphs,
+        )?;
         for id in &required {
             if !checks
                 .get(id)
@@ -1028,6 +1071,70 @@ mod tests {
         assert!(closed_verdict(&verdict["verdict"]).is_err());
     }
     #[test]
+    fn paragraph_checks_respect_host_mode_and_sentence_scope() {
+        for kind in [
+            "paragraph_count",
+            "sentence_length",
+            "sentence_character_length",
+        ] {
+            for paragraphs_only in [false, true] {
+                let policy =
+                    json!({"gates":[{"id":"p","kind":kind,"paragraphs_only":paragraphs_only}]});
+                for media in ["text/plain", "text/markdown", "text/html"] {
+                    let change =
+                        json!({"entries":[{"entity_id":"article","media_type":media,"after":{}}]});
+                    let check = json!({"status":"passed"});
+                    let checks = BTreeMap::from([("gate:7:article:p", &check)]);
+                    for enabled in [false, true] {
+                        assert_eq!(
+                            evidence_capabilities_with_mode(
+                                &policy, &change, &checks, None, None, enabled
+                            )
+                            .is_ok(),
+                            media != "text/plain"
+                                || enabled
+                                || (kind != "paragraph_count" && !paragraphs_only),
+                            "{kind} {media} {paragraphs_only} {enabled}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_plain_paragraphs_cannot_be_reported_as_checked() {
+        for kind in [
+            "paragraph_count",
+            "paragraph_length",
+            "paragraph_character_length",
+            "repeated_paragraph_openings",
+            "repeated_sentence_openings",
+            "sentence_opening_window",
+            "sentence_opening_terms",
+            "repeated_punctuation",
+            "trailing_ing_clause",
+            "similar_sentence_lengths",
+            "sentence_length_variance",
+            "inline_triple_candidates",
+            "duplicate_paragraphs",
+        ] {
+            let policy = json!({"gates":[{"id":"p","kind":kind}]});
+            let change =
+                json!({"entries":[{"entity_id":"article","media_type":"text/plain","after":{}}]});
+            for status in ["passed", "failed", "not_checked"] {
+                let check = json!({"status":status});
+                let checks = BTreeMap::from([("gate:7:article:p", &check)]);
+                assert_eq!(
+                    evidence_capabilities(&policy, &change, &checks, None, None).is_ok(),
+                    status == "not_checked",
+                    "{kind} {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn missing_metadata_cannot_be_reported_as_checked() {
         for kind in ["required_metadata", "metadata_length", "metadata_age"] {
             let policy = json!({"gates":[{"id":"meta","kind":kind}]});
@@ -1284,6 +1391,37 @@ mod tests {
             ),
             Err("candidate gate cannot execute without required evidence")
         );
+    }
+
+    #[test]
+    fn portable_comparator_binds_plain_paragraph_option() {
+        for enabled in [false, true] {
+            let (v, base, after, mut verdict) = fixture();
+            let mut input = inputs(&v, &base, &after);
+            let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+            policy["gates"][0]["kind"] = json!("paragraph_count");
+            let policy_bytes = serde_json::to_vec(&policy).unwrap();
+            input.resolved_policy = &policy_bytes;
+            let mut options: Value = serde_json::from_slice(input.host_options).unwrap();
+            options["plain_text_paragraphs"] = json!(enabled);
+            let option_bytes = serde_json::to_vec(&options).unwrap();
+            input.host_options = &option_bytes;
+            let candidate = overlay(&base, input.change, &after).unwrap();
+            let hash = candidate_binding(&CandidateArtifacts {
+                change: input.change,
+                resolved_policy: input.resolved_policy,
+                host_options: input.host_options,
+                evaluator: input.evaluator_identity,
+                collection: None,
+                external_evidence: None,
+                base_revision_sha256: snapshot_digest(&base).unwrap(),
+                candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+            })
+            .unwrap();
+            verdict["binding_sha256"] =
+                json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            assert_eq!(run(&verdict, &verdict, &input), enabled);
+        }
     }
 
     #[test]
