@@ -1927,6 +1927,38 @@ fn reconciliation_disposition(
     }
 }
 
+/// Whether the recorded process and every member of its process group are
+/// proven gone: the pid is absent or now belongs to a process with another
+/// start token, and a signal-zero probe of the group answers `ESRCH`, with
+/// the identity checked again after the group probe, as marker
+/// reconciliation proves a producer gone. A recorded identity without a
+/// usable start token, a process that cannot be inspected, a group still
+/// present (or one that reused the id), and every non-Unix host prove
+/// nothing. Sends no signal.
+pub(crate) fn process_and_group_proven_gone(process: &ProcessStartIdentity) -> bool {
+    if validate_reconciliation_process_identity(process).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if !matches!(
+            observe_process_identity(process),
+            ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused
+        ) {
+            return false;
+        }
+        let process_group_absent = crate::gates::gate_process_group_absent(process.process_group);
+        process_and_group_proof_allows_removal(
+            observe_process_identity(process),
+            process_group_absent,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessIdentityObservation {
     Absent,

@@ -1142,30 +1142,12 @@ impl OwnedProbeChild {
     }
 
     fn leader_exited_without_reaping(&mut self) -> io::Result<bool> {
-        // SAFETY: an all-zero siginfo_t is a valid output buffer for waitid.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: this invocation owns the unreaped child and uses WNOWAIT to
-        // observe its exit without releasing the process-group identity.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id(),
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == 0 {
-            return Ok(info.si_signo != 0);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        // ECHILD means another waiter released our process-group anchor.
-        // Other waitid failures do not reap, so Drop can still clean up
-        // while this Child remains the sole owner.
-        self.ownership_uncertain = error.raw_os_error() == Some(libc::ECHILD);
-        Err(error)
+        leader_exited_unreaped(self.child.id()).inspect_err(|error| {
+            // ECHILD means another waiter released our process-group anchor.
+            // Other waitid failures do not reap, so Drop can still clean up
+            // while this Child remains the sole owner.
+            self.ownership_uncertain = error.raw_os_error() == Some(libc::ECHILD);
+        })
     }
 
     /// After the leader exited (observed with `WNOWAIT`, so it is still
@@ -1366,6 +1348,267 @@ impl Drop for OwnedProbeChild {
     }
 }
 
+/// Whether the unreaped child `pid` has exited, observed with `WNOWAIT` so
+/// the child stays unreaped: its zombie keeps reserving its process-group id,
+/// so a group it leads can still be signalled without reaching a group that
+/// reused the id. An interrupted probe answers `false`.
+#[cfg(unix)]
+fn leader_exited_unreaped(pid: u32) -> io::Result<bool> {
+    // SAFETY: an all-zero siginfo_t is a valid output buffer for waitid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the caller owns the unreaped child and WNOWAIT observes its
+    // exit without releasing the process-group identity.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == 0 {
+        return Ok(info.si_signo != 0);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// How long a deadline-expired child that leads its own process group gets
+/// to exit on `SIGTERM` before its whole group is sent `SIGKILL`. Git exits
+/// at once on `SIGTERM`; the bound only matters for a child that ignores it.
+#[cfg(unix)]
+const DEADLINE_GROUP_TERM_GRACE: Duration = Duration::from_millis(500);
+
+/// Whether this process is the foreground process group of a controlling
+/// terminal, where a child may prompt (Git's credential prompt and `ssh`
+/// read `/dev/tty`). A child moved into a group of its own would be a
+/// background job there and be stopped by `SIGTTIN` on that read instead of
+/// prompting. Without a controlling terminal (agents, CI) or from a
+/// background job, a prompt could not be answered anyway.
+#[cfg(unix)]
+fn foreground_of_controlling_terminal() -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(test)]
+    if TERMINAL_CHECK_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    let Ok(terminal) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")
+    else {
+        return false;
+    };
+    // SAFETY: tcgetpgrp reads the terminal's foreground group from a valid,
+    // open descriptor; getpgrp reads this process's group. Neither changes
+    // any state.
+    let foreground = unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) };
+    // SAFETY: as above.
+    foreground > 0 && foreground == unsafe { libc::getpgrp() }
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static TERMINAL_CHECK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `operation` as if this process had no controlling terminal, so a test
+/// started from a terminal still exercises process-group cleanup. Applies to
+/// the calling thread only.
+#[cfg(all(unix, test))]
+pub(crate) fn without_terminal_check<T>(operation: impl FnOnce() -> T) -> T {
+    let previous = TERMINAL_CHECK_OFF.with(|off| off.replace(true));
+    let result = operation();
+    TERMINAL_CHECK_OFF.with(|off| off.set(previous));
+    result
+}
+
+/// Poll until `pid` is absent (`ESRCH`), up to `wait`. A killed orphan is
+/// reaped by its new parent shortly after it dies.
+#[cfg(all(unix, test))]
+pub(crate) fn process_gone_within(pid: i32, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: signal zero only checks whether the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Make the child `command` spawns lead a process group of its own, so that
+/// [`stop_deadline_child`] stops everything it started (Git's `pack-objects`,
+/// `index-pack`, remote helpers, `ssh`, hook processes) and not only the
+/// child. Returns whether it will.
+///
+/// Unix only. It is skipped, and the child stays in this process's group as
+/// before, when this process is the foreground of a controlling terminal (see
+/// [`foreground_of_controlling_terminal`]): there an interactive prompt must
+/// keep working. Descendants that start a session or group of their own are
+/// outside any group cleanup.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn lead_own_process_group(command: &mut Command) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        if foreground_of_controlling_terminal() {
+            crate::phase_telemetry::add("deadline_group_kept_foreground_terminal", Duration::ZERO);
+            return false;
+        }
+        command.process_group(0);
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Poll a deadline-bound child for exit. Without an owned group this is
+/// `try_wait`. With one ([`lead_own_process_group`]) an exit is observed
+/// without reaping and the leader is reaped only once `reap` is true (the
+/// caller has drained its output): until then its zombie keeps the group id
+/// reserved, so [`stop_deadline_child`] can still signal the group at the
+/// deadline. `Ok(None)` is "still running, or exited and not yet reaped".
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn poll_deadline_child(
+    child: &mut Child,
+    owned_group: bool,
+    reap: bool,
+) -> io::Result<Option<ExitStatus>> {
+    #[cfg(unix)]
+    if owned_group {
+        if !reap || !leader_exited_unreaped(child.id())? {
+            return Ok(None);
+        }
+        return child.wait().map(Some);
+    }
+    child.try_wait()
+}
+
+/// Stop a child whose deadline expired, and reap it. The caller must not
+/// have reaped it.
+///
+/// Without an owned group only the child is killed, as before. With one,
+/// the whole group gets `SIGTERM`, the leader gets
+/// [`DEADLINE_GROUP_TERM_GRACE`] to exit, and the group then gets `SIGKILL`
+/// for any member that ignored or outlived the `SIGTERM`. Both signals are
+/// sent while the unreaped leader, or its zombie, still reserves the group
+/// id, and only then is the leader reaped. Counted by how the leader ended
+/// (`deadline_group_kill_*`, see `cross-process-consumers.md`).
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn stop_deadline_child(child: &mut Child, owned_group: bool) -> io::Result<ExitStatus> {
+    #[cfg(unix)]
+    if owned_group {
+        return stop_owned_deadline_group(child);
+    }
+    if child.kill().is_err() {
+        crate::phase_telemetry::add("deadline_child_kill_failed", Duration::ZERO);
+    }
+    child.wait()
+}
+
+#[cfg(unix)]
+fn stop_owned_deadline_group(child: &mut Child) -> io::Result<ExitStatus> {
+    let _span = crate::phase_telemetry::span("deadline_group_stop");
+    let process_group = child.id() as i32;
+    stop_owned_deadline_group_with(child, process_group, leader_exited_unreaped)
+}
+
+/// [`stop_owned_deadline_group`] with the exit probe injected, so tests can
+/// make it fail. Only `ECHILD` from the probe means the leader was reaped
+/// elsewhere and may no longer reserve the group id: from then on no group
+/// signal is sent. Any other probe error leaves the child unreaped, so it
+/// still anchors its group and the group is still stopped.
+#[cfg(unix)]
+fn stop_owned_deadline_group_with(
+    child: &mut Child,
+    process_group: i32,
+    mut exited: impl FnMut(u32) -> io::Result<bool>,
+) -> io::Result<ExitStatus> {
+    let unanchored = |error: &io::Error| error.raw_os_error() == Some(libc::ECHILD);
+    let already_exited = match exited(child.id()) {
+        Ok(exited) => exited,
+        Err(error) if unanchored(&error) => {
+            // Reaped elsewhere: signalling the group could reach a group
+            // that reused the id. Signal nothing; the wait returns at once.
+            crate::phase_telemetry::add("deadline_group_kill_unanchored", Duration::ZERO);
+            return child.wait().map_err(|_| error);
+        }
+        Err(_) => {
+            // Not reaped, so still anchored: stop it as if still running.
+            crate::phase_telemetry::add("deadline_group_exit_probe_failed", Duration::ZERO);
+            false
+        }
+    };
+    signal_deadline_group(process_group, libc::SIGTERM);
+    let mut exited_on_term = false;
+    if !already_exited {
+        let grace_end = Instant::now() + DEADLINE_GROUP_TERM_GRACE;
+        while Instant::now() < grace_end {
+            std::thread::sleep(Duration::from_millis(10));
+            match exited(child.id()) {
+                Ok(true) => {
+                    exited_on_term = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) if unanchored(&error) => {
+                    crate::phase_telemetry::add("deadline_group_kill_unanchored", Duration::ZERO);
+                    return child.wait().map_err(|_| error);
+                }
+                // Not reaped: keep waiting out the grace, then SIGKILL.
+                Err(_) => {}
+            }
+        }
+    }
+    // Still anchored by the unreaped leader: this reaches only the group it
+    // leads, including members that ignored `SIGTERM` or that the leader
+    // left behind when it exited.
+    signal_deadline_group(process_group, libc::SIGKILL);
+    let status = child.wait()?;
+    crate::phase_telemetry::add(
+        if already_exited {
+            "deadline_group_kill_already_gone"
+        } else if exited_on_term {
+            "deadline_group_kill_exited_on_term"
+        } else {
+            "deadline_group_kill_needed_kill"
+        },
+        Duration::ZERO,
+    );
+    // Probe only (signal zero): a member in uninterruptible I/O dies when
+    // that I/O returns, and nothing is signalled again after the reap.
+    if !crate::gates::gate_process_group_absent(process_group) {
+        crate::phase_telemetry::add("deadline_group_kill_members_remained", Duration::ZERO);
+    }
+    Ok(status)
+}
+
+/// Signal a deadline group whose leader is unreaped. `ESRCH` (nothing left)
+/// and `EPERM` (on macOS, a group holding only the zombie leader) are the
+/// expected answers once everything has exited.
+#[cfg(unix)]
+fn signal_deadline_group(process_group: i32, signal: i32) {
+    match crate::gates::signal_owned_process_group(process_group, signal) {
+        Ok(()) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) => {}
+        Err(_) => crate::phase_telemetry::add("deadline_group_signal_failed", Duration::ZERO),
+    }
+}
+
 struct LimitedChild(std::process::Child);
 
 impl Drop for LimitedChild {
@@ -1391,8 +1634,30 @@ impl Drop for LimitedChild {
 /// joined: a grandchild that inherited the pipes could otherwise hold the
 /// caller past the deadline it was promised.
 pub(crate) fn output_within(command: &mut Command, budget: Duration) -> io::Result<Option<Output>> {
+    output_within_grouped(command, budget, false)
+}
+
+/// [`output_within`] for a child that starts processes which can outlive it
+/// and keep writing (a `git fetch` leaves `index-pack` writing objects, a
+/// `git push` leaves `pack-objects` and the remote helper sending): the
+/// child leads a process group of its own where it can
+/// ([`lead_own_process_group`]), and on expiry that whole group is stopped
+/// ([`stop_deadline_child`]), not only the child.
+pub(crate) fn output_within_own_group(
+    command: &mut Command,
+    budget: Duration,
+) -> io::Result<Option<Output>> {
+    output_within_grouped(command, budget, true)
+}
+
+fn output_within_grouped(
+    command: &mut Command,
+    budget: Duration,
+    own_group: bool,
+) -> io::Result<Option<Output>> {
     let _span = crate::phase_telemetry::subprocess_span(command);
     let deadline = Instant::now() + budget;
+    let owned_group = own_group && lead_own_process_group(command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1414,11 +1679,13 @@ pub(crate) fn output_within(command: &mut Command, budget: Duration) -> io::Resu
     let mut exited = None;
     let status = loop {
         if exited.is_none() {
-            match child.try_wait() {
+            match poll_deadline_child(&mut child, owned_group, open_streams == 0) {
                 Ok(status) => exited = status,
                 Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::warn_unrecorded(
+                        "stop a child whose exit could not be polled",
+                        stop_deadline_child(&mut child, owned_group),
+                    );
                     return Err(error);
                 }
             }
@@ -1429,8 +1696,10 @@ pub(crate) fn output_within(command: &mut Command, budget: Duration) -> io::Resu
         let now = Instant::now();
         if now >= deadline {
             if exited.is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::warn_unrecorded(
+                    "stop a child past its deadline",
+                    stop_deadline_child(&mut child, owned_group),
+                );
             }
             return Ok(None);
         }
@@ -2238,6 +2507,135 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the wait must end near the budget, not when the child does"
+        );
+    }
+
+    /// A transfer that outlives its deadline is stopped with everything it
+    /// started. A grandchild left running is gone afterwards, both when the
+    /// child waits for it and when the child already exited while the
+    /// grandchild still holds its output. Killing only the child, as before,
+    /// left the grandchild running (as a push's `pack-objects` or remote
+    /// helper kept sending). The grandchild is bounded and released, so a
+    /// failure leaves nothing behind for long.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_stops_every_process_a_grouped_child_started() {
+        for (leader_tail, counter) in [
+            ("wait", "deadline_group_kill_exited_on_term"),
+            ("exit 0", "deadline_group_kill_already_gone"),
+        ] {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            let dir = tempfile::tempdir().unwrap();
+            let release = dir.path().join("release");
+            let pid_file = dir.path().join("grandchild.pid");
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!(
+                    "(i=0; while [ ! -e '{release}' ] && [ \"$i\" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done) &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\n{leader_tail}",
+                    release = release.display(),
+                    pid = pid_file.display(),
+                ),
+            ]);
+            let output = without_terminal_check(|| {
+                output_within_own_group(&mut command, Duration::from_secs(2))
+            })
+            .unwrap();
+            let grandchild: i32 = std::fs::read_to_string(&pid_file)
+                .expect("the child recorded its grandchild")
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = process_gone_within(grandchild, Duration::from_secs(5));
+            std::fs::write(&release, "").unwrap();
+            assert!(output.is_none(), "{leader_tail}: the child must time out");
+            assert!(gone, "{leader_tail}: the grandchild outlived the deadline");
+            let counters = recorder.totals().1;
+            assert!(
+                counters.contains_key(counter),
+                "{leader_tail}: expected {counter}, got {:?}",
+                counters.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// An exit probe that fails with anything but `ECHILD` has not reaped
+    /// the leader, so it still anchors its group: the group is still stopped,
+    /// grandchild included, instead of waiting for the leader to exit on its
+    /// own. `ECHILD` (reaped elsewhere) sends no signal at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exit_probe_still_stops_the_group_unless_the_leader_was_reaped() {
+        use std::os::unix::process::CommandExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "sleep 30 &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nwait",
+                    pid = pid_file.display(),
+                ),
+            ])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let ready = Instant::now() + Duration::from_secs(10);
+        while !pid_file.exists() && Instant::now() < ready {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let group = child.id() as i32;
+        let started = Instant::now();
+        let status = stop_owned_deadline_group_with(&mut child, group, |_| {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stop waited for the leader to exit on its own"
+        );
+        assert!(
+            status.signal().is_some(),
+            "the leader was signalled: {status:?}"
+        );
+        assert!(
+            process_gone_within(grandchild, Duration::from_secs(5)),
+            "the grandchild survived a failed exit probe"
+        );
+        let counters = recorder.totals().1;
+        assert!(counters.contains_key("deadline_group_exit_probe_failed"));
+        assert!(!counters.contains_key("deadline_group_kill_unanchored"));
+
+        let mut short = Command::new("sleep")
+            .arg("0.3")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = short.id() as i32;
+        let status = stop_owned_deadline_group_with(&mut short, group, |_| {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        })
+        .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "an unanchored leader is never signalled"
+        );
+        assert!(
+            recorder
+                .totals()
+                .1
+                .contains_key("deadline_group_kill_unanchored")
         );
     }
 
