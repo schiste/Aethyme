@@ -543,6 +543,14 @@ fn evidence_capabilities(
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
                 "link_reachability" => links.and_then(|v| v["entries"].get(entity)).is_none(),
                 "literal_markdown_links" => entry["media_type"] != "text/html",
+                "list_item_count"
+                | "link_count"
+                | "link_destinations"
+                | "required_headings"
+                | "heading_length"
+                | "heading_hierarchy"
+                | "duplicate_headings"
+                | "prose_sentence_length_variance" => entry["media_type"] == "text/plain",
                 _ => false,
             };
             if missing && check["status"] != "not_checked" {
@@ -1002,6 +1010,35 @@ mod tests {
                     media == "text/html" || status == "not_checked",
                     "{media} {status}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_text_cannot_claim_structural_observations() {
+        for kind in [
+            "list_item_count",
+            "link_count",
+            "link_destinations",
+            "required_headings",
+            "heading_length",
+            "heading_hierarchy",
+            "duplicate_headings",
+            "prose_sentence_length_variance",
+        ] {
+            let policy = json!({"gates":[{"id":"structure","kind":kind}]});
+            for media in ["text/plain", "text/markdown", "text/html"] {
+                let change =
+                    json!({"entries":[{"entity_id":"article","media_type":media,"after":{}}]});
+                for status in ["passed", "failed", "not_checked"] {
+                    let check = json!({"status":status});
+                    let checks = BTreeMap::from([("gate:7:article:structure", &check)]);
+                    assert_eq!(
+                        evidence_capabilities(&policy, &change, &checks, None, None).is_ok(),
+                        media != "text/plain" || status == "not_checked",
+                        "{kind} {media} {status}"
+                    );
+                }
             }
         }
     }
