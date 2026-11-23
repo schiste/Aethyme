@@ -1112,6 +1112,85 @@ fn a_timed_out_push_settles_only_on_combined_evidence() {
     assert_eq!(settle_timed_out_push(Some(None), true), None);
 }
 
+/// An unknown session push still at its old value is settled `failed` only
+/// once it ended long enough ago *and* its recorded provider is gone; a
+/// provider still alive (one a dead broker left orphaned keeps pushing with
+/// no deadline) keeps it unknown however old it is. `succeeded` needs only
+/// the proposed commit.
+#[test]
+fn an_unknown_session_push_settles_failed_only_with_its_provider_gone() {
+    let old = UNKNOWN_PUSH_SETTLE_AGE_MS;
+    assert_eq!(
+        settle_unknown_session_push(Some("failed"), old, || true),
+        Ok(OperationStatus::ReconciledFailed)
+    );
+    assert_eq!(
+        settle_unknown_session_push(Some("failed"), old, || false),
+        Err("unknown_push_auto_reconcile_provider_not_proven_gone")
+    );
+    assert_eq!(
+        settle_unknown_session_push(Some("failed"), old - 1, || true),
+        Err("unknown_push_auto_reconcile_left_unknown")
+    );
+    assert_eq!(
+        settle_unknown_session_push(Some("succeeded"), 0, || false),
+        Ok(OperationStatus::ReconciledSucceeded)
+    );
+    assert_eq!(
+        settle_unknown_session_push(None, old, || true),
+        Err("unknown_push_auto_reconcile_left_unknown")
+    );
+}
+
+/// The recorded provider is proven gone only by its identity: a live
+/// process (this test itself) is not gone, nor is a row that recorded no
+/// provider or one without a start token; a provider that led its own group
+/// and was reaped is.
+#[cfg(unix)]
+#[test]
+fn a_recorded_provider_is_gone_only_when_proven_by_its_identity() {
+    use crate::file_lock::artifact_use::ProcessStartIdentity;
+    use std::os::unix::process::CommandExt as _;
+
+    let details = |identity: &ProcessStartIdentity| json!({ "provider_process": identity });
+    // SAFETY: getpgrp only reads this process's group.
+    let own_group = unsafe { libc::getpgrp() };
+    let alive = ProcessStartIdentity::capture(std::process::id() as i32, own_group).unwrap();
+    assert!(
+        !recorded_provider_gone(&details(&alive)),
+        "a provider that is still running is not gone"
+    );
+    assert!(!recorded_provider_gone(&json!({})), "nothing recorded");
+    let mut tokenless = alive.clone();
+    tokenless.start_time = None;
+    assert!(
+        !recorded_provider_gone(&details(&tokenless)),
+        "an identity without a start token proves nothing"
+    );
+
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    let ended = ProcessStartIdentity::capture(pid, pid).unwrap();
+    assert!(
+        !recorded_provider_gone(&details(&ended)),
+        "a provider still running in its own group is not gone"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        crate::bounded_output::process_gone_within(pid, Duration::from_secs(5)),
+        "the reaped provider is absent"
+    );
+    assert!(
+        recorded_provider_gone(&details(&ended)),
+        "a reaped provider whose group is empty is gone"
+    );
+}
+
 #[test]
 fn only_head_relative_push_sources_are_worktree_relative() {
     let argv = |items: &[&str]| {
@@ -1734,75 +1813,66 @@ fn the_lock_only_gets_what_preparation_left() {
     );
 }
 
-/// A provider can exit while its descendant still holds the captured pipes.
+/// A provider stopped at its deadline is stopped with every process it
+/// started, as a push's `pack-objects`, remote helper and `ssh` are: a
+/// descendant left running is gone afterwards, both when the provider still
+/// waits for it and when the provider already exited while the descendant
+/// holds its output pipes. The deadline is kept either way. Killing only the
+/// provider, as before, left the descendant running past the deadline.
 #[cfg(unix)]
 #[test]
-fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ready = tmp.path().join("descendant-ready");
-    let release = tmp.path().join("release-descendant");
-    let done = tmp.path().join("descendant-done");
-    let ready_for_thread = ready.clone();
-    let release_for_thread = release.clone();
-    let done_for_thread = done.clone();
-    let releaser = std::thread::spawn(move || {
-        let ready_deadline = std::time::Instant::now() + Duration::from_secs(8);
-        while !ready_for_thread.exists() && std::time::Instant::now() < ready_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let ready_seen = ready_for_thread.exists();
-        if ready_seen {
-            // Keep both inherited output descriptors open beyond the provider's
-            // deadline, then release the finite child so the test leaves no
-            // process behind.
-            std::thread::sleep(Duration::from_secs(4));
-        }
-        std::fs::write(release_for_thread, b"release").unwrap();
-        let done_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while ready_seen && !done_for_thread.exists() && std::time::Instant::now() < done_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        (ready_seen, done_for_thread.exists())
-    });
+fn a_timed_out_provider_is_stopped_with_every_process_it_started() {
+    for leader_tail in ["wait", "exit 0"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release-descendant");
+        let pid_file = tmp.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done) & echo $! > \"$2.tmp\" && mv \"$2.tmp\" \"$2\"; printf child; {leader_tail}"
+            ),
+            "sh",
+            release.to_str().unwrap(),
+            pid_file.to_str().unwrap(),
+        ]);
+        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(2);
+        let error = crate::bounded_output::without_terminal_check(|| {
+            output_within(
+                command,
+                AdmissionDeadline {
+                    started,
+                    at: Some(started + budget),
+                    budget: Some(budget),
+                },
+                "owner/repo",
+                "capturing provider output",
+                None,
+            )
+        });
+        let provider_wait = started.elapsed();
+        let descendant: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the provider recorded its descendant")
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = crate::bounded_output::process_gone_within(descendant, Duration::from_secs(5));
+        std::fs::write(&release, b"release").unwrap();
 
-    let mut command = Command::new("sh");
-    command.args([
-        "-c",
-        "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 120 ]; do sleep 0.05; i=$((i + 1)); done; : > \"$3\") & printf child; : > \"$2\"; exit 0",
-        "sh",
-        release.to_str().unwrap(),
-        ready.to_str().unwrap(),
-        done.to_str().unwrap(),
-    ]);
-    let started = std::time::Instant::now();
-    let budget = Duration::from_secs(2);
-    let error = output_within(
-        command,
-        AdmissionDeadline {
-            started,
-            at: Some(started + budget),
-            budget: Some(budget),
-        },
-        "owner/repo",
-        "capturing provider output",
-        None,
-    );
-    let provider_wait = started.elapsed();
-    let (ready_seen, descendant_done) = releaser.join().unwrap();
-
-    assert!(ready_seen, "the provider leader must exit before pipe EOF");
-    assert!(
-        descendant_done,
-        "the finite descendant must exit after release"
-    );
-    assert!(
-        provider_wait < Duration::from_secs(3),
-        "reader drain exceeded the 2s operation deadline: {provider_wait:?}"
-    );
-    assert!(
-        matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
-        "an inherited pipe held past the deadline must time out, got {error:?}"
-    );
+        assert!(
+            gone,
+            "{leader_tail}: the descendant outlived the provider's deadline"
+        );
+        assert!(
+            provider_wait < Duration::from_secs(4),
+            "{leader_tail}: stopping the group exceeded the 2s deadline by too much: {provider_wait:?}"
+        );
+        assert!(
+            matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
+            "{leader_tail}: a provider stopped at its deadline must time out, got {error:?}"
+        );
+    }
 }
 
 #[test]

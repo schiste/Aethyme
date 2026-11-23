@@ -1232,6 +1232,50 @@ the row stays unknown). Status transitions now keep a row's
 `push_reconciliation` (as they kept `fetch_reconciliation`), so a crashed
 push keeps the plan that settles it.
 
+Since 2026-11-23 a coordinated Git write records the identity of the process
+carrying it out in details key `provider_process` (`pid`, `process_group`,
+`start_time`, `start_time_clock`, written once at spawn while the row is
+`running`, and kept by status transitions like `push_reconciliation`). The
+old-value settlement above additionally requires that process proven gone:
+its pid absent or reused (a different start token) *and* a signal-zero probe
+of its process group answering `ESRCH`. A provider still alive, a row that
+recorded no provider (rows written before this change), or an identity
+without a usable start token stays `outcome_unknown`, counted
+`unknown_push_auto_reconcile_provider_not_proven_gone`; a broker that died
+mid-push leaves an orphaned `git push` with no deadline, and its transfer
+could still land. `reconciled_succeeded` is unchanged (the proposed commit is
+proof on its own). No writer signals a recorded provider: a dead broker's
+orphaned group is not killed by a later writer, because a pid and start token
+read before a `killpg` do not reserve the group id against reuse in between.
+
+Deadline process groups (2026-11-23). A coordinated provider (every brokered
+Git or GitHub command, including fetches, pushes and the pre-push hook dry
+run, all through the operation lane's `output_within`) and the broker's own
+`git fetch`/`push`/`pull` calls (`run_git_process_output`) now lead a process
+group of their own (`setpgid(0, 0)` at spawn, Unix only). At the deadline the
+whole group is stopped instead of the provider's pid: `SIGTERM` to the group,
+up to 500 ms for the leader to exit, `SIGKILL` to the group, then the leader is
+reaped. Both signals are sent while the unreaped leader, or its zombie, still
+reserves the group id. A leader that exits while a descendant still holds its
+output pipes is left unreaped until the output closes or the deadline stops
+the group, so that descendant is stopped too. Span `deadline_group_stop`
+(bounded by the 500 ms grace, the reap and a 200 ms absence probe). Counts by
+how the leader ended: `deadline_group_kill_exited_on_term` (exited within the
+grace), `deadline_group_kill_needed_kill` (still running when `SIGKILL` was
+sent), `deadline_group_kill_already_gone` (had exited before the deadline;
+only members it left were stopped); plus
+`deadline_group_kill_members_remained` (the group was still present 200 ms
+after the reap, e.g. a member in uninterruptible I/O),
+`deadline_group_kill_unanchored` (the leader could not be proven unreaped, so
+no group signal was sent), `deadline_group_signal_failed` (a signal error other
+than `ESRCH`/`EPERM`) and `deadline_child_kill_failed` (ungrouped child). The
+group is skipped, and the child killed alone as before, when the broker is
+the foreground process group of a controlling terminal, where Git's
+credential prompt, `ssh` and interactive `gh` must still be able to read the
+terminal (counter `deadline_group_kept_foreground_terminal`). Processes that
+leave the group (start their own session or group) are outside this cleanup.
+Normal completions signal nothing; deadline values are unchanged.
+
 Write-block scope: an ambiguous (`outcome_unknown`, or `running` with its
 process gone) write whose recomputed scope is its own session's branch lane
 (`git-ref/refs/heads/<that session's branch>`, never a shared default or

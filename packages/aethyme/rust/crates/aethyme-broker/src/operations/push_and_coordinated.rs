@@ -506,7 +506,8 @@ fn request_names_branch(
 /// an operator. Its one destination must be the session's branch, read through
 /// the verified push endpoint of the recorded repository. At exactly the
 /// proposed commit it succeeded; still at the plan's old value
-/// [`UNKNOWN_PUSH_SETTLE_AGE_MS`] after it ended, it did not happen. Only the
+/// [`UNKNOWN_PUSH_SETTLE_AGE_MS`] after it ended, with its recorded provider
+/// process and group proven gone, it did not happen. Only the
 /// session's own lanes write that branch, so the observation cannot be another
 /// session's write. Anything else (a third value, a deleted branch, the old
 /// value too soon, a remote that does not answer) leaves it unknown.
@@ -530,6 +531,50 @@ fn try_reconcile_session_push(
 /// fully received push within seconds; a transfer cut off this long ago that
 /// has still not landed never will.
 const UNKNOWN_PUSH_SETTLE_AGE_MS: i64 = 10 * 60 * 1000;
+
+/// How an unknown push of a session's own branch settles, from the outcome
+/// the remote read classified, how long ago the push ended and whether the
+/// process that carried it out is proven gone. At the proposed commit it
+/// succeeded. At the old value it did not happen only when it ended
+/// [`UNKNOWN_PUSH_SETTLE_AGE_MS`] ago *and* its recorded provider and that
+/// provider's process group are gone: a provider still alive (a push the
+/// broker lost track of, or one a broker that died left orphaned with no
+/// deadline) may still land it. Otherwise it stays unknown, and the error is
+/// the counter that says why.
+fn settle_unknown_session_push(
+    outcome: Option<&str>,
+    ended_ms_ago: i64,
+    provider_gone: impl FnOnce() -> bool,
+) -> Result<OperationStatus, &'static str> {
+    match outcome {
+        Some("succeeded") => Ok(OperationStatus::ReconciledSucceeded),
+        Some("failed") if ended_ms_ago >= UNKNOWN_PUSH_SETTLE_AGE_MS => {
+            if provider_gone() {
+                Ok(OperationStatus::ReconciledFailed)
+            } else {
+                Err("unknown_push_auto_reconcile_provider_not_proven_gone")
+            }
+        }
+        _ => Err("unknown_push_auto_reconcile_left_unknown"),
+    }
+}
+
+/// Whether the provider process an operation recorded (`provider_process`)
+/// and its process group are proven gone. An operation that recorded none,
+/// or an identity that cannot be checked, proves nothing.
+fn recorded_provider_gone(details: &serde_json::Value) -> bool {
+    details
+        .get("provider_process")
+        .and_then(|value| {
+            serde_json::from_value::<crate::file_lock::artifact_use::ProcessStartIdentity>(
+                value.clone(),
+            )
+            .ok()
+        })
+        .is_some_and(|process| {
+            crate::file_lock::artifact_use::process_and_group_proven_gone(&process)
+        })
+}
 
 fn try_reconcile_session_push_inner(
     broker: &mut Broker,
@@ -593,13 +638,14 @@ fn try_reconcile_session_push_inner(
     // push ended: it did not happen. A missing branch whose old value was a
     // commit, a third value, or the old value too soon after: unknown.
     let ended_at = operation.finished_at.unwrap_or(operation.updated_at);
-    let status = match observation.outcome {
-        Some("succeeded") => OperationStatus::ReconciledSucceeded,
-        Some("failed") if unix_now_ms().saturating_sub(ended_at) >= UNKNOWN_PUSH_SETTLE_AGE_MS => {
-            OperationStatus::ReconciledFailed
-        }
-        _ => {
-            crate::phase_telemetry::add("unknown_push_auto_reconcile_left_unknown", Duration::ZERO);
+    let status = match settle_unknown_session_push(
+        observation.outcome,
+        unix_now_ms().saturating_sub(ended_at),
+        || recorded_provider_gone(&details),
+    ) {
+        Ok(status) => status,
+        Err(left_unknown) => {
+            crate::phase_telemetry::add(left_unknown, Duration::ZERO);
             return Ok(false);
         }
     };
@@ -4665,7 +4711,25 @@ impl Broker {
         let process_started = std::time::Instant::now();
         let provider_output = {
             let records_fetch = fetch_journal.is_some();
-            let mut observe_provider = |observation| {
+            // A Git write records who carries it out, so a later writer that
+            // settles its unknown outcome can prove that process and its
+            // group gone first (see `try_reconcile_session_push_inner`).
+            let records_provider =
+                request.provider == OperationProvider::Git && effect != OperationEffect::Read;
+            let mut provider_recorded = false;
+            let mut observe_provider = |observation: ProviderObservation| {
+                if records_provider
+                    && !provider_recorded
+                    && let Some(identity) = &observation.identity
+                {
+                    provider_recorded = true;
+                    let identity = serde_json::to_string(identity)
+                        .expect("a process identity contains only serializable fields");
+                    let update = self
+                        .store()
+                        .record_provider_process(operation.id, &identity);
+                    crate::warn_unrecorded("persisting the provider process identity", update);
+                }
                 if let Some(journal) = &mut fetch_journal {
                     journal.observe(observation);
                     let serialized = serde_json::to_string(&*journal)
@@ -4683,7 +4747,7 @@ impl Broker {
                 "executing coordinated operation",
                 operation_heartbeat.as_ref(),
                 MAX_COORDINATED_OUTPUT_BYTES,
-                if records_fetch {
+                if records_fetch || records_provider {
                     Some(&mut observe_provider)
                 } else {
                     None

@@ -410,6 +410,23 @@ impl BrokerStore {
         Ok(changed == 1)
     }
 
+    /// Persist the identity of the process carrying out a running operation
+    /// (pid, process group and start token), without resurrecting a
+    /// concurrently reconciled operation or overwriting other fields.
+    pub(crate) fn record_provider_process(
+        &mut self,
+        id: i64,
+        identity: &str,
+    ) -> Result<bool, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE coordinated_operations SET details_json = json_set(COALESCE(details_json, '{}'),
+                 '$.provider_process', json(?2)), updated_at = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![id, identity, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn transition_coordinated_operation(
         &mut self,
         id: i64,
@@ -431,7 +448,13 @@ impl BrokerStore {
             .details_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
-        for key in ["fetch_reconciliation", "push_reconciliation"] {
+        // So does the provider's process identity, which a settlement must
+        // prove gone before it may call the push failed.
+        for key in [
+            "fetch_reconciliation",
+            "push_reconciliation",
+            "provider_process",
+        ] {
             if let Some(proof) = previous.as_ref().and_then(|value| value.get(key).cloned()) {
                 let destination = details.get_or_insert_with(|| serde_json::json!({}));
                 if let Some(object) = destination.as_object_mut() {

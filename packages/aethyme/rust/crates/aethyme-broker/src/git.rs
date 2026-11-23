@@ -3378,11 +3378,17 @@ fn run_git_process_output(
         None => budget,
     };
     let started = Instant::now();
-    let output = crate::bounded_output::output_within(&mut command, budget).map_err(|source| {
-        GitError::Spawn {
-            args: args.join(" "),
-            source,
-        }
+    // A transfer leaves children that keep writing after Git itself is
+    // killed (`index-pack` for a fetch, `pack-objects` and the remote helper
+    // for a push): at the deadline its whole process group is stopped.
+    let output = if git_subcommand_transfers(args) {
+        crate::bounded_output::output_within_own_group(&mut command, budget)
+    } else {
+        crate::bounded_output::output_within(&mut command, budget)
+    }
+    .map_err(|source| GitError::Spawn {
+        args: args.join(" "),
+        source,
     })?;
     let Some(output) = output else {
         note_git_timeout();
@@ -3395,6 +3401,15 @@ fn run_git_process_output(
         ));
     };
     Ok(output)
+}
+
+/// Whether `args` run a Git subcommand that transfers objects to or from a
+/// remote and so starts children that can outlive Git.
+fn git_subcommand_transfers(args: &[&str]) -> bool {
+    matches!(
+        git_subcommand(&args.join(" ")).as_str(),
+        "fetch" | "push" | "pull"
+    )
 }
 
 #[cfg(unix)]

@@ -671,6 +671,11 @@ fn output_within_observed(
     capture_limit: usize,
     mut observer: Option<&mut dyn FnMut(ProviderObservation)>,
 ) -> Result<CapturedOutput, BrokerOpError> {
+    // The provider leads a process group of its own where it can, so the
+    // deadline stops every process it started (a push's `pack-objects`,
+    // remote helper and `ssh`, a fetch's `index-pack`, a hook's children),
+    // not only the provider: killing Git alone left those sending.
+    let owned_group = crate::bounded_output::lead_own_process_group(&mut command);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -734,17 +739,19 @@ fn output_within_observed(
         if deadline.expired() {
             discard_output_capture(&stdout_capture);
             discard_output_capture(&stderr_capture);
-            // Reap the provider if it is still alive. If it has already exited,
-            // a descendant may still hold an inherited output pipe; stop waiting
-            // for that pipe at the same deadline without killing an unowned
-            // process tree.
-            if exited.is_none() {
-                let _ = child.kill();
-                if let Ok(status) = child.wait() {
-                    observation.exit = Some((status.success(), status.code()));
-                    if let Some(observer) = observer.as_mut() {
-                        observer(observation.clone());
-                    }
+            // Stop and reap the provider unless it was already reaped, with
+            // its whole process group when it leads one (an exited leader is
+            // left unreaped until its output closes, so its group can still be
+            // signalled here). A descendant outside that group may still hold
+            // an inherited output pipe; stop waiting for that pipe at the same
+            // deadline without killing a process tree that is not ours.
+            if exited.is_none()
+                && let Ok(status) =
+                    crate::bounded_output::stop_deadline_child(&mut child, owned_group)
+            {
+                observation.exit = Some((status.success(), status.code()));
+                if let Some(observer) = observer.as_mut() {
+                    observer(observation.clone());
                 }
             }
             // Detached readers end when their inherited descriptors close.
@@ -757,7 +764,11 @@ fn output_within_observed(
             });
         }
         if exited.is_none() {
-            match child.try_wait() {
+            match crate::bounded_output::poll_deadline_child(
+                &mut child,
+                owned_group,
+                open_readers == 0,
+            ) {
                 Ok(Some(status)) => {
                     observation.exit = Some((status.success(), status.code()));
                     if let Some(observer) = observer.as_mut() {
@@ -769,8 +780,10 @@ fn output_within_observed(
                 Err(source) => {
                     discard_output_capture(&stdout_capture);
                     discard_output_capture(&stderr_capture);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::warn_unrecorded(
+                        "stop a provider whose exit could not be polled",
+                        crate::bounded_output::stop_deadline_child(&mut child, owned_group),
+                    );
                     drop(stdout_reader);
                     drop(stderr_reader);
                     return Err(BrokerOpError::OperationIo {
