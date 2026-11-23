@@ -541,7 +541,7 @@ fn evidence_capabilities(
             let missing = match kind {
                 "editorial_pacing" | "evidence_anchors" | "structured_fact" => !has("source"),
                 "evidence_review" | "evidence_review_age" => !has("source") || !has("review"),
-                "link_reachability" => links.is_none(),
+                "link_reachability" => links.and_then(|v| v["entries"].get(entity)).is_none(),
                 _ => false,
             };
             if missing && check["status"] != "not_checked" {
@@ -988,6 +988,73 @@ mod tests {
             .remove("aexeo.offline-input-binding.v1");
         assert!(closed_verdict(&verdict["verdict"]).is_err());
     }
+    #[test]
+    fn link_evidence_is_required_for_each_completed_entity_check() {
+        let policy = json!({"gates":[{"id":"links","kind":"link_reachability"}]});
+        let change = json!({"entries":[{"entity_id":"article","after":{}}]});
+        let mut check = json!({"status":"passed"});
+        let missing = json!({"entries":{}});
+        let present = json!({"entries":{"article":{"observations":[]}}});
+        for status in ["passed", "failed", "not_checked"] {
+            check["status"] = json!(status);
+            let checks = BTreeMap::from([("gate:7:article:links", &check)]);
+            assert_eq!(
+                evidence_capabilities(&policy, &change, &checks, None, Some(&missing)).is_ok(),
+                status == "not_checked"
+            );
+            assert!(evidence_capabilities(&policy, &change, &checks, None, Some(&present)).is_ok());
+        }
+    }
+
+    #[test]
+    fn matching_forged_verdict_cannot_hide_a_missing_link_snapshot() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        policy["gates"].as_array_mut().unwrap().push(json!({
+            "id":"links", "kind":"link_reachability", "severity":"warning", "blocking":false
+        }));
+        let policy_bytes = policy.to_string().into_bytes();
+        let change = parse_change(v["artifacts"]["change"].as_str().unwrap().as_bytes()).unwrap();
+        let evidence = json!({"version":1,"change_id":change["change_id"],"entries":{}})
+            .to_string()
+            .into_bytes();
+        let mut input = inputs(&v, &base, &after);
+        input.resolved_policy = &policy_bytes;
+        input.external_evidence = Some(&evidence);
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let hash = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: input.collection,
+            external_evidence: input.external_evidence,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] =
+            json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        verdict["verdict"]["extensions"] = json!({"aexeo.observed-link-binding.v1": {
+            "inputs_sha256": "a".repeat(64), "observations_sha256": "b".repeat(64)
+        }});
+        verdict["verdict"]["checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":"gate:7:article:links", "status":"passed", "blocking":false
+            }));
+        verdict["verdict"]["summary"]["checks"] = json!(2);
+        verdict["verdict"]["summary"]["passed"] = json!(2);
+        assert!(!run(&verdict, &verdict, &input));
+        verdict["verdict"]["checks"][1]["status"] = json!("not_checked");
+        verdict["verdict"]["checks"][1]["reason"] = json!("observation unavailable");
+        verdict["verdict"]["summary"]["passed"] = json!(1);
+        verdict["verdict"]["summary"]["not_checked"] = json!(1);
+        assert!(run(&verdict, &verdict, &input));
+    }
+
     #[test]
     fn accepts_only_exact_observed_link_extension() {
         let (_, _, _, mut verdict) = fixture();
