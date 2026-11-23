@@ -332,7 +332,10 @@ impl InProcess {
     }
 
     /// Follow symbolic refs to an object id, as Git does with `SYMREF_MAXDEPTH`.
-    fn follow(&self, mut reference: gix::Reference<'_>) -> Result<gix::ObjectId, Fallback> {
+    fn follow<'repo>(
+        &'repo self,
+        mut reference: gix::Reference<'repo>,
+    ) -> Result<gix::ObjectId, Fallback> {
         for _ in 0..=MAX_SYMREF_DEPTH {
             let target = match reference.target() {
                 gix::refs::TargetRef::Object(id) => return Ok(id.to_owned()),
