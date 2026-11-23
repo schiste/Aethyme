@@ -719,6 +719,134 @@ fn acquire_preparation_cache_once(
     ))
 }
 
+/// Trade a preparation's exclusive hold of a sharing repository's cache for
+/// a share, once the work that needed it alone (recovery, the budget check, a
+/// rotation) is done and before any step runs.
+///
+/// Until 2026-11-23 a preparation that took the cache alone for the hourly
+/// budget check kept it alone through its own install steps, which are what
+/// every sharing preparation runs anyway. On the busiest repository those
+/// steps were 85-90% of each exclusive hold (40-270 s), and every preparation
+/// that arrived meanwhile waited for them.
+///
+/// The coordinator has no atomic downgrade, so the exclusive grant is
+/// released and a share requested like any sharing preparation's: through
+/// the wait queue (reclaiming dead holders as the first acquisition does),
+/// then the unfinished-rotation probe under the share. Nothing has linked
+/// from or written to the store yet, so the gap between the two grants is
+/// harmless. If the probe cannot rule out a rotation another holder left
+/// unfinished in that gap, the share is traded back for the cache alone,
+/// exactly as a sharing preparation's first acquisition does, and the caller
+/// recovers before any step runs.
+///
+/// Each acquisition here waits at least [`SHARED_CACHE_DOWNGRADE_WAIT_FLOOR`],
+/// whatever is left of the caller's `--wait`: the preparation already did
+/// the work that needed the cache alone, and failing it because another
+/// holder slipped into the gap (with `--wait 0s`, any holder) would waste
+/// that work. Whatever grant is held when this returns, success or error,
+/// is in `grant`, for the caller to release. Returns the wait spent and the
+/// mode held.
+fn downgrade_preparation_cache(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut Option<crate::HostResourceGrant>,
+    request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
+    wait: Duration,
+    rotation_unsettled: &mut dyn FnMut() -> bool,
+    holder_activity: &dyn Fn() -> Option<String>,
+) -> Result<(Duration, SharedCacheMode), PreparationError> {
+    let _span = crate::phase_telemetry::span("shared_cache_downgrade");
+    let started = Instant::now();
+    let wait = wait.max(SHARED_CACHE_DOWNGRADE_WAIT_FLOOR);
+    if wait == SHARED_CACHE_DOWNGRADE_WAIT_FLOOR {
+        crate::phase_telemetry::add("shared_cache_downgrade_wait_floor", Duration::ZERO);
+    }
+    let deadline = started + wait;
+    release_held_grant(coordinator, grant)?;
+    let mut next_notice = Instant::now();
+    let mut notice = |message: &str| {
+        cache_activity::tick();
+        let now = Instant::now();
+        if now >= next_notice {
+            eprintln!(
+                "{}",
+                shared_cache_wait_notice(wait, message, holder_activity())
+            );
+            next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
+        }
+    };
+    *grant = Some(acquire_reclaiming_dead_holders(
+        coordinator,
+        &request_for(SharedCacheMode::Shared)?,
+        deadline,
+        wait,
+        &mut notice,
+    )?);
+    let unsettled = {
+        let _span = crate::phase_telemetry::span("shared_cache_rotation_probe");
+        rotation_unsettled()
+    };
+    if !unsettled {
+        crate::phase_telemetry::add("shared_cache_downgraded_to_shared", Duration::ZERO);
+        return Ok((started.elapsed(), SharedCacheMode::Shared));
+    }
+    crate::phase_telemetry::add("shared_cache_downgrade_found_rotation", Duration::ZERO);
+    release_held_grant(coordinator, grant)?;
+    *grant = Some(acquire_reclaiming_dead_holders(
+        coordinator,
+        &request_for(SharedCacheMode::Exclusive)?,
+        deadline,
+        wait,
+        &mut notice,
+    )?);
+    Ok((started.elapsed(), SharedCacheMode::Exclusive))
+}
+
+/// The least a downgrade's acquisitions wait, not counted against `--wait`.
+const SHARED_CACHE_DOWNGRADE_WAIT_FLOOR: Duration = Duration::from_secs(10);
+
+/// Release the grant `grant` holds, if any. On failure the grant stays in
+/// `grant`, so the caller's best-effort release still sees it.
+fn release_held_grant(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut Option<crate::HostResourceGrant>,
+) -> Result<(), PreparationError> {
+    if let Some(held) = grant.as_ref() {
+        coordinator.release(
+            &held.lease.lease_id,
+            held.lease.generation,
+            &held.ownership_token,
+        )?;
+        grant.take();
+    }
+    Ok(())
+}
+
+/// Acquire `request` by `deadline`, releasing dead holders of this cache
+/// on the way, as [`acquire_preparation_cache`] does.
+fn acquire_reclaiming_dead_holders(
+    coordinator: &mut HostResourceCoordinator,
+    request: &HostResourceRequest,
+    deadline: Instant,
+    announced_wait: Duration,
+    notice: &mut dyn FnMut(&str),
+) -> Result<crate::HostResourceGrant, PreparationError> {
+    let _span = crate::phase_telemetry::span("shared_cache_downgrade_wait");
+    let mut reclaims = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match coordinator.acquire_with_wait(request, remaining, &mut *notice) {
+            Ok(grant) => return Ok(grant),
+            Err(error)
+                if reclaims < DEAD_HOLDER_RECLAIMS_PER_PREPARATION
+                    && reclaim_dead_cache_holders(coordinator, &error) =>
+            {
+                reclaims += 1;
+            }
+            Err(error) => return Err(shared_cache_wait_exhausted(error, announced_wait)),
+        }
+    }
+}
+
 /// The line a waiting prepare repeats: what it waits for and, when the
 /// holder reports it, what the holder is doing.
 fn shared_cache_wait_notice(wait: Duration, conflict: &str, holder: Option<String>) -> String {
@@ -985,13 +1113,6 @@ struct PreparationRecord {
 }
 
 impl Broker {
-    fn recover_storage_refusal(&mut self, error: &BrokerOpError) {
-        let persisted = self.persist_storage_refusal(error);
-        if persisted {
-            self.start_storage_recovery_worker();
-        }
-    }
-
     /// Persist a recovery generation without launching the worker. A caller
     /// holding the shared preparation lease must release it before launch.
     fn persist_storage_refusal(&mut self, error: &BrokerOpError) -> bool {
@@ -1592,19 +1713,15 @@ impl Broker {
                 // Nothing of the repository's runs under storage pressure:
                 // reclaim the shared package store if no preparation holds
                 // it, then refuse exactly as the storage check below would.
-                let probe_paths = [root.clone(), self.main_root().join(".aethyme")];
-                if let Err(error) = require_preparation_storage(self.main_root(), &probe_paths)
-                    && !(self.reclaim_package_store_under_pressure(
-                        cache_root_binding.as_ref(),
-                        session_id,
-                        &root,
-                        &digest,
-                    ) && require_preparation_storage(self.main_root(), &probe_paths).is_ok())
-                {
-                    let error = BrokerOpError::from(error);
-                    self.recover_storage_refusal(&error);
-                    return Err(error);
-                }
+                let main_root = self.main_root().to_path_buf();
+                let probe_paths = [root.clone(), main_root.join(".aethyme")];
+                self.require_storage_or_reclaim(
+                    cache_root_binding.as_ref(),
+                    session_id,
+                    &root,
+                    &digest,
+                    &|| require_preparation_storage(&main_root, &probe_paths),
+                )?;
                 run_runtime_probes(&root, &config)
             }
         };
@@ -1669,26 +1786,20 @@ impl Broker {
         if let Some(resource_db_path) = &resource_db_path {
             storage_paths.push(resource_db_path.clone());
         }
-        if let Err(error) = require_preparation_storage_with_cache_root(
-            self.main_root(),
-            &storage_paths,
-            cache_root_binding.as_ref(),
-        ) && !(self.reclaim_package_store_under_pressure(
+        let main_root = self.main_root().to_path_buf();
+        self.require_storage_or_reclaim(
             cache_root_binding.as_ref(),
             session_id,
             &root,
             &digest,
-        ) && require_preparation_storage_with_cache_root(
-            self.main_root(),
-            &storage_paths,
-            cache_root_binding.as_ref(),
-        )
-        .is_ok())
-        {
-            let error = BrokerOpError::from(error);
-            self.recover_storage_refusal(&error);
-            return Err(error);
-        }
+            &|| {
+                require_preparation_storage_with_cache_root(
+                    &main_root,
+                    &storage_paths,
+                    cache_root_binding.as_ref(),
+                )
+            },
+        )?;
         // Resolve the exact trusted helper and complete its readiness handshake
         // before opening the host resource DB, acquiring a grant, rotating a
         // cache, or writing preparation state. A library embedder without the
@@ -1708,17 +1819,22 @@ impl Broker {
             .as_ref()
             .map(|binding| shared_cache_budget_checked_key(&binding.path));
         let mut cache_mode = SharedCacheMode::Exclusive;
+        // The mode the cache was taken in, which the report states; steps of
+        // a sharing preparation that took it alone run under a share.
+        let mut acquired_mode = SharedCacheMode::Exclusive;
         // Reports what runs while the shared cache is held: stderr progress,
         // the live record other sessions read, and the report's summaries.
         let mut cache_activity_guard = None;
         let mut lease_held_span = None;
+        // Open only while the cache is held alone.
+        let mut exclusive_section_span = None;
+        let sharing = max_concurrent > 1;
         // Whether this preparation measures the store against its budget. A
         // repository that shares the cache measures only when it holds it
         // alone; one that never shares measures at most once an hour, like a
         // sharing one, instead of on every preparation.
         let mut measure_budget = true;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
-            let sharing = max_concurrent > 1;
             let budget_need = if config
                 .shared_cache
                 .as_ref()
@@ -1733,13 +1849,40 @@ impl Broker {
             } else {
                 None
             };
-            let budget_check = if sharing { budget_need } else { None };
+            let mut budget_check = if sharing { budget_need } else { None };
             if !sharing {
                 measure_budget = budget_need.is_some();
             }
             let binding = cache_root_binding
                 .as_ref()
                 .expect("shared cache has a binding");
+            // A due (not overdue) check whose answer a queued or running
+            // background measurement will give does not take the cache alone
+            // for a foreground inventory: that inventory is the one that
+            // stopped at its time limit and queued the measurement (30 s
+            // under the exclusive lease on the busiest repository, every
+            // hour). The overdue check still waits for the cache alone.
+            if matches!(budget_check, Some(ExclusiveNeed::BudgetCheckDue))
+                && let Some(cache) = config.shared_cache.as_ref()
+            {
+                let repository = repository_identity(self);
+                if self
+                    .fresh_shared_cache_measurement(
+                        &repository,
+                        &binding.path,
+                        cache.max_bytes,
+                        now_ms(),
+                    )
+                    .is_none()
+                    && self.shared_cache_measurement_pending(&repository, &binding.path, now_ms())
+                {
+                    crate::phase_telemetry::add(
+                        "shared_cache_budget_check_deferred_to_background",
+                        Duration::ZERO,
+                    );
+                    budget_check = None;
+                }
+            }
             let probe_db = resource_db_path
                 .as_deref()
                 .expect("shared cache has a host resource database");
@@ -1787,7 +1930,13 @@ impl Broker {
             cache_activity::lease_acquired();
             cache_activity::leave();
             lease_held_span = Some(crate::phase_telemetry::span("shared_cache_lease_held"));
+            if mode == SharedCacheMode::Exclusive {
+                exclusive_section_span = Some(crate::phase_telemetry::span(
+                    "shared_cache_exclusive_section",
+                ));
+            }
             cache_mode = mode;
+            acquired_mode = mode;
             crate::phase_telemetry::add(
                 match mode {
                     SharedCacheMode::Shared => "shared_cache_held_shared",
@@ -1802,7 +1951,7 @@ impl Broker {
         } else {
             None
         };
-        let shared_cache_wait_ms = if shared {
+        let mut shared_cache_wait_ms = if shared {
             cache_wait_started.elapsed().as_millis() as u64
         } else {
             0
@@ -1895,7 +2044,7 @@ impl Broker {
             Ok(None)
         };
         cache_activity::leave();
-        let rotation =
+        let mut rotation =
             self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
                 require_preparation_storage_with_cache_root(
                     &storage_root,
@@ -1936,6 +2085,116 @@ impl Broker {
                     cache.max_bytes,
                     background_measurement.as_ref(),
                 );
+            }
+        }
+        // The work that needed the cache alone is done: steps run under a
+        // share, like every other sharing preparation's, so preparations
+        // arriving now wait for none of this one's install.
+        if shared
+            && sharing
+            && cache_mode == SharedCacheMode::Exclusive
+            && let (Some(coordinator_ref), Some(binding), Some(probe_db)) = (
+                coordinator.as_mut(),
+                cache_root_binding.as_ref(),
+                resource_db_path.as_deref(),
+            )
+        {
+            let repository = repository_identity(self);
+            cache_activity::enter(
+                cache_activity::PreparationCacheOperation::WaitingForCache,
+                None,
+                false,
+            );
+            let downgraded = downgrade_preparation_cache(
+                coordinator_ref,
+                &mut grant,
+                &|mode| {
+                    preparation_resource_request(
+                        self,
+                        session_id,
+                        &root,
+                        &digest,
+                        mode,
+                        max_concurrent,
+                    )
+                },
+                wait.saturating_sub(Duration::from_millis(shared_cache_wait_ms)),
+                &mut || {
+                    probe_rotation_recovery(
+                        &binding.path,
+                        binding.identity.as_deref(),
+                        probe_db,
+                        SHARED_CACHE_ROTATION_PROBE_MAX_ENTRIES,
+                        Instant::now() + SHARED_CACHE_ROTATION_PROBE_BUDGET,
+                    ) != rotation_debt::DebtProbe::NoDebt
+                },
+                &|| {
+                    let now = now_ms();
+                    current_cache_holder(probe_db, &repository, session_id, now)
+                        .map(|record| cache_activity::describe_holder(&record, now))
+                },
+            );
+            cache_activity::leave();
+            // Whatever grant the downgrade holds on failure is released here.
+            let (downgrade_wait, held) =
+                self.release_grant_after_error(downgraded, &mut coordinator, &mut grant, || {
+                    require_preparation_storage_with_cache_root(
+                        &storage_root,
+                        &storage_paths,
+                        cache_root_binding.as_ref(),
+                    )
+                })?;
+            shared_cache_wait_ms =
+                shared_cache_wait_ms.saturating_add(downgrade_wait.as_millis() as u64);
+            if held == SharedCacheMode::Shared {
+                drop(exclusive_section_span.take());
+            } else {
+                // Back alone because a rotation may be unfinished: recover it
+                // (no budget check, that ran already) before any step runs.
+                let mut next_renewal = Instant::now();
+                let mut progress = |force: bool| -> Result<(), PreparationError> {
+                    cache_activity::tick();
+                    if force || Instant::now() >= next_renewal {
+                        let (Some(coordinator), Some(grant)) =
+                            (coordinator.as_mut(), grant.as_mut())
+                        else {
+                            return Err(PreparationError::LivenessIncomplete {
+                                reason: "shared-cache lease is unavailable during recovery".into(),
+                            });
+                        };
+                        grant.lease = coordinator.renew(
+                            &grant.lease.lease_id,
+                            grant.lease.generation,
+                            &grant.ownership_token,
+                            PREPARATION_LEASE_TTL_SECONDS,
+                        )?;
+                        next_renewal =
+                            Instant::now() + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+                    }
+                    Ok(())
+                };
+                let recovered =
+                    shared_cache_budget(None, &digest, self, binding, None, &mut progress);
+                cache_activity::leave();
+                let recovered = self.release_grant_after_error(
+                    recovered,
+                    &mut coordinator,
+                    &mut grant,
+                    || {
+                        require_preparation_storage_with_cache_root(
+                            &storage_root,
+                            &storage_paths,
+                            cache_root_binding.as_ref(),
+                        )
+                    },
+                )?;
+                // The probe could not rule out that the measured store was
+                // rotated away in the gap: its result must not outlive it,
+                // as on the normal path after a rotation.
+                self.forget_shared_cache_measurement();
+                if recovered.is_some() {
+                    rotation = recovered;
+                }
             }
         }
         if let Some(cache_dir) = &cache_dir {
@@ -2340,6 +2599,7 @@ impl Broker {
             report.output_share = Some(share);
         }
         release_grant(&mut coordinator, &mut grant)?;
+        drop(exclusive_section_span);
         drop(lease_held_span);
         let shared_cache_operations = cache_activity_guard
             .take()
@@ -2387,7 +2647,7 @@ impl Broker {
             offline,
             shared_cache_coordinated: shared,
             shared_cache_wait_ms,
-            shared_cache_mode: shared.then_some(cache_mode),
+            shared_cache_mode: shared.then_some(acquired_mode),
             shared_cache_rotation: rotation,
             shared_cache_operations,
             shared_cache_background_measurement,
@@ -5331,16 +5591,48 @@ impl Broker {
     }
 }
 
-/// How long a preparation under storage pressure may spend removing a
-/// retired shared package store before it decides whether to refuse.
-const PRESSURE_RECLAIM_BUDGET: Duration = Duration::from_secs(30);
-
 impl Broker {
+    /// Check the preparation's write volumes; under pressure, retire the
+    /// shared package store and check again before refusing. The storage
+    /// worker that removes the retired store and answers the refusal is
+    /// started once.
+    fn require_storage_or_reclaim(
+        &mut self,
+        binding: Option<&crate::broker::PreparationCacheRootBinding>,
+        session_id: i64,
+        root: &Path,
+        digest: &str,
+        check: &dyn Fn() -> Result<(), PreparationError>,
+    ) -> Result<(), BrokerOpError> {
+        let Err(error) = check() else {
+            return Ok(());
+        };
+        let retired = self.reclaim_package_store_under_pressure(binding, session_id, root, digest);
+        if retired && check().is_ok() {
+            self.start_storage_recovery_worker();
+            return Ok(());
+        }
+        let error = BrokerOpError::from(error);
+        if self.persist_storage_refusal(&error) || retired {
+            self.start_storage_recovery_worker();
+        }
+        if retired {
+            eprintln!(
+                "next: the storage worker is removing the retired package store in the \
+                 background; rerun `aethyme broker submit prepare --session {session_id}` once \
+                 it has freed space (`aethyme broker status --json` reports storage advice \
+                 meanwhile)"
+            );
+        }
+        Err(error)
+    }
+
     /// Under storage pressure, rotate this repository's shared package store
     /// (only if no preparation holds the cache, alone or shared: the
-    /// exclusive request is granted at once or not at all) and remove the
-    /// retired tree within [`PRESSURE_RECLAIM_BUDGET`], before a preparation
-    /// refuses. Returns whether a store was retired.
+    /// exclusive request is granted at once or not at all) and record the
+    /// storage-recovery request that hands the retired tree to the storage
+    /// worker; the caller starts the worker. Returns whether a store was
+    /// retired.
     fn reclaim_package_store_under_pressure(
         &mut self,
         binding: Option<&crate::broker::PreparationCacheRootBinding>,
@@ -5395,31 +5687,29 @@ impl Broker {
                 &grant.ownership_token,
             ),
         );
-        let Some(retired) = retired else {
+        if retired.is_none() {
             return false;
-        };
-        crate::phase_telemetry::add("package_store_rotated_pressure", Duration::ZERO);
-        eprintln!(
-            "preparation cache: storage is under pressure; rotated this repository's shared package store and removing it"
-        );
-        let started = Instant::now();
-        let removal = crate::gc::remove_condemned_tree_with_progress_and_guard(
-            &retired,
-            None,
-            Some(started + PRESSURE_RECLAIM_BUDGET),
-            || {
-                binding
-                    .validate()
-                    .map_err(|error| std::io::Error::other(error.to_string()))
-            },
-        );
-        crate::phase_telemetry::add("package_store_retired_removal", started.elapsed());
-        if let Err(error) = removal {
-            eprintln!(
-                "warning: aethyme could not finish removing the retired package store: {}",
-                error.source
-            );
         }
+        crate::phase_telemetry::add("package_store_rotated_pressure", Duration::ZERO);
+        // The rename freed nothing yet; the removal is the storage worker's
+        // (its sweep removes every retired store, paced, outside any
+        // command). Until 2026-11-23 this preparation removed it inline for
+        // up to 30 s and on the busiest repository still refused after.
+        let handed_off = {
+            let _span = crate::phase_telemetry::span("package_store_retired_handoff");
+            self.persist_storage_recovery_request()
+        };
+        crate::phase_telemetry::add(
+            if handed_off {
+                "package_store_retired_handed_to_worker"
+            } else {
+                "package_store_retired_handoff_failed"
+            },
+            Duration::ZERO,
+        );
+        eprintln!(
+            "preparation cache: storage is under pressure; rotated this repository's shared package store and handed it to the storage worker for removal"
+        );
         true
     }
 

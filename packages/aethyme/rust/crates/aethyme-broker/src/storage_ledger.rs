@@ -229,7 +229,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
             "gates" => Class::GateCache,
             "symbol-index" => Class::SymbolIndex,
             "graph-stores" => Class::GraphStores,
-            "cargo" | "git-probe" | "update-manifests" => Class::ToolCaches,
+            "cargo"
+            | "git-probe"
+            | "update-manifests"
+            | crate::node_compile_cache::CACHE_DIRECTORY => Class::ToolCaches,
             "worktrees" => Class::Worktrees,
             _ => Class::Unclassified,
         },
@@ -288,6 +291,28 @@ pub fn policy(class: Class) -> Policy {
         Class::Worktrees => Policy::ReportOnly("checkouts are removed by checkout cleanup"),
         Class::Coordination => Policy::ReportOnly("live coordination state"),
         Class::Unclassified => Policy::ReportOnly("not a name Aethyme writes; never deleted"),
+    }
+}
+
+/// How long a daily directory of the Node.js compile cache is kept, used or
+/// not: Node.js never prunes it, and a day's directory stops being written
+/// once the day is over.
+pub const NODE_COMPILE_CACHE_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How the top-level entry `name` of `class` is enforced: its class's
+/// policy, except that the Node.js compile cache's daily directories also
+/// expire by age, whatever the tool-cache budget.
+pub fn entry_policy(class: Class, name: &str) -> Policy {
+    match policy(class) {
+        Policy::LruChildren { idle, .. }
+            if class == Class::ToolCaches && name == crate::node_compile_cache::CACHE_DIRECTORY =>
+        {
+            Policy::LruChildren {
+                idle,
+                expire: Some(NODE_COMPILE_CACHE_EXPIRY),
+            }
+        }
+        policy => policy,
     }
 }
 

@@ -6411,6 +6411,7 @@ impl Broker {
             .as_ref()
             .map(crate::command_temp::CommandTemp::environment)
             .unwrap_or_default();
+        let node_environment = crate::node_compile_cache::environment_for_session(session_id);
         let result = self.guarded_exec_with_runner(
             session_id,
             command,
@@ -6431,6 +6432,7 @@ impl Broker {
                     ),
                 ];
                 execution_environment.extend(scratch);
+                execution_environment.extend(node_environment);
                 execution_environment.extend(temp_environment);
                 execution_environment.extend_from_slice(environment);
 
@@ -6656,6 +6658,9 @@ impl Broker {
         execution_environment.extend(self.session_scratch_environment(session_id));
         // Held until the step has ended: dropping it ends the run.
         let command_temp = self.command_temp_for_session(session_id);
+        execution_environment.extend(crate::node_compile_cache::environment_for_session(
+            session_id,
+        ));
         if let Some(temp) = &command_temp {
             execution_environment.extend(temp.environment());
         }

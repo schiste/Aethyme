@@ -247,7 +247,22 @@ pub struct SharedCacheMeasurementRequest {
     pub failure_store_identity: Option<String>,
 }
 
+/// A request older than this is not expected to answer a budget check.
+pub(crate) const PENDING_TRUST_MAX_AGE_MS: i64 = 3 * 60 * 60 * 1000;
+/// A back-off ending later than this is not expected to answer one either.
+pub(crate) const PENDING_TRUST_MAX_RETRY_MS: i64 = 15 * 60_000;
+
 impl SharedCacheMeasurementRequest {
+    /// Whether this request is likely to produce a result soon: no failed
+    /// walks, no long back-off, and not waiting for hours.
+    fn expected_soon(&self, now: i64) -> bool {
+        self.consecutive_failures == 0
+            && self
+                .retry_after_ms
+                .is_none_or(|retry| retry <= now.saturating_add(PENDING_TRUST_MAX_RETRY_MS))
+            && now.saturating_sub(self.queued_at_ms) <= PENDING_TRUST_MAX_AGE_MS
+    }
+
     /// Whether a live worker is walking for it now.
     fn running(&self, now: i64) -> bool {
         let Some(since) = self.running_since_ms else {
@@ -546,6 +561,25 @@ impl Broker {
     pub(crate) fn shared_cache_measurement_due(&self, now: i64) -> bool {
         self.shared_cache_measurement_request()
             .is_some_and(|request| request.due(now))
+    }
+
+    /// Whether a measurement of `repository`'s store under `cache_root` is
+    /// queued or running and can be expected to answer soon: a due
+    /// foreground budget check then leaves the answer to it instead of
+    /// taking the cache alone. A request whose walks keep failing, that
+    /// backs off for long, or that has waited for hours is not counted on.
+    pub(crate) fn shared_cache_measurement_pending(
+        &self,
+        repository: &str,
+        cache_root: &Path,
+        now: i64,
+    ) -> bool {
+        self.shared_cache_measurement_request()
+            .is_some_and(|request| {
+                request.repository == repository
+                    && request.cache_root_key == cache_root_key(cache_root)
+                    && request.expected_soon(now)
+            })
     }
 
     /// The status view, or `None` when nothing was ever queued or measured.
@@ -1820,6 +1854,61 @@ mod tests {
         let status = fixture.broker.shared_cache_measurement_status().unwrap();
         assert!(status.request.is_some() && status.result.is_none());
         assert!(!status.result_fresh && !status.running);
+    }
+
+    /// A due budget check defers to a pending measurement of the same store
+    /// only, and only one expected to answer soon.
+    #[test]
+    fn a_pending_measurement_is_matched_by_store_and_trusted_only_while_healthy() {
+        let mut fixture = fixture(1, 10);
+        let cache_root = fixture.cache_root.clone();
+        let now = now_ms();
+        let pending = |fixture: &Fixture, repository: &str, root: &Path, now: i64| {
+            fixture
+                .broker
+                .shared_cache_measurement_pending(repository, root, now)
+        };
+        assert!(!pending(&fixture, REPOSITORY, &cache_root, now));
+        fixture.queue(1_000);
+        assert!(pending(&fixture, REPOSITORY, &cache_root, now));
+        assert!(!pending(&fixture, &"0".repeat(64), &cache_root, now));
+        let other_root = fixture.host.path().to_path_buf();
+        assert!(!pending(&fixture, REPOSITORY, &other_root, now));
+        // Queued hours ago: not expected to answer.
+        assert!(!pending(
+            &fixture,
+            REPOSITORY,
+            &cache_root,
+            now + PENDING_TRUST_MAX_AGE_MS + 60_000
+        ));
+
+        let rewrite = |fixture: &mut Fixture,
+                       change: &dyn Fn(&mut SharedCacheMeasurementRequest)| {
+            let (raw, request) = fixture.broker.read_measurement_request();
+            let mut request = request.unwrap();
+            change(&mut request);
+            assert!(
+                fixture
+                    .broker
+                    .replace_measurement_request(raw.as_deref(), Some(&request))
+                    .unwrap()
+            );
+        };
+        // A back-off ending soon is still trusted; a long one is not.
+        rewrite(&mut fixture, &|request| {
+            request.retry_after_ms = Some(now + 60_000);
+        });
+        assert!(pending(&fixture, REPOSITORY, &cache_root, now));
+        rewrite(&mut fixture, &|request| {
+            request.retry_after_ms = Some(now + PENDING_TRUST_MAX_RETRY_MS + 60_000);
+        });
+        assert!(!pending(&fixture, REPOSITORY, &cache_root, now));
+        // Failed walks: not trusted.
+        rewrite(&mut fixture, &|request| {
+            request.retry_after_ms = None;
+            request.consecutive_failures = 1;
+        });
+        assert!(!pending(&fixture, REPOSITORY, &cache_root, now));
     }
 
     #[test]
