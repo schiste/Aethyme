@@ -372,6 +372,14 @@ fn policy_coverage(
                     .get(check_id.as_str())
                     .filter(|c| c["blocking"].as_bool() == Some(blocking))
                     .ok_or("resolved policy check is missing or has inconsistent blocking")?;
+                if kind == "unique_collection_metadata"
+                    && !has_collection
+                    && check["status"] != "not_checked"
+                {
+                    return Err(
+                        "candidate evaluator cannot execute collection gate without a collection",
+                    );
+                }
                 if matches!(kind, "custom" | "site_group" | "site_audit")
                     && check["status"] != "not_checked"
                 {
@@ -890,6 +898,21 @@ mod tests {
         let collection = json!({"id":"collection:0::words", "blocking":true});
         let checks = BTreeMap::from([("collection:0::words", &collection)]);
         assert_eq!(policy_coverage(&policy, &change, true, &checks), Ok((1, 1)));
+    }
+
+    #[test]
+    fn collection_gate_cannot_run_without_collection() {
+        let policy = json!({"version":1,"name":"test","gates":[{"id":"unique","kind":"unique_collection_metadata","blocking":false}]});
+        let change =
+            json!({"entries":[{"entity_id":"article","media_type":"text/plain","after":{}}]});
+        for status in ["passed", "failed", "not_checked"] {
+            let check = json!({"status":status,"blocking":false});
+            let checks = BTreeMap::from([("gate:7:article:unique", &check)]);
+            assert_eq!(
+                policy_coverage(&policy, &change, false, &checks).is_ok(),
+                status == "not_checked"
+            );
+        }
     }
 
     #[test]
