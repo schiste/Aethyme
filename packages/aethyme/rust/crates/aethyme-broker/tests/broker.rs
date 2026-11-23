@@ -2641,6 +2641,9 @@ fn status_brief_loads_promotion_config_once_from_committed_default() {
         .args(["--exact", NAME, "--nocapture"])
         .env(CHILD, "1")
         .env("GIT_TRACE2_EVENT", &trace)
+        // These reads are witnessed through the `git` program's trace, so
+        // keep them off the in-process path.
+        .env("AETHYME_GIT_IN_PROCESS", "0")
         .output()
         .unwrap();
     assert!(

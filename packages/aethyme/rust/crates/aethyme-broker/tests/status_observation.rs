@@ -176,6 +176,9 @@ fn summary_status_has_bounded_git_processes_and_no_checkout_scan() {
     let trace = f.owner_path().join("trace.jsonl");
     let output = command(&f, &["status", "--summary", "--json"])
         .env("GIT_TRACE2_EVENT", &trace)
+        // These reads are witnessed through the `git` program's trace, so
+        // keep them off the in-process path.
+        .env("AETHYME_GIT_IN_PROCESS", "0")
         .output()
         .unwrap();
     json(&output);

@@ -33,6 +33,16 @@
 //! - Symbolic refs are followed for at most four hops (Git reads five refs),
 //!   loose refs must have a form Git accepts, and a tag whose `type` header
 //!   disagrees with its target falls back.
+//! - A path in a tree is looked up component by component, byte for byte.
+//!   Only a missing component is answered as absent; a component that exists
+//!   but is not a tree, a final entry the caller cannot use as a file (a
+//!   tree, a submodule, an unusual mode), and a tree Git could read
+//!   differently (entries out of order, a repeated name, a name with a slash)
+//!   fall back. A blob larger than the caller's limit falls back, so Git
+//!   reports the limit as before. A path with any non-ASCII byte falls back:
+//!   with `core.precomposeUnicode` (the macOS default) Git rewrites a
+//!   decomposed argument to its composed form before the lookup, which a
+//!   byte comparison would not match.
 //!
 //! `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`, `on` or `yes`,
 //! and `[git] in_process = false` in the main checkout's
@@ -40,7 +50,7 @@
 //! common directory is not `<main checkout>/.git` (bare, `--separate-git-dir`)
 //! always uses the program, since the switch cannot be located.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
@@ -69,6 +79,13 @@ const KNOWN_EXTENSIONS: [&str; 6] = [
 const MAX_TAG_DEPTH: usize = 32;
 /// Names longer than this go to Git.
 const MAX_NAME_BYTES: usize = 1024;
+/// Paths longer than this go to Git.
+const MAX_PATH_BYTES: usize = 4096;
+/// Files read whole from a revision (`show <rev>:<path>`) larger than this go
+/// to Git, which streams them.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The remote's default branch, as `origin_head_default` reads it.
+const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
 
 /// One kind of read-only query, the key of its counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +98,18 @@ pub(crate) enum ReadKind {
     CommitTree,
     /// `merge-base --is-ancestor <ancestor> <descendant>`
     IsAncestor,
+    /// `symbolic-ref --quiet <name>`
+    SymbolicRef,
+    /// `for-each-ref refs/remotes/origin/HEAD`, with its checked slow path
+    OriginHeadDefault,
+    /// `ls-tree -z --full-tree <commit> -- :(literal)<path>...`
+    ConfigTreeEntries,
+    /// `cat-file blob <object>`
+    BlobBytes,
+    /// `cat-file -e <rev>:<path>`, then `show <rev>:<path>`
+    FileAtRevision,
+    /// `cat-file -e <rev>:<path>`
+    PathExistsAt,
 }
 
 impl ReadKind {
@@ -90,6 +119,12 @@ impl ReadKind {
             Self::HeadCommit => "head_commit",
             Self::CommitTree => "commit_tree",
             Self::IsAncestor => "is_ancestor",
+            Self::SymbolicRef => "symbolic_ref",
+            Self::OriginHeadDefault => "origin_head_default",
+            Self::ConfigTreeEntries => "config_tree_entries",
+            Self::BlobBytes => "blob_bytes",
+            Self::FileAtRevision => "file_at_revision",
+            Self::PathExistsAt => "path_exists_at",
         }
     }
 }
@@ -133,6 +168,27 @@ pub(crate) enum Fallback {
     BrokenRef,
     /// A tag whose `type` header disagrees with the object it names.
     TagTypeMismatch,
+    /// A path with empty, `.` or `..` components, or other syntax this module
+    /// does not look up.
+    UnsupportedPath,
+    /// A path with a non-ASCII byte: Git may rewrite it to another Unicode
+    /// normalization (`core.precomposeUnicode`) before looking it up.
+    NonAsciiPath,
+    /// A leading path component exists but is not a tree.
+    PathThroughNonTree,
+    /// The entry is a tree, a submodule, or has a mode the caller does not
+    /// read as a regular file.
+    NotARegularFile,
+    /// A tree whose entries are out of Git's order, repeat a name, or carry a
+    /// name Git's lookup could match differently.
+    MalformedTree,
+    /// The object is not a blob.
+    NotABlob,
+    /// The blob is larger than the caller reads.
+    TooLarge,
+    /// A symbolic ref whose target is outside what the caller accepts, or a
+    /// ref that is not symbolic where the caller needs one.
+    UnexpectedTarget,
 }
 
 impl Fallback {
@@ -156,6 +212,14 @@ impl Fallback {
             Self::Panic => "panic",
             Self::BrokenRef => "broken_ref",
             Self::TagTypeMismatch => "tag_type_mismatch",
+            Self::UnsupportedPath => "unsupported_path",
+            Self::NonAsciiPath => "non_ascii_path",
+            Self::PathThroughNonTree => "path_through_non_tree",
+            Self::NotARegularFile => "not_a_regular_file",
+            Self::MalformedTree => "malformed_tree",
+            Self::NotABlob => "not_a_blob",
+            Self::TooLarge => "too_large",
+            Self::UnexpectedTarget => "unexpected_target",
         }
     }
 }
@@ -172,6 +236,27 @@ pub(crate) trait GitRead {
     fn commit_tree(&self, spec: &str) -> Result<String, Self::Error>;
     /// `git merge-base --is-ancestor <ancestor> <descendant>`.
     fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, Self::Error>;
+    /// `git symbolic-ref --quiet <name>`: the ref a symbolic chain ends at,
+    /// `None` when `name` is not symbolic.
+    fn symbolic_ref(&self, name: &str) -> Result<Option<String>, Self::Error>;
+    /// `git for-each-ref --count=1 refs/remotes/origin/HEAD` and its checked
+    /// slow path: `(origin/<branch>, commit)`, `None` when absent.
+    fn origin_head_default(&self) -> Result<Option<(String, String)>, Self::Error>;
+    /// `git ls-tree -z --full-tree <commit> -- :(literal)<path>...`: the blob
+    /// of each regular file among `paths`, keyed by path.
+    fn config_tree_entries(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, Self::Error>;
+    /// `git cat-file blob <object>`: a blob of more than `limit` bytes is
+    /// Git's to refuse.
+    fn blob_bytes(&self, object: &str, limit: usize) -> Result<Vec<u8>, Self::Error>;
+    /// `git cat-file -e <rev>:<path>`, then `git show <rev>:<path>` as lossy
+    /// UTF-8 without trailing whitespace; `None` when the first fails.
+    fn file_at_revision(&self, revision: &str, path: &str) -> Result<Option<String>, Self::Error>;
+    /// `git cat-file -e <rev>:<path>`.
+    fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, Self::Error>;
 }
 
 /// Answer `kind` in-process when possible, else through `program`. Every
@@ -463,6 +548,69 @@ impl InProcess {
         }
         Err(Fallback::Unresolved)
     }
+
+    /// The tree of the commit `revision` names.
+    fn tree_of(&self, revision: &str) -> Result<gix::ObjectId, Fallback> {
+        let commit = self.object(self.commit_id(revision)?)?;
+        gix::objs::CommitRefIter::from_bytes(&commit.data, self.repo.object_hash())
+            .tree_id()
+            .map_err(|_| Fallback::Gix)
+    }
+
+    /// The entry at `path` below `tree`, as Git's `<rev>:<path>` lookup and
+    /// `ls-tree` find it; `None` when a component is absent.
+    fn tree_entry(
+        &self,
+        tree: gix::ObjectId,
+        path: &str,
+    ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, Fallback> {
+        let components = path_components(path)?;
+        let mut tree = tree;
+        for (index, component) in components.iter().enumerate() {
+            let object = self.object(tree)?;
+            if object.kind != gix::objs::Kind::Tree {
+                return Err(Fallback::MalformedTree);
+            }
+            let Some((mode, id)) =
+                find_tree_entry(&object.data, self.repo.object_hash(), component.as_bytes())?
+            else {
+                return Ok(None);
+            };
+            if index + 1 == components.len() {
+                return Ok(Some((mode, id)));
+            }
+            // Git reports nothing below a file or a submodule; that absence
+            // is left to Git rather than proven here.
+            if !mode.is_tree() {
+                return Err(Fallback::PathThroughNonTree);
+            }
+            tree = id;
+        }
+        Err(Fallback::UnsupportedPath)
+    }
+
+    /// The kind of a local object, without reading it.
+    fn object_kind(&self, id: gix::ObjectId) -> Result<gix::objs::Kind, Fallback> {
+        Ok(self
+            .repo
+            .try_find_header(id)
+            .map_err(|_| Fallback::Gix)?
+            .ok_or(Fallback::ObjectMissing)?
+            .kind())
+    }
+
+    /// Kind and size of a local blob, without reading it.
+    fn blob_size(&self, id: gix::ObjectId) -> Result<u64, Fallback> {
+        let header = self
+            .repo
+            .try_find_header(id)
+            .map_err(|_| Fallback::Gix)?
+            .ok_or(Fallback::ObjectMissing)?;
+        if header.kind() != gix::objs::Kind::Blob {
+            return Err(Fallback::NotABlob);
+        }
+        Ok(header.size())
+    }
 }
 
 impl GitRead for InProcess {
@@ -484,10 +632,7 @@ impl GitRead for InProcess {
     }
 
     fn commit_tree(&self, spec: &str) -> Result<String, Fallback> {
-        let commit = self.object(self.commit_id(spec)?)?;
-        let tree = gix::objs::CommitRefIter::from_bytes(&commit.data, self.repo.object_hash())
-            .tree_id()
-            .map_err(|_| Fallback::Gix)?;
+        let tree = self.tree_of(spec)?;
         // Git parses the tree it peels to; a missing one is Git's to report.
         if !self.repo.has_object(tree) {
             return Err(Fallback::ObjectMissing);
@@ -534,6 +679,128 @@ impl GitRead for InProcess {
             return Err(Fallback::ObjectMissing);
         }
         Ok(bases.is_some_and(|bases| bases.iter().any(|base| *base == ancestor)))
+    }
+
+    fn symbolic_ref(&self, name: &str) -> Result<Option<String>, Fallback> {
+        // Git prints the ref the chain ends at, which it reads whether or not
+        // it exists; a dangling end is left to Git, like any absence.
+        if name != "HEAD" && !name.starts_with("refs/") {
+            return Err(Fallback::UnsupportedSpec);
+        }
+        if classify(name)? != Spec::Name(name) {
+            return Err(Fallback::UnsupportedSpec);
+        }
+        let mut reference = self.exact_reference(name)?.ok_or(Fallback::NotFound)?;
+        let mut end = None;
+        for hop in 0..=MAX_SYMREF_HOPS {
+            let target = match reference.target() {
+                gix::refs::TargetRef::Object(_) => return Ok(end),
+                gix::refs::TargetRef::Symbolic(_) if hop == MAX_SYMREF_HOPS => break,
+                gix::refs::TargetRef::Symbolic(target) => {
+                    symbolic_target_name(target.as_bstr().as_ref())?
+                }
+            };
+            reference = self.exact_reference(&target)?.ok_or(Fallback::Unresolved)?;
+            end = Some(target);
+        }
+        Err(Fallback::Unresolved)
+    }
+
+    fn origin_head_default(&self) -> Result<Option<(String, String)>, Fallback> {
+        // Only the listing's fast-path answer is given here: one symbolic hop
+        // into `refs/remotes/origin/`, ending at a local commit. Absence, a
+        // direct ref, a longer chain and a tag are the checked path's.
+        let reference = self
+            .exact_reference(ORIGIN_HEAD)?
+            .ok_or(Fallback::NotFound)?;
+        let target = match reference.target() {
+            gix::refs::TargetRef::Symbolic(target) => {
+                symbolic_target_name(target.as_bstr().as_ref())?
+            }
+            gix::refs::TargetRef::Object(_) => return Err(Fallback::UnexpectedTarget),
+        };
+        let short = target
+            .strip_prefix("refs/remotes/")
+            .filter(|short| short.starts_with("origin/"))
+            .ok_or(Fallback::UnexpectedTarget)?
+            .to_string();
+        let resolved = self.exact_reference(&target)?.ok_or(Fallback::Unresolved)?;
+        let id = match resolved.target() {
+            gix::refs::TargetRef::Object(id) => id.to_owned(),
+            gix::refs::TargetRef::Symbolic(_) => return Err(Fallback::Unresolved),
+        };
+        if self.object_kind(id)? != gix::objs::Kind::Commit {
+            return Err(Fallback::NotACommit);
+        }
+        Ok(Some((short, id.to_string())))
+    }
+
+    fn config_tree_entries(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, Fallback> {
+        let tree = self.tree_of(commit)?;
+        let mut entries = BTreeMap::new();
+        for path in paths {
+            let Some((mode, id)) = self.tree_entry(tree, path)? else {
+                continue;
+            };
+            // Git prints canonical modes; only the two it would print
+            // unchanged are answered, anything else is the caller's error
+            // to report from Git's listing.
+            if !matches!(mode.value(), 0o100644 | 0o100755) {
+                return Err(Fallback::NotARegularFile);
+            }
+            entries.insert(path.clone(), id.to_string());
+        }
+        Ok(entries)
+    }
+
+    fn blob_bytes(&self, object: &str, limit: usize) -> Result<Vec<u8>, Fallback> {
+        // Git peels a tag to the blob it names; only a blob id is read here.
+        let Spec::Id(id) = classify(object)? else {
+            return Err(Fallback::UnsupportedSpec);
+        };
+        if self.blob_size(id)? > limit as u64 {
+            return Err(Fallback::TooLarge);
+        }
+        Ok(self.object(id)?.detach().data)
+    }
+
+    fn file_at_revision(&self, revision: &str, path: &str) -> Result<Option<String>, Fallback> {
+        let tree = self.tree_of(revision)?;
+        let Some((mode, id)) = self.tree_entry(tree, path)? else {
+            return Ok(None);
+        };
+        // `show` prints a tree as a listing and a submodule's commit only
+        // when it happens to be local; both are Git's.
+        if !mode.is_blob_or_symlink() {
+            return Err(Fallback::NotARegularFile);
+        }
+        if self.blob_size(id)? > MAX_FILE_BYTES {
+            return Err(Fallback::TooLarge);
+        }
+        let blob = self.object(id)?;
+        Ok(Some(
+            String::from_utf8_lossy(&blob.data).trim_end().to_string(),
+        ))
+    }
+
+    fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, Fallback> {
+        let tree = self.tree_of(revision)?;
+        let Some((mode, id)) = self.tree_entry(tree, path)? else {
+            return Ok(false);
+        };
+        // A submodule names a commit in another repository, which a promisor
+        // repository may try to fetch: Git's to answer.
+        if mode.is_commit() {
+            return Err(Fallback::NotARegularFile);
+        }
+        if !self.repo.has_object(id) {
+            return Err(Fallback::ObjectMissing);
+        }
+        Ok(true)
     }
 }
 
@@ -616,6 +883,86 @@ fn classify(spec: &str) -> Result<Spec<'_>, Fallback> {
         return Err(Fallback::UnsupportedSpec);
     }
     Ok(Spec::Name(spec))
+}
+
+/// A symbolic ref's target, accepted only as a plain, shared `refs/` name.
+fn symbolic_target_name(target: &[u8]) -> Result<String, Fallback> {
+    let target = std::str::from_utf8(target).map_err(|_| Fallback::UnexpectedTarget)?;
+    match classify(target) {
+        Ok(Spec::Name(name)) if name.starts_with("refs/") => Ok(name.to_string()),
+        _ => Err(Fallback::UnexpectedTarget),
+    }
+}
+
+/// The components of a repository-relative ASCII path, each non-empty and
+/// neither `.` nor `..`.
+fn path_components(path: &str) -> Result<Vec<&str>, Fallback> {
+    if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains(['\\', ':', '\0']) {
+        return Err(Fallback::UnsupportedPath);
+    }
+    if !path.is_ascii() {
+        return Err(Fallback::NonAsciiPath);
+    }
+    let components = path.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return Err(Fallback::UnsupportedPath);
+    }
+    Ok(components)
+}
+
+/// The one entry named `name` in a tree, after checking the whole tree is in
+/// Git's order: Git's lookup stops early in a sorted tree, `ls-tree` scans
+/// all of it, and the two agree only on a well-formed tree.
+fn find_tree_entry(
+    data: &[u8],
+    hash: gix::hash::Kind,
+    name: &[u8],
+) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, Fallback> {
+    let mut previous: Option<(&[u8], bool)> = None;
+    let mut found = None;
+    for entry in gix::objs::TreeRefIter::from_bytes(data, hash) {
+        let entry = entry.map_err(|_| Fallback::MalformedTree)?;
+        let filename: &[u8] = entry.filename.as_ref();
+        if filename.is_empty() || filename.contains(&b'/') {
+            return Err(Fallback::MalformedTree);
+        }
+        let is_tree = entry.mode.is_tree();
+        if previous.is_some_and(|(before, before_tree)| {
+            git_tree_order(before, before_tree, filename, is_tree) != std::cmp::Ordering::Less
+        }) {
+            return Err(Fallback::MalformedTree);
+        }
+        if filename == name {
+            if found.is_some() {
+                return Err(Fallback::MalformedTree);
+            }
+            found = Some((entry.mode, entry.oid.to_owned()));
+        }
+        previous = Some((filename, is_tree));
+    }
+    Ok(found)
+}
+
+/// Git's tree entry order: names compared bytewise, a tree's name as if it
+/// ended in `/`.
+fn git_tree_order(
+    left: &[u8],
+    left_tree: bool,
+    right: &[u8],
+    right_tree: bool,
+) -> std::cmp::Ordering {
+    let common = left.len().min(right.len());
+    left[..common].cmp(&right[..common]).then_with(|| {
+        let next = |name: &[u8], tree: bool| {
+            name.get(common)
+                .copied()
+                .unwrap_or(if tree { b'/' } else { 0 })
+        };
+        next(left, left_tree).cmp(&next(right, right_tree))
+    })
 }
 
 /// Git's `ref_rev_parse_rules`, in order.

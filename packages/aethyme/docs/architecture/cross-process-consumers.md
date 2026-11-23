@@ -496,6 +496,17 @@ no default features, no network, SHA-1 only) can prove the same answer:
 `is_ancestor_checked`). Every other case runs the same `git` command as
 before; an in-process failure is never an answer.
 
+The committed-configuration reads followed (stage 2), about 43% of the Git
+processes `broker status --full` started on the busiest repository:
+`symbolic-ref --quiet <name>` (`GitRepo::symbolic_ref`, and the checked form
+behind `upstream_default_checked`), `for-each-ref refs/remotes/origin/HEAD`
+(`origin_head_default_checked`), `ls-tree` of `.aethyme/<stem>.*` at a commit
+and `cat-file blob` of the selected file
+(`config_at_resolved_commit_checked`), `cat-file -e <rev>:<path>` followed by
+`show` (`file_at_commit`, hence `config_at_commit` and
+`config_toml_at_commit`), and `cat-file -e <rev>:<path>` alone
+(`path_exists_at`).
+
 - **Fallbacks.** A query goes to `git` when the name has revision syntax, could
   be a short object id, is a pseudo ref other than `HEAD` or is per-worktree;
   when no candidate ref exists; when a file in the Git directory shares the
@@ -513,6 +524,21 @@ before; an in-process failure is never an answer.
   (`extensions.partialClone`) repository, or when the walk meets a missing or
   non-commit object (gitoxide would skip it); and on any
   gitoxide error or panic.
+- **Stage 2 fallbacks.** A symbolic ref is answered only when its chain ends
+  at an existing ref within four hops and every target is a plain shared
+  `refs/` name; an absent name or a dangling end goes to `git`. The remote
+  default is answered only for its fast path: one symbolic hop into
+  `refs/remotes/origin/` ending at a local commit. A path is looked up byte
+  for byte; only a missing component is answered as absent. A component that
+  exists but is not a tree, a final entry that is a tree, a submodule or (for
+  the tree listing) any mode but `100644` and `100755`, a tree whose entries
+  are out of Git's order or repeat a name, a path with empty, `.` or `..`
+  components, a path with any non-ASCII byte (Git composes a decomposed
+  argument under `core.precomposeUnicode`, the macOS default, before the
+  lookup), a blob larger than the caller reads (4 MiB for configuration,
+  64 MiB for a whole file) and a missing blob or tree (a partial clone) go to
+  `git`. Inherited `GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+  `GIT_NOGLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` send every query to `git`.
 - **Kill switch.** `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`,
   `on` or `yes`, or `[git] in_process = false` in the main checkout's
   `.aethyme/config.toml`, sends every query to `git`. An invalid config value
@@ -521,11 +547,17 @@ before; an in-process failure is never an answer.
 - **Telemetry.** Span `git_read_inprocess` times each in-process attempt,
   fallbacks included. Attachment `git_read` counts them by operation:
   `<kind>.answered` and `<kind>.fallback.<reason>`, with `kind` one of
-  `resolve_commit`, `head_commit`, `commit_tree`, `is_ancestor` and `reason`
+  `resolve_commit`, `head_commit`, `commit_tree`, `is_ancestor`,
+  `symbolic_ref`, `origin_head_default`, `config_tree_entries`, `blob_bytes`,
+  `file_at_revision`, `path_exists_at` and `reason`
   one of `disabled`, `environment`, `deadline`, `open`, `untrusted`, `format`,
   `history_override`, `unsupported_spec`, `not_found`, `root_file_shadow`,
   `unresolved`, `object_missing`, `not_a_commit`, `concurrent_ref_update`,
-  `gix`, `panic`, `broken_ref`, `tag_type_mismatch`. Each answered query is one `subprocess_git` fewer.
+  `gix`, `panic`, `broken_ref`, `tag_type_mismatch`, `unsupported_path`,
+  `non_ascii_path`,
+  `path_through_non_tree`, `not_a_regular_file`, `malformed_tree`,
+  `not_a_blob`, `too_large`, `unexpected_target`. Each answered query is one
+  `subprocess_git` fewer (`file_at_revision` two: `cat-file -e` and `show`).
 
 ## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
 

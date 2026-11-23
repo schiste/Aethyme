@@ -426,6 +426,9 @@ fn doctor_inspects_version_before_retention_inventory() {
         .args(["--exact", NAME, "--nocapture"])
         .env(CHILD, "1")
         .env("GIT_TRACE2_EVENT", &trace)
+        // These reads are witnessed through the `git` program's trace, so
+        // keep them off the in-process path.
+        .env("AETHYME_GIT_IN_PROCESS", "0")
         .output()
         .unwrap();
     assert!(
