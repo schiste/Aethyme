@@ -75,6 +75,9 @@ semver = { workspace = true }
 # the one compressed form Codex unarchives and resumes natively.
 zstd = { workspace = true }
 jsonschema.workspace = true
+# Read-only Git queries answered in-process (`git_read`), falling back to
+# the `git` program on any error or unsupported case.
+gix = { workspace = true }
 
 # `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
 # needs the monorepo root rather than this crate's. `repo_root()` discovers
