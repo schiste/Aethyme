@@ -2201,7 +2201,13 @@ pub(crate) fn in_process_git_environment_refused() -> bool {
             unsafe_graph_git_environment_key(&key)
                 || matches!(
                     key.to_string_lossy().to_ascii_uppercase().as_str(),
-                    "GIT_NO_REPLACE_OBJECTS" | "GIT_DEFAULT_HASH" | "GIT_DEFAULT_REF_FORMAT"
+                    "GIT_NO_REPLACE_OBJECTS"
+                        | "GIT_DEFAULT_HASH"
+                        | "GIT_DEFAULT_REF_FORMAT"
+                        | "GIT_LITERAL_PATHSPECS"
+                        | "GIT_GLOB_PATHSPECS"
+                        | "GIT_NOGLOB_PATHSPECS"
+                        | "GIT_ICASE_PATHSPECS"
                 )
         })
 }
@@ -4060,6 +4066,59 @@ impl GitRead for ProgramRead<'_> {
             }),
         }
     }
+
+    fn symbolic_ref(&self, name: &str) -> Result<Option<String>, GitError> {
+        self.repo().symbolic_ref_program(name)
+    }
+
+    fn origin_head_default(&self) -> Result<Option<(String, String)>, GitError> {
+        self.repo().origin_head_default_program()
+    }
+
+    fn config_tree_entries(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        self.repo().config_tree_entries_program(commit, paths)
+    }
+
+    fn blob_bytes(&self, object: &str, limit: usize) -> Result<Vec<u8>, GitError> {
+        self.repo()
+            .run_git_output_limited(&["cat-file", "blob", object], limit)
+            .map(|output| output.stdout)
+    }
+
+    fn file_at_revision(&self, revision: &str, path: &str) -> Result<Option<String>, GitError> {
+        let object = format!("{revision}:{path}");
+        match run_git(self.root, &["cat-file", "-e", &object]) {
+            Ok(_) => run_git(self.root, &["show", &object]).map(Some),
+            Err(GitError::Git { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, GitError> {
+        let object = format!("{revision}:{path}");
+        let output = git_command()
+            .args(["cat-file", "-e", &object])
+            .current_dir(self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: format!("cat-file -e {object}"),
+                source,
+            })?;
+        Ok(output.status.success())
+    }
+}
+
+impl ProgramRead<'_> {
+    /// The checkout handle whose program helpers these queries share.
+    fn repo(&self) -> GitRepo {
+        GitRepo {
+            root: self.root.to_path_buf(),
+        }
+    }
 }
 
 /// A handle on one git checkout (the main repository or a linked
@@ -4688,9 +4747,18 @@ impl GitRepo {
 
     /// Resolve a symbolic ref without falling back to the checked-out HEAD.
     pub fn symbolic_ref(&self, name: &str) -> Option<String> {
-        run_git(&self.root, &["symbolic-ref", "--quiet", name])
-            .ok()
-            .filter(|value| !value.is_empty())
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::SymbolicRef,
+            |git| git.symbolic_ref(name),
+            || {
+                Ok(run_git(&self.root, &["symbolic-ref", "--quiet", name])
+                    .ok()
+                    .filter(|value| !value.is_empty()))
+            },
+        )
+        .ok()
+        .flatten()
     }
 
     /// Configured tracking ref and its currently fetched commit. This is
@@ -4806,6 +4874,17 @@ impl GitRepo {
     /// outside `refs/remotes/origin/`, or an `origin/HEAD` that is not
     /// symbolic, is an error.
     pub(crate) fn origin_head_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::OriginHeadDefault,
+            |git| git.origin_head_default(),
+            || program.origin_head_default(),
+        )
+    }
+
+    /// [`Self::origin_head_default_checked`] answered by Git alone.
+    fn origin_head_default_program(&self) -> Result<Option<(String, String)>, GitError> {
         const DEFAULT_REF: &str = "refs/remotes/origin/HEAD";
         let listing = self.run_git_output_limited(
             &[
@@ -4830,7 +4909,7 @@ impl GitRepo {
         {
             return Ok(Some((short.to_string(), oid.to_string())));
         }
-        let default_ref = self.symbolic_ref_checked(DEFAULT_REF)?;
+        let default_ref = self.symbolic_ref_program(DEFAULT_REF)?;
         if let Some(target) = default_ref {
             if !target.starts_with("refs/remotes/origin/") {
                 return Err(GitError::UntrustedOutput {
@@ -4853,6 +4932,17 @@ impl GitRepo {
     }
 
     fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::SymbolicRef,
+            |git| git.symbolic_ref(name),
+            || program.symbolic_ref(name),
+        )
+    }
+
+    /// [`Self::symbolic_ref_checked`] answered by Git alone.
+    fn symbolic_ref_program(&self, name: &str) -> Result<Option<String>, GitError> {
         let args = ["symbolic-ref", "--quiet", name];
         let mut command = git_command();
         command
@@ -4904,16 +4994,13 @@ impl GitRepo {
     /// Whether one repository-relative path exists in a local commit/ref.
     /// This never fetches and is suitable for read-only certification.
     pub fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, GitError> {
-        let object = format!("{revision}:{path}");
-        let output = git_command()
-            .args(["cat-file", "-e", &object])
-            .current_dir(&self.root)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: format!("cat-file -e {object}"),
-                source,
-            })?;
-        Ok(output.status.success())
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::PathExistsAt,
+            |git| git.path_exists_at(revision, path),
+            || program.path_exists_at(revision, path),
+        )
     }
 
     /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
@@ -5528,13 +5615,19 @@ impl GitRepo {
         commit: &str,
         paths: &[String],
     ) -> Result<BTreeMap<String, String>, GitError> {
-        let mut owned_args = vec![
-            "ls-tree".to_string(),
-            "-z".to_string(),
-            "--full-tree".to_string(),
-            commit.to_string(),
-            "--".to_string(),
-        ];
+        Self::require_literal_config_paths(paths)?;
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::ConfigTreeEntries,
+            |git| git.config_tree_entries(commit, paths),
+            || program.config_tree_entries(commit, paths),
+        )
+    }
+
+    /// Configuration paths must be repository-relative and free of pathspec
+    /// magic, whoever answers the tree query.
+    fn require_literal_config_paths(paths: &[String]) -> Result<(), GitError> {
         for path in paths {
             let path_value = Path::new(path);
             if path_value.is_absolute()
@@ -5554,11 +5647,28 @@ impl GitRepo {
                             .into(),
                 });
             }
-            // Config stems may contain portable glob characters such as
-            // brackets. Keep each candidate literal so the tree query cannot
-            // match a neighboring path by Git pathspec rules.
-            owned_args.push(format!(":(literal){path}"));
         }
+        Ok(())
+    }
+
+    /// [`Self::config_tree_entries_at_commit_checked`] answered by Git alone.
+    fn config_tree_entries_program(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        Self::require_literal_config_paths(paths)?;
+        let mut owned_args = vec![
+            "ls-tree".to_string(),
+            "-z".to_string(),
+            "--full-tree".to_string(),
+            commit.to_string(),
+            "--".to_string(),
+        ];
+        // Config stems may contain portable glob characters such as
+        // brackets. Keep each candidate literal so the tree query cannot
+        // match a neighboring path by Git pathspec rules.
+        owned_args.extend(paths.iter().map(|path| format!(":(literal){path}")));
         let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.run_git_output_limited(&args, 64 * 1024)?;
         let records = Self::strict_config_tree_records(&output.stdout, &args)?;
@@ -5642,9 +5752,15 @@ impl GitRepo {
     }
 
     fn config_blob_checked(&self, object: &str, path: &str) -> Result<String, GitError> {
-        let args = ["cat-file", "blob", object];
-        let output = self.run_git_output_limited(&args, 4 * 1024 * 1024)?;
-        String::from_utf8(output.stdout).map_err(|_| GitError::UntrustedOutput {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let program = ProgramRead { root: &self.root };
+        let bytes = crate::git_read::answer(
+            &self.root,
+            ReadKind::BlobBytes,
+            |git| git.blob_bytes(object, LIMIT),
+            || program.blob_bytes(object, LIMIT),
+        )?;
+        String::from_utf8(bytes).map_err(|_| GitError::UntrustedOutput {
             detail: format!("committed configuration {path:?} is not UTF-8"),
         })
     }
@@ -5703,12 +5819,13 @@ impl GitRepo {
         let Some(exact) = self.resolve_ref(commit) else {
             return Ok(None);
         };
-        let object = format!("{exact}:{path}");
-        match run_git(&self.root, &["cat-file", "-e", &object]) {
-            Ok(_) => run_git(&self.root, &["show", &object]).map(Some),
-            Err(GitError::Git { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
+        let program = ProgramRead { root: &self.root };
+        crate::git_read::answer(
+            &self.root,
+            ReadKind::FileAtRevision,
+            |git| git.file_at_revision(&exact, path),
+            || program.file_at_revision(&exact, path),
+        )
     }
 
     /// Human-readable description of `rev` using the repository's tags
