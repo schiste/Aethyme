@@ -201,11 +201,14 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Routine status opens a read-only snapshot by design (it must not touch
     // broker storage or mark advisories delivered), and it is the form agents
     // run, so it still checks the scheduled GC service and may start its one
-    // background rebind; that writes only the service's own receipt. A
-    // read-only snapshot that is not merely routine (a compatibility
-    // read-only open, when the broker database is newer than this binary)
-    // keeps the check strictly read-only: classify, count and advise.
-    let gc_service_may_repair = !parsed.read_only_snapshot || parsed.routine_status_snapshot;
+    // background rebind. That child writes the service's own receipt, its
+    // command outcome event (through an open that never migrates) and a
+    // metrics line; `gc service` surfaces no session advisories and renews
+    // or downgrades no task lease. A read-only snapshot that is not merely
+    // routine (a compatibility read-only open, when the broker database is
+    // newer than this binary) keeps the check strictly read-only: classify,
+    // count and advise.
+    let gc_service_may_repair = super::gc_service_may_repair(&parsed);
     let mut broker = if routine {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;

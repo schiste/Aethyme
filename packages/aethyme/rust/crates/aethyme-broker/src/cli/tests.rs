@@ -2023,6 +2023,75 @@ fn every_cli_reference_example_passes_flag_validation() {
     }
 }
 
+/// A routine status (read-only by design) may start the GC service's
+/// background rebind; a compatibility read-only open may not, whether or not
+/// the status is routine. Swapping the two steps of `mark_read_only_snapshot`
+/// would let a compatibility open repair, and fails here.
+#[test]
+fn only_a_compatibility_read_only_open_keeps_the_gc_service_check_from_repairing() {
+    fn may_repair(internal_args: &[&str], mode: &super::CompatibilityMode) -> bool {
+        let args = strings(internal_args);
+        let mut parsed = super::parse(&args[1..]).expect("status arguments parse");
+        super::mark_read_only_snapshot(&args, mode, &mut parsed);
+        super::gc_service_may_repair(&parsed)
+    }
+    let normal = super::CompatibilityMode::Normal;
+    let compatibility =
+        super::CompatibilityMode::ReadOnlySnapshot(super::ReadOnlyCompatibility::default());
+    let routine: [&[&str]; 7] = [
+        &["status"],
+        &["status", "--json"],
+        &["status", "--compact", "--json"],
+        &["status", "--summary", "--json"],
+        &["status", "--session", "17"],
+        &["status", "--session", "17", "--json"],
+        &["status", "--since-revision", "r1", "--json"],
+    ];
+    for args in routine {
+        assert!(super::routine_status(&strings(args)), "{args:?}");
+        assert!(may_repair(args, &normal), "routine {args:?}");
+        assert!(!may_repair(args, &compatibility), "compatibility {args:?}");
+    }
+    assert!(!super::routine_status(&strings(&["status", "--full"])));
+    assert!(may_repair(&["status", "--full", "--json"], &normal));
+    assert!(!may_repair(&["status", "--full", "--json"], &compatibility));
+}
+
+/// `gc service …` is service administration: none of its actions surfaces
+/// (and marks delivered) a session's advisories or touches a task lease, so
+/// the `gc service status` child a routine status may start delivers nothing.
+#[test]
+fn gc_service_administration_surfaces_no_advisories_and_does_no_session_work() {
+    fn classify(public_args: &[&str]) -> (bool, super::TaskLeaseCommandClass) {
+        let resolution = super::surface::resolve(&strings(public_args));
+        assert!(resolution.refusal.is_none(), "{public_args:?}");
+        let subcommand = resolution.args.first().expect("resolved command");
+        let parsed = super::parse(&resolution.args[1..]).expect("normalized command parses");
+        (
+            super::surfaces_command_advisories(subcommand, &parsed),
+            super::task_lease_command_class(subcommand, &parsed),
+        )
+    }
+    use super::TaskLeaseCommandClass::{NoSessionWork, ObservationOnly};
+    for action in [
+        "status",
+        "refresh",
+        "plan",
+        "install",
+        "activate",
+        "deactivate",
+        "uninstall",
+    ] {
+        assert_eq!(
+            classify(&["gc", "service", action, "--json"]),
+            (false, NoSessionWork),
+            "gc service {action}"
+        );
+    }
+    assert_eq!(classify(&["gc", "plan"]), (true, ObservationOnly));
+    assert!(classify(&["status", "--json"]).0);
+}
+
 #[test]
 fn a_read_only_refusal_names_the_cause_the_fix_and_the_snapshot_alternative() {
     let mut parsed = super::parse(&[]).unwrap_or_else(|_| panic!("empty parse"));

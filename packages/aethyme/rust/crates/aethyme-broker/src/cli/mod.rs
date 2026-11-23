@@ -2718,6 +2718,32 @@ fn warn_stale_broker_binary(broker: &Broker) {
     }
 }
 
+/// Set the read-only snapshot flags in their one order: the router's
+/// compatibility read-only open first, then routine status. A routine status
+/// is an observation, including advisory delivery: it does not migrate or
+/// create storage or mark notes delivered merely by polling. It remembers that
+/// it is merely routine only when no compatibility open already set the flag,
+/// which is what [`gc_service_may_repair`] reads.
+fn mark_read_only_snapshot(args: &[String], mode: &CompatibilityMode, parsed: &mut Parsed) {
+    if let CompatibilityMode::ReadOnlySnapshot(compatibility) = mode {
+        parsed.read_only_snapshot = true;
+        parsed.read_only_compatibility = Some(compatibility.clone());
+    }
+    if routine_status(args) {
+        parsed.routine_status_snapshot = !parsed.read_only_snapshot;
+        parsed.read_only_snapshot = true;
+    }
+}
+
+/// Whether this status may start the scheduled GC service's one background
+/// rebind (`gc service status` in a detached child). Every status that may
+/// write may, and so does a routine status, whose snapshot is read-only by
+/// design rather than by necessity; a compatibility read-only open (the broker
+/// database is newer than this binary) may not.
+fn gc_service_may_repair(parsed: &Parsed) -> bool {
+    !parsed.read_only_snapshot || parsed.routine_status_snapshot
+}
+
 fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
@@ -2755,10 +2781,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             error
         }
     })?;
-    if let CompatibilityMode::ReadOnlySnapshot(compatibility) = mode {
-        parsed.read_only_snapshot = true;
-        parsed.read_only_compatibility = Some(compatibility.clone());
-    }
+    mark_read_only_snapshot(args, mode, &mut parsed);
     if subcommand == "exec-status" {
         parsed.read_only_snapshot = true;
     }
@@ -2850,12 +2873,6 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     } else {
         None
     };
-    // Routine status is an observation, including advisory delivery. Do not
-    // migrate/create storage or mark notes delivered merely by polling it.
-    if routine_status(args) {
-        parsed.routine_status_snapshot = !parsed.read_only_snapshot;
-        parsed.read_only_snapshot = true;
-    }
     let task_lease_command = task_lease_command_class(subcommand, &parsed);
     if task_lease_command == TaskLeaseCommandClass::ObservationOnly {
         parsed.read_only_snapshot = true;
@@ -3194,7 +3211,9 @@ enum TaskLeaseCommandClass {
 fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseCommandClass {
     let action = parsed.positional.first().map(String::as_str);
     let nested_action = parsed.positional.get(1).map(String::as_str);
-    if sessionless_automation_command(subcommand, parsed) {
+    if sessionless_automation_command(subcommand, parsed)
+        || gc_service_administration(subcommand, parsed)
+    {
         return TaskLeaseCommandClass::NoSessionWork;
     }
     match subcommand {
@@ -3296,6 +3315,15 @@ fn sessionless_automation_command(subcommand: &str, parsed: &Parsed) -> bool {
     subcommand == "note"
         && parsed.positional.first().map(String::as_str) == Some("send")
         && parsed.note_from.is_some()
+}
+
+/// `gc service …` administers this repository's scheduled GC service, not a
+/// session's work, and a routine `broker status` may start `gc service
+/// status` in a detached child from the main checkout. So none of its actions
+/// surfaces (and marks delivered) a session's advisories, opens the broker
+/// store writable to do so, or renews or downgrades a session's task lease.
+fn gc_service_administration(subcommand: &str, parsed: &Parsed) -> bool {
+    subcommand == "gc" && parsed.positional.first().map(String::as_str) == Some("service")
 }
 
 /// These operations need to reach their domain handler for the established
@@ -3467,18 +3495,24 @@ fn bind_caller_as_holder(store: &mut crate::BrokerStore, session_id: i64) {
     crate::install_replacement::record(store, session_id);
 }
 
+/// Whether [`surface_command_advisories`] runs for this command at all.
+/// Internal hooks are not interactive broker commands: pre-commit remains
+/// quiet on success, while post-commit surfaces through run_post_commit after
+/// its conflict radar and therefore does not print twice. Sessionless
+/// automation and GC service administration act for no session.
+fn surfaces_command_advisories(subcommand: &str, parsed: &Parsed) -> bool {
+    !(matches!(subcommand, "hooks" | "readiness" | "storage")
+        || sessionless_automation_command(subcommand, parsed)
+        || gc_service_administration(subcommand, parsed))
+}
+
 /// Every broker invocation associated with a live session surfaces its
 /// outstanding durable advisories and unread local notes on stderr. Stdout
 /// remains untouched so all existing `--json` contracts stay parseable. This
 /// is best effort: notification failure never changes command behavior, and
 /// the delivery metric path never creates broker state for an offline read.
 fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
-    // Internal hooks are not interactive broker commands. Pre-commit remains
-    // quiet on success, while post-commit surfaces through run_post_commit
-    // after its conflict radar and therefore does not print twice.
-    if matches!(subcommand, "hooks" | "readiness" | "storage")
-        || sessionless_automation_command(subcommand, parsed)
-    {
+    if !surfaces_command_advisories(subcommand, parsed) {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
