@@ -425,15 +425,18 @@ impl BrokerStore {
         // unrelated previous output is deliberately not carried forward.
         let mut details =
             details_json.and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
-        if let Some(proof) = operation
+        // A push's exact plan is what lets a later write settle its unknown
+        // outcome from the remote, so it survives the same way.
+        let previous = operation
             .details_json
             .as_deref()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-            .and_then(|value| value.get("fetch_reconciliation").cloned())
-        {
-            let destination = details.get_or_insert_with(|| serde_json::json!({}));
-            if let Some(object) = destination.as_object_mut() {
-                object.entry("fetch_reconciliation").or_insert(proof);
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+        for key in ["fetch_reconciliation", "push_reconciliation"] {
+            if let Some(proof) = previous.as_ref().and_then(|value| value.get(key).cloned()) {
+                let destination = details.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(object) = destination.as_object_mut() {
+                    object.entry(key).or_insert(proof);
+                }
             }
         }
         let preserved_details = details.map(|value| value.to_string());

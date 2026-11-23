@@ -1155,6 +1155,83 @@ printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
 
+## Session push hooks before the lanes; self-settling unknown pushes (2026-11-23)
+
+Additive. A strict push of the caller's own session branch (`broker push`, or
+`broker advanced git -- push --no-follow-tags --porcelain -- <remote>
+<sha>:refs/heads/<own branch>`) on its narrow lane runs the repository's
+`pre-push` hook in `git push --dry-run` against the pinned commits before it
+takes any shared lane, and the real push then carries `--no-verify`, when an
+executable `pre-push` exists in the directory Git runs hooks from
+(`core.hooksPath`, resolved against the worktree, or the common directory's
+`hooks`). Git hands the dry run's hook the same remote name and URL arguments
+and the same stdin lines it hands the real push, so the hook runs once with
+identical inputs. `[coordination] hooks_outside_lock` is now three-state: absent
+means this default, `true` means every eligible push (as before), `false` means
+no push (the hook stays inside the push, under the lanes);
+`session_hooks_hold_repository_lock = true` also keeps it inside.
+
+- The hook run has its own budget, `[coordination] pre_push_hook_budget_seconds`
+  (default 1200; unbounded when the caller waits forever). The queue and
+  transfer deadline the caller asked for (60 s for `broker push`) starts once
+  the hook has passed. A hook that runs out its budget or refuses resolves the
+  journaled row `failed` (`admission_timed_out` / `pre_push_refused`, the
+  hook's stderr kept); nothing was sent, so it blocks nobody.
+- From before the hook to the end of the operation the push holds the
+  exclusive lane `<repository>::git-ref/refs/heads/<branch>::pre-push`, taken
+  first while nothing else is held, so two pushes of one branch still
+  serialise. A refusal while waiting for it is journaled with reason
+  `push_hook_lane_unavailable`.
+- Phases: span `push_git_hook_lane_wait` (that lane's wait); the existing span
+  `push_git_hook_dry_run` (the hook run) and `push_git_remote_read_before_lock`;
+  count `push_hook_outside_lock_default` when the default chose this path.
+  `coordination_timing.hooks_outside_lock` is `true` for such pushes.
+
+A coordinated push stopped at its deadline is settled without an operator when
+the evidence proves it:
+
+- Git's Trace2 shows it was still inside its own `pre-push` hook (the hook
+  started, never ended, and `push_refs` never began): `failed`, with
+  `remote_outcome` `not_sent`, count `remote_write_failed_timeout_in_pre_push_hook`.
+- Otherwise one bounded (15 s) read of its exact destinations (span
+  `push_timeout_remote_read`) finds every destination at the commit it
+  proposed: `succeeded`, with `remote_outcome` `succeeded`,
+  `push_reconciliation.evidence.source` `post_timeout_remote_read`, counts
+  `push_timeout_proven_succeeded` and `remote_write_succeeded_timeout`. Any
+  other observation counts `push_timeout_left_unknown` and stays
+  `outcome_unknown`: a cut-off transfer may still land, so the old value proves
+  nothing.
+
+An `outcome_unknown` push of a session's own branch that carries its exact
+plan is re-read by the next write it would block (span
+`unknown_push_auto_reconcile`, budget 15 s or the writer's remaining deadline).
+When the branch holds exactly the proposed commit it becomes
+`reconciled_succeeded` with `reconciliation.source` `session_push_remote_read`;
+counts `unknown_push_auto_reconcile_succeeded`,
+`unknown_push_auto_reconcile_left_unknown`,
+`unknown_push_auto_reconcile_unavailable`. Status transitions now keep a row's
+`push_reconciliation` (as they kept `fetch_reconciliation`), so a crashed
+push keeps the plan that settles it.
+
+Write-block scope: an ambiguous (`outcome_unknown`, or `running` with its
+process gone) write whose recomputed scope is its own session's branch lane
+(`git-ref/refs/heads/<that session's branch>`) blocks that session's writes and
+every write on that lane only. Another session's writes elsewhere, including
+repository-wide Git writes and GitHub writes, proceed and add the count
+`unknown_session_branch_write_not_blocking`. An ambiguous write of anything
+else (the default branch, `aethyme/integration`, tags, any repository-wide
+write) still blocks every write. A consumer that assumed every unknown write
+blocks the whole repository must read the row's scope. Covered by
+`a_session_push_hook_holds_no_shared_lane`,
+`a_session_push_hook_slower_than_the_push_deadline_does_not_time_it_out`,
+`a_failing_session_push_hook_refuses_the_push_with_its_output`,
+`session_push_hooks_run_early_only_when_a_hook_exists_and_not_opted_out`,
+`a_timed_out_session_push_that_landed_reconciles_itself`,
+`a_genuinely_unknown_session_push_blocks_only_its_session_and_branch` and
+`unknown_outcomes_block_their_own_lane_and_wide_writes_block_everything` in
+`aethyme-broker/tests/operations_e2e.rs`, and
+`only_a_push_stopped_inside_its_hook_is_proven_unsent`.
+
 ## Coordinated operation outcome journal (2026-11-17)
 
 Schema v64 adds a nullable `coordinated_operations.run_nonce`, a random value

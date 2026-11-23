@@ -2612,6 +2612,17 @@ fn a_slow_pre_lock_hook_exhausts_the_queue_timeout_and_settles_the_row() {
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
     install_pre_push_hook(&repo, "#!/bin/sh\nsleep 5\nexit 0\n");
+    // The hook has a budget of its own, separate from the queue budget.
+    let config = repo.join(".aethyme/config.toml");
+    let existing = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        existing.replace(
+            "hooks_outside_lock = true\n",
+            "hooks_outside_lock = true\npre_push_hook_budget_seconds = 1\n",
+        ),
+    )
+    .unwrap();
     commit_push_fixture(&fixture, "pre-lock timeout\n");
 
     let started = Instant::now();
@@ -3784,6 +3795,308 @@ fn pushes_of_different_session_branches_do_not_serialise_but_one_branch_does() {
     assert!(remote_has_branch(&fx.remote, &other_branch));
 }
 
+/// The measured convoy: a session push held the shared repository lane for
+/// its whole pre-push hook, so a repository-wide write waited for that hook
+/// while holding its wide-intent lock, and every later session push queued
+/// behind both. A session push now runs its hook before taking any shared
+/// lane: while the hook runs, a repository-wide write and another session's
+/// push both proceed, and a second push of the same branch still waits.
+#[cfg(unix)]
+#[test]
+fn a_session_push_hook_holds_no_shared_lane() {
+    let mut fx = LaneFixture::new(&["hook-held", "hook-free"]);
+    let gate = HookGate::install(&fx.hooks(), "pre-push", "hook-held");
+    let held_branch = fx.branch(0);
+    let other_branch = fx.branch(1);
+    let base = git_output(&fx.worktrees[0], &["rev-parse", "HEAD"]);
+    let held_sha = fx.commit_plain(0, "held\n");
+    let pushing = fx.spawn(fx.strict_push(0, &held_sha, &held_branch));
+    gate.wait_started();
+
+    let wide = fx.try_now(request(fx.sessions[1], &["branch", "wide-during-hook"]));
+    let other_sha = fx.commit_plain(1, "other\n");
+    let other = fx.try_now(fx.strict_push(1, &other_sha, &other_branch));
+    let same = fx.try_now(fx.strict_push(0, &base, &held_branch));
+    let hooked_remote_untouched = !remote_has_branch(&fx.remote, &held_branch);
+    gate.release();
+    let held = pushing.join().unwrap().expect("held push completes");
+
+    assert!(
+        wide.expect("a repository-wide write must not wait for a session push hook")
+            .ok()
+    );
+    assert!(other.expect("another session's push must not wait").ok());
+    assert_lock_busy(same, "a second push of the same branch");
+    assert!(
+        hooked_remote_untouched,
+        "nothing is sent before the hook passes"
+    );
+    assert!(held.ok());
+    assert_eq!(
+        git_output(
+            &fx.remote,
+            &["rev-parse", &format!("refs/heads/{held_branch}")]
+        ),
+        held_sha
+    );
+    let timing: serde_json::Value =
+        serde_json::from_str(held.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(timing["coordination_timing"]["hooks_outside_lock"], true);
+}
+
+/// A hook slower than the push's whole queue budget used to time the push
+/// out as `outcome_unknown`. It now has a budget of its own, so the push
+/// succeeds and leaves nothing for an operator to reconcile.
+#[cfg(unix)]
+#[test]
+fn a_session_push_hook_slower_than_the_push_deadline_does_not_time_it_out() {
+    let mut fx = LaneFixture::new(&["slow-hook"]);
+    write_executable(&fx.hooks().join("pre-push"), "#!/bin/sh\nsleep 6\nexit 0\n");
+    let branch = fx.branch(0);
+    let sha = fx.commit_plain(0, "slow\n");
+    let push = fx.strict_push(0, &sha, &branch);
+    let report = fx
+        .broker
+        .run_coordinated_operation_with_wait(push, QueueWait::Seconds(3))
+        .expect("the hook's run is not charged to the push deadline");
+    assert!(report.ok());
+    assert_eq!(report.operation.status, OperationStatus::Succeeded);
+    assert_eq!(
+        git_output(&fx.remote, &["rev-parse", &format!("refs/heads/{branch}")]),
+        sha
+    );
+}
+
+/// A refusing hook refuses the push with its own output, before anything is
+/// sent, and the row is a plain failure that blocks nobody.
+#[cfg(unix)]
+#[test]
+fn a_failing_session_push_hook_refuses_the_push_with_its_output() {
+    let mut fx = LaneFixture::new(&["refused-hook", "bystander"]);
+    write_executable(
+        &fx.hooks().join("pre-push"),
+        "#!/bin/sh\ncat >/dev/null\nprintf 'catalog drift detected\\n' >&2\nexit 1\n",
+    );
+    let branch = fx.branch(0);
+    let sha = fx.commit_plain(0, "refused\n");
+    let error = fx
+        .try_now(fx.strict_push(0, &sha, &branch))
+        .expect_err("a refusing hook refuses the push");
+    let rendered = error.to_string();
+    assert!(rendered.contains("pre-push hook refused"), "{rendered}");
+    assert!(rendered.contains("catalog drift detected"), "{rendered}");
+    assert!(!remote_has_branch(&fx.remote, &branch));
+    let row = fx
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.status, OperationStatus::Failed);
+    assert!(
+        fx.try_now(request(fx.sessions[1], &["branch", "after-refusal"]))
+            .expect("a refused hook blocks nobody")
+            .ok()
+    );
+}
+
+/// Without a `pre-push` hook there is nothing to run early, so no dry run.
+/// A repository that sets `hooks_outside_lock = false` keeps its hook inside
+/// the push, under the shared lanes.
+#[cfg(unix)]
+#[test]
+fn session_push_hooks_run_early_only_when_a_hook_exists_and_not_opted_out() {
+    let mut fx = LaneFixture::new(&["no-hook", "opted-out"]);
+    let branch = fx.branch(0);
+    let sha = fx.commit_plain(0, "no hook\n");
+    let report = fx.try_now(fx.strict_push(0, &sha, &branch)).unwrap();
+    assert!(report.ok());
+    let timing: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(timing["coordination_timing"]["hooks_outside_lock"], false);
+
+    let config = fx.repo().join(".aethyme/config.toml");
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!("{existing}\n[coordination]\nhooks_outside_lock = false\n"),
+    )
+    .unwrap();
+    let gate = HookGate::install(&fx.hooks(), "pre-push", "opted-out");
+    let opted_branch = fx.branch(1);
+    let opted_sha = fx.commit_plain(1, "opted out\n");
+    let pushing = fx.spawn(fx.strict_push(1, &opted_sha, &opted_branch));
+    gate.wait_started();
+    let wide = fx.try_now(request(fx.sessions[0], &["branch", "wide-behind-hook"]));
+    gate.release();
+    let pushed = pushing.join().unwrap().expect("opted-out push completes");
+    assert_lock_busy(wide, "a repository-wide write behind an opted-out hook");
+    assert!(pushed.ok());
+}
+
+/// Journal an unknown-outcome push of session `index`'s own branch, with the
+/// exact plan a real push journals, as a transfer cut off by its deadline
+/// leaves it.
+#[cfg(unix)]
+fn record_unknown_session_push(
+    fx: &mut LaneFixture,
+    index: usize,
+    proposed: &str,
+    pre_push: Option<&str>,
+) -> i64 {
+    let branch = fx.branch(index);
+    let repository = GitRepo::discover(&fx.worktrees[index])
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap()
+        .coordination_key;
+    let refspec = format!("{proposed}:refs/heads/{branch}");
+    let command = [
+        "git",
+        "push",
+        "--no-follow-tags",
+        "--porcelain",
+        "--",
+        "origin",
+        refspec.as_str(),
+    ];
+    let id = fx
+        .broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: fx.sessions[index],
+            provider: OperationProvider::Git,
+            repository,
+            scope: format!("session-push:refs/heads/{branch}"),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("simulated timed-out push".into()),
+            command_json: serde_json::to_string(&command).unwrap(),
+            pid: exited_child_pid(),
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap()
+        .id;
+    let details = serde_json::json!({
+        "failure_class": "coordinated_operation_timeout",
+        "remote_outcome": "unknown",
+        "push_reconciliation": {
+            "planning": "planned",
+            "plan": {
+                "remote": "origin",
+                "destinations": [{
+                    "destination_ref": format!("refs/heads/{branch}"),
+                    "pre_push_sha": pre_push,
+                    "proposed_sha": proposed,
+                }],
+            },
+        },
+    });
+    fx.broker
+        .store()
+        .transition_coordinated_operation(id, OperationStatus::Running, None, None)
+        .unwrap();
+    fx.broker
+        .store()
+        .transition_coordinated_operation(
+            id,
+            OperationStatus::OutcomeUnknown,
+            None,
+            Some(&details.to_string()),
+        )
+        .unwrap();
+    id
+}
+
+/// A timed-out push whose branch now holds exactly the commit it proposed
+/// succeeded. The next write on that branch settles it from the remote
+/// without an operator, and is not blocked by it.
+#[cfg(unix)]
+#[test]
+fn a_timed_out_session_push_that_landed_reconciles_itself() {
+    let mut fx = LaneFixture::new(&["landed"]);
+    let branch = fx.branch(0);
+    let landed = fx.commit_plain(0, "landed\n");
+    git(
+        &fx.worktrees[0],
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{landed}:refs/heads/{branch}"),
+        ],
+    );
+    let unknown = record_unknown_session_push(&mut fx, 0, &landed, None);
+
+    let next = fx.commit_plain(0, "next\n");
+    let report = fx
+        .try_now(fx.strict_push(0, &next, &branch))
+        .expect("a push proven by the remote blocks nothing");
+    assert!(report.ok());
+    let settled = fx
+        .broker
+        .store()
+        .coordinated_operation(unknown)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.status, OperationStatus::ReconciledSucceeded);
+    let details: serde_json::Value =
+        serde_json::from_str(settled.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["reconciliation"]["source"],
+        "session_push_remote_read"
+    );
+}
+
+/// A genuinely unknown push of a session's own branch (the remote does not
+/// hold what it proposed, and a cut-off transfer may still land) blocks that
+/// session and that branch only. Another session's pushes and
+/// repository-wide writes proceed; an unknown write of a shared ref still
+/// blocks everything (`unknown_outcomes_block_their_own_lane_and_wide_writes_block_everything`).
+#[cfg(unix)]
+#[test]
+fn a_genuinely_unknown_session_push_blocks_only_its_session_and_branch() {
+    let mut fx = LaneFixture::new(&["ambiguous", "unaffected"]);
+    let branch = fx.branch(0);
+    let other_branch = fx.branch(1);
+    let proposed = fx.commit_plain(0, "maybe sent\n");
+    let unknown = record_unknown_session_push(&mut fx, 0, &proposed, None);
+
+    let blocked_by_unknown = |result: Result<_, BrokerOpError>, what: &str| match result {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, unknown, "{what}")
+        }
+        other => panic!("{what} must be blocked by {unknown}: {other:?}"),
+    };
+    blocked_by_unknown(
+        fx.try_now(fx.strict_push(0, &proposed, &branch)),
+        "a push of the ambiguous branch",
+    );
+    blocked_by_unknown(
+        fx.try_now(request(fx.sessions[0], &["branch", "same-session-wide"])),
+        "a repository-wide write of the same session",
+    );
+    let other_sha = fx.commit_plain(1, "unaffected\n");
+    assert!(
+        fx.try_now(fx.strict_push(1, &other_sha, &other_branch))
+            .expect("another session's push proceeds")
+            .ok()
+    );
+    assert!(
+        fx.try_now(request(fx.sessions[1], &["branch", "other-session-wide"]))
+            .expect("another session's repository-wide write proceeds")
+            .ok()
+    );
+    let still = fx
+        .broker
+        .store()
+        .coordinated_operation(unknown)
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.status, OperationStatus::OutcomeUnknown);
+}
+
 /// Unknown outcomes keep blocking exactly where the operations would have
 /// serialised. A session-branch commit left unknown blocks its own branch and
 /// every repository-wide write, but not another session's branch; an unknown
@@ -3822,9 +4135,16 @@ fn unknown_outcomes_block_their_own_lane_and_wide_writes_block_everything() {
         "a push of the wedged branch",
     );
     blocked_by(
-        fx.try_now(request(fx.sessions[1], &["branch", "wide-after-commit"])),
+        fx.try_now(request(fx.sessions[0], &["branch", "wide-after-commit"])),
         wedged,
-        "a repository-wide write",
+        "a repository-wide write of the wedged session",
+    );
+    // Only that session's lanes write its branch, so another session's
+    // repository-wide write is not held by its ambiguity.
+    assert!(
+        fx.try_now(request(fx.sessions[1], &["branch", "wide-other-session"]))
+            .expect("another session's repository-wide write is not blocked")
+            .ok()
     );
     let sha = fx.commit_plain(1, "neighbour\n");
     let neighbour = fx.strict_push(1, &sha, &neighbour_branch);

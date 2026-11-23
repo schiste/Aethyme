@@ -2065,6 +2065,22 @@ fn push_timeout_attributes_an_interrupted_hook_and_preserves_unknowns() {
     assert!(timing.get("hook_ms").is_none());
 }
 
+/// A push stopped while its own pre-push hook ran never sent a ref update,
+/// so its timeout is a plain failure. A finished hook, a started transfer or
+/// a trace with no hook proves nothing of the kind.
+#[test]
+fn only_a_push_stopped_inside_its_hook_is_proven_unsent() {
+    let prefix = PUSH_TRACE_WITH_PRE_PUSH_HOOK
+        .lines()
+        .take_while(|line| !line.contains("git\",\"rev-parse"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_git_transfer_trace(&prefix).killed_in_pre_push_hook());
+    assert!(!parse_git_transfer_trace(PUSH_TRACE_WITH_PRE_PUSH_HOOK).killed_in_pre_push_hook());
+    assert!(!parse_git_transfer_trace(PUSH_TRACE_WITHOUT_HOOK).killed_in_pre_push_hook());
+    assert!(!GitTransferTrace::default().killed_in_pre_push_hook());
+}
+
 /// A real `git push https://host.invalid/o/r.git HEAD:refs/heads/x` (Git
 /// 2.55.0) that failed with "Could not resolve host", captured with
 /// `GIT_TRACE2_EVENT`. Version, parameter and nested start/exit events are
