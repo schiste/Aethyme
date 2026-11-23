@@ -4049,6 +4049,49 @@ fn a_timed_out_session_push_that_landed_reconciles_itself() {
     );
 }
 
+/// The remote read that settles an unknown push goes to the verified push
+/// endpoint of the repository the operation recorded. When `origin` has been
+/// pointed at another repository -- one that even holds the same commit --
+/// the read proves nothing: the push stays unknown and keeps blocking.
+#[cfg(unix)]
+#[test]
+fn an_unknown_session_push_is_not_settled_from_a_different_endpoint() {
+    let mut fx = LaneFixture::new(&["moved-remote"]);
+    let branch = fx.branch(0);
+    let landed = fx.commit_plain(0, "landed\n");
+    let refspec = format!("{landed}:refs/heads/{branch}");
+    git(&fx.worktrees[0], &["push", "-q", "origin", &refspec]);
+    let unknown = record_unknown_session_push(&mut fx, 0, &landed, None);
+
+    let elsewhere = fx.storage.owner_path().join("elsewhere.git");
+    git(
+        fx.storage.owner_path(),
+        &["init", "--bare", "-q", elsewhere.to_str().unwrap()],
+    );
+    git(
+        &fx.worktrees[0],
+        &["push", "-q", elsewhere.to_str().unwrap(), &refspec],
+    );
+    git(
+        fx.repo(),
+        &["remote", "set-url", "origin", elsewhere.to_str().unwrap()],
+    );
+
+    match fx.try_now(request(fx.sessions[0], &["branch", "after-move"])) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, unknown)
+        }
+        other => panic!("an unverified endpoint must not settle the push: {other:?}"),
+    }
+    let still = fx
+        .broker
+        .store()
+        .coordinated_operation(unknown)
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.status, OperationStatus::OutcomeUnknown);
+}
+
 /// A genuinely unknown push of a session's own branch (the remote does not
 /// hold what it proposed, and a cut-off transfer may still land) blocks that
 /// session and that branch only. Another session's pushes and

@@ -1051,6 +1051,48 @@ fn push_fixture() -> (tempfile::TempDir, crate::ResolvedRemoteTarget) {
     (tmp, target)
 }
 
+/// A timed-out push is proven succeeded only through the verified push
+/// endpoint of the repository it recorded. Once the remote's URL points at
+/// another repository, even one that holds the same commit, the read proves
+/// nothing and the outcome stays unknown.
+#[test]
+fn a_timed_out_push_is_proven_only_against_its_recorded_repository() {
+    let (tmp, target) = push_fixture();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["push", "-q", "origin", "main"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let planning = PushPlanning::Planned(ExactPushPlan {
+        remote: "origin".into(),
+        destinations: vec![ExactPushDestination {
+            destination_ref: "refs/heads/main".into(),
+            pre_push_sha: None,
+            proposed_sha: head,
+        }],
+    });
+    let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+    let proof = prove_timed_out_push_succeeded(&repo, &target.coordination_key, &planning)
+        .expect("the recorded endpoint holds the proposed commit");
+    assert_eq!(proof["evidence"]["source"], "post_timeout_remote_read");
+
+    let elsewhere = tmp.path().join("elsewhere.git");
+    git(&["init", "-q", "--bare", elsewhere.to_str().unwrap()]);
+    git(&["push", "-q", elsewhere.to_str().unwrap(), "main"]);
+    git(&["remote", "set-url", "origin", elsewhere.to_str().unwrap()]);
+    let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+    assert!(
+        prove_timed_out_push_succeeded(&repo, &target.coordination_key, &planning).is_none(),
+        "a remote that no longer resolves to the recorded repository proves nothing"
+    );
+}
+
 #[test]
 fn only_head_relative_push_sources_are_worktree_relative() {
     let argv = |items: &[&str]| {

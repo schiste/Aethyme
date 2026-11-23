@@ -405,24 +405,31 @@ const UNKNOWN_PUSH_REMOTE_READ_BUDGET: Duration = Duration::from_secs(15);
 /// it less so, since a late server-side update can only set the same value.
 /// Any other observation proves nothing (a cut-off transfer may still land),
 /// so `None` keeps the outcome unknown.
+///
+/// The read goes through the verified push endpoint bound to the operation's
+/// recorded `repository`: a remote whose push URL no longer resolves to that
+/// repository proves nothing, and the outcome stays unknown.
 fn prove_timed_out_push_succeeded(
-    cwd: &Path,
+    repo: &crate::GitRepo,
+    repository: &str,
     planning: &PushPlanning,
 ) -> Option<serde_json::Value> {
     let PushPlanning::Planned(plan) = planning else {
         return None;
     };
     let _span = crate::phase_telemetry::span("push_timeout_remote_read");
-    let repo = crate::GitRepo::discover(cwd).ok()?;
     let destination_refs = plan
         .destinations
         .iter()
         .map(|destination| destination.destination_ref.clone())
         .collect::<Vec<_>>();
     let observed = crate::git::with_git_deadline(UNKNOWN_PUSH_REMOTE_READ_BUDGET, || {
-        repo.remote_ref_oids(&plan.remote, &destination_refs)
-    })
-    .ok()?;
+        repo.checked_push_remote_ref_oids(&plan.remote, repository, &destination_refs)
+    });
+    let Ok(observed) = observed else {
+        crate::phase_telemetry::add("push_timeout_remote_unverified", Duration::ZERO);
+        return None;
+    };
     let observation = classify_exact_push_observation(plan, &observed);
     crate::phase_telemetry::add(
         match observation.outcome {
@@ -4594,7 +4601,13 @@ impl Broker {
                 let proven_push = (remote_outcome_uncertain
                     && !killed_in_hook
                     && request.provider == OperationProvider::Git)
-                    .then(|| prove_timed_out_push_succeeded(cwd, &push_planning))
+                    .then(|| {
+                        prove_timed_out_push_succeeded(
+                            self.repo_handle(),
+                            &repository,
+                            &push_planning,
+                        )
+                    })
                     .flatten();
                 let status = if proven_push.is_some() {
                     OperationStatus::Succeeded

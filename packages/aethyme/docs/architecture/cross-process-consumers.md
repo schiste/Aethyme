@@ -1200,7 +1200,10 @@ the evidence proves it:
   `push_timeout_proven_succeeded` and `remote_write_succeeded_timeout`. Any
   other observation counts `push_timeout_left_unknown` and stays
   `outcome_unknown`: a cut-off transfer may still land, so the old value proves
-  nothing.
+  nothing. The read goes to the verified push URL bound to the operation's
+  recorded repository; a remote that no longer resolves to it (URL changed,
+  push URL elsewhere) counts `push_timeout_remote_unverified` and stays
+  unknown. The re-read below uses the same verified endpoint.
 
 An `outcome_unknown` push of a session's own branch that carries its exact
 plan is re-read by the next write it would block (span
@@ -1227,10 +1230,12 @@ blocks the whole repository must read the row's scope. Covered by
 `a_failing_session_push_hook_refuses_the_push_with_its_output`,
 `session_push_hooks_run_early_only_when_a_hook_exists_and_not_opted_out`,
 `a_timed_out_session_push_that_landed_reconciles_itself`,
-`a_genuinely_unknown_session_push_blocks_only_its_session_and_branch` and
+`a_genuinely_unknown_session_push_blocks_only_its_session_and_branch`,
+`an_unknown_session_push_is_not_settled_from_a_different_endpoint` and
 `unknown_outcomes_block_their_own_lane_and_wide_writes_block_everything` in
 `aethyme-broker/tests/operations_e2e.rs`, and
-`only_a_push_stopped_inside_its_hook_is_proven_unsent`.
+`only_a_push_stopped_inside_its_hook_is_proven_unsent` and
+`a_timed_out_push_is_proven_only_against_its_recorded_repository`.
 
 ## Coordinated operation outcome journal (2026-11-17)
 
