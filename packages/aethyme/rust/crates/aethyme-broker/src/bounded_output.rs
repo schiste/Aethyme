@@ -1524,14 +1524,33 @@ pub(crate) fn stop_deadline_child(child: &mut Child, owned_group: bool) -> io::R
 fn stop_owned_deadline_group(child: &mut Child) -> io::Result<ExitStatus> {
     let _span = crate::phase_telemetry::span("deadline_group_stop");
     let process_group = child.id() as i32;
-    let already_exited = match leader_exited_unreaped(child.id()) {
+    stop_owned_deadline_group_with(child, process_group, leader_exited_unreaped)
+}
+
+/// [`stop_owned_deadline_group`] with the exit probe injected, so tests can
+/// make it fail. Only `ECHILD` from the probe means the leader was reaped
+/// elsewhere and may no longer reserve the group id: from then on no group
+/// signal is sent. Any other probe error leaves the child unreaped, so it
+/// still anchors its group and the group is still stopped.
+#[cfg(unix)]
+fn stop_owned_deadline_group_with(
+    child: &mut Child,
+    process_group: i32,
+    mut exited: impl FnMut(u32) -> io::Result<bool>,
+) -> io::Result<ExitStatus> {
+    let unanchored = |error: &io::Error| error.raw_os_error() == Some(libc::ECHILD);
+    let already_exited = match exited(child.id()) {
         Ok(exited) => exited,
-        Err(error) => {
-            // The leader can no longer be proven unreaped, so it may not
-            // anchor the group id: signalling the group could reach a group
-            // that reused it. Reap what can be reaped and signal nothing.
+        Err(error) if unanchored(&error) => {
+            // Reaped elsewhere: signalling the group could reach a group
+            // that reused the id. Signal nothing; the wait returns at once.
             crate::phase_telemetry::add("deadline_group_kill_unanchored", Duration::ZERO);
             return child.wait().map_err(|_| error);
+        }
+        Err(_) => {
+            // Not reaped, so still anchored: stop it as if still running.
+            crate::phase_telemetry::add("deadline_group_exit_probe_failed", Duration::ZERO);
+            false
         }
     };
     signal_deadline_group(process_group, libc::SIGTERM);
@@ -1540,9 +1559,18 @@ fn stop_owned_deadline_group(child: &mut Child) -> io::Result<ExitStatus> {
         let grace_end = Instant::now() + DEADLINE_GROUP_TERM_GRACE;
         while Instant::now() < grace_end {
             std::thread::sleep(Duration::from_millis(10));
-            if leader_exited_unreaped(child.id()).unwrap_or(false) {
-                exited_on_term = true;
-                break;
+            match exited(child.id()) {
+                Ok(true) => {
+                    exited_on_term = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) if unanchored(&error) => {
+                    crate::phase_telemetry::add("deadline_group_kill_unanchored", Duration::ZERO);
+                    return child.wait().map_err(|_| error);
+                }
+                // Not reaped: keep waiting out the grace, then SIGKILL.
+                Err(_) => {}
             }
         }
     }
@@ -2530,6 +2558,85 @@ mod tests {
                 counters.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// An exit probe that fails with anything but `ECHILD` has not reaped
+    /// the leader, so it still anchors its group: the group is still stopped,
+    /// grandchild included, instead of waiting for the leader to exit on its
+    /// own. `ECHILD` (reaped elsewhere) sends no signal at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exit_probe_still_stops_the_group_unless_the_leader_was_reaped() {
+        use std::os::unix::process::CommandExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "sleep 30 &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nwait",
+                    pid = pid_file.display(),
+                ),
+            ])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let ready = Instant::now() + Duration::from_secs(10);
+        while !pid_file.exists() && Instant::now() < ready {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let group = child.id() as i32;
+        let started = Instant::now();
+        let status = stop_owned_deadline_group_with(&mut child, group, |_| {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stop waited for the leader to exit on its own"
+        );
+        assert!(
+            status.signal().is_some(),
+            "the leader was signalled: {status:?}"
+        );
+        assert!(
+            process_gone_within(grandchild, Duration::from_secs(5)),
+            "the grandchild survived a failed exit probe"
+        );
+        let counters = recorder.totals().1;
+        assert!(counters.contains_key("deadline_group_exit_probe_failed"));
+        assert!(!counters.contains_key("deadline_group_kill_unanchored"));
+
+        let mut short = Command::new("sleep")
+            .arg("0.3")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = short.id() as i32;
+        let status = stop_owned_deadline_group_with(&mut short, group, |_| {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        })
+        .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "an unanchored leader is never signalled"
+        );
+        assert!(
+            recorder
+                .totals()
+                .1
+                .contains_key("deadline_group_kill_unanchored")
+        );
     }
 
     #[test]

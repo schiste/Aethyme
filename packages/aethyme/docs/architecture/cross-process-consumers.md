@@ -1283,7 +1283,16 @@ recorded no provider (rows written before this change), or an identity
 without a usable start token stays `outcome_unknown`, counted
 `unknown_push_auto_reconcile_provider_not_proven_gone`; a broker that died
 mid-push leaves an orphaned `git push` with no deadline, and its transfer
-could still land. `reconciled_succeeded` is unchanged (the proposed commit is
+could still land. The provider is proven gone *before* the remote read (a
+provider alive during the read could land the push after it), and only when
+the push is old enough for a `failed` settlement; the read still runs
+otherwise, since `succeeded` needs no provider proof. Where the provider ran
+without a group of its own (the foreground-terminal exception below,
+including agent harnesses that run commands in a pty's foreground), its
+recorded group is the caller's (the harness's or shell's job), and while
+that group lives, which in a long-lived harness is typically always, such an
+unknown push is not auto-settled as failed: only `succeeded` or an operator
+settles it. `reconciled_succeeded` is unchanged (the proposed commit is
 proof on its own). No writer signals a recorded provider: a dead broker's
 orphaned group is not killed by a later writer, because a pid and start token
 read before a `killpg` do not reserve the group id against reuse in between.
@@ -1291,7 +1300,8 @@ read before a `killpg` do not reserve the group id against reuse in between.
 Deadline process groups (2026-11-23). A coordinated provider (every brokered
 Git or GitHub command, including fetches, pushes and the pre-push hook dry
 run, all through the operation lane's `output_within`) and the broker's own
-`git fetch`/`push`/`pull` calls (`run_git_process_output`) now lead a process
+`git fetch`/`push`/`pull`/`clone`/`ls-remote` calls (`run_git_process_output`,
+including `remote_branch_head(s)` and the exact-push endpoint reads) now lead a process
 group of their own (`setpgid(0, 0)` at spawn, Unix only). At the deadline the
 whole group is stopped instead of the provider's pid: `SIGTERM` to the group,
 up to 500 ms for the leader to exit, `SIGKILL` to the group, then the leader is
@@ -1306,13 +1316,18 @@ sent), `deadline_group_kill_already_gone` (had exited before the deadline;
 only members it left were stopped); plus
 `deadline_group_kill_members_remained` (the group was still present 200 ms
 after the reap, e.g. a member in uninterruptible I/O),
-`deadline_group_kill_unanchored` (the leader could not be proven unreaped, so
-no group signal was sent), `deadline_group_signal_failed` (a signal error other
+`deadline_group_kill_unanchored` (the exit probe answered `ECHILD`: the
+leader was reaped elsewhere and may no longer reserve the group id, so no
+further group signal is sent), `deadline_group_exit_probe_failed` (the exit
+probe failed otherwise; the leader is still unreaped, so the group is still
+stopped as if running), `deadline_group_signal_failed` (a signal error other
 than `ESRCH`/`EPERM`) and `deadline_child_kill_failed` (ungrouped child). The
 group is skipped, and the child killed alone as before, when the broker is
 the foreground process group of a controlling terminal, where Git's
 credential prompt, `ssh` and interactive `gh` must still be able to read the
-terminal (counter `deadline_group_kept_foreground_terminal`). Processes that
+terminal (counter `deadline_group_kept_foreground_terminal`). That includes
+agent harnesses that run each command in the foreground of a pty: there a
+timeout still kills only the provider, as before. Processes that
 leave the group (start their own session or group) are outside this cleanup.
 Normal completions signal nothing; deadline values are unchanged.
 

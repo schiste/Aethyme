@@ -616,6 +616,15 @@ fn try_reconcile_session_push_inner(
         return Ok(false);
     }
     let _span = crate::phase_telemetry::span("unknown_push_auto_reconcile");
+    // Prove the provider gone *before* the remote read: a provider still
+    // alive during the read could land the push after it and then exit, so
+    // an old value read before its exit proves nothing. Checked only when the
+    // push is old enough for a `failed` settlement at all; `succeeded` needs
+    // no provider proof, so the read still runs when this answers no.
+    let ended_at = operation.finished_at.unwrap_or(operation.updated_at);
+    let ended_ms_ago = unix_now_ms().saturating_sub(ended_at);
+    let provider_gone =
+        ended_ms_ago >= UNKNOWN_PUSH_SETTLE_AGE_MS && recorded_provider_gone(&details);
     let budget = deadline
         .remaining()
         .map_or(UNKNOWN_PUSH_REMOTE_READ_BUDGET, |left| {
@@ -637,18 +646,14 @@ fn try_reconcile_session_push_inner(
     // At the proposed commit: succeeded. At the old value long after the
     // push ended: it did not happen. A missing branch whose old value was a
     // commit, a third value, or the old value too soon after: unknown.
-    let ended_at = operation.finished_at.unwrap_or(operation.updated_at);
-    let status = match settle_unknown_session_push(
-        observation.outcome,
-        unix_now_ms().saturating_sub(ended_at),
-        || recorded_provider_gone(&details),
-    ) {
-        Ok(status) => status,
-        Err(left_unknown) => {
-            crate::phase_telemetry::add(left_unknown, Duration::ZERO);
-            return Ok(false);
-        }
-    };
+    let status =
+        match settle_unknown_session_push(observation.outcome, ended_ms_ago, || provider_gone) {
+            Ok(status) => status,
+            Err(left_unknown) => {
+                crate::phase_telemetry::add(left_unknown, Duration::ZERO);
+                return Ok(false);
+            }
+        };
     let succeeded = status == OperationStatus::ReconciledSucceeded;
     if let Some(host_id) = &operation.host_operation_id {
         crate::host_operations::reconcile_host_operation_with_deadline(

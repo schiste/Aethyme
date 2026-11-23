@@ -3403,12 +3403,27 @@ fn run_git_process_output(
     Ok(output)
 }
 
-/// Whether `args` run a Git subcommand that transfers objects to or from a
-/// remote and so starts children that can outlive Git.
+/// Whether `args` run a Git subcommand that talks to a remote and so starts
+/// children that can outlive Git (a remote helper or `ssh` for every one of
+/// them, `index-pack` or `pack-objects` for a transfer). Walks the argument
+/// list itself, so an option value with spaces (a path) cannot be mistaken
+/// for the subcommand; an argument that is a whole display string
+/// (`ls-remote --refs <endpoint> ...`) is judged by its first word.
 fn git_subcommand_transfers(args: &[&str]) -> bool {
+    let mut words = args.iter().copied();
+    let subcommand = loop {
+        match words.next() {
+            Some("-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace") => {
+                words.next();
+            }
+            Some(option) if option.starts_with('-') => {}
+            Some(subcommand) => break subcommand,
+            None => return false,
+        }
+    };
     matches!(
-        git_subcommand(&args.join(" ")).as_str(),
-        "fetch" | "push" | "pull"
+        subcommand.split_whitespace().next(),
+        Some("fetch" | "push" | "pull" | "ls-remote" | "clone")
     )
 }
 
@@ -5738,7 +5753,9 @@ impl GitRepo {
             remote,
             &format!("refs/heads/{branch}"),
         ]);
-        let output = crate::bounded_output::output_within(&mut command, budget).ok()??;
+        // Its own group: a timeout also stops the remote helper or `ssh`.
+        let output =
+            crate::bounded_output::output_within_own_group(&mut command, budget).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -5765,7 +5782,9 @@ impl GitRepo {
             .arg("-C")
             .arg(&self.root)
             .args(["ls-remote", "--heads", remote]);
-        let output = crate::bounded_output::output_within(&mut command, budget).ok()??;
+        // Its own group: a timeout also stops the remote helper or `ssh`.
+        let output =
+            crate::bounded_output::output_within_own_group(&mut command, budget).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -12544,6 +12563,43 @@ mod timeout_tests {
             matches!(&error, GitError::NotARepository { path } if path == fixture.path()),
             "{error:?}"
         );
+    }
+
+    /// Every Git command that reaches a remote runs in a process group of
+    /// its own, however its arguments are spelled; local commands do not.
+    #[test]
+    fn remote_git_commands_are_judged_to_need_their_own_group() {
+        for args in [
+            &["fetch", "origin"][..],
+            &[
+                "-c",
+                "core.hooksPath=/a path/with spaces",
+                "fetch",
+                "origin",
+            ],
+            &["push", "origin", "HEAD"],
+            &["pull"],
+            &["clone", "url", "dir"],
+            &["ls-remote", "--symref", "origin", "HEAD"],
+            &["ls-remote --refs <endpoint> refs/heads/x"],
+            &[
+                "-C",
+                "/a path/with spaces",
+                "ls-remote",
+                "--heads",
+                "origin",
+            ],
+        ] {
+            assert!(git_subcommand_transfers(args), "{args:?}");
+        }
+        for args in [
+            &["status"][..],
+            &["-C", "/fetch dir", "rev-parse", "HEAD"],
+            &["init --quiet --bare --template <private> <private>"],
+            &[],
+        ] {
+            assert!(!git_subcommand_transfers(args), "{args:?}");
+        }
     }
 
     #[test]
