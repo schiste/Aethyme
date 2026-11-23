@@ -2823,6 +2823,10 @@ pub(crate) enum ServiceCheck {
     Sandboxed,
     /// This process could not name its own executable.
     RunningUnknown,
+    /// The status form may not write (an explicit `--read-only-snapshot` or
+    /// a compatibility read-only open): the binding is classified, counted
+    /// and advised, and nothing is scheduled.
+    ReadOnly,
     /// The binding is stale or gone, but this process does not run the
     /// router the installation's `current` selector names (canonical paths
     /// compared), so it may not rebind the service.
@@ -2846,6 +2850,7 @@ impl ServiceCheck {
             Self::Latched => "gc_service_refresh_latched",
             Self::Sandboxed => "gc_service_refresh_sandboxed",
             Self::RunningUnknown => "gc_service_refresh_running_unknown",
+            Self::ReadOnly => "gc_service_refresh_read_only",
             Self::NotCurrentRouter => "gc_service_refresh_not_current_router",
             Self::Refresh(ScheduledRefresh::Started) => "gc_service_refresh_scheduled",
             Self::Refresh(ScheduledRefresh::BackingOff) => "gc_service_refresh_backing_off",
@@ -3033,10 +3038,14 @@ pub(crate) fn status_service_advice(
     uid: u32,
     repository: &Path,
     outcome_evidence: bool,
+    may_repair: bool,
 ) -> Option<RepairAdvice> {
     use std::os::unix::process::CommandExt as _;
     use std::sync::atomic::Ordering;
     let running = || {
+        if !may_repair {
+            return Err(ServiceCheck::ReadOnly);
+        }
         if SCHEDULE_RECEIPT_UNWRITABLE.load(Ordering::Relaxed) {
             return Err(ServiceCheck::Latched);
         }
@@ -5510,6 +5519,7 @@ mod tests {
             ServiceCheck::Latched,
             ServiceCheck::Sandboxed,
             ServiceCheck::RunningUnknown,
+            ServiceCheck::ReadOnly,
         ] {
             let (check, advice) = look(
                 &move || -> Result<PathBuf, ServiceCheck> { Err(blocked) },
@@ -5640,6 +5650,7 @@ mod tests {
             ServiceCheck::Latched,
             ServiceCheck::Sandboxed,
             ServiceCheck::RunningUnknown,
+            ServiceCheck::ReadOnly,
             ServiceCheck::NotCurrentRouter,
             ServiceCheck::Refresh(ScheduledRefresh::Started),
             ServiceCheck::Refresh(ScheduledRefresh::BackingOff),

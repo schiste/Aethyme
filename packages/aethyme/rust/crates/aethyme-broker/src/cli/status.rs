@@ -198,6 +198,13 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Compact is the default for text and JSON alike; only `--full` and
     // `--refresh` build the full `StatusView`.
     let routine = form != StatusForm::Full;
+    // Routine status opens a read-only snapshot by design (it must not touch
+    // broker storage or mark advisories delivered), and it is the form agents
+    // run, so it still checks the scheduled GC service and may start its one
+    // background rebind; that writes only the service's own receipt. Only an
+    // explicit `--read-only-snapshot` (or a compatibility read-only open)
+    // keeps the check strictly read-only: classify, count and advise.
+    let gc_service_may_repair = !parsed.read_only_snapshot || parsed.routine_status_snapshot;
     let mut broker = if routine {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
@@ -263,11 +270,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         drop(main_checkout_span);
         // This repository's scheduled GC service: the session view is the
         // status most agents read, so it notices a stale binding as well.
-        let gc_service_advice = if parsed.read_only_snapshot {
-            None
-        } else {
-            broker.gc_service_status_advice(false)
-        };
+        let gc_service_advice = broker.gc_service_status_advice(false, gc_service_may_repair);
         // Parent, children, recorded PR states and one next action, when the
         // session is part of a stack.
         let stack = {
@@ -371,6 +374,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             broker.status_brief(now_ms())?
         };
+        brief
+            .advice
+            .extend(broker.gc_service_status_advice(true, gc_service_may_repair));
         let context_started = std::time::Instant::now();
         let context = broker.routine_status_context(now_ms())?;
         brief.phase_timings_ms.insert(
@@ -429,6 +435,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             broker.status_brief(now_ms())?
         };
+        brief
+            .advice
+            .extend(broker.gc_service_status_advice(true, gc_service_may_repair));
         brief.phase_timings_ms.insert("open".into(), open_ms);
         brief
             .phase_timings_ms
@@ -447,7 +456,11 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         return Ok(());
     }
     let mut status = if parsed.read_only_snapshot {
-        broker.status_current_snapshot(now_ms())?
+        let mut status = broker.status_current_snapshot(now_ms())?;
+        status
+            .advice
+            .extend(broker.gc_service_status_advice(true, gc_service_may_repair));
+        status
     } else if parsed.refresh {
         broker.status(now_ms())?
     } else {

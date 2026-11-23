@@ -71,7 +71,8 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        view.advice.extend(self.gc_service_status_advice(true));
+        view.advice
+            .extend(self.gc_service_status_advice(true, true));
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -114,9 +115,6 @@ impl Broker {
         let overlaps = self.lease_overlaps_after_agent_reconciliation(&agents)?;
         let overlaps_ms = overlaps_started.elapsed().as_millis() as u64;
         let mut brief = self.build_status_brief(agents, overlaps, now_ms)?;
-        // The status agents run by default must notice a stale GC service
-        // binding too, not only `--full` (0.8.160 missed it here).
-        brief.advice.extend(self.gc_service_status_advice(true));
         brief.phase_timings_ms.insert("agents".into(), agents_ms);
         brief
             .phase_timings_ms
@@ -828,10 +826,24 @@ impl Broker {
     /// The repository identity is read from the Git common directory the
     /// open already bound (no `git rev-parse` here) and the UUID marker file.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    pub(crate) fn gc_service_status_advice(&self, outcome_evidence: bool) -> Option<StatusAdvice> {
+    pub(crate) fn gc_service_status_advice(
+        &self,
+        outcome_evidence: bool,
+        may_repair: bool,
+    ) -> Option<StatusAdvice> {
+        // On every platform: the span and the mode say that this form ran
+        // the check, so a status form that skips it shows on Linux too.
+        let _span = crate::phase_telemetry::span("status_gc_service_runtime");
+        crate::phase_telemetry::add(
+            if may_repair {
+                "status_gc_service_check_may_repair"
+            } else {
+                "status_gc_service_check_read_only"
+            },
+            std::time::Duration::ZERO,
+        );
         #[cfg(target_os = "macos")]
         {
-            let _span = crate::phase_telemetry::span("status_gc_service_runtime");
             let identity = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .and_then(|home| {
@@ -857,6 +869,7 @@ impl Broker {
                 uid,
                 &self.main_root_path(),
                 outcome_evidence,
+                may_repair,
             )?;
             Some(StatusAdvice {
                 id: advice.id,
@@ -1078,7 +1091,8 @@ impl Broker {
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
         self.push_unverified_runtime_probe_advice(&mut view);
-        view.advice.extend(self.gc_service_status_advice(true));
+        view.advice
+            .extend(self.gc_service_status_advice(true, true));
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

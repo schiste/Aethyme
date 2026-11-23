@@ -1544,6 +1544,11 @@ impl<E: std::fmt::Display + 'static> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
+    /// `read_only_snapshot` was set only because this is routine status (no
+    /// explicit `--read-only-snapshot`, no compatibility mode): such a status
+    /// still keeps broker storage untouched, but may start the scheduled GC
+    /// service's background rebind.
+    routine_status_snapshot: bool,
     /// Why `read_only_snapshot` is set; refusals quote it.
     read_only_compatibility: Option<ReadOnlyCompatibility>,
     /// `status --summary`: skip the per-session lease refresh (#182).
@@ -1749,6 +1754,7 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
+        routine_status_snapshot: false,
         read_only_compatibility: None,
         summary: false,
         compact: false,
@@ -2847,6 +2853,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // Routine status is an observation, including advisory delivery. Do not
     // migrate/create storage or mark notes delivered merely by polling it.
     if routine_status(args) {
+        parsed.routine_status_snapshot = !parsed.read_only_snapshot;
         parsed.read_only_snapshot = true;
     }
     let task_lease_command = task_lease_command_class(subcommand, &parsed);
