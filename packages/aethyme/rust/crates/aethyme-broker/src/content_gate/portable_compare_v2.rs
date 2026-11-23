@@ -436,6 +436,10 @@ fn validate_link_evidence(bytes: &[u8], change: &Value) -> Result<(), &'static s
         if item.as_object().is_none_or(|m| m.len() != 4)
             || item["version"].as_u64() != Some(1)
             || entry.get("after").is_none_or(Value::is_null)
+            || !matches!(
+                entry["media_type"].as_str(),
+                Some("text/markdown" | "text/html")
+            )
             || item["source_sha256"] != entry["after"]["sha256"]
             || destinations.len() != observations.len()
             || destinations.iter().any(|v| !v.is_string())
@@ -1152,9 +1156,29 @@ mod tests {
         assert!(closed_verdict(v).is_err());
     }
     #[test]
+    fn link_observations_require_supported_media() {
+        let mut change = json!({"change_id":"c","entries":[{"entity_id":"article","media_type":"text/plain","after":{"sha256":"abc"}}]});
+        let mut snapshot = json!({"version":1,"change_id":"c","entries":{"article":{"version":1,"source_sha256":"abc","destinations":[],"observations":[]}}});
+        for media in ["text/plain", "text/markdown", "text/html"] {
+            change["entries"][0]["media_type"] = json!(media);
+            assert_eq!(
+                validate_link_evidence(snapshot.to_string().as_bytes(), &change).is_ok(),
+                media != "text/plain"
+            );
+        }
+        change["entries"][0]["media_type"] = json!("text/plain");
+        snapshot["entries"] = json!({});
+        assert!(validate_link_evidence(snapshot.to_string().as_bytes(), &change).is_ok());
+    }
+
+    #[test]
     fn rejects_malformed_link_evidence_and_profile_mismatches() {
-        let (v, base, after, mut verdict) = fixture();
-        let change = parse_change(v["artifacts"]["change"].as_str().unwrap().as_bytes()).unwrap();
+        let (mut v, base, mut after, mut verdict) = fixture();
+        let mut change =
+            parse_change(v["artifacts"]["change"].as_str().unwrap().as_bytes()).unwrap();
+        change["entries"][0]["media_type"] = json!("text/markdown");
+        v["artifacts"]["change"] = json!(change.to_string());
+        after[0].media_type = "text/markdown".into();
         let mut snapshot = json!({"version":1,"change_id":change["change_id"],"entries":{"article":{
             "version":1,"source_sha256":change["entries"][0]["after"]["sha256"],
             "destinations":["https://example.org/"],"observations":["reachable"]}}});
