@@ -336,6 +336,46 @@ reading; counters `storage_host_temp_root_measured` (one per root, with its
 time), `storage_host_temp_partial` (a root left partial by the deadline) and
 `storage_host_temp_lock_lost` (a reading stopped by a lost worker lock).
 
+Recovery archive landing proofs (2026-11-23): whether an archive's commits
+are in its repository's default branch is answered by one prover per process
+(`storage_ledger::landing`), keyed by the repository path. Each default tip
+is read once per pass and then reused for 30 s, but every "contained" answer
+is confirmed against a freshly read tip before it is returned (a moved tip is
+re-read, carried or reset, and the archive re-checked once). Every commit of
+an archive is first checked against what is known, then the unknown ones are
+probed (`merge-base --is-ancestor`) once per tip; a forward move of the tip
+carries known answers with one `rev-list <new> ^<old>`, any other move drops
+them. Every Git read (tips, ranges, probes) uses the resolved Git program at
+an ordinary disk priority, with `core.useReplaceRefs=false`,
+`GIT_NO_REPLACE_OBJECTS=1`, `GIT_GRAFT_FILE` set to the null device,
+`GIT_NO_LAZY_FETCH=1`, and inherited `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_COMMON_DIR`, object-directory, namespace, replace-base,
+shallow-file and config-parameter variables removed; each read gets at most
+20 s, what is left of an active Git deadline, and what is left of 120 s for
+all of the process's reads together. `<host state>/storage-landing-cache.json`
+(`schema` 1, `repositories[]` of `repository`, `tip`, `not_contained[]`;
+written by the worker after eviction, classified `coordination`) keeps only
+commits proven not contained that this process asked about, so a damaged or
+stale file can keep an archive, never remove one, and a removed archive's
+commits drop out. The pass report (`storage-ledger.json` `last_pass`, and
+`storage status --json`) adds `landing`: per-pass counts `tip_reads`,
+`tip_memo_hits`, `live_tip_checks`, `live_tip_moved`, `duplicate_commits`,
+`cached_contained`, `cached_not_contained`, `probes`, `probe_contained`,
+`probe_not_contained`, `probe_unproven`, `probe_timeouts`, `budget_spent`,
+`tip_advanced` and `tip_reset`; and `unproven_archives` (archives kept
+because their landing could not be proven either way: a budget, a deadline,
+a Git failure, a moving tip; their skip reason starts `landing not proven`
+and they are not counted in `unlanded_archives`). Spans
+`storage_landing_default_tip`, `storage_landing_probe`,
+`storage_landing_tip_advance`, `storage_landing_cache_load` and
+`storage_landing_cache_save`; counters `storage_landing_tip_memo_hit`,
+`storage_landing_live_tip_check`, `storage_landing_live_tip_moved`,
+`storage_landing_duplicate_commit`, `storage_landing_cached_contained`,
+`storage_landing_cached_not_contained`, `storage_landing_probe_contained`,
+`storage_landing_probe_not_contained`, `storage_landing_probe_unproven`,
+`storage_landing_probe_timeout`, `storage_landing_budget_spent`,
+`storage_landing_tip_advanced` and `storage_landing_tip_reset`.
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
