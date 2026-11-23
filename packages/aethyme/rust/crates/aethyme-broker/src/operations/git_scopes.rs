@@ -630,7 +630,9 @@ fn hook_directory(
         Ok(if path.is_absolute() {
             path
         } else {
-            cwd.join(path)
+            // Git resolves a relative hooks path against the worktree's top,
+            // not the directory the command runs in.
+            crate::GitRepo::discover(cwd)?.root().join(path)
         })
     } else if hook_config.status.code() == Some(1) {
         Ok(common.join("hooks"))

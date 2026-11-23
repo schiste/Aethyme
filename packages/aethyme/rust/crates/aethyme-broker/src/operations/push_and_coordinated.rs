@@ -399,21 +399,24 @@ fn reconcile_failed_push(
 /// too slow to answer leaves the outcome unknown, as before.
 const UNKNOWN_PUSH_REMOTE_READ_BUDGET: Duration = Duration::from_secs(15);
 
-/// After a push whose transfer was cut off, read the destinations once. When
-/// every one already holds the commit this push proposed, the push's intended
-/// result is on the remote and the outcome is `succeeded`: nothing could make
-/// it less so, since a late server-side update can only set the same value.
-/// Any other observation proves nothing (a cut-off transfer may still land),
-/// so `None` keeps the outcome unknown.
+/// The bound on the remote read that plans a push before its hook runs.
+const PRE_LANE_REMOTE_READ_BUDGET: Duration = Duration::from_secs(60);
+
+/// After a push whose transfer was cut off, read the destinations once,
+/// through the verified push endpoint bound to the operation's recorded
+/// `repository` (a remote whose push URL no longer resolves to it proves
+/// nothing). Returns the observed outcome (`succeeded` when every destination
+/// holds the proposed commit, `failed` when every one is still at its old
+/// value, `None` otherwise or when the read fails) with the journal value.
 ///
-/// The read goes through the verified push endpoint bound to the operation's
-/// recorded `repository`: a remote whose push URL no longer resolves to that
-/// repository proves nothing, and the outcome stays unknown.
-fn prove_timed_out_push_succeeded(
+/// Only `succeeded` is proof on its own: a late server-side update can only
+/// set the same value. `failed` proves nothing alone (a cut-off transfer may
+/// still land); the caller pairs it with trace evidence that nothing was sent.
+fn observe_timed_out_push(
     repo: &crate::GitRepo,
     repository: &str,
     planning: &PushPlanning,
-) -> Option<serde_json::Value> {
+) -> Option<(Option<&'static str>, serde_json::Value)> {
     let PushPlanning::Planned(plan) = planning else {
         return None;
     };
@@ -431,22 +434,29 @@ fn prove_timed_out_push_succeeded(
         return None;
     };
     let observation = classify_exact_push_observation(plan, &observed);
-    crate::phase_telemetry::add(
-        match observation.outcome {
-            Some("succeeded") => "push_timeout_proven_succeeded",
-            _ => "push_timeout_left_unknown",
-        },
-        Duration::ZERO,
-    );
-    (observation.outcome == Some("succeeded")).then(|| {
-        let mut value = planning.journal_value().expect("planned push");
-        value["evidence"] = json!({
-            "classification": observation.classification,
-            "source": "post_timeout_remote_read",
-            "destinations": observation.destinations,
-        });
-        value
-    })
+    let mut value = planning.journal_value().expect("planned push");
+    value["evidence"] = json!({
+        "classification": observation.classification,
+        "source": "post_timeout_remote_read",
+        "destinations": observation.destinations,
+    });
+    Some((observation.outcome, value))
+}
+
+/// The settled status of a push stopped at its deadline, from the verified
+/// remote read and the trace: every destination at the proposed commit is
+/// `succeeded`; every one still at its old value *and* a trace showing Git
+/// was still inside its own `pre-push` hook is `failed` (nothing sent);
+/// anything else stays `None` (unknown).
+fn settle_timed_out_push(
+    observed: Option<Option<&'static str>>,
+    killed_in_hook: bool,
+) -> Option<OperationStatus> {
+    match observed {
+        Some(Some("succeeded")) => Some(OperationStatus::Succeeded),
+        Some(Some("failed")) if killed_in_hook => Some(OperationStatus::Failed),
+        _ => None,
+    }
 }
 
 /// The branch an unknown-outcome operation wrote when that branch is its own
@@ -458,18 +468,70 @@ fn own_session_branch_scope(
 ) -> Option<String> {
     let scope = stored_resource_scope(operation)?;
     let branch = scope.strip_prefix("git-ref/refs/heads/")?;
+    // A shared branch (the default branch, the integration branch) is never
+    // a session's own, whatever a session record says: its ambiguity always
+    // blocks everything.
+    if broker
+        .shared_branches()
+        .iter()
+        .any(|shared| shared == branch)
+    {
+        return None;
+    }
     let session = broker.store().session(operation.session_id).ok()?;
     (session.branch == branch).then_some(scope)
 }
 
+/// Whether `request` names `branch`: a GitHub command whose ref targets
+/// include it (a merge of its pull request, a branch delete,
+/// `update-branch`), or a Git command any of whose arguments mentions it or
+/// that addresses refs wholesale (`--all`, `--mirror`, `--prune`, `--tags`
+/// widen to every branch). Conservative: naming it keeps the block.
+fn request_names_branch(
+    provider: OperationProvider,
+    args: &[String],
+    gh_named: &[String],
+    branch: &str,
+) -> bool {
+    match provider {
+        OperationProvider::Github => gh_named.iter().any(|named| named == branch),
+        OperationProvider::Git => args.iter().any(|arg| {
+            arg.contains(branch)
+                || matches!(arg.as_str(), "--all" | "--mirror" | "--prune" | "--tags")
+        }),
+    }
+}
+
 /// Settle an unknown push of a session's own branch from the remote, without
-/// an operator, when the remote proves it succeeded: its one destination is
-/// the session's branch and now holds exactly the commit the push proposed.
-/// Only the session's own lanes write that branch, so the observation cannot
-/// be another session's write. Any other observation (the old value, a third
-/// value, a remote that does not answer in time) leaves it unknown: a cut-off
-/// transfer may still land, so the old value proves nothing.
+/// an operator. Its one destination must be the session's branch, read through
+/// the verified push endpoint of the recorded repository. At exactly the
+/// proposed commit it succeeded; still at the plan's old value
+/// [`UNKNOWN_PUSH_SETTLE_AGE_MS`] after it ended, it did not happen. Only the
+/// session's own lanes write that branch, so the observation cannot be another
+/// session's write. Anything else (a third value, a deleted branch, the old
+/// value too soon, a remote that does not answer) leaves it unknown.
 fn try_reconcile_session_push(
+    broker: &mut Broker,
+    operation: &CoordinatedOperation,
+    deadline: AdmissionDeadline,
+) -> Result<bool, BrokerOpError> {
+    // A failure to settle someone else's row must not fail this writer: the
+    // row simply stays unknown and blocks as it did.
+    Ok(
+        try_reconcile_session_push_inner(broker, operation, deadline).unwrap_or_else(|_| {
+            crate::phase_telemetry::add("unknown_push_auto_reconcile_error", Duration::ZERO);
+            false
+        }),
+    )
+}
+
+/// How long after an unknown push ended a remote still at the push's old
+/// value counts as "it did not happen". A server applies the commands of a
+/// fully received push within seconds; a transfer cut off this long ago that
+/// has still not landed never will.
+const UNKNOWN_PUSH_SETTLE_AGE_MS: i64 = 10 * 60 * 1000;
+
+fn try_reconcile_session_push_inner(
     broker: &mut Broker,
     operation: &CoordinatedOperation,
     deadline: AdmissionDeadline,
@@ -527,36 +589,49 @@ fn try_reconcile_session_push(
         return Ok(false);
     };
     let observation = classify_exact_push_observation(&plan, &observed);
-    if observation.outcome != Some("succeeded") {
-        crate::phase_telemetry::add("unknown_push_auto_reconcile_left_unknown", Duration::ZERO);
-        return Ok(false);
-    }
+    // At the proposed commit: succeeded. At the old value long after the
+    // push ended: it did not happen. A missing branch whose old value was a
+    // commit, a third value, or the old value too soon after: unknown.
+    let ended_at = operation.finished_at.unwrap_or(operation.updated_at);
+    let status = match observation.outcome {
+        Some("succeeded") => OperationStatus::ReconciledSucceeded,
+        Some("failed") if unix_now_ms().saturating_sub(ended_at) >= UNKNOWN_PUSH_SETTLE_AGE_MS => {
+            OperationStatus::ReconciledFailed
+        }
+        _ => {
+            crate::phase_telemetry::add("unknown_push_auto_reconcile_left_unknown", Duration::ZERO);
+            return Ok(false);
+        }
+    };
+    let succeeded = status == OperationStatus::ReconciledSucceeded;
     if let Some(host_id) = &operation.host_operation_id {
         crate::host_operations::reconcile_host_operation_with_deadline(
             &broker.host_operation_database_path()?,
             host_id,
-            true,
+            succeeded,
             deadline.at,
         )?;
     }
     details["reconciliation"] = json!({
         "source": "session_push_remote_read",
-        "outcome": OperationStatus::ReconciledSucceeded.as_str(),
+        "outcome": status.as_str(),
         "remote": plan.remote,
         "destinations": observation.destinations,
         "observed_at": unix_now_ms(),
     });
     let settled = broker
         .store()
-        .reconcile_observed_operation(
-            operation,
-            &details.to_string(),
-            OperationStatus::ReconciledSucceeded,
-            operation.exit_code,
-        )?
+        .reconcile_observed_operation(operation, &details.to_string(), status, operation.exit_code)?
         .is_some();
     if settled {
-        crate::phase_telemetry::add("unknown_push_auto_reconcile_succeeded", Duration::ZERO);
+        crate::phase_telemetry::add(
+            if succeeded {
+                "unknown_push_auto_reconcile_succeeded"
+            } else {
+                "unknown_push_auto_reconcile_failed"
+            },
+            Duration::ZERO,
+        );
     }
     Ok(settled)
 }
@@ -582,6 +657,11 @@ struct GitTransferTrace {
     pre_push_hook_started_ms: Option<u64>,
     /// How long that hook ran, in ms. Telemetry only.
     pre_push_hook_ms: Option<u64>,
+    /// The top-level `git push` started a child Git itself classes as the
+    /// `pre-push` hook (`child_class` `hook` with `hook_name` `pre-push`, or
+    /// an `argv[0]` whose file name is `pre-push`), not merely a child whose
+    /// command line mentions it (a remote URL can).
+    top_level_pre_push_hook_child: bool,
     /// The top-level `git push` entered its `transport_push/get_refs_list`
     /// region: it began asking a remote for its refs.
     remote_refs_list_started: bool,
@@ -685,8 +765,16 @@ impl GitTransferTrace {
     /// `push_refs`, the one region that sends ref updates (it runs only after
     /// the hook exits zero). Nothing that can change a remote ref was sent,
     /// so the timeout is a plain failure, not an unknown outcome.
+    ///
+    /// Trace events alone cannot prove absence: Git stops writing Trace2 on a
+    /// write error and keeps pushing. So this also requires a live trace with
+    /// regions (the ref listing finished) and a child Git itself classes as
+    /// the hook, and the caller acts on it only when a verified remote read
+    /// also finds every destination still at its old value.
     fn killed_in_pre_push_hook(&self) -> bool {
         !self.push_refs_started
+            && self.remote_refs_list_finished
+            && self.top_level_pre_push_hook_child
             && self.pre_push_hook_started_ms.is_some()
             && self.pre_push_hook_ms.is_none()
     }
@@ -818,6 +906,18 @@ fn parse_git_transfer_trace(contents: &str) -> GitTransferTrace {
                     .collect::<Vec<_>>()
                     .join(" ")
                     .to_ascii_lowercase();
+                let is_hook_child = (event.get("child_class").and_then(serde_json::Value::as_str)
+                    == Some("hook")
+                    && event.get("hook_name").and_then(serde_json::Value::as_str)
+                        == Some("pre-push"))
+                    || arguments
+                        .first()
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|program| Path::new(program).file_name())
+                        .is_some_and(|name| name == "pre-push");
+                if top_level && is_hook_child {
+                    trace.top_level_pre_push_hook_child = true;
+                }
                 if command.contains("pre-push") {
                     trace.pre_push_hook = true;
                     if let Some(child_id) =
@@ -3295,6 +3395,14 @@ impl Broker {
         } else {
             GhRefTargets::default()
         };
+        // Branches this GitHub command deletes, rewrites or advances, kept
+        // for the write-block check below.
+        let gh_named: Vec<String> = gh_targets
+            .rewrite
+            .iter()
+            .chain(&gh_targets.advance)
+            .cloned()
+            .collect();
         if let Some(owner) = self.refuse_foreign_session_branches(&request, effect, gh_targets)? {
             // Recorded with the authorization, so the journal says which
             // session's branch this operation was allowed to touch.
@@ -3755,7 +3863,12 @@ impl Broker {
             let _hook_span = push_stage_span(push_stages, "push_git_hook_dry_run");
             let plan = {
                 let _read_span = push_stage_span(push_stages, "push_git_remote_read_before_lock");
-                plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+                // Bounded: it now runs by default. A remote that does not
+                // answer leaves the plan unavailable and refuses the push
+                // before anything is queued or sent.
+                crate::git::with_git_deadline(PRE_LANE_REMOTE_READ_BUDGET, || {
+                    plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+                })
             };
             let pinned = match &plan {
                 PushPlanning::Planned(exact) => pin_push_sources(&request.args, exact),
@@ -4249,6 +4362,12 @@ impl Broker {
                     )
                     && let Some(branch_scope) = own_session_branch_scope(self, &operation)
                     && resource_scope.as_deref() != Some(branch_scope.as_str())
+                    && !request_names_branch(
+                        request.provider,
+                        &request.args,
+                        &gh_named,
+                        branch_scope.trim_start_matches("git-ref/refs/heads/"),
+                    )
                 {
                     crate::phase_telemetry::add(
                         "unknown_session_branch_write_not_blocking",
@@ -4598,18 +4717,32 @@ impl Broker {
                     && timeout_trace
                         .as_ref()
                         .is_some_and(GitTransferTrace::killed_in_pre_push_hook);
-                let proven_push = (remote_outcome_uncertain
-                    && !killed_in_hook
+                let observed_push = (remote_outcome_uncertain
                     && request.provider == OperationProvider::Git)
                     .then(|| {
-                        prove_timed_out_push_succeeded(
-                            self.repo_handle(),
-                            &repository,
-                            &push_planning,
-                        )
+                        observe_timed_out_push(self.repo_handle(), &repository, &push_planning)
                     })
                     .flatten();
-                let status = if proven_push.is_some() {
+                let settled = settle_timed_out_push(
+                    observed_push.as_ref().map(|(outcome, _)| *outcome),
+                    killed_in_hook,
+                );
+                if remote_outcome_uncertain && request.provider == OperationProvider::Git {
+                    crate::phase_telemetry::add(
+                        match (observed_push.is_some(), settled) {
+                            (_, Some(OperationStatus::Succeeded)) => {
+                                "push_timeout_proven_succeeded"
+                            }
+                            (_, Some(_)) => "push_timeout_proven_not_sent",
+                            (true, None) => "push_timeout_left_unknown",
+                            (false, None) => "push_timeout_not_observed",
+                        },
+                        Duration::ZERO,
+                    );
+                }
+                let proven_push = settled.and(observed_push).map(|(_, value)| value);
+                let killed_in_hook = settled == Some(OperationStatus::Failed);
+                let status = if settled == Some(OperationStatus::Succeeded) {
                     OperationStatus::Succeeded
                 } else if killed_in_hook {
                     OperationStatus::Failed
@@ -4640,7 +4773,7 @@ impl Broker {
                             "failure_class": "coordinated_operation_timeout",
                             "stage": stage,
                             "budget": budget,
-                            "remote_outcome": if proven_push.is_some() {
+                            "remote_outcome": if status == OperationStatus::Succeeded {
                                 "succeeded"
                             } else if killed_in_hook {
                                 "not_sent"

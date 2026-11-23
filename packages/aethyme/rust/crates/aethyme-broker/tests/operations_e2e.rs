@@ -3844,6 +3844,40 @@ fn a_session_push_hook_holds_no_shared_lane() {
     assert_eq!(timing["coordination_timing"]["hooks_outside_lock"], true);
 }
 
+/// The hook judged the remote's old value it was given on stdin. If the
+/// remote branch moves between the dry run and taking the lanes, the push
+/// must not go out with `--no-verify` against a value the hook never saw.
+#[cfg(unix)]
+#[test]
+fn a_remote_that_moves_after_the_hook_refuses_the_unverified_push() {
+    let mut fx = LaneFixture::new(&["moved-under-hook"]);
+    let branch = fx.branch(0);
+    let base = git_output(&fx.worktrees[0], &["rev-parse", "HEAD"]);
+    let marker = fx.repo().join(".aethyme/moved-once");
+    write_executable(
+        &fx.hooks().join("pre-push"),
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nif [ ! -f {marker} ]; then\n  : > {marker}\n  \
+             git push -q --no-verify origin {base}:refs/heads/{branch} || exit 1\nfi\nexit 0\n",
+            marker = shell_path(&marker),
+        ),
+    );
+    let held = fx.commit_plain(0, "held\n");
+    let result = fx.try_now(fx.strict_push(0, &held, &branch));
+    assert!(
+        matches!(
+            result,
+            Err(BrokerOpError::InvalidCoordinatedOperation { .. })
+        ),
+        "a moved remote must refuse the push: {result:?}"
+    );
+    assert_eq!(
+        git_output(&fx.remote, &["rev-parse", &format!("refs/heads/{branch}")]),
+        base,
+        "nothing the hook did not judge was sent"
+    );
+}
+
 /// A hook slower than the push's whole queue budget used to time the push
 /// out as `outcome_unknown`. It now has a budget of its own, so the push
 /// succeeds and leaves nothing for an operator to reconcile.
@@ -4090,6 +4124,51 @@ fn an_unknown_session_push_is_not_settled_from_a_different_endpoint() {
         .unwrap()
         .unwrap();
     assert_eq!(still.status, OperationStatus::OutcomeUnknown);
+}
+
+/// Another session's write that names the ambiguous branch (here a tag made
+/// from it) is not exempt: it still waits for the unknown push to be settled.
+#[cfg(unix)]
+#[test]
+fn another_sessions_write_naming_the_ambiguous_branch_stays_blocked() {
+    let mut fx = LaneFixture::new(&["named-branch", "namer"]);
+    let branch = fx.branch(0);
+    let proposed = fx.commit_plain(0, "maybe sent\n");
+    let unknown = record_unknown_session_push(&mut fx, 0, &proposed, None);
+    match fx.try_now(request(fx.sessions[1], &["tag", "probe-tag", &branch])) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, unknown)
+        }
+        other => panic!("a write naming the ambiguous branch must stay blocked: {other:?}"),
+    }
+}
+
+/// A shared branch (here the configured integration branch) is never a
+/// session's own, even if a session records it: its unknown write blocks
+/// every session.
+#[cfg(unix)]
+#[test]
+fn an_unknown_write_of_a_shared_branch_blocks_every_session() {
+    let mut fx = LaneFixture::new(&["shared-lane", "bystander"]);
+    let branch = fx.branch(0);
+    let config = fx.repo().join(".aethyme/config.toml");
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!("{existing}\n[promote]\nbranch = \"{branch}\"\n"),
+    )
+    .unwrap();
+    git(fx.repo(), &["add", "-f", ".aethyme/config.toml"]);
+    git(fx.repo(), &["commit", "-qm", "integration branch"]);
+    git(fx.repo(), &["push", "-q", "origin", "main"]);
+    let proposed = fx.commit_plain(0, "shared\n");
+    let unknown = record_unknown_session_push(&mut fx, 0, &proposed, None);
+    match fx.try_now(request(fx.sessions[1], &["branch", "bystander-wide"])) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, unknown)
+        }
+        other => panic!("a shared branch's unknown write must block everyone: {other:?}"),
+    }
 }
 
 /// A genuinely unknown push of a session's own branch (the remote does not

@@ -485,12 +485,13 @@ A push of a session's own branch on its branch lane therefore runs the hook
 first, by default, whenever the repository has an executable `pre-push` hook:
 it runs `git push --dry-run` against exactly the commits the real push will
 send. Git gives the hook the same arguments and stdin as for the real push, so
-it runs once, with identical inputs. A hook that refuses stops the push there,
+it runs once, with identical inputs; its environment lacks only the
+operation id and progress variables, so a hook that needs those fails closed. A hook that refuses stops the push there,
 with its output, before anything is sent. The hook has its own budget
 (`pre_push_hook_budget_seconds`, default 20 minutes), and the push's queue and
 transfer deadline starts only after it. The broker then takes its lanes,
 re-plans the push, refuses if any destination or proposed commit changed, and
-pushes with `--no-verify`. Two pushes of one branch still serialise: the first
+pushes with `--no-verify`, refusing if the remote's old value changed too. Two pushes of one branch still serialise: the first
 holds a branch-only lane from before its hook to its end.
 
 ```toml
@@ -542,19 +543,23 @@ which every new narrow Git writer must pass, so no new narrow writer starts
 while a wide one waits. The wait is recorded as `wide_intent_wait_ms` in the
 operation's `coordination_timing`. An
 operation left `outcome_unknown` blocks the operations it would have serialised
-with. A session-branch commit or push blocks that branch's lane and every write
-of its own session; another session's writes, repository-wide and GitHub ones
-included, go ahead, because only that session's lanes write its branch. A
+with. A session-branch commit or push blocks that branch's lane, every write
+of its own session, and any write that names the branch (merging its pull
+request, a tag or push naming it); another session's other writes,
+repository-wide and GitHub ones included, go ahead, because only that session's
+lanes write its branch. A shared default or integration branch is never treated
+as a session's own. A
 repository-wide unknown write (the default branch, `aethyme/integration`, tags)
 blocks everything, as before.
 
-A push cut off by its deadline settles itself when the evidence allows: still
-inside its own `pre-push` hook (from Git's Trace2), it sent nothing and is
-`failed`; with every destination already at the pushed commit, it is
-`succeeded`. An unknown push of a session's own branch is read again by the
-next write it would block, and becomes `reconciled_succeeded` once the branch
-holds exactly the pushed commit. A branch still at its old commit stays
-unknown: a cut-off transfer may still land.
+A push cut off by its deadline settles itself when the evidence allows. With
+every destination already at the pushed commit, it is `succeeded`. With every
+destination still at its old commit *and* Git's Trace2 showing it was still
+inside its own `pre-push` hook, it sent nothing and is `failed`. An unknown push
+of a session's own branch is read again by the next write it would block: it
+becomes `reconciled_succeeded` once the branch holds exactly the pushed commit,
+or `reconciled_failed` once it is still at its old commit ten minutes after the
+push ended. Anything else stays unknown.
 
 A write that provably sent nothing to the remote is recorded `failed`, never
 `outcome_unknown`, so it blocks nothing and can simply be retried. For a

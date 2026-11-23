@@ -1089,8 +1089,10 @@ enum PushPlanning {
 impl PushPlanning {
     /// Whether this plan sends exactly what an earlier plan described.
     ///
-    /// Compared by destination and proposed commit, which is precisely what the
-    /// pre-push hook inspected during the dry run. Anything the planner cannot
+    /// Compared by destination, proposed commit and the remote's old value,
+    /// which is precisely what the pre-push hook was given on stdin during the
+    /// dry run. A remote that moved in between gets a push the hook never
+    /// judged, so it is not covered either. Anything the planner cannot
     /// describe exactly is treated as not covered, so an unplannable push never
     /// reaches the remote with its hook skipped.
     fn matches_prechecked(&self, earlier: &PushPlanning) -> bool {
@@ -1102,6 +1104,7 @@ impl PushPlanning {
                         |(current, earlier)| {
                             current.destination_ref == earlier.destination_ref
                                 && current.proposed_sha == earlier.proposed_sha
+                                && current.pre_push_sha == earlier.pre_push_sha
                         },
                     )
             }
