@@ -668,6 +668,11 @@ fn git_timeout_from(value: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_GIT_TIMEOUT)
 }
 
+/// The per-call Git limit when `AETHYME_GIT_TIMEOUT_SECS` does not shorten it.
+pub(crate) fn default_git_timeout() -> Duration {
+    DEFAULT_GIT_TIMEOUT
+}
+
 pub(crate) fn git_timeout() -> Duration {
     let configured = git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref());
     GIT_DEADLINE.with(|deadline| match deadline.get() {

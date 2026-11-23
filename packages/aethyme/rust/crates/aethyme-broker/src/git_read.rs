@@ -24,13 +24,19 @@
 //! - A missing object is a fallback, never "absent" or "not contained": the
 //!   build has no network features, so a partial clone is never fetched.
 //! - Grafts, replace refs, shallow history (for ancestry), SHA-256, non-file
-//!   ref storage, reduced trust, inherited `GIT_*` routing or configuration
-//!   and an expired Git deadline all fall back, preserving each call site's
-//!   current semantics.
+//!   ref storage, unknown repository extensions, reduced trust, inherited
+//!   `GIT_*` routing or history variables, an expired Git deadline, and (for
+//!   the uninterruptible ancestry walk) any active Git deadline all fall back,
+//!   preserving each call site's current semantics.
+//! - Symbolic refs are followed for at most four hops (Git reads five refs),
+//!   loose refs must have a form Git accepts, and a tag whose `type` header
+//!   disagrees with its target falls back.
 //!
-//! `AETHYME_GIT_IN_PROCESS=0` (or `false`, `off`, `no`) and `[git] in_process
-//! = false` in the main checkout's `.aethyme/config.toml` force the program
-//! everywhere.
+//! `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`, `on` or `yes`,
+//! and `[git] in_process = false` in the main checkout's
+//! `.aethyme/config.toml`, force the program everywhere. A repository whose
+//! common directory is not `<main checkout>/.git` (bare, `--separate-git-dir`)
+//! always uses the program, since the switch cannot be located.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,11 +45,24 @@ use std::time::{Instant, SystemTime};
 
 use crate::git::GitError;
 
-/// Environment kill switch: `0`, `false`, `off` or `no` forces the program.
+/// Environment kill switch: unset, `1`, `true`, `on` or `yes` allows
+/// in-process reads; any other value forces the program.
 pub(crate) const IN_PROCESS_ENV: &str = "AETHYME_GIT_IN_PROCESS";
 
-/// Git follows at most five symbolic refs (`SYMREF_MAXDEPTH`).
-const MAX_SYMREF_DEPTH: usize = 5;
+/// Git reads at most five refs per resolution (`SYMREF_MAXDEPTH`), the named
+/// one included, so a chain of more than four symbolic hops is dangling to
+/// Git.
+const MAX_SYMREF_HOPS: usize = 4;
+/// Extensions whose presence does not change what these queries answer;
+/// `objectFormat` and `refStorage` are checked for their values separately.
+const KNOWN_EXTENSIONS: [&str; 6] = [
+    "noop",
+    "preciousobjects",
+    "partialclone",
+    "worktreeconfig",
+    "objectformat",
+    "refstorage",
+];
 /// Tag chains longer than this go to Git rather than being followed here.
 const MAX_TAG_DEPTH: usize = 32;
 /// Names longer than this go to Git.
@@ -108,6 +127,10 @@ pub(crate) enum Fallback {
     Gix,
     /// gitoxide panicked.
     Panic,
+    /// A loose ref file Git would treat as broken.
+    BrokenRef,
+    /// A tag whose `type` header disagrees with the object it names.
+    TagTypeMismatch,
 }
 
 impl Fallback {
@@ -129,6 +152,8 @@ impl Fallback {
             Self::ConcurrentRefUpdate => "concurrent_ref_update",
             Self::Gix => "gix",
             Self::Panic => "panic",
+            Self::BrokenRef => "broken_ref",
+            Self::TagTypeMismatch => "tag_type_mismatch",
         }
     }
 }
@@ -208,11 +233,19 @@ fn preconditions() -> Result<(), Fallback> {
 
 fn disabled_by_environment(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
-        matches!(
+        !matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
+            "1" | "true" | "on" | "yes"
         )
     })
+}
+
+/// An ancestry walk cannot be interrupted, so it runs in-process only when
+/// no caller bounds Git: under an active deadline or a shortened
+/// `AETHYME_GIT_TIMEOUT_SECS`, Git keeps enforcing the bound callers expect.
+fn ancestry_walk_unbounded_ok() -> bool {
+    crate::git::active_git_deadline().is_none()
+        && crate::git::git_timeout() >= crate::git::default_git_timeout()
 }
 
 /// A repository opened by gitoxide for one query, after every
@@ -237,8 +270,11 @@ impl InProcess {
             .config_snapshot()
             .string("extensions.refStorage")
             .is_some_and(|storage| !storage.eq_ignore_ascii_case(b"files"));
-        if other_ref_storage {
+        if other_ref_storage || !known_extensions_only(repo.common_dir()) {
             return Err(Fallback::Format);
+        }
+        if kind == ReadKind::IsAncestor && !ancestry_walk_unbounded_ok() {
+            return Err(Fallback::Deadline);
         }
         if configured_off(repo.common_dir()) {
             return Err(Fallback::Disabled);
@@ -273,6 +309,15 @@ impl InProcess {
     fn guarded<T>(&self, query: impl FnOnce(&Self) -> Result<T, Fallback>) -> Result<T, Fallback> {
         let packed = self.repo.common_dir().join("packed-refs");
         let before = FileStamp::of(&packed)?;
+        // gitoxide may already hold a snapshot from opening, and reloads only
+        // on a strictly newer mtime; reread it so every lookup sees a
+        // snapshot no older than `before`. An absent file drops the snapshot.
+        if before.0.is_some() {
+            self.repo
+                .refs
+                .force_refresh_packed_buffer()
+                .map_err(|_| Fallback::Gix)?;
+        }
         let value = query(self)?;
         if FileStamp::of(&packed)? != before {
             return Err(Fallback::ConcurrentRefUpdate);
@@ -325,20 +370,55 @@ impl InProcess {
             .repo
             .try_find_reference(name)
             .map_err(|_| Fallback::Gix)?;
-        Ok(found.filter(|reference| {
+        let Some(reference) = found.filter(|reference| {
             let found: &[u8] = reference.name().as_bstr().as_ref();
             found == name.as_bytes()
-        }))
+        }) else {
+            return Ok(None);
+        };
+        self.require_well_formed_loose(name)?;
+        Ok(Some(reference))
     }
 
-    /// Follow symbolic refs to an object id, as Git does with `SYMREF_MAXDEPTH`.
+    /// gitoxide accepts an object id followed by garbage in a loose ref; Git
+    /// treats anything but whitespace after the id as a broken ref and skips
+    /// the candidate. Only the two forms Git accepts are answered here.
+    fn require_well_formed_loose(&self, name: &str) -> Result<(), Fallback> {
+        let dir = if name.starts_with("refs/") {
+            self.repo.common_dir()
+        } else {
+            self.repo.git_dir()
+        };
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(metadata) if metadata.is_file() && metadata.len() <= 4096 => {}
+            _ => return Err(Fallback::BrokenRef),
+        }
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => contents,
+            // Packed meanwhile: the packed-refs guard decides.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(Fallback::BrokenRef),
+        };
+        if well_formed_loose_ref(&contents) {
+            Ok(())
+        } else {
+            Err(Fallback::BrokenRef)
+        }
+    }
+
+    /// Follow symbolic refs to an object id: the named ref plus at most
+    /// [`MAX_SYMREF_HOPS`] more reads, Git's five in total.
     fn follow<'repo>(
         &'repo self,
         mut reference: gix::Reference<'repo>,
     ) -> Result<gix::ObjectId, Fallback> {
-        for _ in 0..=MAX_SYMREF_DEPTH {
+        for hop in 0..=MAX_SYMREF_HOPS {
             let target = match reference.target() {
                 gix::refs::TargetRef::Object(id) => return Ok(id.to_owned()),
+                gix::refs::TargetRef::Symbolic(_) if hop == MAX_SYMREF_HOPS => break,
                 gix::refs::TargetRef::Symbolic(name) => {
                     let name: &[u8] = name.as_bstr().as_ref();
                     std::str::from_utf8(name)
@@ -359,14 +439,20 @@ impl InProcess {
     }
 
     fn peel_to_commit(&self, mut id: gix::ObjectId) -> Result<gix::ObjectId, Fallback> {
+        let mut expected = None;
         for _ in 0..MAX_TAG_DEPTH {
             let object = self.object(id)?;
+            // Git refuses a tag whose `type` header names another kind.
+            if expected.is_some_and(|kind| kind != object.kind) {
+                return Err(Fallback::TagTypeMismatch);
+            }
             match object.kind {
                 gix::objs::Kind::Commit => return Ok(object.id),
                 gix::objs::Kind::Tag => {
-                    id = gix::objs::TagRefIter::from_bytes(&object.data, self.repo.object_hash())
-                        .target_id()
+                    let tag = gix::objs::TagRef::from_bytes(&object.data, self.repo.object_hash())
                         .map_err(|_| Fallback::Gix)?;
+                    expected = Some(tag.target_kind);
+                    id = tag.target();
                 }
                 gix::objs::Kind::Tree | gix::objs::Kind::Blob => {
                     return Err(Fallback::NotACommit);
@@ -410,11 +496,17 @@ impl GitRead for InProcess {
     fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, Fallback> {
         let ancestor = self.commit_id(ancestor)?;
         let descendant = self.commit_id(descendant)?;
-        // Missing parents are errors in gitoxide's walk, so `false` is only
-        // returned after a complete one.
-        self.repo
-            .is_ancestor(ancestor, descendant)
-            .map_err(|_| Fallback::Gix)
+        if ancestor == descendant {
+            return Ok(true);
+        }
+        // An ancestor of `descendant` is their only best merge base. Missing
+        // parents are errors in gitoxide's walk, so `false` is only returned
+        // after a complete one.
+        let bases = self
+            .repo
+            .merge_bases_many(ancestor, &[descendant])
+            .map_err(|_| Fallback::Gix)?;
+        Ok(bases.iter().any(|base| *base == ancestor))
     }
 }
 
@@ -542,12 +634,14 @@ fn configured_off(common_dir: &Path) -> bool {
     let Ok(common_dir) = std::fs::canonicalize(common_dir) else {
         return true;
     };
+    // Without a `<main checkout>/.git` common directory (a bare repository,
+    // `--separate-git-dir`) the switch cannot be located, so Git answers.
     let Some(main) = common_dir
         .file_name()
         .filter(|name| *name == std::ffi::OsStr::new(".git"))
         .and_then(|_| common_dir.parent())
     else {
-        return false;
+        return true;
     };
     let dir = main.join(aethyme_config::CONFIG_DIR);
     let Ok(stamps) = aethyme_config::candidate_file_names("config")
@@ -573,6 +667,56 @@ fn configured_off(common_dir: &Path) -> bool {
     };
     switches.insert(dir, (stamps, off));
     off
+}
+
+/// A loose ref Git reads: an object id followed by nothing or whitespace, or
+/// `ref:` with a target.
+fn well_formed_loose_ref(contents: &[u8]) -> bool {
+    if let Some(target) = contents.strip_prefix(b"ref:") {
+        return !target.trim_ascii().is_empty();
+    }
+    contents.len() >= 40
+        && contents[..40].iter().all(u8::is_ascii_hexdigit)
+        && contents[40..].first().is_none_or(u8::is_ascii_whitespace)
+}
+
+/// Whether the repository configuration names only extensions in
+/// [`KNOWN_EXTENSIONS`]. Git reads extensions from this one file, without
+/// includes; anything this parser does not follow leaves the query to Git.
+fn known_extensions_only(common_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(common_dir.join("config")) else {
+        return false;
+    };
+    let mut in_extensions = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.ends_with('\\') {
+            return false;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some((header, after)) = rest.split_once(']') else {
+                return false;
+            };
+            let after = after.trim();
+            if !after.is_empty() && !after.starts_with(['#', ';']) {
+                return false;
+            }
+            let header = header.trim();
+            in_extensions = header.eq_ignore_ascii_case("extensions");
+            if !in_extensions && header.to_ascii_lowercase().starts_with("extensions") {
+                return false;
+            }
+            continue;
+        }
+        if !in_extensions || line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let key = line.split(['=', ' ', '\t']).next().unwrap_or_default();
+        if !KNOWN_EXTENSIONS.contains(&key.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn in_process_off(config: &toml::Value) -> bool {

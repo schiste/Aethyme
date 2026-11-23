@@ -438,7 +438,8 @@ To disable the cache for one shell, `export AETHYME_GIT_PROBE_CACHE=off`.
 Aethyme answers a few read-only Git queries (ref resolution, `HEAD`, a
 commit's tree, ancestry) in-process with gitoxide and runs `git` for every
 case it cannot prove equal. To rule it out, rerun with
-`AETHYME_GIT_IN_PROCESS=0`, or set `[git] in_process = false` in the main
+`AETHYME_GIT_IN_PROCESS=0` (any value other than `1`, `true`, `on` or `yes`
+turns it off), or set `[git] in_process = false` in the main
 checkout's `.aethyme/config.toml`; both send every query to `git`. The
 `git_read` field of a command's metric line counts answered queries and
 fallbacks by reason.

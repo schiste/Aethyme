@@ -501,14 +501,21 @@ before; an in-process failure is never an answer.
   when no candidate ref exists; when a file in the Git directory shares the
   name; when a symbolic ref dangles; when an object is missing locally (a
   partial clone is never fetched in-process); when `packed-refs` changed during
-  the lookup; for grafts, replace refs, shallow history (ancestry only),
-  SHA-256, non-file ref storage, reduced trust, inherited `GIT_*` routing or
-  history variables, isolated graph-verification Git or an expired Git
-  deadline; and on any gitoxide error or panic.
-- **Kill switch.** `AETHYME_GIT_IN_PROCESS=0` (or `false`, `off`, `no`) in the
-  environment, or `[git] in_process = false` in the main checkout's
-  `.aethyme/config.toml`, sends every query to `git`. An invalid value or an
-  unreadable file also does.
+  the lookup; when a symbolic chain is longer than four hops, a loose ref is
+  not in a form Git accepts, or a tag's `type` header disagrees with its
+  target; for grafts, replace refs, shallow history (ancestry only), SHA-256,
+  non-file ref storage, repository extensions outside `noop`,
+  `preciousObjects`, `partialClone`, `worktreeConfig`, `objectFormat` and
+  `refStorage`, reduced trust, inherited `GIT_*` routing or history
+  variables, isolated graph-verification Git or an expired Git deadline; for
+  ancestry, under any active Git deadline or a shortened
+  `AETHYME_GIT_TIMEOUT_SECS` (the walk cannot be interrupted); and on any
+  gitoxide error or panic.
+- **Kill switch.** `AETHYME_GIT_IN_PROCESS` set to anything but `1`, `true`,
+  `on` or `yes`, or `[git] in_process = false` in the main checkout's
+  `.aethyme/config.toml`, sends every query to `git`. An invalid config value
+  or an unreadable file also does. A bare repository or one whose Git
+  directory is separate from its main checkout always uses `git`.
 - **Telemetry.** Span `git_read_inprocess` times each in-process attempt,
   fallbacks included. Attachment `git_read` counts them by operation:
   `<kind>.answered` and `<kind>.fallback.<reason>`, with `kind` one of
@@ -516,7 +523,7 @@ before; an in-process failure is never an answer.
   one of `disabled`, `environment`, `deadline`, `open`, `untrusted`, `format`,
   `history_override`, `unsupported_spec`, `not_found`, `root_file_shadow`,
   `unresolved`, `object_missing`, `not_a_commit`, `concurrent_ref_update`,
-  `gix`, `panic`. Each answered query is one `subprocess_git` fewer.
+  `gix`, `panic`, `broken_ref`, `tag_type_mismatch`. Each answered query is one `subprocess_git` fewer.
 
 ## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
 

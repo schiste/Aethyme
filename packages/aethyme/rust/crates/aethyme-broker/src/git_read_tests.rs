@@ -132,8 +132,8 @@ fn assert_parity(root: &Path, specs: &[String]) -> usize {
     // Every pair would be quadratic in Git processes; these four cover
     // ancestors, descendants, unrelated branches and an annotated tag.
     let ancestry = [
-        specs[specs.len() - 6].clone(),
-        specs[specs.len() - 4].clone(),
+        "lw".to_string(),
+        "feature".to_string(),
         "main".to_string(),
         "v1".to_string(),
     ];
@@ -481,10 +481,10 @@ fn the_configuration_kill_switch_reaches_linked_worktrees() {
 
 #[test]
 fn kill_switch_values() {
-    for value in ["0", "false", "OFF", " no "] {
-        assert!(disabled_by_environment(Some(value)), "{value}");
+    for value in ["0", "false", "OFF", " no ", "", "disabled", "2"] {
+        assert!(disabled_by_environment(Some(value)), "{value:?} is off");
     }
-    for value in [None, Some("1"), Some("true"), Some("")] {
+    for value in [None, Some("1"), Some("true"), Some(" ON "), Some("yes")] {
         assert!(!disabled_by_environment(value), "{value:?}");
     }
     let parse = |text: &str| in_process_off(&text.parse::<toml::Value>().unwrap());
@@ -569,4 +569,127 @@ fn spec_classification() {
         Err(Fallback::UnsupportedSpec)
     );
     assert_eq!(candidates("x")[5], "refs/remotes/x/HEAD");
+}
+
+fn symbolic_chain(dir: &Path, prefix: &str, hops: usize) -> String {
+    let mut target = "refs/heads/main".to_string();
+    for hop in 0..hops {
+        let name = format!("refs/heads/{prefix}{hop}");
+        git(dir, &["symbolic-ref", &name, &target]);
+        target = name;
+    }
+    target.trim_start_matches("refs/heads/").to_string()
+}
+
+#[test]
+fn symbolic_chains_longer_than_git_follows_are_left_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    let four = symbolic_chain(dir.path(), "four", 4);
+    let five = symbolic_chain(dir.path(), "five", 5);
+    let six = symbolic_chain(dir.path(), "six", 6);
+    assert_eq!(resolved(dir.path(), &four), Ok(shape.c2.clone()));
+    assert_eq!(resolved(dir.path(), &five), Err(Fallback::Unresolved));
+    assert_eq!(resolved(dir.path(), &six), Err(Fallback::Unresolved));
+    assert!(assert_parity(dir.path(), &[four, five, six]) > 0);
+}
+
+#[test]
+fn a_packed_ref_deleted_after_open_is_never_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    git(
+        dir.path(),
+        &["update-ref", "refs/heads/packed-only", &shape.c1],
+    );
+    git(dir.path(), &["pack-refs", "--all", "--prune"]);
+    let reader = InProcess::open(dir.path(), ReadKind::ResolveCommit).unwrap();
+    git(dir.path(), &["update-ref", "-d", "refs/heads/packed-only"]);
+    let answer = reader.guarded(|git| git.resolve_commit("packed-only"));
+    assert_eq!(answer, Err(Fallback::NotFound));
+}
+
+#[test]
+fn loose_refs_git_treats_as_broken_are_left_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    std::fs::write(
+        dir.path().join(".git/refs/heads/garbled"),
+        format!("{}garbage\n", shape.c1),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".git/refs/heads/spaced"),
+        format!("{} trailing\n", shape.c1),
+    )
+    .unwrap();
+    assert_eq!(resolved(dir.path(), "garbled"), Err(Fallback::BrokenRef));
+    assert_eq!(resolved(dir.path(), "spaced"), Ok(shape.c1.clone()));
+    assert_parity(dir.path(), &["garbled".to_string(), "spaced".to_string()]);
+}
+
+#[test]
+fn a_tag_whose_type_disagrees_with_its_target_is_left_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    let body = format!(
+        "object {}\ntype tree\ntag liar\ntagger Parity <parity@example.invalid> 0 +0000\n\nliar\n",
+        shape.c1
+    );
+    let body_path = dir.path().join("liar.tag");
+    std::fs::write(&body_path, body).unwrap();
+    let tag = git(
+        dir.path(),
+        &[
+            "hash-object",
+            "-t",
+            "tag",
+            "-w",
+            "--literally",
+            body_path.to_str().unwrap(),
+        ],
+    );
+    git(dir.path(), &["update-ref", "refs/tags/liar", &tag]);
+    assert_eq!(resolved(dir.path(), "liar"), Err(Fallback::TagTypeMismatch));
+    assert_parity(dir.path(), &["liar".to_string()]);
+}
+
+#[test]
+fn ancestry_under_a_git_deadline_is_left_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = shaped(dir.path());
+    let repo = GitRepo::discover(dir.path()).unwrap();
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let answer = crate::git::with_git_deadline(std::time::Duration::from_secs(600), || {
+            repo.is_ancestor_checked(&shape.c1, "main")
+        });
+        assert!(answer.unwrap());
+    }
+    let reads = recorder.attachments().remove("git_read").unwrap();
+    assert_eq!(
+        reads["is_ancestor.fallback.deadline"]["count"], 1,
+        "{reads}"
+    );
+}
+
+#[test]
+fn only_known_extensions_are_read_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = |text: &str| {
+        std::fs::write(dir.path().join("config"), text).unwrap();
+        known_extensions_only(dir.path())
+    };
+    assert!(check("[core]\n\trepositoryformatversion = 0\n"));
+    assert!(check(
+        "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeConfig = true\n\tpartialclone = origin\n"
+    ));
+    assert!(!check("[extensions]\n\tfutureThing = true\n"));
+    assert!(!check(
+        "[Extensions]\n\tobjectformat = sha1\n\tsubmodulePathConfig = true\n"
+    ));
+    assert!(!check("[extensions \"x\"]\n\tnoop = true\n"));
+    assert!(!check("[extensions]\n\tnoop = a \\\n"));
+    assert!(!known_extensions_only(&dir.path().join("missing")));
 }
