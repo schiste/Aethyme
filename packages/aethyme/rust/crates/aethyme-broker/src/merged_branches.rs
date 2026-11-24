@@ -218,7 +218,76 @@ fn branch_checked_out_now(repo: &crate::GitRepo, name: &str) -> Option<bool> {
     Some(false)
 }
 
+/// The session id a finished recovery archive's directory name starts with
+/// (`<id>-...`); `None` for an unfinished one (`.partial`) and for any other
+/// name.
+fn archive_owner(name: &str) -> Option<&str> {
+    if name.ends_with(".partial") {
+        return None;
+    }
+    name.split_once('-').map(|(owner, _)| owner)
+}
+
+/// One slice's listing of the recovery archives, read at the first session
+/// that needs it. Used to judge without the lifecycle claim only: a branch it
+/// lets go is judged again from a fresh reading before the delete.
+#[derive(Default)]
+struct SliceArchives(std::cell::OnceCell<Option<BTreeSet<String>>>);
+
+impl SliceArchives {
+    /// Whether a finished archive belongs to `owner`; `None` when the
+    /// listing failed.
+    fn holds(&self, broker: &crate::Broker, owner: &str) -> Option<bool> {
+        self.0
+            .get_or_init(|| {
+                let _span = crate::phase_telemetry::span("merged_branches_archive_listing");
+                let mut owners = BTreeSet::new();
+                broker.any_archive_owner(|owner| {
+                    owners.insert(owner.to_string());
+                    false
+                })?;
+                Some(owners)
+            })
+            .as_ref()
+            .map(|owners| owners.contains(owner))
+    }
+}
+
 impl crate::Broker {
+    /// Whether `wanted` accepts the owner of a finished recovery archive in
+    /// either archive directory (the pool-side one and the host state one),
+    /// stopping at the first it does. `None` when a directory cannot be
+    /// resolved, or one that exists or one of its entries cannot be read.
+    fn any_archive_owner(&self, mut wanted: impl FnMut(&str) -> bool) -> Option<bool> {
+        let roots = {
+            let _span = crate::phase_telemetry::span("merged_branches_archive_roots");
+            self.checked_recovery_archive_roots()
+        };
+        let Some(roots) = roots else {
+            crate::phase_telemetry::add("merged_branches_archive_roots_unknown", Duration::ZERO);
+            return None;
+        };
+        for root in roots {
+            let listing = match std::fs::read_dir(&root.path) {
+                Ok(listing) => listing,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && root.plainly_absent() =>
+                {
+                    continue;
+                }
+                Err(_) => return None,
+            };
+            for entry in listing {
+                let name = entry.ok()?.file_name();
+                crate::phase_telemetry::add("merged_branches_archive_entries", Duration::ZERO);
+                if archive_owner(&name.to_string_lossy()).is_some_and(&mut wanted) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
     /// Whether `session` still has state a person could restore, so its
     /// branch must stay: anything not plainly cleaned (open or closed), or a
     /// cleaned session with a finished recovery archive. `None` when that
@@ -228,34 +297,45 @@ impl crate::Broker {
     /// for a session elsewhere (an archive that can bring an idle session back
     /// at its path, say) extends this function, and the branch lane then keeps
     /// such sessions' branches without further change.
+    ///
+    /// Reads the archive directories now.
     pub(crate) fn has_restorable_state(&self, session: &crate::Session) -> Option<bool> {
+        self.has_restorable_state_with(session, |owner| {
+            let _span = crate::phase_telemetry::span("merged_branches_archive_listing_fresh");
+            self.any_archive_owner(|found| found == owner)
+        })
+    }
+
+    /// The rule itself, for every caller of [`Self::has_restorable_state`]
+    /// and for the judging loop, which differ only in where the archive names
+    /// come from: `archived` says whether a finished recovery archive belongs
+    /// to a session id, `None` when that cannot be told, and is asked only
+    /// when nothing cheaper decides.
+    fn has_restorable_state_with(
+        &self,
+        session: &crate::Session,
+        archived: impl FnOnce(&str) -> Option<bool>,
+    ) -> Option<bool> {
         if session.cleanup_state != crate::SessionCleanupState::Cleaned {
             return Some(true);
         }
         // Retired through an archive that `start --reuse` restores at the
         // same path: recorded with the session, and marked by a tombstone.
-        if self.session_restorable_archive(session.id).is_some()
-            || crate::broker::is_checkout_tombstone(std::path::Path::new(&session.worktree_path))
-        {
+        let recorded = {
+            let _span = crate::phase_telemetry::span("merged_branches_archive_record");
+            self.session_archive_recorded(session.id)?
+        };
+        if recorded {
             return Some(true);
         }
-        // Both archive directories: the pool-side one and the host state one.
-        let prefix = format!("{}-", session.id);
-        for root in self.recovery_archive_roots() {
-            let listing = match std::fs::read_dir(&root) {
-                Ok(listing) => listing,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-            };
-            for entry in listing {
-                let name = entry.ok()?.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with(&prefix) && !name.ends_with(".partial") {
-                    return Some(true);
-                }
-            }
+        let tombstone = {
+            let _span = crate::phase_telemetry::span("merged_branches_tombstone");
+            crate::broker::is_checkout_tombstone(Path::new(&session.worktree_path))
+        };
+        if tombstone {
+            return Some(true);
         }
-        Some(false)
+        archived(&session.id.to_string())
     }
 
     /// Why the branch must stay, judged afresh: every session that uses it
@@ -428,13 +508,14 @@ impl crate::Broker {
             .take(CHECKS_PER_RUN.min(candidates.len()))
             .collect();
         // Judge from facts read without the lifecycle claim: the ancestry of
-        // two fixed commits (Git), the recovery archives (directory
-        // listings), the sessions and checkouts listed above. Holding the
-        // claim for that kept a foreground `finish` or `start` waiting for
-        // the whole slice budget (7 to 26 s per run on the busiest
-        // repository). A branch judged for deletion is judged again under
-        // the claim, just before the delete, which itself refuses a tip that
-        // moved; nothing judged kept is touched.
+        // two fixed commits (Git), the recovery archives (one listing of
+        // their directories for the slice), the sessions and checkouts
+        // listed above. Holding the claim for that kept a foreground
+        // `finish` or `start` waiting for the whole slice budget (7 to 26 s
+        // per run on the busiest repository). A branch judged for deletion is
+        // judged again under the claim, just before the delete, which itself
+        // refuses a tip that moved; nothing judged kept is touched.
+        let archives = SliceArchives::default();
         let mut judged = 0usize;
         let mut to_delete = Vec::new();
         {
@@ -450,9 +531,10 @@ impl crate::Broker {
                 // A fact is read only when no earlier one keeps the branch.
                 let recovery_archive = !checked_out && {
                     let _span = crate::phase_telemetry::span("merged_branches_restorable_state");
-                    sessions
-                        .iter()
-                        .any(|session| self.has_restorable_state(session) != Some(false))
+                    sessions.iter().any(|session| {
+                        self.has_restorable_state_with(session, |owner| archives.holds(self, owner))
+                            != Some(false)
+                    })
                 };
                 let merged = (!checked_out && !recovery_archive)
                     .then(|| {
