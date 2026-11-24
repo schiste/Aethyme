@@ -969,6 +969,45 @@ fn changed_workflows_have_read_only_permissions() {
     );
 }
 
+#[test]
+fn contract_gate_uses_broker_comparison_base_when_supplied() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let policy = std::fs::read_to_string(root.join(".aethyme/gates.toml")).unwrap();
+    let gate = policy
+        .split("[[gate]]")
+        .find(|gate| gate.contains("name = \"cross-process-contract\""))
+        .unwrap();
+    let command = gate
+        .lines()
+        .find_map(|line| line.strip_prefix("command = '"))
+        .unwrap();
+    let setup = command.split(" && cargo run").next().unwrap();
+    let script = format!(
+        "git() {{ case \"$1\" in merge-base) printf integration-base;; rev-parse) printf parent-base;; esac; }}; {setup}; printf '%s' \"$BASE\""
+    );
+    for (base, expected) in [
+        (Some("verified-base"), "verified-base"),
+        (None, "integration-base"),
+    ] {
+        let mut shell = std::process::Command::new("sh");
+        shell.arg("-c").arg(&script);
+        match base {
+            Some(base) => {
+                shell.env("AETHYME_GATE_BASE_COMMIT", base);
+            }
+            None => {
+                shell.env_remove("AETHYME_GATE_BASE_COMMIT");
+            }
+        }
+        let output = shell.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
 /// A contract decision accepted on a pull request must be accepted again on
 /// its merge commit (PR #514 turned main red on 2026-10-04 because the gate
 /// read only commit messages while the PR check read only the PR body).
