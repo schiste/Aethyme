@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.169] - 2026-11-24
+
+### Fixed
+
+- The background lane that deletes merged local branches of cleaned sessions reads the sessions of every local branch in one scan. Before, it searched the `sessions` table, which has no index on `branch`, once per local branch. In the first five 0.8.168 slices on the busiest repository (1,386 branches, 10,034 sessions) the lane took 44 to 753 s, and its 20 s budget counted that listing, so it judged nothing and its cursor did not move. The budget now counts from the start of judging. Branches with a session not cleaned no longer take places in the 200-branch window (about 170 of them did). Restorable state and ancestry are read only when no earlier fact keeps the branch. Everything re-read under the lifecycle claim before a delete is unchanged (#1999).
+
+### Changed
+
+- `kept_by_reason.session_not_cleaned` in the `merged_branches` summary and attachment counts every such local branch, not only those of the slice's window (#1999).
+
+### Added
+
+- Spans `merged_branches_list_branches`, `merged_branches_list_checkouts`, `merged_branches_list_sessions`, `merged_branches_restorable_state` and `merged_branches_ancestry` (#1999).
+
+### Known issues
+
+- Each deletion still searches the sessions table once while holding the lifecycle claim (at most 4 s per slice), so a slow pass may delete only a few branches.
+
 ## [0.8.168] - 2026-11-24
 
 ### Changed
