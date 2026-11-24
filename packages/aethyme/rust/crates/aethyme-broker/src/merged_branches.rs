@@ -268,13 +268,10 @@ impl crate::Broker {
             return None;
         };
         for root in roots {
-            let listing = match std::fs::read_dir(&root) {
+            let listing = match std::fs::read_dir(&root.path) {
                 Ok(listing) => listing,
-                // Nothing there at all; a link that leads nowhere is unknown.
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && std::fs::symlink_metadata(&root)
-                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    if error.kind() == std::io::ErrorKind::NotFound && root.plainly_absent() =>
                 {
                     continue;
                 }

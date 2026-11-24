@@ -1234,16 +1234,44 @@ fn is_contained_relative(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-/// Whether the host state directory `base` is there, or is only not created
-/// yet (its parent directory is there). A volume that is not mounted has
-/// neither.
-pub(crate) fn host_state_reachable(base: &Path) -> bool {
+/// The directory that proves host state is reachable: `base` itself, or its
+/// parent when `base` is only not created yet. `None` when neither is there
+/// (a volume that is not mounted has neither).
+pub(crate) fn host_state_anchor(base: &Path) -> Option<&Path> {
     match std::fs::metadata(base) {
-        Ok(metadata) => metadata.is_dir(),
+        Ok(metadata) => metadata.is_dir().then_some(base),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            base.parent().is_some_and(Path::is_dir)
+            base.parent().filter(|parent| parent.is_dir())
         }
-        Err(_) => false,
+        Err(_) => None,
+    }
+}
+
+/// One directory recovery archives may be in, and the directory above it that
+/// was there when it was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedArchiveRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) anchor: PathBuf,
+}
+
+impl CheckedArchiveRoot {
+    /// Whether a root that reads as not found holds nothing: each name from
+    /// it up is plainly missing, until one is a directory, the anchor at the
+    /// latest. A link that leads nowhere, an anchor that went away (its
+    /// volume with it) and anything unreadable are not.
+    pub(crate) fn plainly_absent(&self) -> bool {
+        for path in self.path.ancestors() {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return path != self.path && path.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+            }
+            if path == self.anchor {
+                return false;
+            }
+        }
+        false
     }
 }
 
@@ -1363,7 +1391,7 @@ impl Broker {
     /// and a pool with no archive directory yet adds none. A marker naming
     /// another repository forbids writing, not looking: this repository's own
     /// directory beside it is included.
-    pub(crate) fn checked_recovery_archive_roots(&self) -> Option<Vec<PathBuf>> {
+    pub(crate) fn checked_recovery_archive_roots(&self) -> Option<Vec<CheckedArchiveRoot>> {
         use crate::store::repository_binding::RepositoryWorktreeBindingState as State;
         let mut roots = Vec::new();
         match self.store_ref().repository_worktree_binding().ok()?.state {
@@ -1378,7 +1406,10 @@ impl Broker {
                             std::fs::read(parent.join(POOL_RECOVERY_ARCHIVE_MARKER)).ok()?;
                         let marker: serde_json::Value = serde_json::from_slice(&marker).ok()?;
                         marker.get("repository_key")?.as_str()?;
-                        roots.push(parent.join(self.worktree_root_plan().ok()?.repository_key));
+                        roots.push(CheckedArchiveRoot {
+                            path: parent.join(self.worktree_root_plan().ok()?.repository_key),
+                            anchor: parent,
+                        });
                     }
                     Ok(_) => return None,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1386,14 +1417,16 @@ impl Broker {
                 }
             }
         }
-        if let Some(base) = self.durable_archive_state_dir()
-            && !host_state_reachable(base)
-        {
-            return None;
-        }
-        let host = self.recovery_archive_root().ok()?;
-        if !roots.contains(&host) {
-            roots.push(host);
+        let anchor = match self.durable_archive_state_dir() {
+            Some(base) => host_state_anchor(base)?,
+            None => self.main_root(),
+        };
+        let path = self.recovery_archive_root().ok()?;
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(CheckedArchiveRoot {
+                path,
+                anchor: anchor.to_path_buf(),
+            });
         }
         Some(roots)
     }

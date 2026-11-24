@@ -757,9 +757,10 @@ fn kept(summary: &MergedBranchSummary, reason: &str) -> Option<u64> {
 fn a_repository_with_no_pool_bound_still_deletes() {
     let mut fixture = fixture();
     merged_branch(&mut fixture);
+    let roots = fixture.broker.checked_recovery_archive_roots().unwrap();
     assert_eq!(
-        fixture.broker.checked_recovery_archive_roots(),
-        Some(vec![fixture.broker.recovery_archive_root().unwrap()])
+        roots.into_iter().map(|root| root.path).collect::<Vec<_>>(),
+        [fixture.broker.recovery_archive_root().unwrap()]
     );
 
     let (summary, _) = run_counted(&fixture);
@@ -899,28 +900,62 @@ fn an_archive_record_that_cannot_be_checked_keeps_the_branch() {
 fn host_state_is_reachable_when_present_or_only_not_created_yet() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("state");
-    assert!(crate::cleanup_resolve::host_state_reachable(&base));
-    assert!(!crate::cleanup_resolve::host_state_reachable(
-        &base.join("nested")
-    ));
+    let anchor = crate::cleanup_resolve::host_state_anchor;
+    assert_eq!(anchor(&base), Some(dir.path()));
+    assert_eq!(anchor(&base.join("nested")), None);
     std::fs::write(&base, "a file").unwrap();
-    assert!(!crate::cleanup_resolve::host_state_reachable(&base));
+    assert_eq!(anchor(&base), None);
     std::fs::remove_file(&base).unwrap();
     std::fs::create_dir(&base).unwrap();
-    assert!(crate::cleanup_resolve::host_state_reachable(&base));
+    assert_eq!(anchor(&base), Some(base.as_path()));
 }
 
-/// A dangling link where an archive root belongs is unknown, not empty.
+/// A dangling link at the archive root or at the directory above it is
+/// unknown, not empty; with the links gone the branch is deleted.
 #[test]
-fn a_dangling_archive_root_keeps_the_branch() {
+fn a_dangling_link_on_the_way_to_the_archives_keeps_the_branch() {
     let mut fixture = fixture();
     merged_branch(&mut fixture);
     let archive_root = fixture.broker.recovery_archive_root().unwrap();
-    std::fs::create_dir_all(archive_root.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(archive_root.with_file_name("gone"), &archive_root).unwrap();
+    let above = archive_root.parent().unwrap().to_path_buf();
+    let gone = fixture.root.with_file_name("gone");
+    for link in [&above, &archive_root] {
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&gone, link).unwrap();
 
+        let (summary, _) = run_counted(&fixture);
+
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+        std::fs::remove_file(link).unwrap();
+    }
     let (summary, _) = run_counted(&fixture);
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
 
-    assert_eq!(summary.deleted, 0, "{summary:?}");
-    assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+/// A root reads as empty only while its anchor is still a directory and
+/// nothing between the two is in the way.
+#[test]
+fn a_root_is_plainly_absent_only_below_a_directory_that_is_still_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let anchor = dir.path().join("state");
+    let root = crate::cleanup_resolve::CheckedArchiveRoot {
+        path: anchor.join("recovery-archives/key"),
+        anchor: anchor.clone(),
+    };
+    // The anchor went away since the root was resolved.
+    assert!(!root.plainly_absent());
+    std::os::unix::fs::symlink(dir.path().join("gone"), &anchor).unwrap();
+    assert!(!root.plainly_absent());
+    std::fs::remove_file(&anchor).unwrap();
+    std::fs::create_dir(&anchor).unwrap();
+    assert!(root.plainly_absent());
+    std::fs::write(anchor.join("recovery-archives"), "a file").unwrap();
+    assert!(!root.plainly_absent());
+    std::fs::remove_file(anchor.join("recovery-archives")).unwrap();
+    std::fs::create_dir(anchor.join("recovery-archives")).unwrap();
+    assert!(root.plainly_absent());
+    // There after all: the caller read it too early to say.
+    std::fs::create_dir(&root.path).unwrap();
+    assert!(!root.plainly_absent());
 }
