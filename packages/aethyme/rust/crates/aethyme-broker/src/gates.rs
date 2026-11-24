@@ -2974,6 +2974,7 @@ impl GateResourceRefusal {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_gate_resources(
     gate: &Gate,
     repository: &str,
