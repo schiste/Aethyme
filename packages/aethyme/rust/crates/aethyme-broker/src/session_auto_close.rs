@@ -1880,15 +1880,16 @@ mod lane_tests {
                 let lock = state.join("lock");
                 std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0)).unwrap();
             }
-            // A user who can read everything sees no unreadable input.
-            if case != "unreadable input" || std::fs::File::open(state.join("lock")).is_err() {
-                assert!(
-                    broker
-                        .preparation_status(session.id)
-                        .map_or(true, |status| status.state
-                            == crate::PreparationState::Invalid),
-                    "{case}: the full status would keep the session"
-                );
+            let status = broker.preparation_status(session.id);
+            match case {
+                // A root user reads a mode-0 file: the input is usable.
+                "unreadable input" if std::fs::File::open(state.join("lock")).is_ok() => {}
+                "symlinked input" | "unreadable input" => assert_eq!(
+                    status.unwrap().state,
+                    crate::PreparationState::Invalid,
+                    "{case}"
+                ),
+                _ => assert!(status.is_err(), "{case}: {status:?}"),
             }
             let mut table = crate::session_holder::RecordedHolderProcessTable::default();
 
@@ -1909,6 +1910,8 @@ mod lane_tests {
         let boot = now_ms() - HOUR_MS;
         for (label, boot, declared, started_at, closes) in [
             ("before the boot", Some(boot), false, 1, true),
+            ("no start time", Some(boot), false, 0, false),
+            ("negative start time", Some(boot), false, -1, false),
             ("since the boot", Some(boot), false, boot + 1, false),
             ("inside the margin", Some(boot), false, boot - 1, false),
             ("boot unknown", None, false, 1, false),
@@ -1922,9 +1925,18 @@ mod lane_tests {
             write_preparation_record_started(&broker, &session, "in_progress", started_at);
             quiet(&mut broker, &session, 3);
             crate::host_boot::set_boot_time_ms_for_tests(boot);
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let installed = crate::phase_telemetry::install(recorder.clone());
             let mut table = crate::session_holder::RecordedHolderProcessTable::default();
             let outcome = close_directly(&mut broker, &session, &mut table);
+            drop(installed);
             crate::host_boot::set_boot_time_ms_for_tests(None);
+
+            assert_eq!(
+                phase_count(&recorder, "preparation_pre_boot_without_lease"),
+                u64::from(closes),
+                "{label}"
+            );
 
             assert_eq!(
                 outcome == crate::broker::AbandonedSessionCloseOutcome::Closed,

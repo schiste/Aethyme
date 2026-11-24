@@ -5197,9 +5197,15 @@ cleanup and removal lanes are unchanged.
 What this keeps that closed before: the record is read even when the
 declaration is absent (`not_configured`, which did not look at it). An
 `in_progress` record that names a host lease ends by the lease rule; one
-without a lease ends when its `started_at` predates the current boot by ten
-minutes (counter `preparation_pre_boot_without_lease`), and until then the
-abandonment window, which still reads `not_configured`, may close it.
+without a lease counts as ended when its `started_at` (above zero) predates
+the current boot by ten minutes, the margin of guarded-exec's fallback for
+receipts without a boot id (counter `preparation_pre_boot_without_lease`).
+That includes a record kept in progress because command cleanup was
+unverified. Limits: a clock stepped forward past the margin since the boot,
+and a preparer on another host, VM or container sharing the repository state,
+are not told apart. Until then the abandonment and no-work windows, which
+still read `not_configured`, and a Landed close of a legacy holder may close
+such a session.
 
 `preparation_judged_interrupted` is counted by two paths: the full status and
 this check.

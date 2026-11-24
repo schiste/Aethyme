@@ -1376,10 +1376,16 @@ impl Broker {
     ///
     /// The record is read even without a declaration, which may have been
     /// removed while a preparation ran. Such a record, when it names no host
-    /// lease, has no lease that could prove its end. It is idle once it was
-    /// started before the current boot (past [`crate::host_boot`]'s margin),
-    /// the rule guarded-exec receipts use: no process survives a restart. A
-    /// record with a declaration keeps the full status's rule.
+    /// lease, has no lease that could prove its end. It counts as ended once
+    /// it was started before the current boot, by the margin guarded-exec's
+    /// fallback uses for receipts without a boot id
+    /// ([`crate::host_boot::PRE_BOOT_MARGIN_MS`]); a record kept in progress
+    /// because command cleanup was unverified counts as ended then too. A
+    /// `started_at` of zero or less (an unreadable clock) proves nothing.
+    /// Limits: a clock stepped forward past the margin since the boot, and a
+    /// preparer on another host, VM or container sharing this repository's
+    /// state, are not told apart. A record with a declaration keeps the full
+    /// status's rule.
     pub(crate) fn preparation_activity(
         &self,
         session: &crate::Session,
@@ -1401,9 +1407,10 @@ impl Broker {
         }
         match self.in_progress_record_state(&record) {
             Some(PreparationState::Interrupted) => return Ok(PreparationActivity::Idle),
-            Some(_) => {
+            Some(PreparationState::InProgress) => {
                 let pre_boot_without_lease = config.is_none()
                     && record.host_lease_id.is_none()
+                    && record.started_at > 0
                     && crate::host_boot::pre_boot_cutoff_ms()
                         .is_some_and(|cutoff| record.started_at < cutoff);
                 if !pre_boot_without_lease {
@@ -1415,7 +1422,7 @@ impl Broker {
                 );
                 return Ok(PreparationActivity::Idle);
             }
-            None => {}
+            _ => {}
         }
         match record.state {
             PreparationState::Current | PreparationState::Failed => Ok(PreparationActivity::Idle),
@@ -8032,6 +8039,14 @@ mod tests {
             PreparationActivity::InProgress,
             "an unreleased lease keeps the record in progress"
         );
+        // No declaration and a start before the boot: the boot rule is for
+        // records without a lease only.
+        record.started_at = 1;
+        write_record(&path, &record).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - 3_600_000));
+        let leased = broker.preparation_activity(&session).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+        assert_eq!(leased, PreparationActivity::InProgress);
         coordinator
             .release(
                 &grant.lease.lease_id,
