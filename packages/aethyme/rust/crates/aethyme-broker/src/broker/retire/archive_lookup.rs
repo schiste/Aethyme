@@ -225,8 +225,7 @@ impl Broker {
                 UnknownArchive::new(
                     "the record of archived sessions cannot be read",
                     format!(
-                        "Read it with `sqlite3 {database} \"SELECT value FROM meta WHERE key = '{key}'\"`; when you are sure no archive it names for this session is needed, set it aside (the text is kept) with `sqlite3 {database} \"{}\"`",
-                        set_record_aside_sql(key)
+                        "It starts afresh at the next retirement through an archive, but a session closed before that stays refused. Read what it holds with `sqlite3 -readonly {database} \"SELECT value FROM meta WHERE key = '{key}'\"`; if this session has an archive, restore it by hand as its README.md describes. Once the record can be read"
                     ),
                 )
             }
@@ -348,7 +347,7 @@ pub(super) const UNREADABLE_RECORDS_KEY: &str = "checkout_retirement.archived_se
 /// as it is.
 pub(super) const UNREADABLE_RECORDS_MAX: usize = 4;
 /// The longest text preserved.
-const UNREADABLE_RECORD_MAX_BYTES: usize = 16 * 1024 * 1024;
+const UNREADABLE_RECORD_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct UnreadableRecord {
@@ -363,11 +362,6 @@ pub(super) enum RecordUnreadable {
     Database,
     /// The value of this meta key.
     Text(&'static str),
-}
-
-/// Renames a meta key whose value was reviewed, keeping the value.
-pub(super) fn set_record_aside_sql(key: &str) -> String {
-    format!("UPDATE meta SET key = key || '.reviewed-' || strftime('%s','now') WHERE key = '{key}'")
 }
 
 /// The entries of a record that is a JSON object of session ids, whatever

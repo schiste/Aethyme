@@ -4925,6 +4925,7 @@ impl Broker {
                 session.branch
             )));
         }
+        // A leftover has no note to put back if the restore fails.
         if leftover && !super::tombstone::remove_tombstone_leftover(path) {
             return Err(refuse(format!(
                 "cannot remove the empty directory at {} to restore the checkout there",
@@ -10022,26 +10023,20 @@ mod tests {
                 "{next}"
             );
         }
-        let connection = rusqlite::Connection::open(broker.store_ref().db_path()).unwrap();
         std::fs::write(&marker, readable).unwrap();
-        // The record cannot be read: unknown too, until it was reviewed and
-        // set aside as the refusal says. The text is kept.
+        // The record cannot be read: unknown too. What the refusal prints
+        // only reads the database.
         broker
             .store_ref()
             .meta_set(ARCHIVED_SESSIONS_KEY, "not json")
             .unwrap();
         let error = assert_refused_as_unknown(&broker, &worktree);
-        let sql = archive_lookup::set_record_aside_sql(ARCHIVED_SESSIONS_KEY);
-        assert!(error.contains(&sql), "{error}");
-        assert_eq!(connection.execute(&sql, []).unwrap(), 1);
-        let kept: String = connection
-            .query_row(
-                "SELECT value FROM meta WHERE key LIKE ?1",
-                [format!("{ARCHIVED_SESSIONS_KEY}.reviewed-%")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, "not json");
+        assert!(error.contains("sqlite3 -readonly"), "{error}");
+        assert!(error.contains("README.md"), "{error}");
+        for write in ["UPDATE", "DELETE", "INSERT", "REPLACE"] {
+            assert!(!error.to_uppercase().contains(write), "{error}");
+        }
+        forget_recorded_archives(&broker);
         assert!(broker.recreate_retired_checkout(&worktree).unwrap());
         assert!(worktree.join("notes.txt").is_file());
     }
