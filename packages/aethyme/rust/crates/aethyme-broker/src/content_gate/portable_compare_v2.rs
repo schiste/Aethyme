@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "portable_host_v2.rs"]
+mod portable_host_v2;
+
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Inputs independently acquired for a fresh offline evaluation. This draft
@@ -1011,9 +1014,21 @@ pub fn compare(
             .iter()
             .filter_map(|c| c["id"].as_str().map(|id| (id, c)))
             .collect();
+        let host_verified = portable_host_v2::verify(&policy, verdict, input.after, &checks)?;
+        let mut coverage_change = change.clone();
+        if host_verified {
+            for entry in coverage_change["entries"]
+                .as_array_mut()
+                .ok_or("invalid entries")?
+            {
+                if entry["media_type"] == portable_host_v2::MEDIA {
+                    entry["media_type"] = json!("text/plain");
+                }
+            }
+        }
         coverage = Some(policy_coverage(
             &policy,
-            &change,
+            &coverage_change,
             input.collection.is_some(),
             &checks,
         )?);
