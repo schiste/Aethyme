@@ -3281,6 +3281,7 @@ mod verdict_tests {
             log_path: None,
             environment: GateEnvironment::default(),
             host_fault,
+            environment_text_test_failure: false,
         }
     }
 
