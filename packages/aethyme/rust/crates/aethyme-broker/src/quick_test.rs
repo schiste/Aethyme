@@ -732,6 +732,7 @@ mod not_verified_tests {
             log_path: Some("/logs/gate.log".into()),
             environment: crate::GateEnvironment::default(),
             host_fault: false,
+            environment_text_test_failure: false,
         }
     }
 

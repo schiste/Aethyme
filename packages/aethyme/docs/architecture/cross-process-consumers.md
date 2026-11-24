@@ -1054,6 +1054,43 @@ The comparison base is not part of that identity: a gate that reads
 commands"), so a session's verdict for a tree satisfies a submission of the
 same tree.
 
+## Completed vitest failures despite environment text (2026-11-24)
+
+A gate log that contains environment text (such as "permission denied") is
+normally `error`/`environment`. When the command exits 1, and the log's final
+vitest summary is complete, consistent and reports failing tests, the result is
+now `fail`/`test_failure`. Timeouts, capture, resource and storage errors keep
+precedence. The run's failed block (`Failed Suites N` or `Failed Tests N`, with
+its first error numbered 1) must be in the log. Environment text outside every
+run (before, between or after runs) or from the first failed heading to the
+final summary keeps `error`/`environment`, as does a partial, contradictory or
+ambiguous log (an `Errors`, `Type Errors` or `Leaks` line, a run that never
+reported, a later passing summary). When truncation removed the block or its
+start, the result is also unchanged. Nothing becomes a pass, and the submission
+is rejected either way; its exit code is now the verification-failure code
+instead of the environment code.
+
+The stored row is cleared from the start, with `cleared_reason` `test failure
+log contained environment error text; rerun instead of reusing this failure`,
+whatever the gate's `cache` setting and also for early verification. No verdict
+lookup or shared-verdict wait reuses it, and the gate runs again when next
+selected. The row itself, its `gate.fail` event (instead of `gate.error`) and
+the rejected queue entry remain as history. Like every cleared row, it also
+hides older uncleared verdicts of the same identity from those lookups.
+A local controller run whose native gates ended this way is held and raises no
+repair request, as before.
+
+Executed gate results gain `environment_text_test_failure: true` in JSON,
+omitted when false. The text output of `gates run` and `submit` adds one line
+saying the failure is not reused and a rerun may differ; `gates doctor` probes
+and `quick-test` do not print it. Maintainer signals that skip cleared rows (gate
+recommendations, cached-failure blockers, base-incident confirmation) do not see
+these runs, and `environment` failure counts are lower. The
+`gate_environment_text_test_failure` count in `phase_counts` (always 0 in
+`phase_timings_ms`) records each reclassified run, and the
+`gate_vitest_summary_parse` span times the summary check, which runs only for an
+exit 1 that would be `error`/`environment`.
+
 ## Gate admission waits outside the verification slot (2026-11-24)
 
 A submit verifies in one of four pooled verification slots. A gate that would

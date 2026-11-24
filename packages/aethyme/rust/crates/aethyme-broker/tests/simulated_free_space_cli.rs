@@ -152,15 +152,19 @@ fn a_marginal_reading_admits_the_gate_but_warns_before_it_would_refuse() {
 }
 
 /// A repository whose one gate writes `reading` into the free-space file the
-/// broker reads, then fails: free disk drops while the gate runs.
+/// broker reads, then fails: free disk drops while the gate runs. It first
+/// prints `gate-output` from the host directory, empty unless a test fills it.
 fn starving_fixture(reading_after: &str) -> (Fixture, PathBuf) {
     let fx = fixture();
     let reading = fx.host.join("free-bytes");
+    let gate_output = fx.host.join("gate-output");
     std::fs::write(&reading, GENEROUS).unwrap();
+    std::fs::write(&gate_output, "").unwrap();
     std::fs::write(
         fx.repo.join(".aethyme/gates.toml"),
         format!(
-            "[[gate]]\nname = \"starve\"\ncommand = \"printf {reading_after} > '{}'; exit 1\"\ntriggers = [\"**\"]\n",
+            "[[gate]]\nname = \"starve\"\ncommand = \"cat '{}'; printf {reading_after} > '{}'; exit 1\"\ntriggers = [\"**\"]\n",
+            gate_output.display(),
             reading.display()
         ),
     )
@@ -223,4 +227,47 @@ fn a_gate_that_fails_on_a_healthy_disk_is_still_a_verdict() {
 
     let second = gate_json(&fx, &reading);
     assert_eq!(second["cached"], true, "{second}");
+}
+
+const VITEST_FAILURE_WITH_ENVIRONMENT_TEXT: &str = " RUN  v4.1.11 /work/app\n\nEACCES: permission denied\n\n⎯⎯⎯ Failed Tests 1 ⎯⎯⎯\n\nAssertionError: expected 1 to be 2\n⎯⎯⎯[1/1]⎯\n\n Test Files  1 failed | 2 passed (3)\n      Tests  1 failed | 8 passed (9)\n   Start at  10:11:12\n   Duration  1.00s\n";
+
+/// Starvation outranks a completed vitest failure with environment text.
+#[test]
+fn a_starved_vitest_failure_stays_a_host_fault() {
+    let (fx, reading) = starving_fixture(LOW);
+    std::fs::write(
+        fx.host.join("gate-output"),
+        VITEST_FAILURE_WITH_ENVIRONMENT_TEXT,
+    )
+    .unwrap();
+
+    let outcome = gate_json(&fx, &reading);
+    assert_eq!(outcome["status"], "error", "{outcome}");
+    assert_eq!(outcome["failure_class"], "resource_contention", "{outcome}");
+    assert_eq!(outcome["host_fault"], true, "{outcome}");
+    assert!(
+        outcome.get("environment_text_test_failure").is_none(),
+        "{outcome}"
+    );
+}
+
+/// The same run on a healthy disk is the flagged failure, and the text output
+/// says that a rerun may differ. Without environment text it says nothing.
+#[test]
+fn a_vitest_failure_with_environment_text_says_a_rerun_may_differ() {
+    let (fx, reading) = starving_fixture(MARGINAL);
+    for (output, flagged) in [
+        (VITEST_FAILURE_WITH_ENVIRONMENT_TEXT.to_string(), true),
+        (
+            VITEST_FAILURE_WITH_ENVIRONMENT_TEXT.replace("permission denied", "refused"),
+            false,
+        ),
+    ] {
+        std::fs::write(fx.host.join("gate-output"), output).unwrap();
+        std::fs::write(&reading, GENEROUS).unwrap();
+        let (passed, text) = fx.gate(&format!("@{}", reading.display()));
+        assert!(!passed, "{text}");
+        assert!(text.contains("fail/test_failure"), "{text}");
+        assert_eq!(text.contains("a rerun may differ"), flagged, "{text}");
+    }
 }

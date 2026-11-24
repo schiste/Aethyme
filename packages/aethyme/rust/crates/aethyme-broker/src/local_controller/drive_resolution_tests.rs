@@ -49,6 +49,11 @@ fn native_resolution_refuses_infrastructure_stale_or_incomplete_failure_ids() {
             valid.clone(),
             {"gate":"infra","status":"error","host_fault":false,"failure_class":"environment","definition_hash":hash},
         ]}),
+        json!({"current_authority":true,"status":"failed","gates":[
+            valid.clone(),
+            {"gate":"mixed","status":"fail","host_fault":false,"failure_class":"test_failure",
+             "environment_text_test_failure":true,"definition_hash":hash},
+        ]}),
         json!({"current_authority":true,"status":"failed","gates":[valid,invalid]}),
         json!({"current_authority":true,"status":"failed","gates":[]}),
     ];

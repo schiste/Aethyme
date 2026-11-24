@@ -22,9 +22,19 @@ pub(super) const GATE_FAILURE_TAIL_LINES: usize = 20;
 
 pub(super) const GATE_FAILURE_TAIL_BYTES: usize = 16 * 1024;
 
+fn gate_rerun_note(environment_text_test_failure: bool) -> Option<&'static str> {
+    environment_text_test_failure.then_some(
+        "tests failed and the log also contains environment error text; \
+         this failure is not reused, and a rerun may differ",
+    )
+}
+
 pub(super) fn render_gate_failure_tail(outcome: &crate::gates::GateRunOutcome) {
     if outcome.status == crate::GateStatus::Pass {
         return;
+    }
+    if let Some(note) = gate_rerun_note(outcome.environment_text_test_failure) {
+        eprintln!("gate {}: {note}", outcome.gate);
     }
     let Some(path) = outcome.log_path.as_deref() else {
         return;
@@ -1197,4 +1207,18 @@ fn run_gate_incidents(parsed: &Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rerun_note_tests {
+    use super::gate_rerun_note;
+
+    #[test]
+    fn only_a_mixed_test_failure_says_a_rerun_may_differ() {
+        assert!(
+            gate_rerun_note(true)
+                .is_some_and(|note| note.contains("not reused, and a rerun may differ"))
+        );
+        assert_eq!(gate_rerun_note(false), None);
+    }
 }
