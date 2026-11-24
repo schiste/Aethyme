@@ -175,7 +175,7 @@ fn validate_collection(
     bytes: &[u8],
     candidate: &Snapshot,
     change: &Value,
-) -> Result<(), &'static str> {
+) -> Result<Value, &'static str> {
     let collection = parse_unique(bytes)?;
     closed(&collection, &["change_id", "items", "complete"])?;
     if collection["change_id"] != change["change_id"] {
@@ -252,6 +252,161 @@ fn validate_collection(
             if metadata(item) != metadata(entry) {
                 return Err("collection changed metadata differs");
             }
+        }
+    }
+    Ok(collection)
+}
+
+// Limits mirror the versioned Aexeo evaluator. The comparator adds a
+// separate aggregate bound on work over distinct field/group pairs.
+const COLLECTION_MAX_KEYS: usize = 10_000;
+const COLLECTION_MAX_KEY_BYTES: usize = 4 * 1024 * 1024;
+const COLLECTION_MAX_VALUE_BYTES: usize = 16 * 1024;
+const COLLECTION_MAX_WORK: usize = 1_000_000;
+
+fn collection_uniqueness_status(
+    collection: &Value,
+    field: &str,
+    group: Option<&str>,
+) -> Result<&'static str, &'static str> {
+    if collection["complete"].as_bool() != Some(true) {
+        return Ok("not_checked");
+    }
+    let items = collection["items"]
+        .as_array()
+        .ok_or("invalid collection items")?;
+    let mut seen = BTreeSet::new();
+    let mut key_bytes = 0usize;
+    let mut duplicate = false;
+    for item in items {
+        let metadata = &item["metadata"];
+        let Some(value) = metadata
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        else {
+            return Ok("not_checked");
+        };
+        let category = match group {
+            Some(name) => match metadata
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+            {
+                Some(value) => Some(value),
+                None => return Ok("not_checked"),
+            },
+            None => None,
+        };
+        let category_bytes = category.map_or(0, str::len);
+        if value.len() > COLLECTION_MAX_VALUE_BYTES || category_bytes > COLLECTION_MAX_VALUE_BYTES {
+            return Ok("not_checked");
+        }
+        let key = (category, value);
+        if seen.contains(&key) {
+            duplicate = true;
+        } else {
+            key_bytes += value.len() + category_bytes;
+            if seen.len() >= COLLECTION_MAX_KEYS || key_bytes > COLLECTION_MAX_KEY_BYTES {
+                return Ok("not_checked");
+            }
+            seen.insert(key);
+        }
+    }
+    Ok(if duplicate { "failed" } else { "passed" })
+}
+
+fn verify_plain_word_count_statuses(
+    policy: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    after: &[Item],
+    counts: &mut BTreeMap<String, u64>,
+) -> Result<(), &'static str> {
+    for gate in policy["gates"].as_array().ok_or("invalid gates")? {
+        if gate["kind"] != "word_count" {
+            continue;
+        }
+        let gate_id = gate["id"].as_str().ok_or("invalid gate id")?;
+        for item in after.iter().filter(|item| item.media_type == "text/plain") {
+            let id = format!(
+                "gate:{}:{}:{}",
+                item.entity_id.len(),
+                item.entity_id,
+                gate_id
+            );
+            let check = checks
+                .get(id.as_str())
+                .ok_or("resolved policy check is missing")?;
+            let status = check["status"].as_str().ok_or("invalid check status")?;
+            if !matches!(status, "passed" | "failed") {
+                continue;
+            }
+            let count = *counts.entry(item.entity_id.clone()).or_insert_with(|| {
+                u64::try_from(item.source.split_whitespace().count()).unwrap_or(u64::MAX)
+            });
+            let failed = gate["min"].as_u64().is_some_and(|min| count < min)
+                || gate["max"].as_u64().is_some_and(|max| count > max);
+            if status != if failed { "failed" } else { "passed" } {
+                return Err("plain-text word count status differs from source");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_collection_statuses(
+    policy: &Value,
+    collection: &Value,
+    checks: &BTreeMap<&str, &Value>,
+) -> Result<(), &'static str> {
+    let gates = policy["gates"].as_array().ok_or("invalid resolved gates")?;
+    let items = collection["items"]
+        .as_array()
+        .ok_or("invalid collection items")?;
+    let mut cache = BTreeMap::new();
+    let mut work = 0usize;
+    for gate in gates
+        .iter()
+        .filter(|gate| gate["kind"] == "unique_collection_metadata")
+    {
+        let field = gate["field"]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or("invalid collection metadata fields")?;
+        let group = match gate.get("group_by") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or("invalid collection metadata fields")?,
+            ),
+        };
+        let id = gate["id"].as_str().ok_or("invalid gate id")?;
+        let check_id = format!("collection:0::{id}");
+        let check = checks
+            .get(check_id.as_str())
+            .ok_or("resolved policy check is missing")?;
+        let status = check["status"].as_str().ok_or("invalid check status")?;
+        if status == "not_checked" {
+            continue;
+        }
+        let key = (field, group);
+        if !cache.contains_key(&key) {
+            work = work
+                .checked_add(items.len())
+                .ok_or("collection comparison work limit exceeded")?;
+            if work > COLLECTION_MAX_WORK {
+                return Err("collection comparison work limit exceeded");
+            }
+            cache.insert(key, collection_uniqueness_status(collection, field, group)?);
+        }
+        let actual = cache[&key];
+        if actual == "not_checked" {
+            return Err("collection gate cannot assess incomplete observations");
+        }
+        if matches!(status, "passed" | "failed") && status != actual {
+            return Err("collection uniqueness status differs from observations");
         }
     }
     Ok(())
@@ -654,9 +809,10 @@ pub fn compare(
     let plain_text_paragraphs = options["plain_text_paragraphs"]
         .as_bool()
         .ok_or("invalid host paragraph option")?;
-    if let Some(bytes) = input.collection {
-        validate_collection(bytes, &candidate, &change)?;
-    }
+    let collection = input
+        .collection
+        .map(|bytes| validate_collection(bytes, &candidate, &change))
+        .transpose()?;
     let (sources, links) = match input.external_evidence {
         Some(bytes) => candidate_evidence(bytes, &change, input.host_options)?,
         None => (None, None),
@@ -705,6 +861,7 @@ pub fn compare(
         additional: BTreeMap::new(),
     };
     let mut coverage = None;
+    let mut word_counts = BTreeMap::new();
     for env in [&previous, &fresh] {
         if env["binding_sha256"] != binding_hex {
             return Err("candidate input binding differs");
@@ -748,6 +905,10 @@ pub fn compare(
             input.collection.is_some(),
             &checks,
         )?);
+        if let Some(collection) = collection.as_ref() {
+            verify_collection_statuses(&policy, collection, &checks)?;
+        }
+        verify_plain_word_count_statuses(&policy, &checks, input.after, &mut word_counts)?;
         evidence_capabilities_with_mode(
             &policy,
             &change,
@@ -831,6 +992,180 @@ mod tests {
         fresh["verdict"]["validator"]["name"] = json!("other");
         assert!(!run(&old, &fresh, &input));
     }
+    #[test]
+    fn plain_word_counts_respect_bounds_whitespace_and_unavailable() {
+        let (_, _, mut after, _) = fixture();
+        after[0].source = "é\u{a0}word\u{85}next\u{1c}tail".into();
+        let mut policy = json!({"gates":[{"id":"words","kind":"word_count","min":3,"max":3}]});
+        let mut check = json!({"status":"passed"});
+        let mut counts = BTreeMap::new();
+        let verify = |p: &Value, c: &Value, items: &[Item], cache: &mut BTreeMap<String, u64>| {
+            let checks = BTreeMap::from([("gate:7:article:words", c)]);
+            verify_plain_word_count_statuses(p, &checks, items, cache)
+        };
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        assert_eq!(counts.get("article"), Some(&3));
+        policy["gates"][0]["min"] = json!(4);
+        policy["gates"][0]["max"] = Value::Null;
+        assert!(verify(&policy, &check, &after, &mut counts).is_err());
+        check["status"] = json!("failed");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        policy["gates"][0]["min"] = Value::Null;
+        policy["gates"][0]["max"] = json!(2);
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        check["status"] = json!("not_checked");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        after[0].media_type = "text/markdown".into();
+        check["status"] = json!("passed");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+    }
+    #[test]
+    fn rejects_rebound_plain_text_word_count_false_pass() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        policy["gates"][0]["min"] = json!(2);
+        let policy = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let binding = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] = json!(
+            binding
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("plain-text word count status differs from source")
+        );
+    }
+    #[test]
+    fn rejects_rebound_collection_pass_when_metadata_is_unavailable() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let policy = json!({"version":1,"name":"test","gates":[{
+            "id":"unique","kind":"unique_collection_metadata","field":"slug",
+            "severity":"warning","blocking":true
+        }]})
+        .to_string()
+        .into_bytes();
+        let collection = json!({"change_id":"example","complete":true,
+            "items":[{"id":"article"}]})
+        .to_string()
+        .into_bytes();
+        input.resolved_policy = &policy;
+        input.collection = Some(&collection);
+        input.required_checks = &["collection:0::unique"];
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let binding = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: input.collection,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] = json!(
+            binding
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        verdict["verdict"]["checks"][0]["id"] = json!("collection:0::unique");
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("collection gate cannot assess incomplete observations")
+        );
+    }
+
+    #[test]
+    fn collection_uniqueness_observes_group_values_and_limits() {
+        let mut collection = json!({"complete": true, "items": [
+            {"metadata":{"slug":"same", "lang":"en"}},
+            {"metadata":{"slug":"same", "lang":"en"}}
+        ]});
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", Some("lang")),
+            Ok("failed")
+        );
+        collection["items"][1]["metadata"]["lang"] = json!("fr");
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", Some("lang")),
+            Ok("passed")
+        );
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("failed")
+        );
+        collection["items"][1]["metadata"]["slug"] = json!(" same ");
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("passed")
+        );
+        collection["items"][1]["metadata"]["slug"] = json!(" ");
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("not_checked")
+        );
+        collection["items"][1]["metadata"]["slug"] = json!("é".repeat(8193));
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("not_checked")
+        );
+        collection["complete"] = json!(false);
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("not_checked")
+        );
+        let items: Vec<_> = (0..10001)
+            .map(|i| json!({"metadata":{"slug": i.to_string()}}))
+            .collect();
+        collection = json!({"complete":true,"items":items});
+        assert_eq!(
+            collection_uniqueness_status(&collection, "slug", None),
+            Ok("not_checked")
+        );
+    }
+
+    #[test]
+    fn collection_status_must_match_available_observations() {
+        let policy =
+            json!({"gates":[{"id":"unique", "kind":"unique_collection_metadata", "field":"slug"}]});
+        let collection = json!({"complete":true,"items":[
+            {"metadata":{"slug":"same"}},{"metadata":{"slug":"same"}}
+        ]});
+        for (status, accepted) in [("passed", false), ("failed", true), ("not_checked", true)] {
+            let check = json!({"status":status});
+            let checks = BTreeMap::from([("collection:0::unique", &check)]);
+            assert_eq!(
+                verify_collection_statuses(&policy, &collection, &checks).is_ok(),
+                accepted
+            );
+        }
+    }
+
     #[test]
     fn rejects_rebound_policy_with_omitted_gate_even_when_required_check_passes() {
         let (v, base, after, mut verdict) = fixture();
