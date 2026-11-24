@@ -5013,3 +5013,38 @@ reload only when the state file changes, timed by
 members when known and records `role` (`leader`, `follower`, or `single`) and
 `outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
 on the verifier's `batch_verification` attachment.
+
+### Landed proof without the ignored-path listing (changed 2026-11-24)
+
+The landed and merged-pull-request lanes' proof 3 (span
+`landed_proof_worktree_clean`, inner span `proof_uncommitted_check`) by
+default asks only what closing a session can lose: uncommitted or untracked
+paths, an operation in progress, or a stash on the session branch. It no
+longer runs `git status --ignored=matching`, so these lanes no longer produce
+the inner span `proof_ignored_check` or the counters
+`landed_worktree_unclean_ignored_content` and
+`landed_worktree_unclean_ignored_content_unverified` (the names stay valid).
+Closing deletes nothing. Automatic removal and checkout retirement list and
+classify ignored content before deleting a closed checkout, so a checkout
+holding unknown ignored content stays on disk with keep code
+`ignored_content`.
+
+Exception: the opt-in in-place ignored-directory sweep (`[cleanup]
+ignored_directory_sweep = true`, run by the artifact sweep on closed
+checkouts after `artifact_reclaim_days`) deletes ignored directories that no
+artifact witness covers, without classifying or archiving them. When a
+repository enables it, proof 3 keeps the full `unclean_reason` listing,
+ignored content included (counter `landed_proof_ignored_checked_for_sweep`),
+so unknown ignored content keeps the session open as before. The re-check
+under the claims does not list ignored content again. The proof-3 status
+listing (`uncommitted_verdict`) now also passes `-c core.untrackedCache=false`,
+as `unclean_reason` does.
+
+On the busiest repository (sweep off) the ignored listing took 45 s per
+checkout against 0.1 s without it, which turned proofs into `budget_exhausted`
+and `proof_timed_out` declines (2,193 and 458 in two days, of 4,722 landed
+judgements) and kept 501 sessions for regenerable leftovers. Covered by
+`session_auto_close.rs` test
+`ignored_content_keeps_the_checkout_but_not_the_session` and `auto_cleanup.rs`
+test
+`unknown_ignored_content_keeps_the_checkout_and_the_session_only_under_the_sweep`.

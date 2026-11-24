@@ -797,6 +797,41 @@ mod lane_tests {
         assert!(refusal.contains("broker start --reuse"), "{refusal}");
     }
 
+    /// Ignored content no longer keeps a landed session open: closing
+    /// deletes nothing, and the checkout-removal proof still lists and
+    /// classifies the ignored directory before anything is removed.
+    #[test]
+    fn ignored_content_keeps_the_checkout_but_not_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "project-cache/\n").unwrap();
+        let (session, worktree) = session(&mut broker, "merged with an ignored cache", true);
+        std::fs::create_dir_all(worktree.join("project-cache/quality")).unwrap();
+        std::fs::write(worktree.join("project-cache/quality/index.json"), "{}\n").unwrap();
+        link_pull_request(&mut broker, session.id, 12, Some(1));
+        quiet(&mut broker, &session, 3);
+
+        let report = broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+
+        assert_eq!(report.merged_pull_request_sessions_closed, 1, "{report:#?}");
+        assert!(!is_open(&broker, session.id));
+        assert!(worktree.join("project-cache/quality/index.json").exists());
+        let policy = crate::auto_cleanup::AutoCleanupPolicy::load(&root).unwrap();
+        let removal = crate::auto_cleanup::unclean_reason(
+            &worktree,
+            Some(session.branch.as_str()),
+            &root,
+            &policy,
+        )
+        .unwrap()
+        .expect("the removal proof still keeps the checkout");
+        assert_eq!(
+            crate::auto_cleanup::kept_reason_code(&removal),
+            "ignored_content",
+            "{removal}"
+        );
+    }
+
     /// A script proof-3 listings run instead of Git: `status` runs `status`
     /// (a shell fragment), anything else goes to the real Git.
     fn status_script(dir: &Path, name: &str, status: &str) -> PathBuf {

@@ -249,7 +249,7 @@ pub(crate) enum LandedSessionDecline {
     NotLanded,
     /// The landing rule could not be evaluated.
     LandingUnknown,
-    /// Uncommitted, untracked, in-progress or protected ignored content.
+    /// Uncommitted, untracked or in-progress content, or a stash.
     WorktreeUnclean,
     /// HEAD or the worktree's index/HEAD activity changed between the proof
     /// and the close: the agent committed or worked meanwhile.
@@ -2265,8 +2265,12 @@ impl Broker {
     /// holds every commit of its HEAD by the landing rule `finish` uses (a
     /// representation recorded against that branch, ancestry, or
     /// `default_branch_landing`, whose `landing_covers` keeps a follow-up
-    /// commit after a squash unlanded), and the worktree is clean under the
-    /// shared cleanup classifier.
+    /// commit after a squash unlanded), and the worktree holds nothing
+    /// uncommitted, untracked, in progress or stashed. Ignored content keeps
+    /// a close only when `[cleanup] ignored_directory_sweep` is on, since
+    /// that sweep deletes ignored directories of closed checkouts without
+    /// classifying them; otherwise the checkout-removal lanes classify it
+    /// before any deletion.
     ///
     /// The content search runs only when a merged pull request, a
     /// representation or ancestry already suggests a landing, stops at
@@ -2700,13 +2704,42 @@ impl Broker {
         let clean = {
             // Proof 3, timed on its own: an uncommitted-path listing that
             // crawled on a loaded host was the untimed part of `landed_proof`.
+            // Closing deletes nothing, so by default the proof asks only what
+            // a close can lose: uncommitted or untracked paths, an operation
+            // in progress, a stash. Ignored content is then the checkout
+            // removal lanes' question (automatic removal and checkout
+            // retirement list and classify it before deleting). The ignored
+            // listing walks every dependency and build directory: on the
+            // busiest repository it took 45 s per checkout against 0.1 s
+            // without it, so proofs ran out of budget or were kept for
+            // regenerable leftovers instead of closing.
+            //
+            // One deleting lane does not classify: with `[cleanup]
+            // ignored_directory_sweep = true` the artifact sweep deletes the
+            // ignored directories of closed checkouts in place, unwitnessed
+            // and unarchived. A repository that opts into it keeps the
+            // ignored-content check here, so a close never exposes unknown
+            // ignored content to that sweep.
             let _span = crate::phase_telemetry::span("landed_proof_worktree_clean");
-            crate::auto_cleanup::unclean_reason(
-                worktree,
-                Some(session.branch.as_str()),
-                self.main_root(),
-                &policy,
-            )
+            if policy.ignored_directory_sweep {
+                crate::phase_telemetry::add(
+                    "landed_proof_ignored_checked_for_sweep",
+                    std::time::Duration::ZERO,
+                );
+                crate::auto_cleanup::unclean_reason(
+                    worktree,
+                    Some(session.branch.as_str()),
+                    self.main_root(),
+                    &policy,
+                )
+            } else {
+                crate::auto_cleanup::uncommitted_reason(
+                    worktree,
+                    Some(session.branch.as_str()),
+                    self.main_root(),
+                    &policy,
+                )
+            }
         };
         if clean.is_err() && out_of_budget() {
             crate::phase_telemetry::add(
@@ -2767,8 +2800,8 @@ impl Broker {
     /// Re-check a landed proof under the session and lifecycle claims without
     /// searching again: the preconditions still hold, HEAD is the proved
     /// head, the default branch has not moved, and nothing uncommitted,
-    /// untracked or in progress appeared. Ignored content was classified by
-    /// the proof and is classified again by the checkout-removal lane.
+    /// untracked or in progress appeared. Ignored content is not listed
+    /// again: the proof decided it under the same policy.
     fn landed_proof_still_holds(
         &self,
         session: &crate::Session,
@@ -3138,7 +3171,9 @@ impl Broker {
         let task_lease_expiry_enabled = crate::load_retention_policy(&self.main_root)
             .is_ok_and(|policy| policy.expire_abandoned_task_leases);
         // A landed session needs no opt-in to outlive a live holder: its work
-        // is on the default branch and its worktree holds nothing else, so an
+        // is on the default branch and its worktree holds nothing uncommitted,
+        // untracked, in progress or stashed (nor unclassified ignored content
+        // when the ignored-directory sweep is on), so an
         // expired task lease plus the process-use checks below suffice. The
         // agent process itself routinely lives on, bound to later sessions.
         let holder_task_lease_expired = holder_event.as_ref().is_some_and(|event| {
