@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.165] - 2026-11-24
+
+### Fixed
+
+- Stale sessions whose work has landed are retired fast enough to clear a backlog. Before a landed or merged-PR session was closed, its worktree was proved clean with a Git status that also listed every ignored file. That walked dependency and build directories and took up to 45 s per checkout. On the busiest repository, 4,722 landed judgements over two days closed only 81 sessions. Most ran out of time (2,193 `budget_exhausted`, 458 `proof_timed_out`), and 501 sessions were kept open only for ignored content, while 688 sessions sat stale. The proof now checks only uncommitted work, the same check already repeated under the session's claims immediately before the close. Ignored content stays in the checkout, and the lanes that remove checkouts list and classify it again before deleting anything. A repository with `[cleanup] ignored_directory_sweep = true` keeps the full check, because that sweep deletes unclassified ignored directories in closed checkouts; the counter is `landed_proof_ignored_checked_for_sweep`. Closing a session deletes nothing (#1990).
+- Repository gate policy: the cross-process contract gate compares against the base the broker verified (`AETHYME_GATE_BASE_COMMIT`) instead of a merge-base with a possibly stale local integration ref, which could select unrelated history and time out (#1986).
+
+### Changed
+
+- The uncommitted-work check used by finish, stale classification and interrupted removal disables Git's untracked cache, as the full check already did (#1990).
+
+### Upgrade notes
+
+- The counters `landed_worktree_unclean_ignored_content` and `landed_worktree_unclean_ignored_content_unverified` are no longer produced by the landed and merged-PR lanes unless the ignored-directory sweep is on (#1990).
+
 ## [0.8.164] - 2026-11-23
 
 ### Changed
