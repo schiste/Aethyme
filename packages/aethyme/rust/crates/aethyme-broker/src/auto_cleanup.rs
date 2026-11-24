@@ -15408,12 +15408,13 @@ mod tests {
     }
 
     /// A tool cache Git ignores is the repository's data until `[cleanup]
-    /// regenerable` names it: unlisted it keeps the landed session, listed
-    /// it is disposable output and the session closes.
+    /// regenerable` names it. It no longer keeps a landed session open,
+    /// listed or not (closing deletes nothing); unlisted, the checkout
+    /// removal that runs in the same pass still keeps the cache on disk.
     #[cfg(unix)]
     #[test]
     fn a_configured_regenerable_directory_does_not_keep_a_landed_session() {
-        for (cleanup, closes) in [
+        for (cleanup, regenerable) in [
             (None, false),
             (Some("[cleanup]\nregenerable = [\"tool-cache\"]\n"), true),
         ] {
@@ -15431,18 +15432,17 @@ mod tests {
 
             let report = broker.auto_cleanup_now(None).unwrap().unwrap();
 
+            assert_eq!(report.landed_sessions_closed, 1, "{report:#?}");
             assert_eq!(
-                report.landed_sessions_closed,
-                usize::from(closes),
+                report.landed_sessions_declined.get("worktree_unclean"),
+                None,
                 "{report:#?}"
             );
-            if !closes {
-                assert_eq!(
-                    report.landed_sessions_declined.get("worktree_unclean"),
-                    Some(&1),
+            if !regenerable {
+                assert!(
+                    worktree.join("tool-cache/entry.bin").exists(),
                     "{report:#?}"
                 );
-                assert!(worktree.join("tool-cache/entry.bin").exists());
             }
         }
     }
