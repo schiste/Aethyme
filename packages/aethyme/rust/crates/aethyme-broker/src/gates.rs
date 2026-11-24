@@ -10820,6 +10820,72 @@ mod tests {
         }
     }
 
+    /// An early verification cancelled between the command's exit and its
+    /// classification stays cancelled, whatever the log says.
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_outranks_a_completed_vitest_failure() {
+        /// Cancelled once the process named in the file has been reaped.
+        struct CancelledAfterExit(PathBuf);
+        impl GateProgressSink for CancelledAfterExit {
+            fn early_verification_cancelled(&self) -> Option<bool> {
+                let pid = std::fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok());
+                // SAFETY: signal zero only probes the process.
+                Some(pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0))
+            }
+            fn report(&self, _line: &str) {}
+        }
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let mut store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let source = root.path().join("output.txt");
+        std::fs::write(&source, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+        let pid = root.path().join("pid");
+        let gate = synthetic_gate(
+            "cancelled",
+            true,
+            &format!(
+                "echo $$ > '{}'; cat '{}'; exit 1",
+                pid.display(),
+                source.display()
+            ),
+        );
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        let outcomes = run_selections_with_profile_capture(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                fresh_checkout: false,
+                slot_handoff: None,
+                progress: &CancelledAfterExit(pid),
+                admission_host: &SequencedAdmissionHost::new(vec![None]),
+                deadline: None,
+                comparison_base: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+            |_, _| profile.clone(),
+        )
+        .unwrap();
+        assert_eq!(outcomes[0].exit_code, Some(1), "the command finished");
+        assert_eq!(outcomes[0].status, GateStatus::Cancelled);
+        assert_eq!(outcomes[0].failure_class, None);
+        assert!(!outcomes[0].environment_text_test_failure);
+    }
+
     const FAILED_TAP: &str = "TAP version 13\n# Subtest: computes a value\nnot ok 1 - computes a value\n  ---\n  error: assertion failed\n  ...\n1..1\n# tests 1\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n";
 
     #[test]

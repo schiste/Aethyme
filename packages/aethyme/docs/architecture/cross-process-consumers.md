@@ -1061,9 +1061,9 @@ normally `error`/`environment`. When the command exits 1, and the log's final
 vitest summary is complete, consistent and reports failing tests, the result is
 now `fail`/`test_failure`. Timeouts, capture, resource and storage errors keep
 precedence. The run's failed block (`Failed Suites N` or `Failed Tests N`, with
-its first error numbered 1) must be in the log. Environment text before the
-first run banner, from the first failed heading to the final summary, or after
-that summary keeps `error`/`environment`, as does a partial, contradictory or
+its first error numbered 1) must be in the log. Environment text outside every
+run (before, between or after runs) or from the first failed heading to the
+final summary keeps `error`/`environment`, as does a partial, contradictory or
 ambiguous log (an `Errors`, `Type Errors` or `Leaks` line, a run that never
 reported, a later passing summary). When truncation removed the block or its
 start, the result is also unchanged. Nothing becomes a pass, and the submission
@@ -1081,8 +1081,9 @@ A local controller run whose native gates ended this way is held and raises no
 repair request, as before.
 
 Executed gate results gain `environment_text_test_failure: true` in JSON,
-omitted when false, and text output adds one line saying the failure is not
-reused and a rerun may differ. Maintainer signals that skip cleared rows (gate
+omitted when false. The text output of `gates run` and `submit` adds one line
+saying the failure is not reused and a rerun may differ; `gates doctor` probes
+and `quick-test` do not print it. Maintainer signals that skip cleared rows (gate
 recommendations, cached-failure blockers, base-incident confirmation) do not see
 these runs, and `environment` failure counts are lower. The
 `gate_environment_text_test_failure` count in `phase_counts` (always 0 in

@@ -7,11 +7,11 @@
 //! whose counts have no total to check, Jest prints lines that any script can
 //! resemble, and TAP already has its own reader in `gates.rs`.
 //!
-//! Where the environment text stands decides the rest. Between the run banner
-//! and the failed block it is the output of tests, most of them passing.
-//! Before the banner it is the setup; inside the failed block it is why a test
-//! failed (`pg_ctl: command not found`); after the summary it is a later
-//! command. In those three places it may be the host's fault and stays one.
+//! Where the environment text stands decides the rest. Between a run's banner
+//! and its failed block it is the output of tests, most of them passing.
+//! Outside every run it is setup or a later command; inside a failed block it
+//! is why a test failed (`pg_ctl: command not found`). In those places it may
+//! be the host's fault and stays one.
 
 use std::path::Path;
 
@@ -50,22 +50,24 @@ fn failure_report(log: &str) -> bool {
     // like brackets. An open banner means some run, possibly the outer one,
     // never reported; a summary without a banner cannot be attributed.
     let mut open_runs = 0_usize;
-    let mut first_banner = None;
     let mut last = None;
     let mut previous = None;
     for (index, line) in lines.iter().enumerate() {
         if is_run_banner(line) {
             open_runs += 1;
-            first_banner = first_banner.or(Some(index));
         } else if line.trim_start().starts_with("Test Files  ") {
             let Some(remaining) = open_runs.checked_sub(1) else {
                 return false;
             };
             open_runs = remaining;
             previous = last.replace(index);
+        } else if open_runs == 0 && has_environment_text(line) {
+            // Setup before or between runs, or a later command. A truncation
+            // footer outside every run also lands here.
+            return false;
         }
     }
-    let (Some(first_banner), Some(last)) = (first_banner, last.filter(|_| open_runs == 0)) else {
+    let Some(last) = last.filter(|_| open_runs == 0) else {
         return false;
     };
 
@@ -90,9 +92,8 @@ fn failure_report(log: &str) -> bool {
         .iter()
         .position(|line| is_failed_heading(line))
         .unwrap_or(block);
-    if lines[..first_banner]
+    if lines[first_block..last]
         .iter()
-        .chain(&lines[first_block..last])
         .any(|line| has_environment_text(line))
     {
         return false;
@@ -111,13 +112,10 @@ fn failure_report(log: &str) -> bool {
         && duration
             .strip_prefix("   Duration  ")
             .is_some_and(starts_with_digit)
-        // A later runner's summary under a prefix, a later run's start, or a
-        // later command's environment error: this summary is not the last word.
-        // The truncation footer also lands here when it follows the summary.
+        // A later runner's summary or start under a prefix: this summary is
+        // not the last word.
         && !after.iter().any(|line| {
-            line.contains("Test Files")
-                || line.contains("RUN  v")
-                || has_environment_text(line)
+            line.contains("Test Files") || line.contains("RUN  v")
         })
 }
 
@@ -403,6 +401,13 @@ mod tests {
             )));
             // In the setup before the first banner.
             assert!(!failure_report(&format!("{text}\n{}", report())));
+            // In the setup between two complete runs.
+            let passing = " Test Files  1 passed (1)\n      Tests  4 passed (4)\n   Start at  10:11:12\n   Duration  12ms\n";
+            let last_run = format!("{BANNER}{BLOCK}{SUMMARY}");
+            assert!(failure_report(&format!("{BANNER}{passing}{last_run}")));
+            assert!(!failure_report(&format!(
+                "{BANNER}{passing}{text}\n{last_run}"
+            )));
             // In an earlier run's failed block.
             let earlier = format!("{BANNER}{BLOCK}{SUMMARY}").replace("expected 1 to be 2", text);
             assert!(!failure_report(&format!(
