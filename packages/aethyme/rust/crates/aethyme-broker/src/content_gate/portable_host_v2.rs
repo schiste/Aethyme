@@ -108,6 +108,24 @@ pub(super) fn verify(
     for gate in gates {
         valid_gate(gate)?;
     }
+    // Index positions once so batches do not rescan every finding for every item.
+    let mut unscoped_location = false;
+    let mut located_entities = BTreeSet::new();
+    for finding in verdict["findings"].as_array().ok_or("invalid findings")? {
+        if finding
+            .get("location")
+            .is_some_and(|location| !location.is_null())
+        {
+            match finding.get("entity_id") {
+                None | Some(Value::Null) => unscoped_location = true,
+                Some(entity) => {
+                    if let Some(entity) = entity.as_str() {
+                        located_entities.insert(entity);
+                    }
+                }
+            }
+        }
+    }
     let needs_words = gates.iter().any(|gate| gate["kind"] == "word_count");
     let needs_paragraph_words = gates.iter().any(|gate| gate["kind"] == "paragraph_length");
     let needs_paragraph_chars = gates
@@ -223,16 +241,7 @@ pub(super) fn verify(
                     .collect()
             })
             .transpose()?;
-        if verdict["findings"]
-            .as_array()
-            .ok_or("invalid findings")?
-            .iter()
-            .any(|finding| {
-                (finding.get("entity_id").is_none_or(Value::is_null)
-                    || finding["entity_id"] == item.entity_id)
-                    && finding.get("location").is_some_and(|v| !v.is_null())
-            })
-        {
+        if unscoped_location || located_entities.contains(item.entity_id.as_str()) {
             return Err("host finding cannot claim a source position");
         }
         let mut character_counts = [None, None];
@@ -390,6 +399,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn host_location_index_respects_entity_scope() {
+        for finding in [
+            json!({"entity_id":"article", "location":{"line":1}}),
+            json!({"entity_id":null, "location":{"line":1}}),
+            json!({"location":{"line":1}}),
+        ] {
+            assert!(run(&policy(), projection(), "passed", json!([finding])).is_err());
+        }
+        for finding in [
+            json!({"entity_id":"other", "location":{"line":1}}),
+            json!({"entity_id":"article", "location":null}),
+        ] {
+            assert_eq!(
+                run(&policy(), projection(), "passed", json!([finding])),
+                Ok(true)
+            );
+        }
     }
     #[test]
     fn each_composed_status_is_checked_independently() {
