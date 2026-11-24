@@ -206,6 +206,74 @@ fn a_slice_deletes_merged_branches_of_cleaned_sessions_and_keeps_the_rest() {
     );
 }
 
+/// The slice reads every branch's sessions at once: the answer is the
+/// per-branch lookup's, including several sessions on one branch, newest
+/// first, and no entry for a branch without sessions.
+#[test]
+fn the_one_scan_session_lookup_answers_as_the_per_branch_lookup() {
+    let mut fixture = fixture();
+    for (branch, open) in [
+        ("agent/two", false),
+        ("agent/other", false),
+        ("agent/two", true),
+        ("agent/not-asked", true),
+    ] {
+        fixture.session(branch, open);
+    }
+    let names = ["agent/two", "agent/other", "agent/none"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let store = fixture.broker.store_ref();
+    let found = store.sessions_on_branches(&names).unwrap();
+    assert_eq!(
+        found.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["agent/other", "agent/two"]
+    );
+    for (branch, sessions) in &found {
+        let ids = |sessions: &[crate::Session]| {
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(sessions),
+            ids(&store.sessions_on_branch(branch).unwrap())
+        );
+    }
+    assert_eq!(found["agent/two"].len(), 2);
+}
+
+/// Branches with a session not cleaned take no place in the window: more of
+/// them than one window holds, all sorting first, do not delay the merged
+/// branch behind them.
+#[test]
+fn branches_of_uncleaned_sessions_take_no_place_in_the_window() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    let tip = git(&root, &["rev-parse", "HEAD"]);
+    for index in 0..=CHECKS_PER_RUN {
+        let name = format!("agent/a-{index:04}");
+        let path = root.join(".git/refs/heads").join(&name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{tip}\n")).unwrap();
+        fixture.session(&name, true);
+    }
+    git(&root, &["branch", "agent/z-merged"]);
+    fixture.session("agent/z-merged", false);
+
+    let summary = fixture.broker.run_merged_branch_lane();
+
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert_eq!(summary.cleaned_session_branches, 1, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("session_not_cleaned").copied(),
+        Some(CHECKS_PER_RUN as u64 + 1),
+        "{summary:?}"
+    );
+    assert!(!branch_exists(&root, "agent/z-merged"));
+}
+
 #[test]
 fn a_branch_that_moved_after_it_was_judged_is_kept() {
     let mut fixture = fixture();

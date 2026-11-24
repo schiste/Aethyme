@@ -30,7 +30,10 @@ pub(crate) const SUMMARY_KEY: &str = "merged_branches.summary";
 const CHECKS_PER_RUN: usize = 200;
 /// Branches one slice deletes at most.
 const DELETES_PER_RUN: usize = 100;
-/// One slice stops starting work after this long.
+/// One slice stops judging branches after this long. Counted from the start
+/// of the judging, not of the listing before it: on the busiest repository
+/// the listing alone outlasted it (44 to 753 s a run), so the slice judged
+/// nothing, its cursor never moved and no branch was ever deleted.
 const SLICE_BUDGET: Duration = Duration::from_secs(20);
 /// The lifecycle-lock lane name.
 const LIFECYCLE_LANE: &str = "merged_branches";
@@ -325,46 +328,55 @@ impl crate::Broker {
         summary: &mut MergedBranchSummary,
         after_listing: &mut dyn FnMut(),
     ) -> Result<(), &'static str> {
-        let started = Instant::now();
         let repo = self.repo_handle();
         let Some(default) = crate::session_push::tracked_default(repo) else {
             return Err("no_fetched_default_branch");
         };
         let default_branch = default.branch.clone();
-        let listing = repo
-            .for_each_local_branch()
-            .map_err(|_| "branch_listing_failed")?;
-        let checked_out = repo
-            .worktree_inventory()
-            .map_err(|_| "worktree_listing_failed")?
-            .into_iter()
-            .filter_map(|entry| entry.branch)
-            .filter_map(|branch| branch.strip_prefix("refs/heads/").map(str::to_string))
-            .collect::<BTreeSet<_>>();
+        let listing = {
+            let _span = crate::phase_telemetry::span("merged_branches_list_branches");
+            repo.for_each_local_branch()
+                .map_err(|_| "branch_listing_failed")?
+        };
+        let checked_out = {
+            let _span = crate::phase_telemetry::span("merged_branches_list_checkouts");
+            repo.worktree_inventory()
+                .map_err(|_| "worktree_listing_failed")?
+                .into_iter()
+                .filter_map(|entry| entry.branch)
+                .filter_map(|branch| branch.strip_prefix("refs/heads/").map(str::to_string))
+                .collect::<BTreeSet<_>>()
+        };
+        let mut sessions_by_branch = {
+            let _span = crate::phase_telemetry::span("merged_branches_list_sessions");
+            let names = listing.iter().map(|(name, _)| name.as_str()).collect();
+            self.store_ref()
+                .sessions_on_branches(&names)
+                .map_err(|_| "session_lookup_failed")?
+        };
 
         // Local branches every one of whose sessions is cleaned, by name.
+        // One with a session not cleaned is kept, and counted, without taking
+        // a place in the window: on the busiest repository those were 170 of
+        // the 200 a slice judged.
         let mut candidates = Vec::new();
         for (name, tip) in &listing {
             if *name == default_branch {
                 continue;
             }
-            let sessions = self
-                .store_ref()
-                .sessions_on_branch(name)
-                .map_err(|_| "session_lookup_failed")?;
-            if sessions.is_empty() {
+            let Some(sessions) = sessions_by_branch.remove(name) else {
+                continue;
+            };
+            if sessions
+                .iter()
+                .any(|session| session.cleanup_state != crate::SessionCleanupState::Cleaned)
+            {
+                record_keep(summary, "session_not_cleaned");
                 continue;
             }
             candidates.push((name.clone(), tip.clone(), sessions));
         }
-        summary.cleaned_session_branches = candidates
-            .iter()
-            .filter(|(_, _, sessions)| {
-                sessions
-                    .iter()
-                    .all(|session| session.cleanup_state == crate::SessionCleanupState::Cleaned)
-            })
-            .count() as u64;
+        summary.cleaned_session_branches = candidates.len() as u64;
         if candidates.is_empty() {
             return Ok(());
         }
@@ -396,21 +408,32 @@ impl crate::Broker {
         let mut to_delete = Vec::new();
         {
             let _span = crate::phase_telemetry::span("merged_branches_judge");
+            let started = Instant::now();
             for (index, (name, tip, sessions)) in window.iter().enumerate() {
                 if started.elapsed() >= SLICE_BUDGET {
                     crate::phase_telemetry::add("merged_branches_slice_budget", Duration::ZERO);
                     break;
                 }
                 judged = index + 1;
-                let facts = BranchFacts {
-                    session_not_cleaned: sessions.iter().any(|session| {
-                        session.cleanup_state != crate::SessionCleanupState::Cleaned
-                    }),
-                    checked_out: checked_out.contains(name),
-                    recovery_archive: sessions
+                let checked_out = checked_out.contains(name);
+                // A fact is read only when no earlier one keeps the branch.
+                let recovery_archive = !checked_out && {
+                    let _span = crate::phase_telemetry::span("merged_branches_restorable_state");
+                    sessions
                         .iter()
-                        .any(|session| self.has_restorable_state(session) != Some(false)),
-                    merged: repo.is_ancestor_checked(tip, &default.commit).ok(),
+                        .any(|session| self.has_restorable_state(session) != Some(false))
+                };
+                let merged = (!checked_out && !recovery_archive)
+                    .then(|| {
+                        let _span = crate::phase_telemetry::span("merged_branches_ancestry");
+                        repo.is_ancestor_checked(tip, &default.commit).ok()
+                    })
+                    .flatten();
+                let facts = BranchFacts {
+                    session_not_cleaned: false,
+                    checked_out,
+                    recovery_archive,
+                    merged,
                 };
                 match judge(facts) {
                     Verdict::Delete => to_delete.push(index),

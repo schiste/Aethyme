@@ -1224,6 +1224,33 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// [`Self::sessions_on_branch`] for every branch of `branches` in one
+    /// table scan, each branch's sessions newest first. A branch no session
+    /// ever worked on has no entry. The `sessions` table has no index on
+    /// `branch`, so asking branch by branch scans it once per branch.
+    pub(crate) fn sessions_on_branches(
+        &self,
+        branches: &std::collections::BTreeSet<&str>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Session>>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SESSION_SELECT} ORDER BY id DESC"))?;
+        let mut rows = stmt.query([])?;
+        let mut sessions = std::collections::BTreeMap::<String, Vec<Session>>::new();
+        while let Some(row) = rows.next()? {
+            // Other branches' rows are not decoded, so one unreadable row
+            // elsewhere does not fail the lookup.
+            let branch: String = row.get("branch")?;
+            if branches.contains(branch.as_str()) {
+                sessions
+                    .entry(branch)
+                    .or_default()
+                    .push(session_from_row(row)??);
+            }
+        }
+        Ok(sessions)
+    }
+
     /// All sessions not yet cleaned, oldest first.
     pub fn live_sessions(&self) -> Result<Vec<Session>, BrokerError> {
         let mut stmt = self.conn.prepare(&format!(
