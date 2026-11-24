@@ -10889,28 +10889,8 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
             host_cache_dir: Some(owner.path().join("cache")),
         };
 
-        // The long build: it holds the managed cache the first submit needs.
-        let repository = git_origin_fingerprint(&GitRepo::discover(&root).unwrap());
-        let mut coordinator = crate::HostResourceCoordinator::open(&resource_db).unwrap();
-        let build = coordinator
-            .acquire(&crate::HostResourceRequest {
-                schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-                request_id: "long-build".into(),
-                repository: repository.clone(),
-                worktree_fingerprint: "long-build".into(),
-                run_id: "long-build".into(),
-                ttl_seconds: 300,
-                holder_pid: Some(std::process::id()),
-                resources: vec![crate::HostResourceRequirement {
-                    key: "managed_cache".into(),
-                    resource: crate::HostResourceKind::ExclusiveKey {
-                        name: managed_cache_lease_name(&repository, "shared-build"),
-                    },
-                }],
-            })
-            .unwrap();
-
-        let (verifying, started) = std::sync::mpsc::channel();
+        let (materialized, cache_owner) = std::sync::mpsc::channel();
+        let (build_holds_cache, held) = std::sync::mpsc::channel::<()>();
         let waiter = std::thread::spawn({
             let root = root.clone();
             let commit = commit.clone();
@@ -10933,6 +10913,12 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                     .unwrap()
                     .materialize(&GitRepo::discover(&root).unwrap(), &commit)
                     .unwrap();
+                // The cache is keyed by the repository the gate resolves from
+                // its own checkout; the build holds exactly that key.
+                materialized
+                    .send(git_origin_fingerprint(&checkout))
+                    .unwrap();
+                held.recv().unwrap();
                 let mut gate = synthetic_gate("cached-build", false, "touch .built");
                 gate.managed_cache = Some(ManagedGateCache {
                     key: "shared-build".into(),
@@ -10945,7 +10931,6 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                 let handoff = crate::verification::PooledSlotHandoff::new(
                     &mut slot, &root, NAMESPACE, 1, &root_plan, &commit, None,
                 );
-                verifying.send(()).unwrap();
                 let outcomes = run_selections_with_admission(
                     &mut store,
                     &root,
@@ -10968,16 +10953,37 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                     },
                     |_, _| None,
                     |_, _, _, _| None,
-                )
-                .unwrap();
+                );
                 let counts = handoff.counts();
                 let held_at_the_end = slot.is_some();
-                (outcomes, counts, held_at_the_end)
+                let lines = progress.0.into_inner().unwrap();
+                (outcomes, counts, held_at_the_end, lines)
             }
         });
-        started
+
+        // The long build: it holds the managed cache the first submit needs.
+        let repository = cache_owner
             .recv_timeout(Duration::from_secs(60))
             .expect("the first submit took its slot");
+        let mut coordinator = crate::HostResourceCoordinator::open(&resource_db).unwrap();
+        let build = coordinator
+            .acquire(&crate::HostResourceRequest {
+                schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+                request_id: "long-build".into(),
+                repository: repository.clone(),
+                worktree_fingerprint: "long-build".into(),
+                run_id: "long-build".into(),
+                ttl_seconds: 300,
+                holder_pid: Some(std::process::id()),
+                resources: vec![crate::HostResourceRequirement {
+                    key: "managed_cache".into(),
+                    resource: crate::HostResourceKind::ExclusiveKey {
+                        name: managed_cache_lease_name(&repository, "shared-build"),
+                    },
+                }],
+            })
+            .unwrap();
+        build_holds_cache.send(()).unwrap();
 
         // The second submit: no host resource, only a slot.
         let root_plan = crate::verification::default_worktree_root_plan(&root);
@@ -11024,10 +11030,13 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Pass);
-        assert!(
-            !waiter.is_finished(),
-            "the first submit is still waiting for the cache the build holds"
-        );
+        if waiter.is_finished() {
+            let (outcomes, counts, _, lines) = waiter.join().unwrap();
+            panic!(
+                "the first submit stopped waiting for the cache the build holds: \
+                 {outcomes:?}, handoffs {counts:?}, progress {lines:#?}"
+            );
+        }
         drop(slot);
 
         // The build finishes; the first submit takes the cache, a slot, and runs.
@@ -11038,7 +11047,8 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                 &build.ownership_token,
             )
             .unwrap();
-        let (outcomes, counts, held_at_the_end) = waiter.join().unwrap();
+        let (outcomes, counts, held_at_the_end, lines) = waiter.join().unwrap();
+        let outcomes = outcomes.unwrap_or_else(|error| panic!("{error}: {lines:#?}"));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
         assert!(outcomes[0].resource_lease.is_some());
