@@ -4571,12 +4571,16 @@ fn uncommitted_verdict(
     // modification time is the worktree activity the idle windows read.
     // `core.fsmonitor=false`: a background judge must not start a monitor
     // daemon for each of hundreds of checkouts; the answer is the same.
+    // `core.untrackedCache=false`: a cleanliness proof must not trust a
+    // cached untracked listing, as in `unclean_reason`.
     // Timed through the in-progress markers and the stash listing below.
     let _span = crate::phase_telemetry::span("proof_uncommitted_check");
     let args = [
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
         "status",
         "--porcelain=v1",
         "-z",
@@ -15407,17 +15411,24 @@ mod tests {
         }
     }
 
-    /// A tool cache Git ignores is the repository's data until `[cleanup]
-    /// regenerable` names it. It no longer keeps a landed session open,
-    /// listed or not (closing deletes nothing); unlisted, the checkout
-    /// removal that runs in the same pass still keeps the cache on disk.
+    /// Unknown ignored content (a cache no rule declares regenerable) keeps
+    /// the checkout on disk, landed or merged by pull request alike: closing
+    /// deletes nothing and the removal lane, which runs in the same pass,
+    /// keeps the checkout for it. It keeps the session open only when
+    /// `[cleanup] ignored_directory_sweep` is on, because that sweep deletes
+    /// the ignored directories of closed checkouts without classifying them.
     #[cfg(unix)]
     #[test]
-    fn a_configured_regenerable_directory_does_not_keep_a_landed_session() {
-        for (cleanup, regenerable) in [
-            (None, false),
-            (Some("[cleanup]\nregenerable = [\"tool-cache\"]\n"), true),
-        ] {
+    fn unknown_ignored_content_keeps_the_checkout_and_the_session_only_under_the_sweep() {
+        const SWEEP: &str = "[cleanup]\nignored_directory_sweep = true\n";
+        // (case, cleanup config, merged pull request, closes)
+        let cases = [
+            ("landed", None, false, true),
+            ("merged pull request", None, true, true),
+            ("landed, sweep on", Some(SWEEP), false, false),
+            ("merged pull request, sweep on", Some(SWEEP), true, false),
+        ];
+        for (case, cleanup, merged, closes) in cases {
             let (_owner, _storage, mut broker) = landed_lane_fixture(cleanup);
             let root = broker.main_root().to_path_buf();
             std::fs::write(root.join(".git/info/exclude"), "tool-cache/\n").unwrap();
@@ -15428,22 +15439,47 @@ mod tests {
             );
             std::fs::create_dir_all(worktree.join("tool-cache")).unwrap();
             std::fs::write(worktree.join("tool-cache/entry.bin"), "cached\n").unwrap();
+            if merged {
+                record_merged_pull_request(&mut broker, session.id, 41);
+            }
             quiet_with_gone_holder(&mut broker, &session, 30);
 
             let report = broker.auto_cleanup_now(None).unwrap().unwrap();
 
-            assert_eq!(report.landed_sessions_closed, 1, "{report:#?}");
+            let state = broker.store().session(session.id).unwrap().cleanup_state;
             assert_eq!(
-                report.landed_sessions_declined.get("worktree_unclean"),
-                None,
-                "{report:#?}"
+                state != SessionCleanupState::Open,
+                closes,
+                "{case}: {state:?} {report:#?}"
             );
-            if !regenerable {
-                assert!(
-                    worktree.join("tool-cache/entry.bin").exists(),
-                    "{report:#?}"
-                );
+            if closes {
+                // The removal lane may reach the newly closed checkout in a
+                // later pass; it keeps it for the unknown cache.
+                let text = std::fs::canonicalize(&worktree)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let mut report = report;
+                let mut kept = None;
+                for _ in 0..3 {
+                    kept = report
+                        .kept
+                        .iter()
+                        .find(|kept| kept.worktree == text)
+                        .cloned();
+                    if kept.is_some() {
+                        break;
+                    }
+                    report = broker.auto_cleanup_now(None).unwrap().unwrap();
+                }
+                let kept = kept
+                    .unwrap_or_else(|| panic!("{case}: the removal lane keeps it: {report:#?}"));
+                assert_eq!(kept.code, "ignored_content", "{case}: {kept:?}");
             }
+            assert!(
+                worktree.join("tool-cache/entry.bin").exists(),
+                "{case}: the unknown cache is never deleted"
+            );
         }
     }
 
