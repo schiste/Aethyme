@@ -2444,6 +2444,30 @@ worktree-volume root otherwise. `auto` serializes as `host`, so no
 preparation digest or trusted policy changes. Older binaries refuse
 `root = "auto"` written explicitly; omit it to stay readable by them.
 
+Changed 2026-11-24 (per-step preparation timings). The command metric of
+`broker submit prepare` gains the attachment `preparation_steps`: a list with
+one entry per configured `[[steps]]` entry, in configuration order, on every
+exit path (success, a failed or timed-out step, a cache hit), so the
+`preparation_step` span's total is attributed to a step. Each entry carries
+`index` (the step's 0-based position in `.aethyme/prepare.toml`), `name` (the
+configured step name, already present in `preparation.steps[].name` and the
+cache-activity record), `cache` (`repository_shared` or `worktree_local`),
+`mode` (`online` or `offline` for the command that ran, `skipped` when none
+ran), `duration_ms` (wall time including execution supervision, 0 when
+skipped) and `outcome` (`ok`, `failed`, `timed_out` or `skipped`). `outcome`
+describes the step's command: a step whose command succeeded but whose
+declared outputs are missing reports `ok`, and the record's `failed_step`
+names it. Steps after a failure, and every step on a cache hit, are
+`skipped`. Step names stay out of span names. The preparation record
+`.aethyme/run/preparation/session-<id>.json` gains the same list as the
+optional field `steps` (schema version unchanged; absent in records written
+before it, and omitted when empty); readers must tolerate its absence and
+unknown `outcome` or `mode` values, and an older binary that rewrites a
+record drops it. Covered by `preparation_cli.rs` test
+`prepare_metric_and_record_time_each_configured_step` and `preparation.rs`
+tests `step_timings_report_every_configured_step_and_skip_those_not_run` and
+`preparation_records_read_with_or_without_step_timings`.
+
 The preparation schema remains version 1. An empty list is omitted from the
 serialized configuration to preserve existing preparation digests; a
 nonempty selection changes the digest and trusted prepare policy, and requires

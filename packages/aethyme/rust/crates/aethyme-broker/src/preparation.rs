@@ -1110,6 +1110,105 @@ struct PreparationRecord {
     /// The runtime probes this preparation ran, with their executables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     runtimes: Vec<package_store::RuntimeIdentity>,
+    /// Each configured step's wall time and how it ended, in configuration
+    /// order; steps after a failure are `skipped`. Absent in records written
+    /// before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    steps: Vec<PreparationStepTiming>,
+}
+
+/// One configured step's timing, for the command metric's
+/// `preparation_steps` attachment and the preparation record. Plain strings,
+/// every field defaulted, so a record written by a newer binary with another
+/// outcome still reads.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+struct PreparationStepTiming {
+    /// The step's 0-based position in `.aethyme/prepare.toml` `[[steps]]`.
+    index: usize,
+    name: String,
+    /// `repository_shared` or `worktree_local`.
+    cache: String,
+    /// `online` or `offline` for the command that ran, `skipped` when none ran.
+    mode: String,
+    duration_ms: u64,
+    /// `ok`, `failed`, `timed_out` or `skipped`: how the step's command ended
+    /// (a step whose command succeeded but whose outputs are missing is `ok`;
+    /// the record's `failed_step` names it).
+    outcome: String,
+}
+
+impl PreparationStepTiming {
+    fn ran(
+        index: usize,
+        step: &PreparationStep,
+        offline: bool,
+        elapsed: Duration,
+        outcome: &'static str,
+    ) -> Self {
+        Self {
+            index,
+            name: step.name.clone(),
+            cache: preparation_cache_kind(step.cache).into(),
+            mode: if offline { "offline" } else { "online" }.into(),
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            outcome: outcome.into(),
+        }
+    }
+
+    fn skipped(index: usize, step: &PreparationStep) -> Self {
+        Self {
+            index,
+            name: step.name.clone(),
+            cache: preparation_cache_kind(step.cache).into(),
+            mode: "skipped".into(),
+            duration_ms: 0,
+            outcome: "skipped".into(),
+        }
+    }
+}
+
+fn preparation_cache_kind(policy: PreparationCachePolicy) -> &'static str {
+    match policy {
+        PreparationCachePolicy::WorktreeLocal => "worktree_local",
+        PreparationCachePolicy::RepositoryShared => "repository_shared",
+    }
+}
+
+/// The outcome of a step whose command returned a report.
+fn preparation_step_outcome(report: &crate::GuardedExecReport) -> &'static str {
+    if report.command_timed_out {
+        "timed_out"
+    } else if report.ok {
+        "ok"
+    } else {
+        "failed"
+    }
+}
+
+/// Every configured step: those in `ran` (a prefix, in order), then the rest
+/// as `skipped`.
+fn preparation_step_timings(
+    steps: &[PreparationStep],
+    ran: &[PreparationStepTiming],
+) -> Vec<PreparationStepTiming> {
+    ran.iter()
+        .cloned()
+        .chain(
+            steps
+                .iter()
+                .enumerate()
+                .skip(ran.len())
+                .map(|(index, step)| PreparationStepTiming::skipped(index, step)),
+        )
+        .collect()
+}
+
+/// Attach `timings` to the command metric as `preparation_steps`, replacing
+/// any earlier list, so whichever path the preparation leaves by reports
+/// every step.
+fn attach_preparation_steps(timings: &[PreparationStepTiming]) {
+    crate::phase_telemetry::attach("preparation_steps", serde_json::json!(timings));
 }
 
 impl Broker {
@@ -1563,6 +1662,8 @@ impl Broker {
                     );
                 }
             }
+            // A hit runs no command: every step is reported skipped.
+            attach_preparation_steps(&preparation_step_timings(&config.steps, &[]));
             return Ok(PreparationReport {
                 schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
                 session_id,
@@ -2323,6 +2424,7 @@ impl Broker {
             host_lease_generation: grant.as_ref().map(|grant| grant.lease.generation),
             package_store: None,
             runtimes: probes.clone(),
+            steps: Vec::new(),
         };
         let state_path = record_path(self.main_root(), session_id);
         self.release_grant_after_error(
@@ -2341,7 +2443,8 @@ impl Broker {
         let mut results = Vec::new();
         let main_root = self.main_root().to_path_buf();
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
-        for step in &config.steps {
+        let mut step_timings: Vec<PreparationStepTiming> = Vec::new();
+        for (index, step) in config.steps.iter().enumerate() {
             let step_started = Instant::now();
             let step_free_before = package_store::volume_free_bytes(&root);
             let _step_span = crate::phase_telemetry::span("preparation_step");
@@ -2428,6 +2531,15 @@ impl Broker {
             }) {
                 Ok(report) => report,
                 Err(error) => {
+                    step_timings.push(PreparationStepTiming::ran(
+                        index,
+                        step,
+                        offline,
+                        step_started.elapsed(),
+                        "failed",
+                    ));
+                    record.steps = preparation_step_timings(&config.steps, &step_timings);
+                    attach_preparation_steps(&record.steps);
                     let restart_storage_worker = route_preparation_command_failure(
                         &error,
                         PreparationCommandFailureContext {
@@ -2455,11 +2567,21 @@ impl Broker {
                     return Err(error);
                 }
             };
+            let step_elapsed = step_started.elapsed();
+            step_timings.push(PreparationStepTiming::ran(
+                index,
+                step,
+                offline,
+                step_elapsed,
+                preparation_step_outcome(&report),
+            ));
+            record.steps = preparation_step_timings(&config.steps, &step_timings);
+            attach_preparation_steps(&record.steps);
             results.push(PreparationStepResult {
                 name: step.name.clone(),
                 exit_code: report.exit_code,
                 succeeded: report.ok,
-                duration_ms: step_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                duration_ms: step_elapsed.as_millis().min(u64::MAX as u128) as u64,
                 volume_bytes_allocated: package_store::allocated_between(
                     step_free_before,
                     package_store::volume_free_bytes(&root),
@@ -7770,7 +7892,96 @@ mod tests {
             host_lease_generation: Some(grant.lease.generation),
             package_store: None,
             runtimes: Vec::new(),
+            steps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn step_timings_report_every_configured_step_and_skip_those_not_run() {
+        let step = |name: &str, cache| PreparationStep {
+            name: name.into(),
+            command: vec!["true".into()],
+            offline_command: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            cache,
+            shared_package_caches: Vec::new(),
+            required_for_hooks: false,
+        };
+        let steps = [
+            step("first", PreparationCachePolicy::RepositoryShared),
+            step("second", PreparationCachePolicy::WorktreeLocal),
+            step("third", PreparationCachePolicy::WorktreeLocal),
+        ];
+        let ran = [
+            PreparationStepTiming::ran(0, &steps[0], false, Duration::from_millis(12), "ok"),
+            PreparationStepTiming::ran(1, &steps[1], true, Duration::from_millis(5), "failed"),
+        ];
+        let timings = preparation_step_timings(&steps, &ran);
+        let summary: Vec<_> = timings
+            .iter()
+            .map(|timing| {
+                (
+                    timing.index,
+                    timing.cache.as_str(),
+                    timing.mode.as_str(),
+                    timing.duration_ms,
+                    timing.outcome.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0, "repository_shared", "online", 12, "ok"),
+                (1, "worktree_local", "offline", 5, "failed"),
+                (2, "worktree_local", "skipped", 0, "skipped"),
+            ]
+        );
+        // A cache hit runs nothing: every step is skipped.
+        assert!(
+            preparation_step_timings(&steps, &[])
+                .iter()
+                .all(|timing| timing.outcome == "skipped")
+        );
+    }
+
+    #[test]
+    fn preparation_records_read_with_or_without_step_timings() {
+        let base = serde_json::json!({
+            "schema_version": PREPARATION_SCHEMA_VERSION,
+            "session_id": 7,
+            "state": "failed",
+            "digest": "d",
+            "source_digest": "s",
+            "started_at": 1,
+            "completed_at": 2,
+            "failed_step": "second",
+            "exit_code": 3,
+            "host_lease_id": null,
+            "host_lease_generation": null,
+        });
+        let legacy: PreparationRecord = serde_json::from_value(base.clone()).unwrap();
+        assert!(legacy.steps.is_empty());
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("steps")
+        );
+
+        let mut newer = base;
+        newer["steps"] = serde_json::json!([
+            {"index": 0, "name": "first", "cache": "worktree_local", "mode": "online",
+             "duration_ms": 40, "outcome": "ok"},
+            // A later outcome or field must not make the record unreadable.
+            {"index": 1, "outcome": "cancelled", "future_field": true},
+        ]);
+        let record: PreparationRecord = serde_json::from_value(newer).unwrap();
+        assert_eq!(record.steps.len(), 2);
+        assert_eq!(record.steps[0].duration_ms, 40);
+        assert_eq!(record.steps[1].outcome, "cancelled");
     }
 
     #[test]

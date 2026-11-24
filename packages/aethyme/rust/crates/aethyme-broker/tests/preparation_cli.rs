@@ -473,6 +473,91 @@ required_for_hooks = true
     assert!(reason.contains("generation 3"), "{reason}");
 }
 
+#[test]
+fn prepare_metric_and_record_time_each_configured_step() {
+    let temp = fixture();
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "step timings", "--json"],
+    ));
+    let session_id = adopted["id"].as_i64().unwrap();
+    let session = session_id.to_string();
+
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        r#"schema_version = 1
+
+[[steps]]
+name = "installs"
+command = ["sh", "-c", "mkdir -p node_modules"]
+inputs = ["package-lock.json"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+
+[[steps]]
+name = "fails"
+command = ["sh", "-c", "exit 3"]
+inputs = ["Cargo.lock"]
+outputs = ["target/"]
+"#,
+    )
+    .unwrap();
+    let failed = run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    );
+    assert!(!failed.status.success());
+
+    let metrics =
+        std::fs::read_to_string(temp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let metric = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|value| value["command"] == "prepare")
+        .unwrap();
+    let steps = metric["preparation_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no preparation_steps attachment: {metric}"));
+    let summary: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            (
+                step["index"].as_u64().unwrap(),
+                step["name"].as_str().unwrap(),
+                step["cache"].as_str().unwrap(),
+                step["mode"].as_str().unwrap(),
+                step["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (0, "installs", "repository_shared", "online", "ok"),
+            (1, "fails", "worktree_local", "online", "failed"),
+        ],
+        "{metric}"
+    );
+    for step in steps {
+        assert!(step["duration_ms"].as_u64().is_some(), "{step}");
+    }
+
+    // The record keeps the same per-step timings next to the failed step.
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(temp.path().join(format!(
+            ".aethyme/run/preparation/session-{session_id}.json"
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "failed");
+    assert_eq!(record["failed_step"], "fails");
+    assert_eq!(&record["steps"], &metric["preparation_steps"], "{record}");
+}
+
 /// A repository that declares gates but no preparation config (#131 finding 2).
 fn gates_without_preparation_fixture() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
