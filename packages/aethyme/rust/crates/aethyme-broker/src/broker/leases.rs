@@ -882,6 +882,18 @@ enum SessionCloseLane {
     NoWork,
 }
 
+impl SessionCloseLane {
+    /// The lane's part of an activity look's telemetry key.
+    const fn look_name(self) -> &'static str {
+        match self {
+            Self::Abandonment => "abandonment",
+            Self::Landed => "landed",
+            Self::MergedPullRequest => "merged_pull_request",
+            Self::NoWork => "no_work",
+        }
+    }
+}
+
 /// The phase counter one `worktree_unclean` landed decline adds, per kind.
 fn worktree_unclean_counter(code: &str) -> &'static str {
     match code {
@@ -2734,12 +2746,20 @@ impl Broker {
                     &policy,
                 )
             } else {
-                crate::auto_cleanup::uncommitted_reason(
+                let probed = crate::worktree_status_activity::probed_just_before(worktree);
+                let started = std::time::Instant::now();
+                let clean = crate::auto_cleanup::uncommitted_reason(
                     worktree,
                     Some(session.branch.as_str()),
                     self.main_root(),
                     &policy,
-                )
+                );
+                crate::phase_telemetry::add_keyed(
+                    "landed_proof_worktree_clean_by_probe",
+                    probed,
+                    started.elapsed(),
+                );
+                clean
             }
         };
         if clean.is_err() && out_of_budget() {
@@ -2852,8 +2872,63 @@ impl Broker {
         }
     }
 
+    /// One look at the activity of `session`'s checkout, timed as `look`.
+    fn look_at_activity(
+        &self,
+        session: &crate::Session,
+        look: &str,
+    ) -> std::io::Result<Option<crate::worktree_status_activity::WorktreeActivity>> {
+        let started = std::time::Instant::now();
+        let activity = checked_worktree_activity(self.main_root(), session);
+        let timed_out = matches!(&activity, Ok(Some(read)) if read.status.timed_out);
+        crate::worktree_status_activity::note_look(look, started.elapsed(), timed_out);
+        activity
+    }
+
+    /// [`Self::judge_session_close`], recording how a judgement whose first
+    /// activity look timed out ended.
     #[allow(clippy::too_many_arguments)]
     fn try_close_session_inner(
+        &mut self,
+        session_id: i64,
+        decision_now_ms: i64,
+        abandon_after_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        allow_process_snapshot: bool,
+        deadline: Option<std::time::Instant>,
+        lane: SessionCloseLane,
+    ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
+        process_table.note_first_look_timed_out(false);
+        let outcome = self.judge_session_close(
+            session_id,
+            decision_now_ms,
+            abandon_after_ms,
+            process_table,
+            allow_process_snapshot,
+            deadline,
+            lane,
+        )?;
+        if process_table.first_look_timed_out() {
+            let kept = process_table
+                .keep_reason()
+                .unwrap_or(AbandonmentKeepReason::Unrecorded);
+            let ended = match (lane, LandedSessionDecline::from_outcome(outcome)) {
+                (_, None) => "closed",
+                (SessionCloseLane::Abandonment, Some(_)) => kept.telemetry_name(),
+                (SessionCloseLane::NoWork, Some(_)) => kept.no_work_telemetry_name(),
+                (_, Some(declined)) => declined.telemetry_name(),
+            };
+            crate::phase_telemetry::add_keyed(
+                "worktree_activity_after_first_look_timed_out",
+                &format!("{}.{ended}", lane.look_name()),
+                std::time::Duration::ZERO,
+            );
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn judge_session_close(
         &mut self,
         session_id: i64,
         decision_now_ms: i64,
@@ -3023,8 +3098,9 @@ impl Broker {
             None
         };
         let merged_at = merged_evidence.as_ref().map_or(0, |(_, at)| *at);
-        let fs_activity = match checked_worktree_activity_ms(self.main_root(), &candidate) {
-            Ok(activity) => activity.unwrap_or(0),
+        let first_look = format!("{}_first", lane.look_name());
+        let first_activity = match self.look_at_activity(&candidate, &first_look) {
+            Ok(activity) => activity.unwrap_or_default(),
             Err(_) => {
                 return Ok(keep_with(
                     process_table,
@@ -3033,6 +3109,8 @@ impl Broker {
                 ));
             }
         };
+        process_table.note_first_look_timed_out(first_activity.status.timed_out);
+        let fs_activity = first_activity.newest_ms();
         // An agent that only reads (tool calls, no writes, no broker
         // command) still signals through its PreToolUse hook.
         let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), session_id);
@@ -3040,6 +3118,29 @@ impl Broker {
             .max(candidate.last_activity_at)
             .max(merged_at)
             .max(hook_activity);
+        let recent = |last_activity_at: i64, created_at: i64| {
+            !matches!(
+                crate::decide_abandonment(
+                    &SessionActivity {
+                        session_id,
+                        last_activity_at,
+                        created_at,
+                        agent_alive: None,
+                        closed: false,
+                    },
+                    decision_now_ms,
+                    abandon_after_ms,
+                ),
+                crate::AbandonmentVerdict::Abandoned { .. }
+            )
+        };
+        crate::worktree_status_activity::note_recent_verdict(
+            &first_look,
+            &first_activity,
+            candidate.last_activity_at,
+            candidate.last_activity_at.max(merged_at).max(hook_activity),
+            |at| recent(at, candidate.created_at),
+        );
         if !matches!(
             crate::decide_abandonment(
                 &SessionActivity {
@@ -3497,12 +3598,13 @@ impl Broker {
                 AbandonedSessionCloseOutcome::OperationActive,
             ));
         }
+        let claimed_look = format!("{}_claimed", lane.look_name());
         let claimed_activity = {
             let _span = crate::phase_telemetry::span("session_close_checkout_activity");
-            checked_worktree_activity_ms(self.main_root(), &current)
+            self.look_at_activity(&current, &claimed_look)
         };
-        let fs_activity = match claimed_activity {
-            Ok(activity) => activity.unwrap_or(0),
+        let claimed_activity = match claimed_activity {
+            Ok(activity) => activity.unwrap_or_default(),
             Err(_) => {
                 return Ok(keep_with(
                     process_table,
@@ -3511,7 +3613,15 @@ impl Broker {
                 ));
             }
         };
-        let claimed_fs_activity = fs_activity;
+        let claimed_fs_activity = claimed_activity.newest_ms();
+        let fs_activity = claimed_fs_activity;
+        crate::worktree_status_activity::note_recent_verdict(
+            &claimed_look,
+            &claimed_activity,
+            current.last_activity_at,
+            current.last_activity_at.max(merged_at),
+            |at| recent(at, current.created_at),
+        );
         let activity_at = fs_activity.max(current.last_activity_at).max(merged_at);
         let observed_at = decision_now_ms;
         let crate::AbandonmentVerdict::Abandoned { idle_ms } = crate::decide_abandonment(
@@ -4188,15 +4298,26 @@ impl Broker {
             #[cfg(test)]
             process_table.run_before_landed_close_for_test();
             let worktree = std::path::Path::new(&current.worktree_path);
+            let close_look = format!("{}_close", lane.look_name());
             let (head_now, activity_now) = {
                 let _span = crate::phase_telemetry::span("landed_close_head_and_activity");
                 (
                     current_checkout_head(worktree),
-                    checked_worktree_activity_ms(self.main_root(), &current)
+                    self.look_at_activity(&current, &close_look)
                         .ok()
-                        .map(|activity| activity.unwrap_or(0)),
+                        .map(Option::unwrap_or_default),
                 )
             };
+            if head_now.as_deref() == Some(proof.head.as_str())
+                && let Some(now) = activity_now.as_ref()
+            {
+                crate::worktree_status_activity::note_close_verdict(
+                    &close_look,
+                    &claimed_activity,
+                    now,
+                );
+            }
+            let activity_now = activity_now.map(|activity| activity.newest_ms());
             if head_now.as_deref() != Some(proof.head.as_str())
                 || activity_now != Some(claimed_fs_activity)
             {
@@ -8166,17 +8287,50 @@ mod generic_guarded_exec_tests {
             git(&worktree, &["add", "late.txt"]);
             git(&worktree, &["commit", "-qm", "late work"]);
         }));
+        // Every look of this checkout is answered as a timed-out one.
+        crate::worktree_status_activity::remember_timeout(Path::new(&session.worktree_path));
+        let recorder = crate::phase_telemetry::Recorder::default();
 
-        let outcome = broker
-            .try_close_landed_session(
-                session.id,
-                crate::clock::epoch_ms(),
-                24 * 60 * 60 * 1_000,
-                &mut table,
-                true,
-                None,
-            )
-            .unwrap();
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .try_close_landed_session(
+                    session.id,
+                    crate::clock::epoch_ms(),
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None,
+                )
+                .unwrap()
+        };
+        // The looks, what decided the last one and how the judgement whose
+        // first look timed out ended. Mutations caught: a look left untimed,
+        // the timeout flag not carried, the lane left out of the ending, the
+        // last look judged although HEAD differs.
+        let attached = recorder.attachments();
+        for name in ["worktree_activity_look", "worktree_activity_look_timed_out"] {
+            let looks = attached[name].as_object().unwrap();
+            assert_eq!(
+                looks.keys().collect::<Vec<_>>(),
+                ["landed_claimed", "landed_close", "landed_first"],
+                "{name}"
+            );
+        }
+        assert!(
+            attached
+                .get("worktree_activity_index_head_decides")
+                .is_none_or(|looks| looks.get("landed_close").is_none())
+        );
+        assert_eq!(
+            attached["worktree_activity_after_first_look_timed_out"]["landed.landed_sessions_declined_moved_before_close"]
+                ["count"],
+            1
+        );
+        assert_eq!(
+            attached["landed_proof_worktree_clean_by_probe"]["no_probe"]["count"],
+            1
+        );
 
         assert_eq!(
             outcome,

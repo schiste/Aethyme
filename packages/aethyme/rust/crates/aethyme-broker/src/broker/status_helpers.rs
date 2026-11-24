@@ -1628,10 +1628,10 @@ pub(super) fn worktree_activity_ms(main_root: &Path, session: &Session) -> Optio
 /// Checked activity evidence for an abandonment decision. A missing checkout
 /// retains the age-only rule, but an existing checkout with unreadable Git
 /// metadata must remain protected rather than looking maximally old.
-pub(crate) fn checked_worktree_activity_ms(
+pub(crate) fn checked_worktree_activity(
     main_root: &Path,
     session: &Session,
-) -> Result<Option<i64>, std::io::Error> {
+) -> Result<Option<crate::worktree_status_activity::WorktreeActivity>, std::io::Error> {
     let worktree = Path::new(&session.worktree_path);
     match std::fs::symlink_metadata(worktree) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
@@ -1697,24 +1697,27 @@ pub(crate) fn checked_worktree_activity_ms(
     // changed files' own modification times (and their parents') count too.
     // A status call that times out or reaches its cap without evidence
     // leaves the index and HEAD evidence alone (counted).
+    let mut status = crate::worktree_status_activity::StatusActivity::default();
     if newest.is_some() {
-        let status = crate::worktree_status_activity::status_activity(
+        status = crate::worktree_status_activity::status_activity(
             worktree,
             crate::worktree_status_activity::STATUS_ACTIVITY_BUDGET,
             crate::worktree_status_activity::STATUS_ACTIVITY_PATH_CAP,
         );
-        match status.newest_ms {
-            Some(changed) => {
-                newest = newest.map(|known| known.max(changed));
-            }
-            None if !status.complete => crate::phase_telemetry::add(
+        if status.newest_ms.is_none() && !status.complete {
+            crate::phase_telemetry::add(
                 "worktree_activity_status_fallback",
                 std::time::Duration::ZERO,
-            ),
-            None => {}
+            );
         }
     }
-    newest.map(Some).ok_or_else(|| {
+    let activity = newest.map(
+        |metadata_ms| crate::worktree_status_activity::WorktreeActivity {
+            metadata_ms,
+            status,
+        },
+    );
+    activity.map(Some).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "existing worktree has no readable Git activity metadata",
