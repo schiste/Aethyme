@@ -108,6 +108,11 @@ pub(super) fn verify(
     for gate in gates {
         valid_gate(gate)?;
     }
+    let needs_words = gates.iter().any(|gate| gate["kind"] == "word_count");
+    let needs_paragraph_words = gates.iter().any(|gate| gate["kind"] == "paragraph_length");
+    let needs_paragraph_chars = gates
+        .iter()
+        .any(|gate| gate["kind"] == "paragraph_character_length");
     for item in host {
         let projection = parse_unique(item.source.as_bytes())?;
         fields(
@@ -134,11 +139,15 @@ pub(super) fn verify(
                 if end > text.len() || !text.is_char_boundary(end) || (index > 0 && end <= start) {
                     return Err("invalid block boundary");
                 }
-                count += text[start..end].split_whitespace().count();
+                if needs_words {
+                    count += text[start..end].split_whitespace().count();
+                }
                 start = end;
             }
         }
-        count += text[start..].split_whitespace().count();
+        if needs_words {
+            count += text[start..].split_whitespace().count();
+        }
         let paragraphs = projection
             .get("paragraphs")
             .map(|v| v.as_array().ok_or("invalid host paragraphs"))
@@ -172,8 +181,12 @@ pub(super) fn verify(
                     return Err("invalid host paragraph range");
                 }
                 let paragraph_text = &text[start..end];
-                longest_words = longest_words.max(paragraph_text.split_whitespace().count());
-                longest_chars = longest_chars.max(paragraph_text.chars().count());
+                if needs_paragraph_words {
+                    longest_words = longest_words.max(paragraph_text.split_whitespace().count());
+                }
+                if needs_paragraph_chars {
+                    longest_chars = longest_chars.max(paragraph_text.chars().count());
+                }
                 previous = end;
             }
         }
@@ -222,8 +235,9 @@ pub(super) fn verify(
         {
             return Err("host finding cannot claim a source position");
         }
+        let mut character_counts = [None, None];
         for gate in gates {
-            let kind = valid_gate(gate)?;
+            let kind = gate["kind"].as_str().ok_or("invalid host gate kind")?;
             let id = gate["id"].as_str().ok_or("invalid host gate id")?;
             let check_id = format!("gate:{}:{}:{id}", item.entity_id.len(), item.entity_id);
             let status = checks
@@ -237,10 +251,14 @@ pub(super) fn verify(
                 "word_count" | "character_count" | "paragraph_count" => {
                     let amount = match kind {
                         "word_count" => count,
-                        "character_count" => text
-                            .chars()
-                            .filter(|c| gate["ignore_whitespace"] != true || !c.is_whitespace())
-                            .count(),
+                        "character_count" => {
+                            let ignore = gate["ignore_whitespace"] == true;
+                            *character_counts[usize::from(ignore)].get_or_insert_with(|| {
+                                text.chars()
+                                    .filter(|c| !ignore || !c.is_whitespace())
+                                    .count()
+                            })
+                        }
                         _ => paragraphs.ok_or("host paragraphs unavailable")?.len(),
                     } as u64;
                     gate["min"].as_u64().is_some_and(|v| amount < v)
