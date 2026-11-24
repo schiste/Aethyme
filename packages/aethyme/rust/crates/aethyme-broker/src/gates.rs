@@ -10971,7 +10971,6 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                 )
                 .unwrap();
                 let counts = handoff.counts();
-                drop(handoff);
                 let held_at_the_end = slot.is_some();
                 (outcomes, counts, held_at_the_end)
             }

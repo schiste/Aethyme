@@ -296,7 +296,6 @@ impl Broker {
             Some(&handoff),
         );
         handoff.record_telemetry();
-        drop(handoff);
         report.gates = gates_run?;
         if let Some(slot) = slot.as_mut() {
             slot.cleanup();

@@ -2357,7 +2357,6 @@ impl Broker {
             Some(&handoff),
         );
         handoff.record_telemetry();
-        drop(handoff);
         // One rename into the trash instead of Git deleting the whole tree
         // inline (21 s a submit on the busiest repository); Git's removal
         // stays the fallback. After a handoff this is the slot held now; a
