@@ -316,14 +316,16 @@ fn collection_uniqueness_status(
     Ok(if duplicate { "failed" } else { "passed" })
 }
 
-fn verify_plain_word_count_statuses(
+fn verify_plain_count_statuses(
     policy: &Value,
     checks: &BTreeMap<&str, &Value>,
     after: &[Item],
-    counts: &mut BTreeMap<String, u64>,
+    kind: &str,
+    mismatch: &'static str,
+    mut count: impl FnMut(&Value, &Item) -> Result<u64, &'static str>,
 ) -> Result<(), &'static str> {
     for gate in policy["gates"].as_array().ok_or("invalid gates")? {
-        if gate["kind"] != "word_count" {
+        if gate["kind"] != kind {
             continue;
         }
         let gate_id = gate["id"].as_str().ok_or("invalid gate id")?;
@@ -341,17 +343,35 @@ fn verify_plain_word_count_statuses(
             if !matches!(status, "passed" | "failed") {
                 continue;
             }
-            let count = *counts.entry(item.entity_id.clone()).or_insert_with(|| {
-                u64::try_from(item.source.split_whitespace().count()).unwrap_or(u64::MAX)
-            });
+            let count = count(gate, item)?;
             let failed = gate["min"].as_u64().is_some_and(|min| count < min)
                 || gate["max"].as_u64().is_some_and(|max| count > max);
             if status != if failed { "failed" } else { "passed" } {
-                return Err("plain-text word count status differs from source");
+                return Err(mismatch);
             }
         }
     }
     Ok(())
+}
+
+fn verify_plain_word_count_statuses(
+    policy: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    after: &[Item],
+    counts: &mut BTreeMap<String, u64>,
+) -> Result<(), &'static str> {
+    verify_plain_count_statuses(
+        policy,
+        checks,
+        after,
+        "word_count",
+        "plain-text word count status differs from source",
+        |_, item| {
+            Ok(*counts.entry(item.entity_id.clone()).or_insert_with(|| {
+                u64::try_from(item.source.split_whitespace().count()).unwrap_or(u64::MAX)
+            }))
+        },
+    )
 }
 
 fn verify_plain_character_count_statuses(
@@ -401,6 +421,45 @@ fn verify_plain_character_count_statuses(
         }
     }
     Ok(())
+}
+
+fn plain_text_paragraph_count(source: &str) -> Result<u64, &'static str> {
+    let mut count = 0;
+    let mut inside = false;
+    for line in source.split_inclusive('\n') {
+        let blank = line.trim_end_matches(['\r', '\n']).trim().is_empty();
+        if !blank && !inside {
+            count += 1;
+            if count > 100_000 {
+                return Err("plain-text paragraph count exceeds evaluator limit");
+            }
+        }
+        inside = !blank;
+    }
+    Ok(count)
+}
+
+fn verify_plain_paragraph_count_statuses(
+    policy: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    after: &[Item],
+    counts: &mut BTreeMap<String, u64>,
+) -> Result<(), &'static str> {
+    verify_plain_count_statuses(
+        policy,
+        checks,
+        after,
+        "paragraph_count",
+        "plain-text paragraph count status differs from source",
+        |_, item| {
+            if let Some(count) = counts.get(&item.entity_id) {
+                return Ok(*count);
+            }
+            let count = plain_text_paragraph_count(&item.source)?;
+            counts.insert(item.entity_id.clone(), count);
+            Ok(count)
+        },
+    )
 }
 
 fn verify_collection_statuses(
@@ -912,6 +971,7 @@ pub fn compare(
     let mut coverage = None;
     let mut word_counts = BTreeMap::new();
     let mut character_counts = BTreeMap::new();
+    let mut paragraph_counts = BTreeMap::new();
     for env in [&previous, &fresh] {
         if env["binding_sha256"] != binding_hex {
             return Err("candidate input binding differs");
@@ -959,6 +1019,12 @@ pub fn compare(
             verify_collection_statuses(&policy, collection, &checks)?;
         }
         verify_plain_word_count_statuses(&policy, &checks, input.after, &mut word_counts)?;
+        verify_plain_paragraph_count_statuses(
+            &policy,
+            &checks,
+            input.after,
+            &mut paragraph_counts,
+        )?;
         verify_plain_character_count_statuses(
             &policy,
             &checks,
@@ -1048,6 +1114,53 @@ mod tests {
         fresh["verdict"]["validator"]["name"] = json!("other");
         assert!(!run(&old, &fresh, &input));
     }
+    #[test]
+    fn plain_paragraph_counts_respect_boundaries_and_limits() {
+        for (source, expected) in [
+            ("", 0),
+            (" \n\t\r\n", 0),
+            ("One\r\ntwo\r\n\u{a0}\r\nThree", 2),
+            ("a\r\rb", 1),
+            ("a\n\u{1c}\nb", 1),
+            ("a\n\nb\n", 2),
+        ] {
+            assert_eq!(plain_text_paragraph_count(source), Ok(expected));
+        }
+        assert_eq!(
+            plain_text_paragraph_count(&"x\n\n".repeat(100_000)),
+            Ok(100_000)
+        );
+        assert_eq!(
+            plain_text_paragraph_count(&"x\n\n".repeat(100_001)),
+            Err("plain-text paragraph count exceeds evaluator limit")
+        );
+    }
+
+    #[test]
+    fn plain_paragraph_statuses_respect_bounds_and_unavailable() {
+        let (_, _, mut after, _) = fixture();
+        after[0].source = "One\n\nTwo".into();
+        let policy =
+            json!({"gates":[{"id":"paragraphs","kind":"paragraph_count","min":2,"max":2}]});
+        let mut check = json!({"status":"passed"});
+        let mut counts = BTreeMap::new();
+        let verify = |c: &Value, items: &[Item], cache: &mut BTreeMap<String, u64>| {
+            let checks = BTreeMap::from([("gate:7:article:paragraphs", c)]);
+            verify_plain_paragraph_count_statuses(&policy, &checks, items, cache)
+        };
+        assert!(verify(&check, &after, &mut counts).is_ok());
+        check["status"] = json!("failed");
+        assert_eq!(
+            verify(&check, &after, &mut counts),
+            Err("plain-text paragraph count status differs from source")
+        );
+        check["status"] = json!("not_checked");
+        assert!(verify(&check, &after, &mut counts).is_ok());
+        after[0].media_type = "text/markdown".into();
+        check["status"] = json!("failed");
+        assert!(verify(&check, &after, &mut counts).is_ok());
+    }
+
     #[test]
     fn plain_word_counts_respect_bounds_whitespace_and_unavailable() {
         let (_, _, mut after, _) = fixture();
@@ -1168,6 +1281,46 @@ mod tests {
                 &input
             ),
             Err("plain-text character count status differs from source")
+        );
+    }
+    #[test]
+    fn rejects_rebound_plain_text_paragraph_count_false_pass() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        policy["gates"][0]["kind"] = json!("paragraph_count");
+        policy["gates"][0]["min"] = json!(2);
+        let policy = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy;
+        let mut options: Value = serde_json::from_slice(input.host_options).unwrap();
+        options["plain_text_paragraphs"] = json!(true);
+        let options = serde_json::to_vec(&options).unwrap();
+        input.host_options = &options;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let binding = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] = json!(
+            binding
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("plain-text paragraph count status differs from source")
         );
     }
     #[test]
