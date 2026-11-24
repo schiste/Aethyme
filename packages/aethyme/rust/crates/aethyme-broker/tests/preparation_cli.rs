@@ -473,6 +473,162 @@ required_for_hooks = true
     assert!(reason.contains("generation 3"), "{reason}");
 }
 
+#[test]
+fn prepare_metric_and_record_time_each_configured_step() {
+    let temp = fixture();
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "step timings", "--json"],
+    ));
+    let session_id = adopted["id"].as_i64().unwrap();
+    let session = session_id.to_string();
+
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        r#"schema_version = 1
+
+[[steps]]
+name = "installs"
+command = ["sh", "-c", "mkdir -p node_modules"]
+inputs = ["package-lock.json"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+
+[[steps]]
+name = "fails"
+command = ["sh", "-c", "exit 3"]
+inputs = ["Cargo.lock"]
+outputs = ["target/"]
+"#,
+    )
+    .unwrap();
+    let failed = run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    );
+    assert!(!failed.status.success());
+
+    let metric = last_prepare_metric(temp.path());
+    assert_eq!(
+        step_summary(&metric),
+        [
+            (0, "installs", "repository_shared", "online", "ok"),
+            (1, "fails", "worktree_local", "online", "failed"),
+        ],
+        "{metric}"
+    );
+
+    // The record keeps the same per-step timings next to the failed step.
+    let record_path = temp.path().join(format!(
+        ".aethyme/run/preparation/session-{session_id}.json"
+    ));
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["state"], "failed");
+    assert_eq!(record["failed_step"], "fails");
+    assert_eq!(&record["steps"], &metric["preparation_steps"], "{record}");
+
+    // Fixed, the second step runs for at least its sleep.
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        r#"schema_version = 1
+
+[[steps]]
+name = "installs"
+command = ["sh", "-c", "mkdir -p node_modules"]
+inputs = ["package-lock.json"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+
+[[steps]]
+name = "sleeps"
+command = ["sh", "-c", "sleep 0.05 && mkdir -p target"]
+inputs = ["Cargo.lock"]
+outputs = ["target/"]
+"#,
+    )
+    .unwrap();
+    let prepared = success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    assert_eq!(prepared["state"], "current", "{prepared}");
+    let metric = last_prepare_metric(temp.path());
+    assert_eq!(
+        step_summary(&metric),
+        [
+            (0, "installs", "repository_shared", "online", "ok"),
+            (1, "sleeps", "worktree_local", "online", "ok"),
+        ],
+        "{metric}"
+    );
+    assert!(
+        metric["preparation_steps"][1]["duration_ms"]
+            .as_u64()
+            .is_some_and(|millis| millis >= 50),
+        "{metric}"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["state"], "current");
+    assert_eq!(&record["steps"], &metric["preparation_steps"], "{record}");
+
+    // A cache hit runs nothing: every step is skipped, in zero time.
+    let hit = success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    assert_eq!(hit["cache_outcome"]["hit"], true, "{hit}");
+    let metric = last_prepare_metric(temp.path());
+    assert_eq!(
+        step_summary(&metric),
+        [
+            (0, "installs", "repository_shared", "skipped", "skipped"),
+            (1, "sleeps", "worktree_local", "skipped", "skipped"),
+        ],
+        "{metric}"
+    );
+    for step in metric["preparation_steps"].as_array().unwrap() {
+        assert_eq!(step["duration_ms"], 0, "{step}");
+    }
+}
+
+/// The command metric line of the most recent `prepare`.
+fn last_prepare_metric(repo: &Path) -> serde_json::Value {
+    std::fs::read_to_string(repo.join(".aethyme/logs/command-metrics.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|value| value["command"] == "prepare")
+        .unwrap()
+}
+
+/// `(index, name, cache, mode, outcome)` of each `preparation_steps` entry;
+/// every entry must also carry `duration_ms`.
+fn step_summary(metric: &serde_json::Value) -> Vec<(u64, &str, &str, &str, &str)> {
+    let steps = metric["preparation_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no preparation_steps attachment: {metric}"));
+    steps
+        .iter()
+        .map(|step| {
+            assert!(step["duration_ms"].as_u64().is_some(), "{step}");
+            (
+                step["index"].as_u64().unwrap(),
+                step["name"].as_str().unwrap(),
+                step["cache"].as_str().unwrap(),
+                step["mode"].as_str().unwrap(),
+                step["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// A repository that declares gates but no preparation config (#131 finding 2).
 fn gates_without_preparation_fixture() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();

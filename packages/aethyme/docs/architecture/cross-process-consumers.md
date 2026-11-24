@@ -2449,6 +2449,51 @@ serialized configuration to preserve existing preparation digests; a
 nonempty selection changes the digest and trusted prepare policy, and requires
 trust before execution.
 
+Changed 2026-11-24 (per-step preparation timings). The command metric of
+`broker submit prepare`, and of `broker advance` when it prepares, gains the
+attachment `preparation_steps`: a list with one entry per configured
+`[[steps]]` entry, in configuration order, so the `preparation_step` span's
+total is attributed to a step. It is attached on a cache hit and once the
+step loop has started (after each step, so a run that stops at a step still
+reports every step). A preparation refused before its steps start (retry
+blocked, untrusted policy, offline command missing, install slot
+unavailable, storage refusal, failure to write the initial record) attaches
+none. Each entry carries `index` (the step's 0-based position in
+`.aethyme/prepare.toml`), `name` (the configured step name, already present
+in `preparation.steps[].name` and the cache-activity record; step names stay
+out of span names), `cache` (`repository_shared` or `worktree_local`),
+`mode`, `duration_ms` (wall time including execution supervision, 0 when
+skipped) and `outcome`:
+
+- `ok`, `failed`, `timed_out`: how the step's command ended, judged by its
+  exit alone. The ownership audit's verdict is not folded in; it is reported
+  by the guarded exec (`report.ok`, the exec audit receipt) and a failed audit
+  still fails the preparation. A step whose command succeeded but whose
+  declared outputs are missing is `ok`, and the record's `failed_step` names
+  it.
+- `error`: the broker failed the step without a command result (for example
+  a storage refusal before the command, or a supervisor error).
+- `unknown`: the command's outcome or its process cleanup could not be
+  established (`CommandOutcomeUnknown`, `CleanupUnknown`). The record then
+  stays `in_progress` for an operator, so its `steps` are not rewritten.
+- `skipped`: the step was not reached: steps after one that stopped the run,
+  and every step on a cache hit.
+
+`mode` is `online` or `offline`, the configured command the step used, or
+`skipped` when the step was not reached. For `error` and `unknown` it names
+the command the step would run, not proof that it spawned.
+
+The preparation record `.aethyme/run/preparation/session-<id>.json` gains
+the same list as the optional field `steps` (schema version unchanged;
+absent in records written before it, and omitted when empty). Readers must
+tolerate its absence and unknown `outcome` or `mode` values; an older binary
+that rewrites a record drops it. A cache hit leaves the record, and so the
+last run's timings, unchanged. Covered by `preparation_cli.rs` test
+`prepare_metric_and_record_time_each_configured_step` (a failed step, a
+successful rerun with a timed step, and a cache hit) and `preparation.rs`
+tests `step_timings_report_every_configured_step_and_skip_those_not_run` and
+`preparation_records_read_with_or_without_step_timings`.
+
 ### Managed-storage ledger schema v4
 
 The host-resource database contains a separate managed-storage ledger version
