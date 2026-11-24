@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.166] - 2026-11-24
+
+### Fixed
+
+- A submit that is only waiting for a gate's resources no longer holds one of the four merge-verification slots. Before, a submit kept its slot through load admission and the wait for the managed-cache lease and host build units, so one long build could fill every slot with submits that were only waiting, and every other submit on the repository (including ones with no build gate) waited behind them. Before each gate the broker now probes load, owner locks and resources without waiting; if any would wait, it releases the slot, waits outside it, then takes a slot again, re-creates the same merge commit, and refuses unless the tree matches the one already admitted. The repository and cache key are fixed before the release, so the wait and the cache directory always name the same cache. A released slot's checkout is moved to the pool trash in one rename instead of being removed inline (#1991).
+- A gate returning for a slot holds a reservation, so new arrivals take a free slot only while more slots are free than live reservations, and returning gates take slots in the order they reserved; a crashed holder's reservation is reaped. While holding its resources a gate waits at most 300 s for a slot, then hands the resources back and queues for them again, at most twice; after that the gate is deferred before it starts (retryable, no verdict) (#1991).
+- Batch followers wait for a live leader for as long as the leader's gates can take (load bound plus three rounds of resource wait and slot wait plus the longest load-scaled timeout), instead of giving up after 30 minutes and verifying the same tree again (#1991).
+
+### Changed
+
+- Repository gate policy: the managed build gates wait up to 7500 s for the workspace build cache and 1200 s for the contract cache, enough for the longest load-scaled holder of each cache. Load admission keeps its own bound of at most 900 s; `resource_wait_seconds` now bounds only the lease wait (#1991).
+
+### Added
+
+- Spans `gate_slot_admission_probe`, `gate_slot_release`, `gate_admission_wait_outside_slot`, `gate_slot_reacquire`, `gate_slot_reservation`, `gate_resource_requeue`; attachments `verification_slot_handoff` (`releases`, `reacquires`) and `gate_slot_release_trigger` (`load`, `owner_locks`, `resources`, `probe_error`); counters `gate_slot_reservation_unavailable`, `gate_slot_reservation_reaped`, `verification_slot_deferred_to_reservation`, `gate_slot_wait_requeues`, `gate_slot_wait_requeue_limit_reached` (#1991).
+
+### Known issues
+
+- The shared-verdict claim is still held while a gate waits outside its slot, so a second submit of the same tree still defers after 60 s.
+
 ## [0.8.165] - 2026-11-24
 
 ### Fixed
