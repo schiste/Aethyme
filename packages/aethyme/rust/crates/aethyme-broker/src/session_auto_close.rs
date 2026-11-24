@@ -1878,7 +1878,7 @@ mod lane_tests {
             quiet(&mut broker, &session, 3);
             if case == "unreadable input" {
                 let lock = state.join("lock");
-                std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o0)).unwrap();
             }
             let status = broker.preparation_status(session.id);
             match case {
