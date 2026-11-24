@@ -132,7 +132,8 @@ timeout_seconds = 2400
 # at most 900 s whatever this value (`gate_admission::MAX_LOAD_WAIT_SECONDS`),
 # and a gate holding the lease waits at most 300 s for a verification slot
 # before it hands the lease on and queues again
-# (`gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION`).
+# (`gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION`), at most twice before it is
+# deferred (`gates::MAX_SLOT_WAIT_REQUEUES`).
 resource_wait_seconds = 7500
 triggers = [
     ".aethyme/gates.toml",

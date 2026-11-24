@@ -1080,7 +1080,9 @@ file. The wait for a slot while holding resources is bounded at 300 s
 (`gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION`): past it the gate releases its
 lease and owner locks and queues for them again at the back of the FIFO
 resource queue, so it never sits on an exclusive cache while the slots stay
-busy.
+busy. A gate re-queues at most twice (`gates::MAX_SLOT_WAIT_REQUEUES`); the
+next time no slot frees within the bound it is deferred before it starts, as
+an exhausted resource wait is (retryable, no verdict).
 
 The wait for host load is bounded separately from the resource wait: a gate
 waits for load at most `min(resource_wait_seconds, 900)` seconds
@@ -1088,7 +1090,8 @@ waits for load at most `min(resource_wait_seconds, 900)` seconds
 before the managed-cache gates raised `resource_wait_seconds` to 7500 s and
 1200 s. A follower of a queued batch now waits for a live leader as long as
 the base's gate policy lets one verification take (each gate's load bound,
-resource wait, slot bound and longest scaled timeout, summed), and never less
+resource wait and slot bound once plus once per allowed re-queue, and longest
+scaled timeout, summed), and never less
 than the previous 30 minutes.
 
 Command metrics add these phases. `gate_slot_admission_probe` times the
@@ -1111,8 +1114,9 @@ happened. `gate_slot_reservation` times creating the reservation, and
 holder was gone. `verification_slot_deferred_to_reservation` counts
 acquisitions that left a free slot to a reservation at least once, with the
 time until they got one. `gate_resource_requeue` times handing held resources
-back when no slot freed within the bound, and `gate_slot_wait_requeues`
-counts those re-queues. The released checkout's trash move reuses the
+back when no slot freed within the bound, `gate_slot_wait_requeues` counts
+those re-queues, and `gate_slot_wait_requeue_limit_reached` counts gates
+deferred because the re-queue limit was used up. The released checkout's trash move reuses the
 existing `verification_slot_trash`, `verification_slot_trashed` and
 `verification_slot_trash_fell_back_to_git` metrics. Consumers must tolerate the additive phases and attachment; no
 existing field changes.

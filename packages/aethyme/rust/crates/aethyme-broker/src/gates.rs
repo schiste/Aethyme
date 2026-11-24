@@ -224,18 +224,22 @@ impl Gate {
 }
 
 /// An upper bound, in seconds, on one verification that runs every gate in
-/// `gates` in turn, each waiting as long as admission allows (host load,
-/// its resource wait, one bounded wait for a verification slot) and then
-/// running to its longest deadline. A gate with no timeout adds only its
-/// waits. Followers of a queued batch wait this long for a live leader.
+/// `gates` in turn, each waiting as long as admission allows (host load, then
+/// its resource wait and a bounded wait for a verification slot, once plus
+/// once per allowed re-queue) and then running to its longest deadline. A gate
+/// with no timeout adds only its waits. Followers of a queued batch wait this
+/// long for a live leader.
 pub(crate) fn longest_verification_seconds(gates: &[Gate]) -> u64 {
+    let rounds = u64::from(MAX_SLOT_WAIT_REQUEUES) + 1;
     gates
         .iter()
         .map(|gate| {
+            let round = gate
+                .resource_wait_seconds
+                .saturating_add(SLOT_WAIT_WHILE_HOLDING_ADMISSION.as_secs());
             crate::gate_admission::load_wait_bound(gate)
                 .as_secs()
-                .saturating_add(gate.resource_wait_seconds)
-                .saturating_add(SLOT_WAIT_WHILE_HOLDING_ADMISSION.as_secs())
+                .saturating_add(round.saturating_mul(rounds))
                 .saturating_add(gate.longest_timeout_seconds().unwrap_or(0))
         })
         .fold(0, u64::saturating_add)
@@ -1122,7 +1126,19 @@ pub(crate) trait VerificationSlotHandoff {
         &self,
         keepalive: &mut dyn FnMut(),
     ) -> Result<Option<GitRepo>, crate::broker::BrokerOpError>;
+    /// How many times one gate may hand its resources back and queue again
+    /// after a slot wait reached its bound, before it is deferred.
+    fn requeue_limit(&self) -> u32 {
+        MAX_SLOT_WAIT_REQUEUES
+    }
 }
+
+/// How many times a gate re-queues for its resources after finding no slot
+/// within [`SLOT_WAIT_WHILE_HOLDING_ADMISSION`] before it is deferred (before
+/// it starts, retryable, with no verdict), as an exhausted resource wait is.
+/// Without a cap a steady stream of long gates could keep a submit cycling
+/// between the resource queue and the slot pool for ever.
+pub(crate) const MAX_SLOT_WAIT_REQUEUES: u32 = 2;
 
 /// How long a gate holding its host resources and owner locks waits for a
 /// verification slot before it gives them back and queues for them again.
@@ -4488,6 +4504,7 @@ where
         } else {
             checkout_root.clone()
         };
+        let mut requeues = 0;
         let (owner_locks, mut resource_runtime, reacquired) = 'admission: loop {
             if let Some((locks, resources)) = admitted_in_slot.take() {
                 break 'admission (locks, resources, None);
@@ -4657,9 +4674,43 @@ where
                     // host build units and owner locks on to whoever queues
                     // for them, and queue again (at the back of the FIFO).
                     let _span = crate::phase_telemetry::span("gate_resource_requeue");
-                    crate::phase_telemetry::add("gate_slot_wait_requeues", Duration::ZERO);
                     release_gate_resources(&mut resource_runtime);
                     drop(owner_locks);
+                    if requeues >= handoff.requeue_limit() {
+                        // Bounded like an exhausted resource wait: defer the
+                        // gate before it starts, retryable, with no verdict.
+                        crate::phase_telemetry::add(
+                            "gate_slot_wait_requeue_limit_reached",
+                            Duration::ZERO,
+                        );
+                        artifact_use.finish_not_started().map_err(|source| {
+                            crate::BrokerError::Io {
+                                path: error_root.clone(),
+                                source,
+                            }
+                        })?;
+                        let diagnostic = format!(
+                            "no verification slot freed while the gate held its host resources, \
+                             {} time(s); retry when fewer long gates are running",
+                            requeues + 1
+                        );
+                        let outcome = record_gate_preflight_resource_failure(
+                            store,
+                            GatePreflightResourceFailure {
+                                gate,
+                                tree: &tree,
+                                session_id,
+                                wait_duration_ms: wait_started.elapsed().as_millis() as i64,
+                                log_path: &log_path,
+                                diagnostic: &diagnostic,
+                                progress,
+                            },
+                        )?;
+                        outcomes.push(outcome);
+                        break 'gates;
+                    }
+                    requeues += 1;
+                    crate::phase_telemetry::add("gate_slot_wait_requeues", Duration::ZERO);
                     progress.report(&format!(
                         "gate {} found no free verification slot within {}s; \
                          handing its host resources on and queueing for them again",
@@ -11491,7 +11542,10 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
                 let handoff = crate::verification::PooledSlotHandoff::new(
                     &mut slot, &root, NAMESPACE, 1, &root_plan, &commit, None,
                 )
-                .with_hold_bound(Duration::from_secs(1));
+                .with_hold_bound(Duration::from_secs(1))
+                // Re-queues until the build has had the cache, however many
+                // bounds pass first; the cap has its own test.
+                .with_requeue_limit(u32::MAX);
                 let outcomes = run_selections_with_admission(
                     &mut store,
                     &root,
@@ -11612,5 +11666,251 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
         assert_eq!(counts, (1, 1), "one release and one successful re-acquire");
+    }
+
+    /// A gate re-queues for its resources at most its limit of times; past
+    /// it, the gate is deferred before it starts (retryable, no verdict) and
+    /// its cache lease is free for others, instead of cycling between the
+    /// resource queue and a busy slot pool for ever.
+    #[test]
+    fn a_gate_that_keeps_finding_no_slot_is_deferred_after_its_requeues() {
+        const NAMESPACE: &str = "requeue-cap";
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repo");
+        init_repo(&root);
+        let commit = GitRepo::discover(&root).unwrap().head_commit().unwrap();
+        let resource_db = owner.path().join("host-state/resources.db");
+        let storage = GateStorageLocations::Captured {
+            host_resource_db_path: Some(resource_db.clone()),
+            host_cache_dir: Some(owner.path().join("cache")),
+        };
+        let progress = std::sync::Arc::new(Lines::default());
+        let (materialized, cache_owner) = std::sync::mpsc::channel();
+        let (build_holds_cache, held) = std::sync::mpsc::channel::<()>();
+        let waiter = std::thread::spawn({
+            let root = root.clone();
+            let commit = commit.clone();
+            let database = owner.path().join("waiter.db");
+            let storage = storage.clone();
+            let progress = progress.clone();
+            move || {
+                let root_plan = crate::verification::default_worktree_root_plan(&root);
+                let mut slot =
+                    crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+                        &root,
+                        NAMESPACE,
+                        1,
+                        &root_plan,
+                        Duration::from_secs(1),
+                        &mut |_, _| false,
+                    )
+                    .unwrap();
+                let checkout = slot
+                    .as_mut()
+                    .unwrap()
+                    .materialize(&GitRepo::discover(&root).unwrap(), &commit)
+                    .unwrap();
+                materialized
+                    .send(git_origin_fingerprint(&checkout))
+                    .unwrap();
+                held.recv().unwrap();
+                let mut gate = synthetic_gate("cached-build", false, "touch ran");
+                gate.managed_cache = Some(ManagedGateCache {
+                    key: "shared-build".into(),
+                    max_bytes: 1024 * 1024,
+                });
+                gate.resource_wait_seconds = 120;
+                let mut store = BrokerStore::open(&database).unwrap();
+                let host = SequencedAdmissionHost::new(vec![None]);
+                let handoff = crate::verification::PooledSlotHandoff::new(
+                    &mut slot, &root, NAMESPACE, 1, &root_plan, &commit, None,
+                )
+                .with_hold_bound(Duration::from_millis(500))
+                .with_requeue_limit(1);
+                let outcomes = run_selections_with_admission(
+                    &mut store,
+                    &root,
+                    &checkout,
+                    vec![Selection {
+                        gate: &gate,
+                        triggered_by: None,
+                        owner_paths: Vec::new(),
+                    }],
+                    None,
+                    CachePolicy::Bypass,
+                    GateRuntimeContext {
+                        fresh_checkout: true,
+                        progress: &*progress,
+                        admission_host: &host,
+                        deadline: None,
+                        comparison_base: None,
+                        storage,
+                        slot_handoff: Some(&handoff),
+                    },
+                    |_, _| None,
+                    |_, _, _, _| None,
+                );
+                (outcomes, handoff.counts(), slot.is_some())
+            }
+        });
+        let repository = cache_owner.recv_timeout(Duration::from_secs(60)).unwrap();
+        let cache_request = |id: &str| crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: id.into(),
+            repository: repository.clone(),
+            worktree_fingerprint: id.into(),
+            run_id: id.into(),
+            ttl_seconds: 300,
+            holder_pid: Some(std::process::id()),
+            resources: vec![crate::HostResourceRequirement {
+                key: "managed_cache".into(),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: managed_cache_lease_name(&repository, "shared-build"),
+                },
+            }],
+        };
+        let mut coordinator = crate::HostResourceCoordinator::open(&resource_db).unwrap();
+        let build = coordinator.acquire(&cache_request("long-build")).unwrap();
+        build_holds_cache.send(()).unwrap();
+        let lines = || progress.0.lock().unwrap().clone();
+        let started = Instant::now();
+        while !lines()
+            .iter()
+            .any(|line| line.contains("cached-build must wait (resources)"))
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "{:#?}",
+                lines()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Another submit takes the given-back slot and keeps it throughout.
+        let root_plan = crate::verification::default_worktree_root_plan(&root);
+        let busy = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+            &root,
+            NAMESPACE,
+            1,
+            &root_plan,
+            Duration::from_secs(1),
+            &mut |waited, _| waited >= Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("the gate kept its slot while it waited for the cache");
+        coordinator
+            .release(
+                &build.lease.lease_id,
+                build.lease.generation,
+                &build.ownership_token,
+            )
+            .unwrap();
+        let (outcomes, counts, held_a_slot) = waiter.join().unwrap();
+        let outcomes = outcomes.unwrap_or_else(|error| panic!("{error}: {:#?}", lines()));
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert_eq!(outcomes[0].status, GateStatus::Error, "{outcomes:?}");
+        assert_eq!(counts, (1, 0), "released once, never taken again");
+        assert!(!held_a_slot);
+        let lines = lines();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("found no free verification slot within"))
+                .count(),
+            1,
+            "one re-queue, then deferred: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("could not start")
+                && line.contains("no verification slot freed while the gate held")),
+            "{lines:#?}"
+        );
+        assert!(!busy.path().join("ran").exists());
+        // The deferred gate left the cache free.
+        let after = coordinator.acquire(&cache_request("after")).unwrap();
+        coordinator
+            .release(
+                &after.lease.lease_id,
+                after.lease.generation,
+                &after.ownership_token,
+            )
+            .unwrap();
+        drop(busy);
+    }
+
+    /// An in-slot attempt that fails in a way the established path would
+    /// retry or wait on (here the owner-lock directory cannot be created)
+    /// gives the slot back before that path runs.
+    #[test]
+    fn a_failed_admission_probe_gives_the_slot_back() {
+        const NAMESPACE: &str = "probe-error";
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repo");
+        init_repo(&root);
+        let commit = GitRepo::discover(&root).unwrap().head_commit().unwrap();
+        let run_dir = running_dir(&root);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("owners"), "not a directory\n").unwrap();
+        let root_plan = crate::verification::default_worktree_root_plan(&root);
+        let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+            &root,
+            NAMESPACE,
+            1,
+            &root_plan,
+            Duration::from_secs(1),
+            &mut |_, _| false,
+        )
+        .unwrap();
+        let checkout = slot
+            .as_mut()
+            .unwrap()
+            .materialize(&GitRepo::discover(&root).unwrap(), &commit)
+            .unwrap();
+        let gate = synthetic_gate("owned", false, "true");
+        let mut store = BrokerStore::open(&owner.path().join("broker.db")).unwrap();
+        let progress = Lines::default();
+        let host = SequencedAdmissionHost::new(vec![None]);
+        let handoff = crate::verification::PooledSlotHandoff::new(
+            &mut slot, &root, NAMESPACE, 1, &root_plan, &commit, None,
+        );
+        let result = run_selections_with_admission(
+            &mut store,
+            &root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Bypass,
+            GateRuntimeContext {
+                fresh_checkout: true,
+                progress: &progress,
+                admission_host: &host,
+                deadline: None,
+                comparison_base: None,
+                storage: GateStorageLocations::Captured {
+                    host_resource_db_path: Some(owner.path().join("resources.db")),
+                    host_cache_dir: Some(owner.path().join("cache")),
+                },
+                slot_handoff: Some(&handoff),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+        );
+        let counts = handoff.counts();
+        let lines = progress.0.into_inner().unwrap();
+        assert!(
+            result.is_err(),
+            "an unusable owner-lock directory was not reported"
+        );
+        assert_eq!(counts, (1, 0), "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("owned must wait (probe_error)")),
+            "{lines:#?}"
+        );
+        assert!(slot.is_none(), "the slot was kept through a failed probe");
     }
 }

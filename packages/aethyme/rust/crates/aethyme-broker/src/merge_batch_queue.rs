@@ -767,15 +767,16 @@ mod tests {
         );
 
         // The deadline comes from the policy: a workspace gate that may wait
-        // 7500 s for its cache and run 2400 s at up to three times load keeps
-        // followers for its whole bound, far past the old 30 minutes.
+        // 7500 s for its cache (and 300 s for a slot), again on each of its
+        // two allowed re-queues, and run 2400 s at up to three times load
+        // keeps followers for its whole bound, far past the old 30 minutes.
         let gates = crate::gates::parse_gates(
             "[[gate]]\nname='workspace'\ncommand='true'\ncost=3\ntimeout_seconds=2400\nresource_wait_seconds=7500\n",
         )
         .unwrap();
         assert_eq!(
             follow_deadline(Some(&gates)),
-            Duration::from_secs(900 + 7500 + 300 + 7200)
+            Duration::from_secs(900 + 3 * (7500 + 300) + 7200)
         );
         assert_eq!(follow_deadline(None), FOLLOW_DEADLINE);
         assert_eq!(follow_deadline(Some(&[])), FOLLOW_DEADLINE);

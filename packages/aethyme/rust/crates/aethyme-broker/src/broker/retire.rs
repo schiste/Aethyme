@@ -1633,6 +1633,19 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> impl Fn(&crate::BrokerStore, &Path) -> bool + use<> {
+        self.verification_slot_trasher_with_temporary_root(
+            session_id,
+            std::env::temp_dir().join("aethyme-run"),
+        )
+    }
+
+    /// [`Self::verification_slot_trasher`] with the temporary-directory slot
+    /// fallback named explicitly (tests place slots there).
+    fn verification_slot_trasher_with_temporary_root(
+        &self,
+        session_id: i64,
+        temporary_root: PathBuf,
+    ) -> impl Fn(&crate::BrokerStore, &Path) -> bool + use<> {
         let main_root = self.main_root.clone();
         let common_dir = self
             .main_git_common_dir()
@@ -1644,7 +1657,7 @@ impl Broker {
                 store,
                 slot,
                 session_id,
-                &std::env::temp_dir().join("aethyme-run"),
+                &temporary_root,
             ),
             Err(_) => {
                 crate::phase_telemetry::add(
@@ -7182,6 +7195,77 @@ mod tests {
         let drained = broker
             .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
         assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// A slot the gates give back while they wait goes into the trash with
+    /// one rename and its trash row, through the same path as a submit's
+    /// final slot, and the gate's re-acquire then materializes the same
+    /// commit at that slot path again.
+    #[test]
+    fn a_slot_handed_back_by_the_gates_is_trashed_and_taken_again_in_place() {
+        use crate::gates::VerificationSlotHandoff as _;
+        let (_owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("handing a slot back", None).unwrap();
+        let main = broker.main_root().to_path_buf();
+        let head = broker.repo_handle().head_commit().unwrap();
+        let plan = crate::verification::default_worktree_root_plan(&main);
+        let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+            &main,
+            "handoff-trash",
+            1,
+            &plan,
+            Duration::MAX,
+            &mut |_, _| false,
+        )
+        .unwrap();
+        let checkout = slot
+            .as_mut()
+            .unwrap()
+            .materialize(broker.repo_handle(), &head)
+            .unwrap();
+        std::fs::write(checkout.root().join("gate-output.log"), "built\n").unwrap();
+        let path = slot.as_ref().unwrap().path().to_path_buf();
+        let canonical = path.canonicalize().unwrap();
+        let trash = broker.verification_slot_trasher_with_temporary_root(
+            session.id,
+            PathBuf::from("/no-such-temporary-root"),
+        );
+        let handoff = crate::verification::PooledSlotHandoff::new(
+            &mut slot,
+            &main,
+            "handoff-trash",
+            1,
+            &plan,
+            &head,
+            None,
+        )
+        .with_trash(&trash);
+
+        handoff.release(broker.store_ref());
+        assert!(
+            !path.exists(),
+            "the released slot's checkout was not moved away"
+        );
+        let rows = broker
+            .checkout_trash_rows()
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].stripped && !rows[0].pending && rows[0].session_id == session.id);
+
+        let again = handoff
+            .reacquire(&mut || {})
+            .unwrap()
+            .expect("the only slot was free again");
+        assert_eq!(again.root().canonicalize().unwrap(), canonical);
+        assert!(again.root().join("base.txt").exists());
+        assert!(
+            !again.root().join("gate-output.log").exists(),
+            "the re-acquired checkout kept the released one's output"
+        );
+        assert_eq!(handoff.counts(), (1, 1));
+        assert!(slot.is_some(), "the slot taken again is the caller's");
     }
 
     /// Two submits in a row reuse one slot path, each moving it into the
