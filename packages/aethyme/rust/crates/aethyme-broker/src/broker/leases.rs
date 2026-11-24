@@ -2920,7 +2920,7 @@ impl Broker {
             };
             crate::phase_telemetry::add_keyed(
                 "worktree_activity_after_first_look_timed_out",
-                ended,
+                &format!("{}.{ended}", lane.look_name()),
                 std::time::Duration::ZERO,
             );
         }
@@ -3137,6 +3137,7 @@ impl Broker {
         crate::worktree_status_activity::note_recent_verdict(
             &first_look,
             &first_activity,
+            candidate.last_activity_at,
             candidate.last_activity_at.max(merged_at).max(hook_activity),
             |at| recent(at, candidate.created_at),
         );
@@ -3617,6 +3618,7 @@ impl Broker {
         crate::worktree_status_activity::note_recent_verdict(
             &claimed_look,
             &claimed_activity,
+            current.last_activity_at,
             current.last_activity_at.max(merged_at),
             |at| recent(at, current.created_at),
         );
@@ -4306,11 +4308,13 @@ impl Broker {
                         .map(Option::unwrap_or_default),
                 )
             };
-            if let Some(now) = activity_now.as_ref() {
-                crate::worktree_status_activity::note_deciding_evidence(
+            if head_now.as_deref() == Some(proof.head.as_str())
+                && let Some(now) = activity_now.as_ref()
+            {
+                crate::worktree_status_activity::note_close_verdict(
                     &close_look,
-                    now.metadata_ms > claimed_fs_activity,
-                    now.status.complete && now.newest_ms() > claimed_fs_activity,
+                    &claimed_activity,
+                    now,
                 );
             }
             let activity_now = activity_now.map(|activity| activity.newest_ms());
@@ -8302,7 +8306,8 @@ mod generic_guarded_exec_tests {
         };
         // The looks, what decided the last one and how the judgement whose
         // first look timed out ended. Mutations caught: a look left untimed,
-        // the timeout flag not carried, the last look's index not compared.
+        // the timeout flag not carried, the lane left out of the ending, the
+        // last look judged although HEAD differs.
         let attached = recorder.attachments();
         for name in ["worktree_activity_look", "worktree_activity_look_timed_out"] {
             let looks = attached[name].as_object().unwrap();
@@ -8312,12 +8317,13 @@ mod generic_guarded_exec_tests {
                 "{name}"
             );
         }
-        assert_eq!(
-            attached["worktree_activity_index_head_decides"]["landed_close"]["count"],
-            1
+        assert!(
+            attached
+                .get("worktree_activity_index_head_decides")
+                .is_none_or(|looks| looks.get("landed_close").is_none())
         );
         assert_eq!(
-            attached["worktree_activity_after_first_look_timed_out"]["landed_sessions_declined_moved_before_close"]
+            attached["worktree_activity_after_first_look_timed_out"]["landed.landed_sessions_declined_moved_before_close"]
                 ["count"],
             1
         );

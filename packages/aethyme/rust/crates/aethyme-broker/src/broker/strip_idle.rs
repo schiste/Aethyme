@@ -510,10 +510,8 @@ pub(crate) fn recent_file_activity(
             .is_ok_and(|modified| modified >= since)
     };
     let index_head_decides = || {
-        crate::worktree_status_activity::note_deciding_evidence(
+        crate::worktree_status_activity::note_index_head_decides(
             crate::worktree_status_activity::IDLE_STRIP_LOOK,
-            true,
-            false,
         );
     };
     if let Some(admin) = git_admin_dir(worktree) {

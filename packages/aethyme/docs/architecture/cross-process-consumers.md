@@ -5294,25 +5294,47 @@ is `{count, total_ms, max_ms}` (metric attachments):
   lanes' last look), and `idle_strip`, whose only look is timed without the
   index and `HEAD` reads before it.
 - `worktree_activity_look_timed_out`: the looks whose `git status` ran out of
-  time, now or earlier in the same process (then without running Git).
+  time. It mixes fresh timeouts (about 2 s) with ones remembered from earlier
+  in the same process, which run no Git; the count
+  `worktree_status_activity_unavailable_remembered` tells them apart.
+- `worktree_activity_probe_newest`: looks where the probe's newest file was
+  newer than the index, `HEAD` and the session's recorded activity, whatever
+  was decided. An upper bound: zero for a close lane's `_first` and `_claimed`
+  looks means the probe mattered to none of their verdict, class gate,
+  closing-soon notice or moved-on holder check. The hook's and the merge's
+  time are not held against it, because the moved-on check does not read
+  them. For `_close` it compares with the index and `HEAD` alone, and for
+  `idle_strip` with the strip's idle cutoff.
 - `worktree_activity_index_head_decides`: looks the index or `HEAD` alone
-  already decided; for `_close`, one newer than the claimed look's evidence.
-  A session its own age keeps is not counted. `idle_strip` runs no probe then;
-  the close lanes do.
-- `worktree_activity_probe_changed_verdict`: looks where only a completed
-  probe, newer than the index, `HEAD` and the other activity, kept the
-  session. In a landed lane such a probe found a changed path, which the clean
-  check lists too, so it is not split by that check's verdict: learning that
-  verdict takes another Git call.
+  already decided. A session its own age keeps is not counted. `idle_strip`
+  runs no probe then; the close lanes do.
+- `worktree_activity_probe_changed_verdict`: looks where the probe examined
+  every changed path and only its newest file, not the index, `HEAD` or the
+  other activity, kept the session. `worktree_activity_capped_probe_changed_verdict`
+  is the same for a probe that stopped at its path cap after it found newer
+  evidence. Neither is split by the landed clean check's verdict: that check
+  usually lists the same paths, but not an untracked `.DS_Store` (unless
+  cleanup is strict), and learning its verdict takes another Git call.
+- `_close` looks are judged only while `HEAD` is still the proved one, and,
+  like the check, keep a session whose newest time differs (either way) from
+  the `_claimed` look's: `worktree_activity_index_head_decides` when the index
+  or `HEAD` time alone makes it differ, `worktree_activity_probe_changed_verdict`
+  when both probes examined every path, and
+  `worktree_activity_probe_answer_differs` when one of them did not (timed
+  out, failed or capped), so the difference may be the probe's alone. A look
+  that could not read the checkout is in none of them.
 - `worktree_activity_after_first_look_timed_out`: how a close judgement whose
-  first look timed out ended: `closed`, or the existing counter name of its
-  keep (`session_abandonment_kept_*`, `session_no_work_kept_*`,
-  `landed_sessions_declined_*`). The idle strip's answer after a timeout is
-  already counted by the `worktree_mtime_walk_*` counters.
+  first look timed out ended: the lane, a dot and `closed` or the existing
+  counter name of its keep (`session_abandonment_kept_*`,
+  `session_no_work_kept_*`, `landed_sessions_declined_*`). The idle strip's
+  answer after a timeout is already counted by the `worktree_mtime_walk_*`
+  counters.
 - `landed_proof_worktree_clean_by_probe`: the landed proof's uncommitted-path
   check (not the one that also lists ignored content for
   `ignored_directory_sweep`), by what ran before it on the same thread and
   checkout within 30 s: `after_probe`, `after_timed_out_probe` or `no_probe`.
+  It includes proofs made outside a close judgement, and a remembered timeout
+  reads as `no_probe` once the fresh one is older than that.
 
 The looks run on the thread that judges the session, which is the thread that
 records; none is handed to a worker thread. Covered by

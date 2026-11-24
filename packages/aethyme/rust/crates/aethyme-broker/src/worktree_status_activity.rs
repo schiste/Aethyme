@@ -64,43 +64,86 @@ pub(crate) fn note_look(look: &str, elapsed: Duration, timed_out: bool) {
     }
 }
 
-/// Record what decided a look, for `index_head` (the Git index or HEAD alone
-/// decides it) or `probe_changed` (only a completed probe's newer file did).
-pub(crate) fn note_deciding_evidence(look: &str, index_head: bool, probe_changed: bool) {
-    if index_head {
-        crate::phase_telemetry::add_keyed(
-            "worktree_activity_index_head_decides",
-            look,
-            Duration::ZERO,
-        );
-    } else if probe_changed {
-        crate::phase_telemetry::add_keyed(
-            "worktree_activity_probe_changed_verdict",
-            look,
-            Duration::ZERO,
-        );
+fn count_look(name: &'static str, look: &str) {
+    crate::phase_telemetry::add_keyed(name, look, Duration::ZERO);
+}
+
+/// Record that the Git index or HEAD alone decided a look.
+pub(crate) fn note_index_head_decides(look: &str) {
+    count_look("worktree_activity_index_head_decides", look);
+}
+
+/// Record that only the probe's newer file kept the session: told apart by
+/// whether the probe examined every changed path or stopped at its cap.
+fn note_probe_changed_verdict(look: &str, complete: bool) {
+    count_look(
+        if complete {
+            "worktree_activity_probe_changed_verdict"
+        } else {
+            "worktree_activity_capped_probe_changed_verdict"
+        },
+        look,
+    );
+}
+
+/// Record a probe whose newest file outranks the index, HEAD and `floor_ms`:
+/// an upper bound on the looks where the probe can have mattered to anything.
+fn note_probe_newest(look: &str, activity: &WorktreeActivity, floor_ms: i64) {
+    if activity
+        .status
+        .newest_ms
+        .is_some_and(|changed| changed > activity.metadata_ms.max(floor_ms))
+    {
+        count_look("worktree_activity_probe_newest", look);
     }
 }
 
 /// Record what decided a look that asks whether a session is recent:
-/// `recent` judges a time, `other_ms` is the newest evidence from elsewhere.
+/// `recent` judges a time, `session_ms` is the session's recorded activity
+/// and `other_ms` the newest evidence from elsewhere (that included).
 pub(crate) fn note_recent_verdict(
     look: &str,
     activity: &WorktreeActivity,
+    session_ms: i64,
     other_ms: i64,
     recent: impl Fn(i64) -> bool,
 ) {
+    // Against the evidence every reader shares: whether a holder moved on is
+    // judged without the hook's or the merge's time, so a probe newer than
+    // the session's own activity alone can matter there.
+    note_probe_newest(look, activity, session_ms);
     // The session's own age already decides: no evidence does.
     if recent(0) {
         return;
     }
-    note_deciding_evidence(
-        look,
-        recent(activity.metadata_ms),
-        activity.status.complete
-            && !recent(activity.metadata_ms.max(other_ms))
-            && recent(activity.newest_ms().max(other_ms)),
-    );
+    if recent(activity.metadata_ms) {
+        note_index_head_decides(look);
+    } else if !recent(activity.metadata_ms.max(other_ms))
+        && recent(activity.newest_ms().max(other_ms))
+    {
+        note_probe_changed_verdict(look, activity.status.complete);
+    }
+}
+
+/// Record what decided the last look, which keeps the session when the newest
+/// time differs from the `claimed` look's (asked only while HEAD is the same).
+pub(crate) fn note_close_verdict(look: &str, claimed: &WorktreeActivity, now: &WorktreeActivity) {
+    note_probe_newest(look, now, 0);
+    if now.newest_ms() == claimed.newest_ms() {
+        return;
+    }
+    if now.metadata_ms > claimed.newest_ms()
+        || (now.metadata_ms != claimed.metadata_ms
+            && now.status.newest_ms == claimed.status.newest_ms)
+    {
+        note_index_head_decides(look);
+    } else if now.status.complete && claimed.status.complete {
+        note_probe_changed_verdict(look, true);
+    } else {
+        // The two probes did not answer alike (one timed out, failed or
+        // stopped at its cap): not necessarily a change in the checkout.
+        count_look("worktree_activity_probe_answer_differs", look);
+    }
 }
 
 /// How long after a probe a Git call on the same checkout counts as right
@@ -290,11 +333,10 @@ pub(crate) fn recent_status_activity(worktree: &Path, since: SystemTime) -> Opti
     let activity = status_activity(worktree, STATUS_ACTIVITY_BUDGET, STATUS_ACTIVITY_PATH_CAP);
     note_look(IDLE_STRIP_LOOK, started.elapsed(), activity.timed_out);
     // Asked only once nothing cheaper showed activity.
-    note_deciding_evidence(
-        IDLE_STRIP_LOOK,
-        false,
-        activity.complete && activity.newest_ms.is_some_and(|newest| newest >= since_ms),
-    );
+    if activity.newest_ms.is_some_and(|newest| newest >= since_ms) {
+        count_look("worktree_activity_probe_newest", IDLE_STRIP_LOOK);
+        note_probe_changed_verdict(IDLE_STRIP_LOOK, activity.complete);
+    }
     if activity.newest_ms.is_some_and(|newest| newest >= since_ms) {
         return Some(true);
     }
@@ -465,8 +507,9 @@ mod tests {
     }
 
     /// What decided a look is recorded once, under its name. Mutations
-    /// caught: counting a probe that other evidence outranks, one that did
-    /// not complete, or a session its own age keeps.
+    /// caught: counting a verdict other evidence outranks or a session its own
+    /// age keeps, counting a capped probe as a complete one, and holding the
+    /// upper bound to the other evidence or to the verdict.
     #[test]
     fn the_evidence_that_decided_a_look_is_counted() {
         let recorder = crate::phase_telemetry::Recorder::default();
@@ -479,7 +522,7 @@ mod tests {
                     ..StatusActivity::default()
                 },
             };
-            note_recent_verdict(name, &activity, other_ms, |ms| ms >= since);
+            note_recent_verdict(name, &activity, 7, other_ms, |ms| ms >= since);
         };
         {
             let _installed = crate::phase_telemetry::install(recorder.clone());
@@ -504,10 +547,61 @@ mod tests {
         assert_eq!(keys("worktree_activity_index_head_decides"), ["index"]);
         assert_eq!(keys("worktree_activity_probe_changed_verdict"), ["probe"]);
         assert_eq!(
+            keys("worktree_activity_capped_probe_changed_verdict"),
+            ["capped"]
+        );
+        // Every probe newer than the index, HEAD and the session's activity,
+        // whatever was decided; not "old" (6, the session was active at 7).
+        assert_eq!(
+            keys("worktree_activity_probe_newest"),
+            ["capped", "index", "outranked", "probe", "young"]
+        );
+        assert_eq!(
             keys("worktree_activity_look"),
             ["landed_close", "landed_first"]
         );
         assert_eq!(keys("worktree_activity_look_timed_out"), ["landed_close"]);
+    }
+
+    /// The last look compares with `!=` and tells a changed checkout from
+    /// two probes that did not answer alike. Mutations caught: comparing with
+    /// `>`, counting an equal time, counting a probe that stopped answering
+    /// as a change, and taking a moved index for one.
+    #[test]
+    fn the_last_look_tells_a_change_from_a_probe_that_answered_differently() {
+        let at = |metadata_ms, newest_ms, complete| WorktreeActivity {
+            metadata_ms,
+            status: StatusActivity {
+                newest_ms,
+                complete,
+                ..StatusActivity::default()
+            },
+        };
+        let seen = |claimed: WorktreeActivity, now: WorktreeActivity| {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                note_close_verdict("landed_close", &claimed, &now);
+            }
+            recorder
+                .attachments()
+                .into_keys()
+                .filter(|name| name != "worktree_activity_probe_newest")
+                .collect::<Vec<_>>()
+        };
+        let index = ["worktree_activity_index_head_decides"];
+        let changed = ["worktree_activity_probe_changed_verdict"];
+        let differs = ["worktree_activity_probe_answer_differs"];
+        assert!(seen(at(5, Some(8), true), at(5, Some(8), true)).is_empty());
+        assert!(seen(at(5, None, false), at(5, Some(4), true)).is_empty());
+        assert_eq!(seen(at(5, Some(8), true), at(9, Some(8), true)), index);
+        assert_eq!(seen(at(5, None, true), at(4, None, true)), index);
+        assert_eq!(seen(at(5, Some(8), true), at(5, Some(9), true)), changed);
+        assert_eq!(seen(at(5, Some(8), true), at(5, Some(7), true)), changed);
+        assert_eq!(seen(at(5, Some(8), true), at(5, None, true)), changed);
+        assert_eq!(seen(at(5, Some(8), true), at(5, None, false)), differs);
+        assert_eq!(seen(at(5, None, false), at(5, Some(8), true)), differs);
+        assert_eq!(seen(at(5, Some(8), false), at(5, Some(9), true)), differs);
     }
 
     #[test]
@@ -575,7 +669,19 @@ mod tests {
         assert_eq!(recent_status_activity(worktree, since), Some(false));
         std::fs::write(worktree.join("src/a/b/c.rs"), "two\n").unwrap();
         set(&worktree.join("src/a/b"), old);
-        assert_eq!(recent_status_activity(worktree, since), Some(true));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            assert_eq!(recent_status_activity(worktree, since), Some(true));
+        }
+        let attached = recorder.attachments();
+        for name in [
+            "worktree_activity_look",
+            "worktree_activity_probe_newest",
+            "worktree_activity_probe_changed_verdict",
+        ] {
+            assert_eq!(attached[name][IDLE_STRIP_LOOK]["count"], 1, "{name}");
+        }
         set(&worktree.join("src/a/b/c.rs"), old);
         assert_eq!(recent_status_activity(worktree, since), Some(false));
         // A deep edit inside a new untracked directory is seen too.
