@@ -7,6 +7,7 @@ use super::candidate_revision_v2::{Item, Snapshot, snapshot_digest};
 use super::portable_v2::{CandidateArtifacts, candidate_binding};
 use super::strict::{DecisionInputs, parse_change, parse_unique, strict_precheck_v1};
 use serde_json::{Value, json};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
@@ -499,17 +500,18 @@ fn verify_collection_statuses(
         if status == "not_checked" {
             continue;
         }
-        let key = (field, group);
-        if !cache.contains_key(&key) {
-            work = work
-                .checked_add(items.len())
-                .ok_or("collection comparison work limit exceeded")?;
-            if work > COLLECTION_MAX_WORK {
-                return Err("collection comparison work limit exceeded");
+        let actual = match cache.entry((field, group)) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                work = work
+                    .checked_add(items.len())
+                    .ok_or("collection comparison work limit exceeded")?;
+                if work > COLLECTION_MAX_WORK {
+                    return Err("collection comparison work limit exceeded");
+                }
+                *entry.insert(collection_uniqueness_status(collection, field, group)?)
             }
-            cache.insert(key, collection_uniqueness_status(collection, field, group)?);
-        }
-        let actual = cache[&key];
+        };
         if actual == "not_checked" {
             return Err("collection gate cannot assess incomplete observations");
         }
