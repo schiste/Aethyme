@@ -908,6 +908,7 @@ fn process_use_verdict(
     exempt_holder: Option<i64>,
     require_landed: bool,
 ) -> Option<AbandonedSessionCloseOutcome> {
+    let _span = crate::phase_telemetry::span("session_close_process_use");
     let Some(open_files) = process_table.process_use_snapshot_for_retirement(root, deadline) else {
         let throttled = process_table.process_use_throttled();
         process_table.note_keep_reason(if throttled {
@@ -3346,7 +3347,11 @@ impl Broker {
         // refused the listing (a worker that inherited a caller's sandbox)
         // closes nothing, `Unbound` sessions included, which need no holder
         // listing of their own.
-        if let Err(denied) = process_table.require_complete_listing(allow_process_snapshot) {
+        let listing = {
+            let _span = crate::phase_telemetry::span("session_close_process_listing");
+            process_table.require_complete_listing(allow_process_snapshot)
+        };
+        if let Err(denied) = listing {
             let (reason, outcome) = if require_landed {
                 (
                     AbandonmentKeepReason::LandedDeclined,
@@ -3410,11 +3415,15 @@ impl Broker {
         // Both claims (the operation claim below, the lifecycle claim at the
         // close) are non-blocking: a busy one declines the session
         // (`busy`) instead of waiting, so this pass never waits on a lock here.
-        let _operation_claim = match crate::file_lock::try_acquire_session_operation_guard(
-            self.main_root(),
-            session_id,
-            crate::file_lock::SessionOperationLockMode::Exclusive,
-        ) {
+        let operation_claim = {
+            let _span = crate::phase_telemetry::span("session_close_operation_guard");
+            crate::file_lock::try_acquire_session_operation_guard(
+                self.main_root(),
+                session_id,
+                crate::file_lock::SessionOperationLockMode::Exclusive,
+            )
+        };
+        let _operation_claim = match operation_claim {
             Ok(Some(guard)) => guard,
             Ok(None) => {
                 return Ok(keep_with(
@@ -3474,17 +3483,25 @@ impl Broker {
         // A running `broker start` (a `--reuse` of this checkout included)
         // reserves the path before it records anything: the checkout is in
         // use, and closing it now would race that start.
-        if crate::start_reservation::path_is_reserved(
-            self.main_root(),
-            std::path::Path::new(&current.worktree_path),
-        ) {
+        let start_reserved = {
+            let _span = crate::phase_telemetry::span("session_close_start_reservation");
+            crate::start_reservation::path_is_reserved(
+                self.main_root(),
+                std::path::Path::new(&current.worktree_path),
+            )
+        };
+        if start_reserved {
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::StartReserved,
                 AbandonedSessionCloseOutcome::OperationActive,
             ));
         }
-        let fs_activity = match checked_worktree_activity_ms(self.main_root(), &current) {
+        let claimed_activity = {
+            let _span = crate::phase_telemetry::span("session_close_checkout_activity");
+            checked_worktree_activity_ms(self.main_root(), &current)
+        };
+        let fs_activity = match claimed_activity {
             Ok(activity) => activity.unwrap_or(0),
             Err(_) => {
                 return Ok(keep_with(
@@ -3568,12 +3585,15 @@ impl Broker {
                     AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
                 ));
             }
-            let gates = crate::gates::checked_running_session_gates_until(
-                self.main_root(),
-                session_id,
-                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
-                256,
-            );
+            let gates = {
+                let _span = crate::phase_telemetry::span("session_close_gates");
+                crate::gates::checked_running_session_gates_until(
+                    self.main_root(),
+                    session_id,
+                    || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+                    256,
+                )
+            };
             let Some(gates) = gates else {
                 return Ok(keep_with(
                     process_table,
@@ -3588,7 +3608,11 @@ impl Broker {
                     AbandonedSessionCloseOutcome::OperationActive,
                 ));
             }
-            match self.session_operations_unresolved_since_boot(session_id) {
+            let unresolved_operations = {
+                let _span = crate::phase_telemetry::span("session_close_operations");
+                self.session_operations_unresolved_since_boot(session_id)
+            };
+            match unresolved_operations {
                 Ok(true) => {
                     return Ok(keep_with(
                         process_table,
@@ -3608,7 +3632,11 @@ impl Broker {
             // A submission still being simulated, gated or awaiting promotion
             // is work in flight for this session.
             if merged_lane || no_work_lane || moved_on_to.is_some() {
-                match self.store_ref().latest_merge_queue_for_session(session_id) {
+                let queue_entry = {
+                    let _span = crate::phase_telemetry::span("session_close_merge_queue");
+                    self.store_ref().latest_merge_queue_for_session(session_id)
+                };
+                match queue_entry {
                     Ok(Some(entry))
                         if matches!(
                             entry.status,
@@ -3633,22 +3661,46 @@ impl Broker {
                     }
                 }
             }
-            match self.preparation_status(session_id) {
-                Ok(status) if status.state == crate::PreparationState::InProgress => {
+            // Asked only inside this block: a Landed close of a session whose
+            // holder has no task lease and has not moved on never reaches it.
+            // The landed lanes already proved the work landed, so only a
+            // running preparation, or one that cannot be ruled out, keeps the
+            // session: the declaration and the record answer that. An invalid
+            // or unknown answer is `operation_unknown`, so past the landed
+            // window a merged-pull-request session is retried in the Landed
+            // lane, which may skip this block. Every other lane keeps the
+            // full status, input hashes included.
+            let preparation = if require_landed {
+                self.preparation_activity(&current).map_err(drop)
+            } else {
+                self.preparation_status(session_id)
+                    .map(|status| match status.state {
+                        crate::PreparationState::InProgress => {
+                            crate::preparation::PreparationActivity::InProgress
+                        }
+                        crate::PreparationState::Invalid => {
+                            crate::preparation::PreparationActivity::Invalid
+                        }
+                        _ => crate::preparation::PreparationActivity::Idle,
+                    })
+                    .map_err(drop)
+            };
+            match preparation {
+                Ok(crate::preparation::PreparationActivity::InProgress) => {
                     return Ok(keep_with(
                         process_table,
                         AbandonmentKeepReason::PreparationInProgress,
                         AbandonedSessionCloseOutcome::OperationActive,
                     ));
                 }
-                Ok(status) if status.state == crate::PreparationState::Invalid => {
+                Ok(crate::preparation::PreparationActivity::Invalid) => {
                     return Ok(keep_with(
                         process_table,
                         AbandonmentKeepReason::PreparationInvalid,
                         AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
                     ));
                 }
-                Ok(_) => {}
+                Ok(crate::preparation::PreparationActivity::Idle) => {}
                 Err(_) => {
                     return Ok(keep_with(
                         process_table,
@@ -3668,10 +3720,14 @@ impl Broker {
                     ));
                 }
             }
-            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-                self.main_root(),
-                worktree,
-            ) {
+            let reclaimer = {
+                let _span = crate::phase_telemetry::span("session_close_artifact_use");
+                crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                    self.main_root(),
+                    worktree,
+                )
+            };
+            match reclaimer {
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reclaimer)) => {
                     _artifact_use_reclaimer = Some(reclaimer);
                 }
@@ -3843,6 +3899,7 @@ impl Broker {
             }
         }
         if !explicit_leases.is_empty() {
+            let _span = crate::phase_telemetry::span("session_close_explicit_claims");
             let bound_holder =
                 crate::session_holder::recorded_holder(self.store_ref(), session_id)?;
             let shared_holder = bound_holder.as_ref().is_some_and(|holder| {
@@ -4106,9 +4163,11 @@ impl Broker {
                     AbandonedSessionCloseOutcome::Changed,
                 ));
             };
-            if let Some(reason) =
+            let moved = {
+                let _span = crate::phase_telemetry::span("landed_proof_recheck");
                 self.landed_proof_still_holds(&current, proof, deadline, session_deadline)
-            {
+            };
+            if let Some(reason) = moved {
                 return Ok(keep_with(
                     process_table,
                     AbandonmentKeepReason::LandedDeclined,
@@ -4129,10 +4188,15 @@ impl Broker {
             #[cfg(test)]
             process_table.run_before_landed_close_for_test();
             let worktree = std::path::Path::new(&current.worktree_path);
-            let head_now = current_checkout_head(worktree);
-            let activity_now = checked_worktree_activity_ms(self.main_root(), &current)
-                .ok()
-                .map(|activity| activity.unwrap_or(0));
+            let (head_now, activity_now) = {
+                let _span = crate::phase_telemetry::span("landed_close_head_and_activity");
+                (
+                    current_checkout_head(worktree),
+                    checked_worktree_activity_ms(self.main_root(), &current)
+                        .ok()
+                        .map(|activity| activity.unwrap_or(0)),
+                )
+            };
             if head_now.as_deref() != Some(proof.head.as_str())
                 || activity_now != Some(claimed_fs_activity)
             {
@@ -4147,7 +4211,11 @@ impl Broker {
             // The pull requests are read again under the operation claim, last: a new pull
             // request, a reopened one or a later merge changes the evidence.
             if let Some((merges, _)) = merged_evidence.as_ref() {
-                match self.merged_pull_request_evidence(&current) {
+                let reread = {
+                    let _span = crate::phase_telemetry::span("landed_merged_pr_evidence_recheck");
+                    self.merged_pull_request_evidence(&current)
+                };
+                match reread {
                     Ok((current_merges, _)) if current_merges == *merges => {}
                     Ok(_) => {
                         return Ok(keep_with(
@@ -4177,6 +4245,7 @@ impl Broker {
                 ));
             };
             let last_look = {
+                let _span = crate::phase_telemetry::span("landed_close_last_look");
                 let _git_deadline = session_deadline.map(crate::git::limit_git_until);
                 crate::auto_cleanup::uncommitted_reason(
                     worktree,
@@ -4325,7 +4394,10 @@ impl Broker {
                 }
             }
         };
-        let cleanup_request = self.checkout_cleanup_request_policy(&current);
+        let cleanup_request = {
+            let _span = crate::phase_telemetry::span("session_close_cleanup_request");
+            self.checkout_cleanup_request_policy(&current)
+        };
         #[cfg(test)]
         AFTER_SECOND_LOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -4371,10 +4443,14 @@ impl Broker {
         }
         // A running `broker start` (a `--reuse` of this checkout included)
         // reserves the path before it records anything.
-        if crate::start_reservation::path_is_reserved(
-            self.main_root(),
-            std::path::Path::new(&current.worktree_path),
-        ) {
+        let start_reserved = {
+            let _span = crate::phase_telemetry::span("session_close_start_reservation");
+            crate::start_reservation::path_is_reserved(
+                self.main_root(),
+                std::path::Path::new(&current.worktree_path),
+            )
+        };
+        if start_reserved {
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::StartReserved,

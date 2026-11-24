@@ -12,7 +12,7 @@
 //! `subprocess_git` time) and worker threads add to the same total, so a span
 //! can exceed the command's wall time and spans must not be summed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ struct Accumulated {
     totals: BTreeMap<&'static str, Totals>,
     attachments: BTreeMap<&'static str, serde_json::Value>,
     intervals: Vec<(Instant, Instant, bool)>,
+    distinct: BTreeMap<&'static str, BTreeSet<i64>>,
 }
 
 /// One command's accumulated spans, shared with its worker threads.
@@ -200,6 +201,19 @@ pub(crate) fn attach(name: &'static str, value: serde_json::Value) {
     });
 }
 
+/// Count `id` under `name` once, however often it is seen while recording.
+/// The metric line carries only how many distinct ids were seen
+/// (`phase_distinct_counts`), never the ids.
+pub(crate) fn add_distinct(name: &'static str, id: i64) {
+    ACTIVE.with(|active| {
+        if let Some(recorder) = active.borrow().as_ref()
+            && let Ok(mut accumulated) = recorder.0.lock()
+        {
+            accumulated.distinct.entry(name).or_default().insert(id);
+        }
+    });
+}
+
 /// The span name for a child process: Git is by far the most frequent child
 /// and the one whose cost depends on the repository, so it is told apart.
 pub(crate) fn subprocess_span(command: &std::process::Command) -> Span {
@@ -281,11 +295,20 @@ impl Recorder {
         let Ok(accumulated) = self.0.lock() else {
             return BTreeMap::new();
         };
-        accumulated
+        let mut attachments: BTreeMap<String, serde_json::Value> = accumulated
             .attachments
             .iter()
             .map(|(name, value)| (name.to_string(), value.clone()))
-            .collect()
+            .collect();
+        if !accumulated.distinct.is_empty() {
+            let counts: BTreeMap<&str, usize> = accumulated
+                .distinct
+                .iter()
+                .map(|(name, ids)| (*name, ids.len()))
+                .collect();
+            attachments.insert("phase_distinct_counts".into(), serde_json::json!(counts));
+        }
+        attachments
     }
 }
 
@@ -334,6 +357,26 @@ mod tests {
         assert_eq!(costs["queue_wait_ms"], 5);
         assert_eq!(costs["broker_and_unattributed_ms"], 0);
         assert_eq!(costs["retries"], 1);
+    }
+
+    #[test]
+    fn distinct_counts_count_each_id_once_and_attach_no_id() {
+        let recorder = Recorder::default();
+        {
+            let _installed = install(recorder.clone());
+            for id in [4_711, 4_712, 4_711] {
+                add_distinct("judged", id);
+            }
+        }
+        add_distinct("judged", 4_713);
+        assert_eq!(
+            recorder.attachments()["phase_distinct_counts"],
+            serde_json::json!({ "judged": 2 })
+        );
+        assert!(
+            Recorder::default().attachments().is_empty(),
+            "absent when nothing was counted"
+        );
     }
 
     #[test]

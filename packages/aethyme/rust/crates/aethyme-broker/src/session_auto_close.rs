@@ -1282,6 +1282,10 @@ mod lane_tests {
             phase_count(&recorder, "landed_sessions_declined_proof_timed_out"),
             1
         );
+        assert_eq!(
+            recorder.attachments()["phase_distinct_counts"]["landed_sessions_examined"],
+            2
+        );
     }
 
     /// Every condition the merged-pull-request window cannot prove keeps the
@@ -1612,6 +1616,406 @@ mod lane_tests {
         reason: crate::broker::LandedSessionDecline,
     ) -> crate::broker::AbandonedSessionCloseOutcome {
         crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(reason)
+    }
+
+    /// Where the session's preparation record lives, its directory created.
+    fn preparation_record(broker: &crate::Broker, session: &crate::Session) -> PathBuf {
+        let directory = broker.main_root().join(".aethyme/run/preparation");
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join(format!("session-{}.json", session.id))
+    }
+
+    fn write_preparation_record(broker: &crate::Broker, session: &crate::Session, state: &str) {
+        write_preparation_record_started(broker, session, state, 1);
+    }
+
+    fn write_preparation_record_started(
+        broker: &crate::Broker,
+        session: &crate::Session,
+        state: &str,
+        started_at: i64,
+    ) {
+        std::fs::write(
+            preparation_record(broker, session),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": session.id,
+                "state": state,
+                "digest": "fixture",
+                "source_digest": "fixture",
+                "started_at": started_at,
+                "completed_at": null,
+                "failed_step": null,
+                "exit_code": null,
+                "host_lease_id": null,
+                "host_lease_generation": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A declaration whose input does not exist and whose output was never
+    /// made: the full status reads `invalid`.
+    fn declare_preparation(worktree: &Path) {
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n[[steps]]\nname = \"deps\"\ncommand = [\"true\"]\n\
+             inputs = [\"absent.lock\"]\noutputs = [\"vendor/\"]\n",
+        )
+        .unwrap();
+    }
+
+    fn declare_text(worktree: &Path, text: &[u8]) {
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(worktree.join(".aethyme/prepare.toml"), text).unwrap();
+    }
+
+    /// The landed close asks the preparation record, not the prepared state:
+    /// it closes with a finished, failed or absent record without hashing
+    /// one declared input, even when the full status would be `invalid`.
+    #[test]
+    fn a_landed_close_hashes_no_preparation_input() {
+        let (_owner, _storage, mut broker) = fixture("");
+        for state in [None, Some("current"), Some("failed")] {
+            let (session, worktree) = merged_candidate(&mut broker, &format!("prepared {state:?}"));
+            declare_preparation(&worktree);
+            if let Some(state) = state {
+                write_preparation_record(&broker, &session, state);
+            }
+            quiet(&mut broker, &session, 3);
+            let computed =
+                || crate::preparation::SOURCE_DIGESTS_COMPUTED.with(std::cell::Cell::get);
+            let before_status = computed();
+            assert_eq!(
+                broker.preparation_status(session.id).unwrap().state,
+                crate::PreparationState::Invalid
+            );
+            assert!(computed() > before_status, "the counter sees a full status");
+
+            let before = computed();
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let outcome = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+                close_directly(&mut broker, &session, &mut table)
+            };
+
+            assert_eq!(
+                outcome,
+                crate::broker::AbandonedSessionCloseOutcome::Closed,
+                "{state:?}"
+            );
+            assert_eq!(computed(), before, "{state:?}");
+            assert_eq!(phase_count(&recorder, "preparation_record_check"), 1);
+            assert_eq!(phase_count(&recorder, "preparation_status"), 0);
+        }
+    }
+
+    /// Bind a gone holder that entered the task-lease protocol, and age the
+    /// session.
+    fn quiet_with_task_lease(broker: &mut crate::Broker, session: &crate::Session, hours: u64) {
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "fixture-agent".into(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_task_lease_bound_payload(
+                    &holder, "fixture", None,
+                )),
+            )
+            .unwrap();
+        age(broker, session, hours);
+    }
+
+    /// The Landed lane asks the record check when the holder has a task
+    /// lease binding, and not at all for a legacy binding.
+    #[test]
+    fn the_landed_lane_asks_the_record_for_a_task_lease_holder_only() {
+        use crate::broker::AbandonedSessionCloseOutcome as Outcome;
+        for (label, task_lease, state, expected, asked) in [
+            ("leased, ended", true, "current", Outcome::Closed, 1),
+            (
+                "leased, running",
+                true,
+                "in_progress",
+                Outcome::OperationActive,
+                1,
+            ),
+            ("legacy holder", false, "in_progress", Outcome::Closed, 0),
+        ] {
+            let (_owner, _storage, mut broker) = fixture("");
+            let (session, worktree) = session(&mut broker, label, true);
+            declare_preparation(&worktree);
+            write_preparation_record(&broker, &session, state);
+            if task_lease {
+                quiet_with_task_lease(&mut broker, &session, 30);
+            } else {
+                quiet(&mut broker, &session, 30);
+            }
+            let computed =
+                || crate::preparation::SOURCE_DIGESTS_COMPUTED.with(std::cell::Cell::get);
+            let before = computed();
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let outcome = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+                broker
+                    .try_close_landed_session(
+                        session.id,
+                        now_ms(),
+                        24 * HOUR_MS,
+                        &mut table,
+                        true,
+                        None,
+                    )
+                    .unwrap()
+            };
+
+            assert_eq!(outcome, expected, "{label}");
+            assert_eq!(computed(), before, "{label}");
+            assert_eq!(
+                phase_count(&recorder, "preparation_record_check"),
+                asked,
+                "{label}"
+            );
+            assert_eq!(phase_count(&recorder, "preparation_status"), 0, "{label}");
+        }
+    }
+
+    /// The abandonment and no-work lanes keep the full status: a missing
+    /// declared input still keeps their session.
+    #[test]
+    fn the_abandonment_and_no_work_lanes_still_read_the_full_status() {
+        use crate::broker::{AbandonedSessionCloseOutcome as Outcome, AbandonmentKeepReason};
+        let (_owner, _storage, mut broker) = fixture("");
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let (abandoned, abandoned_tree) = session(&mut broker, "abandoned", false);
+        declare_preparation(&abandoned_tree);
+        quiet_with_task_lease(&mut broker, &abandoned, 80);
+        let (idle, idle_tree) = no_work_session(&mut broker, "no work");
+        declare_preparation(&idle_tree);
+        quiet(&mut broker, &idle, 5);
+
+        let mut judge = |no_work: bool, session: &crate::Session| {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            let outcome = if no_work {
+                close_no_work_directly(&mut broker, session, &mut table)
+            } else {
+                close_abandoned_directly(&mut broker, session, &mut table)
+            };
+            (
+                outcome,
+                table.keep_reason(),
+                phase_count(&recorder, "preparation_status"),
+                phase_count(&recorder, "preparation_record_check"),
+            )
+        };
+        let judged = [judge(false, &abandoned), judge(true, &idle)];
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+
+        for judged in judged {
+            assert_eq!(
+                judged,
+                (
+                    Outcome::OperationEvidenceUnavailable,
+                    Some(AbandonmentKeepReason::PreparationInvalid),
+                    1,
+                    0
+                )
+            );
+        }
+        assert!(is_open(&broker, abandoned.id));
+        assert!(is_open(&broker, idle.id));
+    }
+
+    /// What the full status cannot use (a symlinked or unreadable declared
+    /// input or output) says nothing about a running preparation: the
+    /// landed lanes close over it.
+    #[test]
+    fn a_landed_close_ignores_unusable_inputs_and_outputs() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for case in [
+            "symlinked input",
+            "unreadable input",
+            "symlinked output",
+            "unreadable output",
+        ] {
+            let (_owner, _storage, mut broker) = fixture("");
+            let (session, worktree) = merged_candidate(&mut broker, case);
+            // Everything is under the ignored `.aethyme/`: the checkout stays
+            // clean. `file/vendor` cannot be looked up: `file` is no
+            // directory.
+            let state = worktree.join(".aethyme");
+            let (input, output) = match case {
+                "symlinked input" | "unreadable input" => (".aethyme/lock", ".aethyme/vendor"),
+                "symlinked output" => (".aethyme/file", ".aethyme/vendor"),
+                _ => (".aethyme/file", ".aethyme/file/vendor"),
+            };
+            declare_text(
+                &worktree,
+                format!(
+                    "schema_version = 1\n[[steps]]\nname = \"deps\"\ncommand = [\"true\"]\n\
+                     inputs = [\"{input}\"]\noutputs = [\"{output}\"]\n"
+                )
+                .as_bytes(),
+            );
+            std::fs::write(state.join("file"), "file\n").unwrap();
+            match case {
+                "symlinked input" => symlink("file", state.join("lock")).unwrap(),
+                "unreadable input" => std::fs::write(state.join("lock"), "lock\n").unwrap(),
+                "symlinked output" => symlink("file", state.join("vendor")).unwrap(),
+                _ => {}
+            }
+            quiet(&mut broker, &session, 3);
+            if case == "unreadable input" {
+                let lock = state.join("lock");
+                std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o0)).unwrap();
+            }
+            let status = broker.preparation_status(session.id);
+            match case {
+                // A root user reads a mode-0 file: the input is usable.
+                "unreadable input" if std::fs::File::open(state.join("lock")).is_ok() => {}
+                "symlinked input" | "unreadable input" => assert_eq!(
+                    status.unwrap().state,
+                    crate::PreparationState::Invalid,
+                    "{case}"
+                ),
+                _ => assert!(status.is_err(), "{case}: {status:?}"),
+            }
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+
+            assert_eq!(
+                close_directly(&mut broker, &session, &mut table),
+                crate::broker::AbandonedSessionCloseOutcome::Closed,
+                "{case}"
+            );
+        }
+    }
+
+    /// An in-progress record without a host lease whose declaration was
+    /// removed ends with the boot that wrote it: nothing else can prove its
+    /// end. With a declaration, or started since the boot, or with the boot
+    /// unknown, it keeps the session.
+    #[test]
+    fn a_lease_less_record_without_a_declaration_ends_with_its_boot() {
+        let boot = now_ms() - HOUR_MS;
+        for (label, boot, declared, started_at, closes) in [
+            ("before the boot", Some(boot), false, 1, true),
+            ("no start time", Some(boot), false, 0, false),
+            ("negative start time", Some(boot), false, -1, false),
+            ("since the boot", Some(boot), false, boot + 1, false),
+            ("inside the margin", Some(boot), false, boot - 1, false),
+            ("boot unknown", None, false, 1, false),
+            ("declared", Some(boot), true, 1, false),
+        ] {
+            let (_owner, _storage, mut broker) = fixture("");
+            let (session, worktree) = merged_candidate(&mut broker, label);
+            if declared {
+                declare_preparation(&worktree);
+            }
+            write_preparation_record_started(&broker, &session, "in_progress", started_at);
+            quiet(&mut broker, &session, 3);
+            crate::host_boot::set_boot_time_ms_for_tests(boot);
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let installed = crate::phase_telemetry::install(recorder.clone());
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            let outcome = close_directly(&mut broker, &session, &mut table);
+            drop(installed);
+            crate::host_boot::set_boot_time_ms_for_tests(None);
+
+            assert_eq!(
+                phase_count(&recorder, "preparation_pre_boot_without_lease"),
+                u64::from(closes),
+                "{label}"
+            );
+
+            assert_eq!(
+                outcome == crate::broker::AbandonedSessionCloseOutcome::Closed,
+                closes,
+                "{label}: {outcome:?}"
+            );
+            assert_eq!(is_open(&broker, session.id), !closes, "{label}");
+        }
+    }
+
+    /// A preparation that runs, or that cannot be ruled out, keeps a landed
+    /// session: an in-progress record (with or without a declaration), and
+    /// an unreadable or invalid declaration or record.
+    #[test]
+    fn a_landed_close_keeps_a_session_whose_preparation_may_run() {
+        use crate::broker::{AbandonedSessionCloseOutcome as Outcome, AbandonmentKeepReason};
+        type Setup = fn(&crate::Broker, &crate::Session, &Path);
+        let cases: [(&str, Setup, Outcome, AbandonmentKeepReason); 6] = [
+            (
+                "in progress",
+                |broker, session, worktree| {
+                    declare_preparation(worktree);
+                    write_preparation_record(broker, session, "in_progress");
+                },
+                Outcome::OperationActive,
+                AbandonmentKeepReason::PreparationInProgress,
+            ),
+            (
+                "in progress, declaration removed",
+                |broker, session, _| write_preparation_record(broker, session, "in_progress"),
+                Outcome::OperationActive,
+                AbandonmentKeepReason::PreparationInProgress,
+            ),
+            (
+                "invalid declaration",
+                |_, _, worktree| declare_text(worktree, b"schema_version = 99\nsteps = []\n"),
+                Outcome::OperationEvidenceUnavailable,
+                AbandonmentKeepReason::PreparationInvalid,
+            ),
+            (
+                "unreadable declaration",
+                |_, _, worktree| declare_text(worktree, b"\xff\xfe"),
+                Outcome::OperationEvidenceUnavailable,
+                AbandonmentKeepReason::PreparationInvalid,
+            ),
+            (
+                "invalid record",
+                |broker, session, worktree| {
+                    declare_preparation(worktree);
+                    std::fs::write(preparation_record(broker, session), "{").unwrap();
+                },
+                Outcome::OperationEvidenceUnavailable,
+                AbandonmentKeepReason::PreparationUnknown,
+            ),
+            (
+                "unreadable record",
+                |broker, session, worktree| {
+                    declare_preparation(worktree);
+                    std::fs::create_dir(preparation_record(broker, session)).unwrap();
+                },
+                Outcome::OperationEvidenceUnavailable,
+                AbandonmentKeepReason::PreparationUnknown,
+            ),
+        ];
+        for (label, setup, expected, reason) in cases {
+            let (_owner, _storage, mut broker) = fixture("");
+            let (session, worktree) = merged_candidate(&mut broker, label);
+            setup(&broker, &session, &worktree);
+            quiet(&mut broker, &session, 3);
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+
+            assert_eq!(
+                close_directly(&mut broker, &session, &mut table),
+                expected,
+                "{label}"
+            );
+            assert_eq!(table.keep_reason(), Some(reason), "{label}");
+            assert!(is_open(&broker, session.id), "{label}");
+        }
     }
 
     /// Running work the merged lane checks for every holder: a submission

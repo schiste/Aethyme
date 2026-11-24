@@ -933,6 +933,23 @@ impl PreparationState {
     }
 }
 
+/// What an automatic close asks about a session's preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationActivity {
+    /// No record, or one that says the last preparation ended.
+    Idle,
+    InProgress,
+    /// The declaration cannot be read or does not validate.
+    Invalid,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Preparation keys computed on this thread (each hashes every input).
+    pub(crate) static SOURCE_DIGESTS_COMPUTED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PreparationStatus {
     pub schema_version: u32,
@@ -1344,6 +1361,78 @@ impl Broker {
         absent
     }
 
+    /// Whether a preparation of `session` is running, from its declaration
+    /// and its record alone: no declared input is hashed, no output is
+    /// looked up and no runtime is resolved. Nothing here says the prepared
+    /// state is usable; [`Self::preparation_status`] answers that.
+    ///
+    /// The caller holds the session's operation claim exclusively, so no
+    /// guarded `aethyme` CLI command is preparing it. That claim does not
+    /// cover a library caller, an older binary, or a child that outlived its
+    /// broker; the record does, and fails closed: a declaration that cannot
+    /// be read or validated is `Invalid`, and a record that cannot be read,
+    /// names another session or holds a state no preparation writes is an
+    /// error.
+    ///
+    /// The record is read even without a declaration, which may have been
+    /// removed while a preparation ran. Such a record, when it names no host
+    /// lease, has no lease that could prove its end. It counts as ended once
+    /// it was started before the current boot, by the margin guarded-exec's
+    /// fallback uses for receipts without a boot id
+    /// ([`crate::host_boot::PRE_BOOT_MARGIN_MS`]); a record kept in progress
+    /// because command cleanup was unverified counts as ended then too. A
+    /// `started_at` of zero or less (an unreadable clock) proves nothing.
+    /// Limits: a clock stepped forward past the margin since the boot, and a
+    /// preparer on another host, VM or container sharing this repository's
+    /// state, are not told apart. A record with a declaration keeps the full
+    /// status's rule.
+    pub(crate) fn preparation_activity(
+        &self,
+        session: &crate::Session,
+    ) -> Result<PreparationActivity, PreparationError> {
+        let _span = crate::phase_telemetry::span("preparation_record_check");
+        let Ok(config) = load_config(Path::new(&session.worktree_path)) else {
+            return Ok(PreparationActivity::Invalid);
+        };
+        let path = record_path(self.main_root(), session.id);
+        let Some(record) = read_record(&path)? else {
+            return Ok(PreparationActivity::Idle);
+        };
+        let invalid = |reason: String| PreparationError::InvalidState {
+            path: path.to_string_lossy().into_owned(),
+            reason,
+        };
+        if record.session_id != session.id {
+            return Err(invalid("the record names another session".into()));
+        }
+        match self.in_progress_record_state(&record) {
+            Some(PreparationState::Interrupted) => return Ok(PreparationActivity::Idle),
+            Some(PreparationState::InProgress) => {
+                let pre_boot_without_lease = config.is_none()
+                    && record.host_lease_id.is_none()
+                    && record.started_at > 0
+                    && crate::host_boot::pre_boot_cutoff_ms()
+                        .is_some_and(|cutoff| record.started_at < cutoff);
+                if !pre_boot_without_lease {
+                    return Ok(PreparationActivity::InProgress);
+                }
+                crate::phase_telemetry::add(
+                    "preparation_pre_boot_without_lease",
+                    std::time::Duration::ZERO,
+                );
+                return Ok(PreparationActivity::Idle);
+            }
+            _ => {}
+        }
+        match record.state {
+            PreparationState::Current | PreparationState::Failed => Ok(PreparationActivity::Idle),
+            other => Err(invalid(format!(
+                "unexpected recorded state {}",
+                other.as_str()
+            ))),
+        }
+    }
+
     pub fn preparation_status(&self, session_id: i64) -> Result<PreparationStatus, BrokerOpError> {
         let _span = crate::phase_telemetry::span("preparation_status");
         let session = self.store_ref().session(session_id)?;
@@ -1446,6 +1535,9 @@ impl Broker {
             .as_ref()
             .map(|record| record.runtimes.clone())
             .unwrap_or_default();
+        let running = record
+            .as_ref()
+            .and_then(|record| self.in_progress_record_state(record));
         let (state, reason, recorded_digest, recorded_source_digest) = match record {
             None => (
                 PreparationState::Required,
@@ -1453,27 +1545,18 @@ impl Broker {
                 None,
                 None,
             ),
-            Some(record)
-                if record.state == PreparationState::InProgress
-                    && self.preparation_host_lease_released(&record) =>
-            {
-                crate::phase_telemetry::add(
-                    "preparation_judged_interrupted",
-                    std::time::Duration::ZERO,
-                );
-                (
-                    PreparationState::Interrupted,
-                    format!(
-                        "a prior preparation was interrupted: its host lease {} generation {} \
-                         is released, so no preparer holds it; prepare again",
-                        record.host_lease_id.as_deref().unwrap_or("none"),
-                        record.host_lease_generation.unwrap_or(0)
-                    ),
-                    Some(record.digest),
-                    Some(record.source_digest),
-                )
-            }
-            Some(record) if record.state == PreparationState::InProgress => (
+            Some(record) if running == Some(PreparationState::Interrupted) => (
+                PreparationState::Interrupted,
+                format!(
+                    "a prior preparation was interrupted: its host lease {} generation {} \
+                     is released, so no preparer holds it; prepare again",
+                    record.host_lease_id.as_deref().unwrap_or("none"),
+                    record.host_lease_generation.unwrap_or(0)
+                ),
+                Some(record.digest),
+                Some(record.source_digest),
+            ),
+            Some(record) if running == Some(PreparationState::InProgress) => (
                 PreparationState::InProgress,
                 format!(
                     "a prior preparation was interrupted; inspect host lease {} generation {} before retrying",
@@ -1569,6 +1652,22 @@ impl Broker {
             package_store,
             runtimes: recorded_runtimes,
         })
+    }
+
+    /// What an `in_progress` record means now: `Interrupted` once its host
+    /// lease proves the preparer stopped, `InProgress` until then; `None` for
+    /// a record in any other state. Each interrupted answer is counted
+    /// (`preparation_judged_interrupted`), by the full status and by the
+    /// landed lanes' [`Self::preparation_activity`] alike.
+    fn in_progress_record_state(&self, record: &PreparationRecord) -> Option<PreparationState> {
+        if record.state != PreparationState::InProgress {
+            return None;
+        }
+        if !self.preparation_host_lease_released(record) {
+            return Some(PreparationState::InProgress);
+        }
+        crate::phase_telemetry::add("preparation_judged_interrupted", std::time::Duration::ZERO);
+        Some(PreparationState::Interrupted)
     }
 
     /// Whether an `in_progress` record's preparer provably stopped: the host
@@ -3826,6 +3925,8 @@ fn preparation_source_digest_with(
     deadline: Option<Instant>,
     runtime_keys: RuntimeKeys<'_>,
 ) -> Result<String, PreparationError> {
+    #[cfg(test)]
+    SOURCE_DIGESTS_COMPUTED.with(|count| count.set(count.get() + 1));
     check_liveness_deadline(deadline)?;
     let mut hasher = Sha256::new();
     hasher.update(PREPARATION_SCHEMA_VERSION.to_le_bytes());
@@ -7895,6 +7996,88 @@ mod tests {
         for allowed in 1..=SHARED_CACHE_MAX_CONCURRENT {
             assert_eq!(SHARED_CACHE_USER_UNITS % allowed, 0);
         }
+    }
+
+    /// The record check keeps the host-lease rule of the full status: an
+    /// in-progress record is idle only once its lease, at its recorded
+    /// generation, is released and the holder process is gone.
+    #[test]
+    fn the_record_check_reads_an_interrupted_preparation_as_idle() {
+        let repository = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker.start_worktree("record check", None).unwrap();
+        let host_db = broker
+            .storage_context()
+            .host_resource_db_path
+            .clone()
+            .expect("the test storage has a host resource database");
+        let mut coordinator = HostResourceCoordinator::open(&host_db).unwrap();
+        let grant = coordinator
+            .acquire(&request_from_a_dead_holder(SharedCacheMode::Exclusive))
+            .unwrap();
+        let mut record = in_progress_test_record(session.id, &grant);
+        let path = record_path(broker.main_root(), session.id);
+        write_record(&path, &record).unwrap();
+
+        assert_eq!(
+            broker.preparation_activity(&session).unwrap(),
+            PreparationActivity::InProgress,
+            "an unreleased lease keeps the record in progress"
+        );
+        // No declaration and a start before the boot: the boot rule is for
+        // records without a lease only.
+        record.started_at = 1;
+        write_record(&path, &record).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - 3_600_000));
+        let leased = broker.preparation_activity(&session).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+        assert_eq!(leased, PreparationActivity::InProgress);
+        coordinator
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+        assert_eq!(
+            broker.preparation_activity(&session).unwrap(),
+            PreparationActivity::Idle
+        );
+        record.host_lease_generation = Some(grant.lease.generation + 1);
+        write_record(&path, &record).unwrap();
+        assert_eq!(
+            broker.preparation_activity(&session).unwrap(),
+            PreparationActivity::InProgress,
+            "another generation is no evidence"
+        );
+        record.state = PreparationState::Invalid;
+        write_record(&path, &record).unwrap();
+        assert!(
+            broker.preparation_activity(&session).is_err(),
+            "a state no preparation writes"
+        );
+        record.state = PreparationState::Current;
+        record.session_id += 1;
+        write_record(&path, &record).unwrap();
+        assert!(
+            broker.preparation_activity(&session).is_err(),
+            "a record of another session"
+        );
     }
 
     fn in_progress_test_record(
