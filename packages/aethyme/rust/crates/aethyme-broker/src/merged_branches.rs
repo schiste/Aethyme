@@ -31,9 +31,9 @@ const CHECKS_PER_RUN: usize = 200;
 /// Branches one slice deletes at most.
 const DELETES_PER_RUN: usize = 100;
 /// One slice stops judging branches after this long. Counted from the start
-/// of the judging, not of the listing before it: on the busiest repository
-/// the listing alone outlasted it (44 to 753 s a run), so the slice judged
-/// nothing, its cursor never moved and no branch was ever deleted.
+/// of the judging, not of the listing before it: a slice whose listing alone
+/// outlasted it (44 to 753 s in the first 0.8.168 slices of the busiest
+/// repository) judged nothing and its cursor did not move.
 const SLICE_BUDGET: Duration = Duration::from_secs(20);
 /// The lifecycle-lock lane name.
 const LIFECYCLE_LANE: &str = "merged_branches";
@@ -87,6 +87,32 @@ thread_local! {
     /// the lifecycle claim to delete.
     pub(crate) static AFTER_JUDGING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a shorter [`SLICE_BUDGET`].
+    static SLICE_BUDGET_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn slice_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = SLICE_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return budget;
+    }
+    SLICE_BUDGET
+}
+
+fn attach_summary(summary: &MergedBranchSummary) {
+    crate::phase_telemetry::attach(
+        "merged_branches",
+        serde_json::json!({
+            "cleaned_session_branches": summary.cleaned_session_branches,
+            "deleted": summary.deleted,
+            "kept_by_reason": summary.kept_by_reason,
+        }),
+    );
 }
 
 fn record_keep(summary: &mut MergedBranchSummary, reason: &'static str) {
@@ -349,7 +375,11 @@ impl crate::Broker {
         };
         let mut sessions_by_branch = {
             let _span = crate::phase_telemetry::span("merged_branches_list_sessions");
-            let names = listing.iter().map(|(name, _)| name.as_str()).collect();
+            let names = listing
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| *name != default_branch)
+                .collect();
             self.store_ref()
                 .sessions_on_branches(&names)
                 .map_err(|_| "session_lookup_failed")?
@@ -378,6 +408,7 @@ impl crate::Broker {
         }
         summary.cleaned_session_branches = candidates.len() as u64;
         if candidates.is_empty() {
+            attach_summary(summary);
             return Ok(());
         }
         after_listing();
@@ -410,7 +441,7 @@ impl crate::Broker {
             let _span = crate::phase_telemetry::span("merged_branches_judge");
             let started = Instant::now();
             for (index, (name, tip, sessions)) in window.iter().enumerate() {
-                if started.elapsed() >= SLICE_BUDGET {
+                if started.elapsed() >= slice_budget() {
                     crate::phase_telemetry::add("merged_branches_slice_budget", Duration::ZERO);
                     break;
                 }
@@ -507,14 +538,7 @@ impl crate::Broker {
             "advance the merged-branch cursor",
             self.store_ref().meta_set(CURSOR_KEY, &last),
         );
-        crate::phase_telemetry::attach(
-            "merged_branches",
-            serde_json::json!({
-                "cleaned_session_branches": summary.cleaned_session_branches,
-                "deleted": summary.deleted,
-                "kept_by_reason": summary.kept_by_reason,
-            }),
-        );
+        attach_summary(summary);
         Ok(())
     }
 }

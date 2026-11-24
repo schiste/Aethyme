@@ -274,6 +274,27 @@ fn branches_of_uncleaned_sessions_take_no_place_in_the_window() {
     assert!(!branch_exists(&root, "agent/z-merged"));
 }
 
+/// The slice budget counts from the judging: a listing that outlasts it
+/// still leaves the slice its first branch to judge.
+#[test]
+fn a_listing_longer_than_the_slice_budget_does_not_stop_the_judging() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+
+    // Long enough that the judging's first check cannot reach it.
+    let budget = Duration::from_secs(1);
+    SLICE_BUDGET_FOR_TEST.with(|cell| cell.set(Some(budget)));
+    let summary = fixture.broker.run_merged_branch_lane_with(&mut || {
+        std::thread::sleep(budget + Duration::from_millis(200));
+    });
+    SLICE_BUDGET_FOR_TEST.with(|cell| cell.set(None));
+
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert!(!branch_exists(&root, "agent/merged"));
+}
+
 #[test]
 fn a_branch_that_moved_after_it_was_judged_is_kept() {
     let mut fixture = fixture();

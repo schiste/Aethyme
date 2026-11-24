@@ -1238,8 +1238,7 @@ impl BrokerStore {
         let mut rows = stmt.query([])?;
         let mut sessions = std::collections::BTreeMap::<String, Vec<Session>>::new();
         while let Some(row) = rows.next()? {
-            // Other branches' rows are not decoded, so one unreadable row
-            // elsewhere does not fail the lookup.
+            // Of another branch's row only the branch name is read.
             let branch: String = row.get("branch")?;
             if branches.contains(branch.as_str()) {
                 sessions
