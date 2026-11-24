@@ -268,14 +268,8 @@ impl crate::Broker {
             return None;
         };
         for root in roots {
-            let listing = match std::fs::read_dir(&root.path) {
-                Ok(listing) => listing,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && root.plainly_absent() =>
-                {
-                    continue;
-                }
-                Err(_) => return None,
+            let Some(listing) = root.read().ok()? else {
+                continue;
             };
             for entry in listing {
                 let name = entry.ok()?.file_name();

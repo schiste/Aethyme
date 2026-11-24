@@ -3977,7 +3977,7 @@ pub(crate) use retire::{
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]
 pub(crate) use scratch::scratch_instruction;
-pub(crate) use tombstone::{is_checkout_tombstone, restore_command};
+pub(crate) use tombstone::{is_checkout_tombstone, may_be_retired_checkout, restore_command};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

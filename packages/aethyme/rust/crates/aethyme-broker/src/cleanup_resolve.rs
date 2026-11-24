@@ -1273,6 +1273,17 @@ impl CheckedArchiveRoot {
         }
         false
     }
+
+    /// The root's listing; `None` when it plainly holds nothing.
+    pub(crate) fn read(&self) -> std::io::Result<Option<std::fs::ReadDir>> {
+        match std::fs::read_dir(&self.path) {
+            Ok(listing) => Ok(Some(listing)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.plainly_absent() => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Broker {
