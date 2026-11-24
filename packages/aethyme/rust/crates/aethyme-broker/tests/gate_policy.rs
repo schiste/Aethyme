@@ -787,7 +787,8 @@ fn every_rust_gate_draws_its_cost_from_the_host_build_pool() {
     }
 }
 
-/// A queued build must be able to wait for a preceding long-running build.
+/// Budget for two build slots at the broker’s maximum 4x load-scaled timeout.
+/// This is bounded and does not guarantee admission under an unbounded queue.
 #[test]
 fn managed_build_gates_wait_for_long_running_peers() {
     let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
@@ -802,8 +803,8 @@ fn managed_build_gates_wait_for_long_running_peers() {
         .expect("build timeout");
     for gate in builds {
         assert!(
-            gate.resource_wait_seconds >= longest * 2,
-            "{} waits {}s, less than two longest build slots of {}s",
+            gate.resource_wait_seconds >= longest * 4 * 2,
+            "{} waits {}s, less than two 4x-scaled longest build slots of {}s",
             gate.name,
             gate.resource_wait_seconds,
             longest
