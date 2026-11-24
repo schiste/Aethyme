@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.170] - 2026-11-24
+
+### Fixed
+
+- A gate that ends with a complete, consistent Vitest failure summary is reported as a test failure even when its log contains environment wording such as "permission denied". Before, that wording anywhere in the log made it an environment failure: on the busiest repository 69 runs of one gate in 14 days (21.4 h) got that label, 66 of them with a complete summary of failing tests, and in the traced log a passing test had printed the words. The rule is strict: exit code 1 only, the failed block must be present, and environment wording outside every test run or inside a failed block keeps the environment label, as does any partial or ambiguous log. Such a gate still blocks, its result is never reused for the same tree, and text output says a rerun may differ (#2001).
+
+### Upgrade notes
+
+- `submit` exits with the verification-failure code instead of the environment code for these failures, and `insights` counts fewer environment failures. Native controller repair requests are unchanged (#2001).
+
+### Added
+
+- Gate outcome field `environment_text_test_failure` (only when true), counter `gate_environment_text_test_failure` and span `gate_vitest_summary_parse` (#2001).
+
 ## [0.8.169] - 2026-11-24
 
 ### Fixed
