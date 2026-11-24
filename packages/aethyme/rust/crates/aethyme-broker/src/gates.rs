@@ -2976,7 +2976,8 @@ impl GateResourceRefusal {
 
 fn acquire_gate_resources(
     gate: &Gate,
-    checkout: &GitRepo,
+    repository: &str,
+    checkout_root: &Path,
     tree: &str,
     worker_id: &str,
     progress: &dyn GateProgressSink,
@@ -2984,7 +2985,15 @@ fn acquire_gate_resources(
     storage: GateStorageLocations,
 ) -> Result<Option<GateResourceRuntime>, String> {
     acquire_gate_resources_within(
-        gate, checkout, tree, worker_id, progress, deadline, storage, None,
+        gate,
+        repository,
+        checkout_root,
+        tree,
+        worker_id,
+        progress,
+        deadline,
+        storage,
+        None,
     )
     .map_err(GateResourceRefusal::into_message)
 }
@@ -2992,10 +3001,16 @@ fn acquire_gate_resources(
 /// [`acquire_gate_resources`], waiting at most `wait_limit` when one is given
 /// (zero makes a single attempt that records no waiter), and telling ordinary
 /// contention from other refusals.
+///
+/// `repository` is the coordination key the caller resolved while its
+/// checkout existed: a gate waiting after it gave its verification slot back
+/// no longer has that checkout, and resolving the key from a removed checkout
+/// degrades to a different key, which would wait on (and lease) another cache.
 #[allow(clippy::too_many_arguments)]
 fn acquire_gate_resources_within(
     gate: &Gate,
-    checkout: &GitRepo,
+    repository: &str,
+    checkout_root: &Path,
     tree: &str,
     worker_id: &str,
     progress: &dyn GateProgressSink,
@@ -3006,8 +3021,7 @@ fn acquire_gate_resources_within(
     if gate.resources.is_empty() && gate.managed_cache.is_none() {
         return Ok(None);
     }
-    let repository = git_origin_fingerprint(checkout);
-    let worktree_fingerprint = sha256_text(&checkout.root().to_string_lossy());
+    let worktree_fingerprint = sha256_text(&checkout_root.to_string_lossy());
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -3021,14 +3035,14 @@ fn acquire_gate_resources_within(
         resources.push(crate::HostResourceRequirement {
             key: "managed_cache".into(),
             resource: crate::HostResourceKind::ExclusiveKey {
-                name: managed_cache_lease_name(&repository, &cache.key),
+                name: managed_cache_lease_name(repository, &cache.key),
             },
         });
     }
     let request = crate::HostResourceRequest {
         schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
         request_id,
-        repository,
+        repository: repository.to_owned(),
         worktree_fingerprint,
         run_id: format!("{}-{}", worker_id, short_tree_hash(tree)),
         ttl_seconds: gate.resource_ttl_seconds,
@@ -4337,6 +4351,11 @@ where
             worker_id
         ));
         let owner_dir = run_dir.join("owners");
+        // Resolved now, while this run's checkout exists: after a handoff the
+        // admission waits run with no checkout, and the re-acquired one is the
+        // same repository.
+        let repository = git_origin_fingerprint(checkout);
+        let checkout_root = checkout.root().to_path_buf();
         // A submit verification never waits inside its slot. One host-load
         // reading, then the owner locks and host resources are tried without
         // waiting; if any of them would wait, the slot is given back and the
@@ -4365,7 +4384,8 @@ where
                     Err(_) => None,
                     Ok(Some(locks)) => match acquire_gate_resources_within(
                         gate,
-                        checkout,
+                        &repository,
+                        &checkout_root,
                         &tree,
                         &worker_id,
                         progress,
@@ -4508,7 +4528,8 @@ where
             };
             let resource_runtime = match acquire_gate_resources(
                 gate,
-                checkout,
+                &repository,
+                &checkout_root,
                 &tree,
                 &worker_id,
                 progress,
@@ -4659,7 +4680,8 @@ where
                 expires_at: runtime.grant.lease.expires_at,
                 allocations: runtime.grant.lease.allocations.clone(),
             });
-        let repository = git_origin_fingerprint(checkout);
+        // The key the lease was taken under, so the cache directory and its
+        // lease always name the same cache.
         let mut managed_cache_runtime = match prepare_managed_gate_cache(
             gate.managed_cache.as_ref(),
             &repository,
