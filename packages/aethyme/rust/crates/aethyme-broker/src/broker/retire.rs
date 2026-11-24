@@ -2780,6 +2780,27 @@ impl Broker {
             })
     }
 
+    /// [`Self::session_restorable_archive`] for a decision that deletes when
+    /// there is none: `None` when the record cannot be read, or when the
+    /// recorded archive cannot be looked at (an unreadable path, or the
+    /// directory that held it is gone with its volume).
+    pub(crate) fn session_archive_recorded(&self, session_id: i64) -> Option<bool> {
+        let Some(text) = self.store_ref().meta_get(ARCHIVED_SESSIONS_KEY).ok()? else {
+            return Some(false);
+        };
+        let recorded: std::collections::BTreeMap<i64, String> = serde_json::from_str(&text).ok()?;
+        let Some(archive) = recorded.get(&session_id).map(PathBuf::from) else {
+            return Some(false);
+        };
+        match std::fs::metadata(archive.join(crate::cleanup_resolve::MANIFEST_FILE)) {
+            Ok(metadata) => Some(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                archive.parent().is_some_and(Path::is_dir).then_some(false)
+            }
+            Err(_) => None,
+        }
+    }
+
     /// The newest recovery archive written for `session_id` (an archive
     /// directory whose name starts with the session id and holds a
     /// manifest), in either archive directory, if any. Operation archives

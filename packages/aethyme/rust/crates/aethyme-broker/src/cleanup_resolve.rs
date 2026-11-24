@@ -1234,6 +1234,47 @@ fn is_contained_relative(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// The directory that proves host state is reachable: `base` itself, or its
+/// parent when `base` is only not created yet. `None` when neither is there
+/// (a volume that is not mounted has neither).
+pub(crate) fn host_state_anchor(base: &Path) -> Option<&Path> {
+    match std::fs::metadata(base) {
+        Ok(metadata) => metadata.is_dir().then_some(base),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            base.parent().filter(|parent| parent.is_dir())
+        }
+        Err(_) => None,
+    }
+}
+
+/// One directory recovery archives may be in, and the directory above it that
+/// was there when it was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedArchiveRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) anchor: PathBuf,
+}
+
+impl CheckedArchiveRoot {
+    /// Whether a root that reads as not found holds nothing: each name from
+    /// it up is plainly missing, until one is a directory, the anchor at the
+    /// latest. A link that leads nowhere, an anchor that went away (its
+    /// volume with it) and anything unreadable are not.
+    pub(crate) fn plainly_absent(&self) -> bool {
+        for path in self.path.ancestors() {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return path != self.path && path.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+            }
+            if path == self.anchor {
+                return false;
+            }
+        }
+        false
+    }
+}
+
 impl Broker {
     /// Where recovery archives for this repository live: host state, beside
     /// the worktrees, so an archive outlives both the worktree and a deleted
@@ -1242,17 +1283,22 @@ impl Broker {
     /// rule that keeps its worktrees out of durable host state.
     pub(crate) fn recovery_archive_root(&self) -> Result<PathBuf, BrokerOpError> {
         let key = self.worktree_root_plan()?.repository_key;
-        let storage = self.storage_context();
-        let durable = storage.host_state_dir.as_ref().filter(|_| {
-            storage.host_state_dir_is_explicit
-                || !crate::host_state::path_is_ephemeral(self.main_root())
-        });
-        Ok(match durable {
+        Ok(match self.durable_archive_state_dir() {
             Some(base) => base.join(RECOVERY_ARCHIVE_DIRECTORY).join(key),
             None => self
                 .main_root()
                 .join(".aethyme")
                 .join(RECOVERY_ARCHIVE_DIRECTORY),
+        })
+    }
+
+    /// The host state directory [`Self::recovery_archive_root`] sits in, when
+    /// it is not the repository's own `.aethyme/`.
+    fn durable_archive_state_dir(&self) -> Option<&PathBuf> {
+        let storage = self.storage_context();
+        storage.host_state_dir.as_ref().filter(|_| {
+            storage.host_state_dir_is_explicit
+                || !crate::host_state::path_is_ephemeral(self.main_root())
         })
     }
 
@@ -1335,6 +1381,54 @@ impl Broker {
             roots.push(host);
         }
         roots
+    }
+
+    /// [`Self::recovery_archive_roots`] for a decision that deletes when it
+    /// finds no archive: `None` when a root an archive may be in cannot be
+    /// resolved (the pool's binding cannot be verified, its volume is not
+    /// there, its archive directory or marker cannot be read, or host state
+    /// is not there). A repository with no pool bound has only the host root,
+    /// and a pool with no archive directory yet adds none. A marker naming
+    /// another repository forbids writing, not looking: this repository's own
+    /// directory beside it is included.
+    pub(crate) fn checked_recovery_archive_roots(&self) -> Option<Vec<CheckedArchiveRoot>> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState as State;
+        let mut roots = Vec::new();
+        match self.store_ref().repository_worktree_binding().ok()?.state {
+            State::FreshUnbound | State::LegacyUnbound => {}
+            State::FreshReserved | State::RecoveryRequired => return None,
+            State::Bound => {
+                let pool = self.validate_bound_repository_worktree_root().ok()??;
+                let parent = pool.join(POOL_RECOVERY_ARCHIVE_DIRECTORY);
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        let marker =
+                            std::fs::read(parent.join(POOL_RECOVERY_ARCHIVE_MARKER)).ok()?;
+                        let marker: serde_json::Value = serde_json::from_slice(&marker).ok()?;
+                        marker.get("repository_key")?.as_str()?;
+                        roots.push(CheckedArchiveRoot {
+                            path: parent.join(self.worktree_root_plan().ok()?.repository_key),
+                            anchor: parent,
+                        });
+                    }
+                    Ok(_) => return None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+        let anchor = match self.durable_archive_state_dir() {
+            Some(base) => host_state_anchor(base)?,
+            None => self.main_root(),
+        };
+        let path = self.recovery_archive_root().ok()?;
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(CheckedArchiveRoot {
+                path,
+                anchor: anchor.to_path_buf(),
+            });
+        }
+        Some(roots)
     }
 
     /// Plan preserving one closed session's worktree before removing it.
