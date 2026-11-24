@@ -593,3 +593,133 @@ fn a_recovery_archive_written_after_judging_keeps_the_branch() {
     );
     assert!(branch_exists(&root, "agent/merged"));
 }
+
+/// Runs one slice and returns its summary and its telemetry counts.
+fn run_counted(fixture: &Fixture) -> (MergedBranchSummary, BTreeMap<String, u64>) {
+    let recorder = crate::phase_telemetry::Recorder::default();
+    let summary = {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        fixture.broker.run_merged_branch_lane()
+    };
+    (summary, recorder.totals().1)
+}
+
+/// The judging reads the archive directories once for the slice; each branch
+/// about to be deleted still gets its own fresh reading under the claim.
+#[test]
+fn a_slice_lists_the_recovery_archives_once_and_each_delete_reads_them_afresh() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    for branch in ["agent/a", "agent/b", "agent/c"] {
+        git(&root, &["branch", branch]);
+        fixture.session(branch, false);
+    }
+    let archive_root = fixture.broker.recovery_archive_root().unwrap();
+    std::fs::create_dir_all(archive_root.join("999999-other")).unwrap();
+
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 3, "{summary:?}");
+    let count = |name: &str| counts.get(name).copied().unwrap_or(0);
+    assert_eq!(count("merged_branches_archive_listing"), 1, "{counts:?}");
+    assert_eq!(
+        count("merged_branches_archive_listing_fresh"),
+        3,
+        "{counts:?}"
+    );
+    // One entry, read by the slice's listing and by each fresh reading.
+    assert_eq!(count("merged_branches_archive_entries"), 4, "{counts:?}");
+}
+
+/// Only a finished archive whose name starts with exactly the session's id
+/// counts, whichever way the names are read.
+#[test]
+fn the_slice_listing_answers_as_the_fresh_reading() {
+    let mut fixture = fixture();
+    let ids = ["agent/a", "agent/b", "agent/c"].map(|branch| fixture.session(branch, false));
+    let archive_root = fixture.broker.recovery_archive_root().unwrap();
+    for name in [
+        format!("{}-archive", ids[0]),
+        format!("{}-archive.partial", ids[1]),
+        format!("{}0-archive", ids[2]),
+        format!("{}.retirement-v6", ids[2]),
+        format!(".partial-operation-{}-x", ids[2]),
+    ] {
+        std::fs::create_dir_all(archive_root.join(name)).unwrap();
+    }
+    let archives = SliceArchives::default();
+    for (id, expected) in ids.into_iter().zip([true, false, false]) {
+        let session = fixture.broker.store_ref().session(id).unwrap();
+        assert_eq!(
+            fixture.broker.has_restorable_state(&session),
+            Some(expected)
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .has_restorable_state_with(&session, |owner| archives
+                    .holds(&fixture.broker, owner)),
+            Some(expected)
+        );
+    }
+}
+
+/// An archive directory that cannot be listed is unknown, not empty: every
+/// branch that needs it is kept, and none is taken to the claimed re-judge.
+#[test]
+fn an_unreadable_archive_directory_keeps_every_branch_of_the_slice() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    for branch in ["agent/a", "agent/b"] {
+        git(&root, &["branch", branch]);
+        fixture.session(branch, false);
+    }
+    let archive_root = fixture.broker.recovery_archive_root().unwrap();
+    std::fs::create_dir_all(archive_root.parent().unwrap()).unwrap();
+    std::fs::write(&archive_root, "not a directory\n").unwrap();
+
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("recovery_archive").copied(),
+        Some(2),
+        "{summary:?}"
+    );
+    assert!(
+        !counts.contains_key("merged_branches_archive_listing_fresh"),
+        "{counts:?}"
+    );
+    assert!(branch_exists(&root, "agent/a"));
+    assert!(branch_exists(&root, "agent/b"));
+}
+
+/// The listing is read only for a session nothing cheaper keeps, and the
+/// tombstone check stays per session.
+#[test]
+fn a_slice_whose_sessions_all_left_tombstones_lists_no_archives() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/retired"]);
+    let id = fixture.session("agent/retired", false);
+    let session = fixture.broker.store_ref().session(id).unwrap();
+    std::fs::create_dir_all(&session.worktree_path).unwrap();
+    std::fs::write(
+        Path::new(&session.worktree_path).join("ARCHIVED-SESSION.txt"),
+        "aethyme: retired session checkout\n",
+    )
+    .unwrap();
+
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(
+        summary.kept_by_reason.get("recovery_archive").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(
+        !counts.contains_key("merged_branches_archive_listing"),
+        "{counts:?}"
+    );
+    assert!(branch_exists(&root, "agent/retired"));
+}
