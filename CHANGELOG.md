@@ -4,6 +4,13 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.167] - 2026-11-24
+
+### Added
+
+- Every preparation run records how long each configured step took. The command-metrics line of `broker submit prepare` and `broker advance` carries a `preparation_steps` attachment, one entry per `[[steps]]` entry in configuration order: `index`, `name`, `cache` (`repository_shared` or `worktree_local`), `mode` (`online`, `offline` or `skipped`), `duration_ms` and `outcome` (`ok`, `failed`, `timed_out`, `error`, `unknown` or `skipped`). Before, only successful runs listed step durations, so a failed or refused preparation could not be attributed to a step. On the busiest repository preparation is the largest single cost (median 270–365 s); its steps measured 174 s, 81 s and 40 s at the median. The attachment is rewritten after every step, steps after a failure are `skipped`, and a cache hit lists every step as `skipped` with 0 ms. `outcome` describes the step's command; the ownership audit result is reported by the guarded exec as before. Refusals before the first step attach nothing (#1994).
+- The preparation record `.aethyme/run/preparation/session-<id>.json` gains an optional `steps` list with the same entries. The schema stays version 1: older binaries ignore the field, and records without it read as before (#1994).
+
 ## [0.8.166] - 2026-11-24
 
 ### Fixed
