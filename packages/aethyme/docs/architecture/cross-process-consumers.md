@@ -1071,7 +1071,10 @@ uses the same handoff.
 Command metrics add these phases. `gate_slot_admission_probe` times the
 single in-slot attempt (one load reading, owner locks and resources tried
 without waiting). `gate_slot_release` counts slot releases and times the
-release, including the removal of the released checkout.
+release, including the removal of the released checkout. The
+`gate_slot_release_trigger` attachment counts releases by the wait that
+caused them (`load`, `owner_locks` or `resources`), and the release progress
+line names the same trigger.
 `gate_admission_wait_outside_slot` times the load, owner-lock and resource
 waits a released gate spends with no slot. `gate_slot_reacquire` counts
 re-acquisitions and times the wait for a slot plus the new checkout. The

@@ -4347,8 +4347,9 @@ where
         let mut admitted_in_slot = None;
         if let Some(handoff) = slot_handoff {
             let probe = crate::phase_telemetry::span("gate_slot_admission_probe");
-            let contended = if crate::gate_admission::load_would_wait(gate, admission_host) {
-                true
+            // Which wait made the gate give its slot back, if any.
+            let trigger = if crate::gate_admission::load_would_wait(gate, admission_host) {
+                Some("load")
             } else {
                 match GateOwnerLocks::try_acquire(
                     &owner_dir,
@@ -4360,8 +4361,8 @@ where
                         gate_checkout_root.as_deref(),
                     ),
                 ) {
-                    Ok(None) => true,
-                    Err(_) => false,
+                    Ok(None) => Some("owner_locks"),
+                    Err(_) => None,
                     Ok(Some(locks)) => match acquire_gate_resources_within(
                         gate,
                         checkout,
@@ -4374,18 +4375,25 @@ where
                     ) {
                         Ok(resources) => {
                             admitted_in_slot = Some((locks, resources));
-                            false
+                            None
                         }
                         // A gate with no wait budget is refused at once
                         // either way; keeping the slot keeps that unchanged.
-                        Err(GateResourceRefusal::Contended(_)) => gate.resource_wait_seconds > 0,
-                        Err(GateResourceRefusal::Failed(_)) => false,
+                        Err(GateResourceRefusal::Contended(_)) => {
+                            (gate.resource_wait_seconds > 0).then_some("resources")
+                        }
+                        Err(GateResourceRefusal::Failed(_)) => None,
                     },
                 }
             };
             drop(probe);
-            if contended {
+            if let Some(trigger) = trigger {
                 let _release = crate::phase_telemetry::span("gate_slot_release");
+                crate::phase_telemetry::add_keyed(
+                    "gate_slot_release_trigger",
+                    trigger,
+                    Duration::ZERO,
+                );
                 artifact_use
                     .finish_not_started()
                     .map_err(|source| crate::BrokerError::Io {
@@ -4393,8 +4401,8 @@ where
                         source,
                     })?;
                 progress.report(&format!(
-                    "gate {} must wait for host load, owner locks or host resources; \
-                     releasing its verification slot until they are held",
+                    "gate {} must wait ({trigger}); releasing its verification slot \
+                     until host load, owner locks and host resources admit it",
                     gate.name
                 ));
                 handoff.release();
@@ -11032,9 +11040,16 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert_eq!(outcomes[0].status, GateStatus::Pass);
         if waiter.is_finished() {
             let (outcomes, counts, _, lines) = waiter.join().unwrap();
+            let build_lease = coordinator.renew(
+                &build.lease.lease_id,
+                build.lease.generation,
+                &build.ownership_token,
+                300,
+            );
             panic!(
                 "the first submit stopped waiting for the cache the build holds: \
-                 {outcomes:?}, handoffs {counts:?}, progress {lines:#?}"
+                 {outcomes:?}, handoffs {counts:?}, progress {lines:#?}, \
+                 build lease now {build_lease:?}"
             );
         }
         drop(slot);
@@ -11053,6 +11068,12 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
         assert!(outcomes[0].resource_lease.is_some());
         assert_eq!(counts, (1, 1), "one release and one re-acquire");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cached-build must wait (resources)")),
+            "the held cache, not load or owner locks, released the slot: {lines:#?}"
+        );
         assert!(
             held_at_the_end,
             "the slot taken again is the caller's to clean up"
