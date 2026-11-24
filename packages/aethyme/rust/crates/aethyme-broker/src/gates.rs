@@ -206,6 +206,21 @@ impl Gate {
             Some(set) => set.is_match(path),
         }
     }
+
+    /// The longest deadline this gate's command can run under: its
+    /// `timeout_seconds`, scaled by the largest load multiplier admission
+    /// allows (its load threshold, capped at four times) when it is
+    /// load-admitted. `None` for a gate with no timeout. A gate waiting for a
+    /// resource this gate holds may wait this long for one run of it.
+    pub fn longest_timeout_seconds(&self) -> Option<u64> {
+        crate::gate_admission::timeout_seconds_for_load(
+            self.timeout_seconds,
+            self.cost,
+            self.max_load_per_cpu,
+            Some(f64::MAX),
+            Some(1),
+        )
+    }
 }
 
 /// Load and validate `.aethyme/gates.toml`, sorted cheap-first.

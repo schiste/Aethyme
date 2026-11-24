@@ -730,6 +730,47 @@ fn contract_check_has_a_separate_managed_cache_from_workspace_tests() {
     );
 }
 
+/// A gate waiting for its managed cache must be able to outwait one whole run
+/// of any gate that shares the cache.
+///
+/// Each cache is one exclusive lease, so a waiter is served only once the
+/// holder's run ends. The longest a holder runs is its own timeout, scaled up
+/// for load when it is load-admitted (`Gate::longest_timeout_seconds`): that is
+/// why the bound is computed per gate and compared per cache key, and never as
+/// one maximum across caches that do not exclude each other. A waiter served
+/// later in a queue may still wait longer; this asserts only that a single
+/// healthy holder can no longer make a waiter give up.
+#[test]
+fn managed_cache_waits_outlast_the_longest_holder_of_their_cache() {
+    let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
+    let cache_key =
+        |gate: &aethyme_broker::Gate| gate.managed_cache.as_ref().map(|cache| cache.key.clone());
+    let managed: Vec<_> = gates
+        .iter()
+        .filter(|gate| gate.managed_cache.is_some())
+        .collect();
+    assert!(!managed.is_empty(), "no gate uses a managed Rust cache");
+    for waiter in &managed {
+        let (holder, longest) = managed
+            .iter()
+            .filter(|holder| cache_key(holder) == cache_key(waiter))
+            .map(|holder| {
+                let longest = holder.longest_timeout_seconds().unwrap_or_else(|| {
+                    panic!("{} holds a managed cache with no timeout", holder.name)
+                });
+                (holder.name.as_str(), longest)
+            })
+            .max_by_key(|(_, longest)| *longest)
+            .expect("a waiter shares its cache with itself");
+        assert!(
+            waiter.resource_wait_seconds >= longest,
+            "{} waits {} s for its cache, but {holder} may hold it for {longest} s",
+            waiter.name,
+            waiter.resource_wait_seconds,
+        );
+    }
+}
+
 /// A Rust gate compiles, so it must queue with every other build on the host.
 ///
 /// `cost` orders gates and bounds this repository's own scheduler; it reserves
