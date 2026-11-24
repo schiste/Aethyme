@@ -354,6 +354,55 @@ fn verify_plain_word_count_statuses(
     Ok(())
 }
 
+fn verify_plain_character_count_statuses(
+    policy: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    after: &[Item],
+    counts: &mut BTreeMap<(String, bool), u64>,
+) -> Result<(), &'static str> {
+    for gate in policy["gates"].as_array().ok_or("invalid gates")? {
+        if gate["kind"] != "character_count" {
+            continue;
+        }
+        let gate_id = gate["id"].as_str().ok_or("invalid gate id")?;
+        let ignore = gate["ignore_whitespace"]
+            .as_bool()
+            .ok_or("invalid whitespace option")?;
+        for item in after.iter().filter(|item| item.media_type == "text/plain") {
+            let id = format!(
+                "gate:{}:{}:{}",
+                item.entity_id.len(),
+                item.entity_id,
+                gate_id
+            );
+            let check = checks
+                .get(id.as_str())
+                .ok_or("resolved policy check is missing")?;
+            let status = check["status"].as_str().ok_or("invalid check status")?;
+            if !matches!(status, "passed" | "failed") {
+                continue;
+            }
+            let count = *counts
+                .entry((item.entity_id.clone(), ignore))
+                .or_insert_with(|| {
+                    u64::try_from(
+                        item.source
+                            .chars()
+                            .filter(|c| !ignore || !c.is_whitespace())
+                            .count(),
+                    )
+                    .unwrap_or(u64::MAX)
+                });
+            let failed = gate["min"].as_u64().is_some_and(|min| count < min)
+                || gate["max"].as_u64().is_some_and(|max| count > max);
+            if status != if failed { "failed" } else { "passed" } {
+                return Err("plain-text character count status differs from source");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_collection_statuses(
     policy: &Value,
     collection: &Value,
@@ -862,6 +911,7 @@ pub fn compare(
     };
     let mut coverage = None;
     let mut word_counts = BTreeMap::new();
+    let mut character_counts = BTreeMap::new();
     for env in [&previous, &fresh] {
         if env["binding_sha256"] != binding_hex {
             return Err("candidate input binding differs");
@@ -909,6 +959,12 @@ pub fn compare(
             verify_collection_statuses(&policy, collection, &checks)?;
         }
         verify_plain_word_count_statuses(&policy, &checks, input.after, &mut word_counts)?;
+        verify_plain_character_count_statuses(
+            &policy,
+            &checks,
+            input.after,
+            &mut character_counts,
+        )?;
         evidence_capabilities_with_mode(
             &policy,
             &change,
@@ -1052,6 +1108,66 @@ mod tests {
                 &input
             ),
             Err("plain-text word count status differs from source")
+        );
+    }
+    #[test]
+    fn plain_character_counts_respect_whitespace_and_unavailable() {
+        let (_, _, mut after, _) = fixture();
+        after[0].source = "é\u{a0}a\u{1c}b".into();
+        let mut policy = json!({"gates":[{"id":"chars","kind":"character_count","min":4,"max":4,"ignore_whitespace":true}]});
+        let mut check = json!({"status":"passed"});
+        let mut counts = BTreeMap::new();
+        let verify =
+            |p: &Value, c: &Value, items: &[Item], cache: &mut BTreeMap<(String, bool), u64>| {
+                let checks = BTreeMap::from([("gate:7:article:chars", c)]);
+                verify_plain_character_count_statuses(p, &checks, items, cache)
+            };
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        policy["gates"][0]["ignore_whitespace"] = json!(false);
+        assert!(verify(&policy, &check, &after, &mut counts).is_err());
+        check["status"] = json!("failed");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        check["status"] = json!("not_checked");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+        after[0].media_type = "text/markdown".into();
+        check["status"] = json!("passed");
+        assert!(verify(&policy, &check, &after, &mut counts).is_ok());
+    }
+    #[test]
+    fn rejects_rebound_plain_text_character_count_false_pass() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        policy["gates"][0]["kind"] = json!("character_count");
+        policy["gates"][0]["ignore_whitespace"] = json!(false);
+        policy["gates"][0]["min"] = json!(4);
+        let policy = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let binding = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] = json!(
+            binding
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("plain-text character count status differs from source")
         );
     }
     #[test]
