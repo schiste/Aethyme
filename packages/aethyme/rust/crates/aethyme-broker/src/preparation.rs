@@ -1129,12 +1129,18 @@ struct PreparationStepTiming {
     name: String,
     /// `repository_shared` or `worktree_local`.
     cache: String,
-    /// `online` or `offline` for the command that ran, `skipped` when none ran.
+    /// `online` or `offline`: which configured command the step used;
+    /// `skipped` when the step was not reached. For `error` and `unknown` it
+    /// names the command the step would run, not proof that it spawned.
     mode: String,
     duration_ms: u64,
-    /// `ok`, `failed`, `timed_out` or `skipped`: how the step's command ended
-    /// (a step whose command succeeded but whose outputs are missing is `ok`;
-    /// the record's `failed_step` names it).
+    /// `ok`, `failed` or `timed_out`: how the step's command ended, judged by
+    /// its exit alone (the ownership audit's verdict is reported by the
+    /// guarded exec, not here; a step whose command succeeded but whose
+    /// outputs are missing is `ok` and the record's `failed_step` names it).
+    /// `error`: the broker failed the step without a command result.
+    /// `unknown`: the command's outcome or cleanup could not be established.
+    /// `skipped`: the step was not reached.
     outcome: String,
 }
 
@@ -1175,14 +1181,31 @@ fn preparation_cache_kind(policy: PreparationCachePolicy) -> &'static str {
     }
 }
 
-/// The outcome of a step whose command returned a report.
+/// The outcome of a step whose command returned a report: the command's own
+/// exit, not the ownership audit folded into `report.ok`.
 fn preparation_step_outcome(report: &crate::GuardedExecReport) -> &'static str {
     if report.command_timed_out {
         "timed_out"
-    } else if report.ok {
+    } else if report.command_success {
         "ok"
     } else {
         "failed"
+    }
+}
+
+/// The outcome of a step whose execution returned a broker error instead of
+/// a command result.
+fn preparation_step_error_outcome(error: &BrokerOpError) -> &'static str {
+    if matches!(
+        error,
+        BrokerOpError::Preparation(
+            PreparationError::CommandOutcomeUnknown { .. }
+                | PreparationError::CleanupUnknown { .. }
+        )
+    ) {
+        "unknown"
+    } else {
+        "error"
     }
 }
 
@@ -2536,7 +2559,7 @@ impl Broker {
                         step,
                         offline,
                         step_started.elapsed(),
-                        "failed",
+                        preparation_step_error_outcome(&error),
                     ));
                     record.steps = preparation_step_timings(&config.steps, &step_timings);
                     attach_preparation_steps(&record.steps);
@@ -2581,7 +2604,7 @@ impl Broker {
                 name: step.name.clone(),
                 exit_code: report.exit_code,
                 succeeded: report.ok,
-                duration_ms: step_elapsed.as_millis().min(u64::MAX as u128) as u64,
+                duration_ms: u64::try_from(step_elapsed.as_millis()).unwrap_or(u64::MAX),
                 volume_bytes_allocated: package_store::allocated_between(
                     step_free_before,
                     package_store::volume_free_bytes(&root),
@@ -7944,6 +7967,25 @@ mod tests {
                 .iter()
                 .all(|timing| timing.outcome == "skipped")
         );
+
+        // A broker error without a command result is `error`; a lost result
+        // or unconfirmed cleanup is `unknown`.
+        assert_eq!(
+            preparation_step_error_outcome(&BrokerOpError::MissingExecCommand),
+            "error"
+        );
+        for error in [
+            PreparationError::CommandOutcomeUnknown {
+                session_id: 1,
+                reason: "lost".into(),
+            },
+            PreparationError::CleanupUnknown {
+                session_id: 1,
+                reason: "unconfirmed".into(),
+            },
+        ] {
+            assert_eq!(preparation_step_error_outcome(&error.into()), "unknown");
+        }
     }
 
     #[test]
