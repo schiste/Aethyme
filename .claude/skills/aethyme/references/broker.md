@@ -575,6 +575,14 @@ blocked.
    publish a remote branch, merge a pull request, or push a release tag. Work
    lands through GitHub: push the session branch with `aethyme broker push
    --session <id> --pr` (step 4) and merge the pull request there.
+   If a gate still chooses `aethyme/integration` as its comparison base in a
+   verify-only repository, inspect whether that ref trails the fetched default
+   branch before treating a timeout as a code failure. Run
+   `aethyme broker advanced integration reconcile --upstream origin/main --dry-run`
+   (substitute the actual default upstream), review its ref changes and safety
+   result, then apply only the exact safe plan using its printed confirmation
+   digest. Retry submission and verify the gate uses the intended base. Do not
+   manually reset shared refs or bypass failed checks.
    If your session contains an owned merge commit, submission refuses safely
    and prints the accepted checkpoint plus an exact recovery sequence.
    Follow it in order: preserve the current HEAD on the named recovery branch
