@@ -1054,6 +1054,32 @@ The comparison base is not part of that identity: a gate that reads
 commands"), so a session's verdict for a tree satisfies a submission of the
 same tree.
 
+## Gate admission waits outside the verification slot (2026-11-24)
+
+A submit verifies in one of four pooled verification slots. A gate that would
+wait for admission (host load above its threshold, a held owner lock, or host
+resources such as a managed build cache or host-build pool units) now gives
+its slot back first, waits with no slot held, and re-acquires a slot from the
+same pool once it holds its owner locks and resources. The same merge commit
+is then materialized in the re-acquired slot, its tree is checked against the
+tree the earlier gates judged, and the host resource lease is renewed while
+waiting for the slot and once more before the gate runs. A gate that needs no
+wait keeps its slot, and a gate with `resource_wait_seconds = 0` keeps its
+fail-fast behavior. Batch verification (queued leaders and `merge-batch`)
+uses the same handoff.
+
+Command metrics add these phases. `gate_slot_admission_probe` times the
+single in-slot attempt (one load reading, owner locks and resources tried
+without waiting). `gate_slot_release` counts slot releases and times the
+release, including the removal of the released checkout.
+`gate_admission_wait_outside_slot` times the load, owner-lock and resource
+waits a released gate spends with no slot. `gate_slot_reacquire` counts
+re-acquisitions and times the wait for a slot plus the new checkout. The
+`verification_slot_handoff` attachment (`releases`, `reacquires`) totals both
+counts for one submit verification and is present only when a handoff
+happened. Consumers must tolerate the additive phases and attachment; no
+existing field changes.
+
 ## Git wrapper probe verdict cache (2026-11-15)
 
 Before its first Git command every `aethyme` process proves that the `git` it

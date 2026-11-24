@@ -131,7 +131,16 @@ fn promotion_subject(session_id: i64, task: Option<&str>) -> String {
 /// is a full checkout, and gates that share a build cache still serialise on
 /// its resource lease, so this bounds disk and contention rather than promising
 /// that many times the throughput.
+///
+/// A slot holder never waits for gate admission (host load, owner locks, host
+/// resources): a gate that would wait gives its slot back and takes one again
+/// once it holds what it waited for (`gates::VerificationSlotHandoff`), so a
+/// long build holding a shared cache cannot fill the pool with submits that
+/// are only queued behind it.
 const MERGE_VERIFICATION_SLOTS: usize = 4;
+
+/// The pool every submit verification draws its slot from.
+const MERGE_VERIFICATION_NAMESPACE: &str = "merge-sim";
 
 /// `[promote]` section of `.aethyme/config.toml`.
 ///
@@ -2206,7 +2215,7 @@ impl Broker {
                 && entry.base_commit == base
                 && !main_checkout_session
         });
-        let mut verification_slot = match self.admit_queued_verification(
+        let verification_slot = match self.admit_queued_verification(
             &main_root,
             &worktree_root_plan,
             &entry,
@@ -2247,7 +2256,13 @@ impl Broker {
         if let Some(progress) = progress {
             progress.phase(crate::submit_progress::PHASE_VERIFYING);
         }
-        let sim_worktree = verification_slot.materialize(self.repo_handle(), merge_commit)?;
+        // Owned through an `Option` so the gates can give the slot back while
+        // they wait for admission and take another one before executing.
+        let mut verification_slot = Some(verification_slot);
+        let sim_worktree = verification_slot
+            .as_mut()
+            .expect("the slot was just admitted")
+            .materialize(self.repo_handle(), merge_commit)?;
         // Verification policy comes from the base the change lands on, never
         // from the merged tree: otherwise a session could weaken or delete the
         // gates and graph policy that judge it. A policy change a session makes
@@ -2319,6 +2334,15 @@ impl Broker {
         if let Some(progress) = progress {
             progress.subphase("executing gates");
         }
+        let handoff = crate::verification::PooledSlotHandoff::new(
+            &mut verification_slot,
+            &main_root,
+            MERGE_VERIFICATION_NAMESPACE,
+            MERGE_VERIFICATION_SLOTS,
+            &worktree_root_plan,
+            merge_commit,
+            progress,
+        );
         let gate_outcomes = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main_root,
@@ -2330,12 +2354,18 @@ impl Broker {
             cache_policy,
             progress,
             storage,
+            Some(&handoff),
         );
+        handoff.record_telemetry();
+        drop(handoff);
         // One rename into the trash instead of Git deleting the whole tree
         // inline (21 s a submit on the busiest repository); Git's removal
-        // stays the fallback.
-        if !self.trash_verification_slot(verification_slot.path(), entry.session_id) {
-            verification_slot.cleanup();
+        // stays the fallback. After a handoff this is the slot held now; a
+        // slot given back was cleaned up when it was released.
+        if let Some(slot) = verification_slot.as_mut()
+            && !self.trash_verification_slot(slot.path(), entry.session_id)
+        {
+            slot.cleanup();
         }
         // Promotion may re-simulate another in-flight entry, and a stale
         // verification may recursively re-simulate this entry. Both paths

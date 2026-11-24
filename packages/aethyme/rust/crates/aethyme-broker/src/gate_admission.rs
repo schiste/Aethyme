@@ -24,6 +24,9 @@
 //! so a gate waiting on load never holds a lease another gate needs, and
 //! before the timeout clock starts, so the waited time is never charged to
 //! the gate's deadline. It is counted in the gate's `wait_duration_ms`.
+//! A submit verification that would wait gives its verification slot back
+//! first ([`load_would_wait`]), so a wait never keeps another submit out of
+//! a slot.
 
 use std::time::Duration;
 
@@ -199,6 +202,17 @@ pub(crate) fn admit_gate_with(
         host,
         progress,
     )
+}
+
+/// Whether [`admit_gate_with`] would wait for this gate right now: the gate is
+/// load-admitted, has a wait budget, and one reading is above its threshold.
+/// Unreadable load never waits, as in [`admit`]. A submit verification uses
+/// this single reading to decide whether to give its slot back before waiting.
+pub(crate) fn load_would_wait(gate: &Gate, host: &dyn AdmissionHost) -> bool {
+    let Some(max) = effective_max_load_per_cpu(gate.cost, gate.max_load_per_cpu) else {
+        return false;
+    };
+    gate.resource_wait_seconds > 0 && host.sample().is_some_and(|sample| sample.per_cpu() > max)
 }
 
 pub(crate) fn admit(

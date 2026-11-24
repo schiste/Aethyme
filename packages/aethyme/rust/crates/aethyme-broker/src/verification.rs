@@ -928,6 +928,100 @@ impl Drop for ExactTreeVerificationSlot {
     }
 }
 
+/// A slot from a pool that a submit's gates may give back while they wait for
+/// admission, and take again (any slot of the same pool) before they execute.
+///
+/// The caller keeps owning the slot through `slot`: after the gates it is the
+/// slot that is held then, or `None` when the gates gave it back and did not
+/// get one again, and the caller cleans up whatever is there. The pool,
+/// placement and commit are the ones the caller verified with, so a
+/// re-acquired slot is the same kind of checkout of the same merge commit.
+pub(crate) struct PooledSlotHandoff<'a> {
+    slot: std::cell::RefCell<&'a mut Option<ExactTreeVerificationSlot>>,
+    main_root: &'a Path,
+    namespace: &'a str,
+    size: usize,
+    root_plan: &'a crate::WorktreeRootPlan,
+    commit: &'a str,
+    progress: Option<&'a crate::submit_progress::SubmitProgress>,
+    releases: std::cell::Cell<u64>,
+    reacquires: std::cell::Cell<u64>,
+}
+
+impl<'a> PooledSlotHandoff<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        slot: &'a mut Option<ExactTreeVerificationSlot>,
+        main_root: &'a Path,
+        namespace: &'a str,
+        size: usize,
+        root_plan: &'a crate::WorktreeRootPlan,
+        commit: &'a str,
+        progress: Option<&'a crate::submit_progress::SubmitProgress>,
+    ) -> Self {
+        Self {
+            slot: std::cell::RefCell::new(slot),
+            main_root,
+            namespace,
+            size,
+            root_plan,
+            commit,
+            progress,
+            releases: std::cell::Cell::new(0),
+            reacquires: std::cell::Cell::new(0),
+        }
+    }
+
+    /// How many times the slot was given back and taken again.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.releases.get(), self.reacquires.get())
+    }
+
+    /// Attach the counts to the command's metric line, when there are any.
+    pub(crate) fn record_telemetry(&self) {
+        let (releases, reacquires) = self.counts();
+        if releases > 0 || reacquires > 0 {
+            crate::phase_telemetry::attach(
+                "verification_slot_handoff",
+                serde_json::json!({"releases": releases, "reacquires": reacquires}),
+            );
+        }
+    }
+}
+
+impl crate::gates::VerificationSlotHandoff for PooledSlotHandoff<'_> {
+    fn release(&self) {
+        // Dropping the slot removes its checkout and then its lock, so the
+        // next holder starts from an empty directory.
+        drop(self.slot.borrow_mut().take());
+        self.releases.set(self.releases.get() + 1);
+    }
+
+    fn reacquire(&self, keepalive: &mut dyn FnMut()) -> Result<GitRepo, BrokerOpError> {
+        let mut slot = ExactTreeVerificationSlot::acquire_pooled_until(
+            self.main_root,
+            self.namespace,
+            self.size,
+            self.root_plan,
+            crate::gates::heartbeat_interval(),
+            &mut |waited, report| {
+                keepalive();
+                if report && let Some(progress) = self.progress {
+                    progress.report_slot_wait(self.main_root, waited);
+                }
+                false
+            },
+        )?
+        .expect("this slot acquisition never redirects");
+        let repository = GitRepo::discover(self.main_root)?;
+        let checkout = slot.materialize(&repository, self.commit);
+        // Held even when materializing failed, so the caller cleans it up.
+        **self.slot.borrow_mut() = Some(slot);
+        self.reacquires.set(self.reacquires.get() + 1);
+        checkout
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
