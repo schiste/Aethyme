@@ -8163,6 +8163,7 @@ impl Broker {
                 landed_judged_in_pass += 1;
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+                crate::phase_telemetry::add_distinct("landed_sessions_examined", session.id);
                 let started = Instant::now();
                 #[cfg(test)]
                 let forced_budget_exhausted =
@@ -8604,6 +8605,7 @@ impl Broker {
             };
             summary.landed_examined += 1;
             crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+            crate::phase_telemetry::add_distinct("landed_sessions_examined", session.id);
             crate::phase_telemetry::add("landed_likely_examined", Duration::ZERO);
             let started = Instant::now();
             // A spawned session whose every pull request merged takes the

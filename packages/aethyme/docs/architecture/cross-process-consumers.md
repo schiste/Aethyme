@@ -5160,3 +5160,48 @@ judgements) and kept 501 sessions for regenerable leftovers. Covered by
 `ignored_content_keeps_the_checkout_but_not_the_session` and `auto_cleanup.rs`
 test
 `unknown_ignored_content_keeps_the_checkout_and_the_session_only_under_the_sweep`.
+
+### Record-only preparation check in the landed lanes (changed 2026-11-24)
+
+Under the operation claim, the landed and merged-pull-request lanes no longer
+read the full `preparation_status` of a session. They load its declaration and
+its preparation record only (span `preparation_record_check`): no declared
+input is hashed, no output looked up, no runtime resolved. A running
+preparation (an `in_progress` record whose host lease is not proved released)
+still keeps the session, as `preparation_in_progress`; an unreadable or
+invalid declaration as `preparation_invalid`; a record that cannot be read,
+names another session or holds a state no preparation writes as
+`preparation_unknown`. The record is now read even without a declaration, so
+an `in_progress` record outlives a removed one.
+
+What this allows: a landed session whose declared input or runtime is missing
+or unreadable, or whose declared output is a symlink or unreadable, was kept
+before and may now close, after every other check. Those conditions describe
+whether the prepared state is usable, not whether anyone is preparing. The close
+itself deletes nothing; checkout retirement, which a budgeted pass may try
+right after the close, applies its own proofs and never read this status.
+The abandonment and no-work lanes, `finish`, hooks, `submit prepare` and the
+cleanup and removal lanes are unchanged.
+
+New phase spans, for the checks after the landing proof:
+`session_close_process_listing`, `session_close_operation_guard`,
+`session_close_start_reservation`,
+`session_close_checkout_activity`, `session_close_gates`,
+`session_close_operations`, `session_close_merge_queue`,
+`session_close_artifact_use`, `session_close_process_use`,
+`session_close_explicit_claims`, `session_close_cleanup_request` (every lane)
+and `landed_proof_recheck`, `landed_close_head_and_activity`,
+`landed_merged_pr_evidence_recheck`, `landed_close_last_look` (landed lanes).
+
+New metric attachment `phase_distinct_counts`: an object of counter name to
+how many distinct sessions were seen in that command (one background `gc`
+pass is one command), numbers only, absent when empty. Its first key,
+`landed_sessions_examined`, stands beside the `phase_counts` entry of the same
+name, which counts every judgement, repeats included.
+
+Covered by `session_auto_close.rs` tests
+`a_landed_close_hashes_no_preparation_input` and
+`a_landed_close_keeps_a_session_whose_preparation_may_run`, `preparation.rs`
+test `the_record_check_reads_an_interrupted_preparation_as_idle` and
+`phase_telemetry.rs` test
+`distinct_counts_count_each_id_once_and_attach_no_id`.
