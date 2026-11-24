@@ -5,8 +5,10 @@
 //! expensive gate can run several times slower than it was sized for and
 //! time out through no fault of the diff. Before such a gate is spawned, the
 //! broker therefore waits while the one-minute load average per logical CPU
-//! is above the gate's threshold, bounded by the gate's existing
-//! `resource_wait_seconds`. If load remains above the threshold at the bound,
+//! is above the gate's threshold, bounded by the gate's `resource_wait_seconds`
+//! and never more than [`MAX_LOAD_WAIT_SECONDS`] ([`load_wait_bound`]): a
+//! long wait for a held build cache must not also become a long wait for
+//! host load. If load remains above the threshold at the bound,
 //! the broker defers the gate before it starts; if the load cannot be read,
 //! the gate runs without waiting because saturation was not established.
 //!
@@ -41,6 +43,21 @@ pub(crate) const DEFAULT_MAX_LOAD_PER_CPU: f64 = 3.0;
 /// Hard ceiling for load-based timeout scaling, regardless of a repository's
 /// admission threshold.
 const MAX_TIMEOUT_LOAD_MULTIPLIER: f64 = 4.0;
+
+/// The longest a gate waits for host load, whatever its
+/// `resource_wait_seconds`. This was the effective bound of every gate before
+/// managed-cache gates raised their resource waits to outwait one run of the
+/// longest gate sharing their cache (up to 7500 s): those waits are for a
+/// lease, while a host that stays saturated for 15 minutes is a reason to
+/// defer and retry, not to keep waiting.
+pub(crate) const MAX_LOAD_WAIT_SECONDS: u64 = 900;
+
+/// How long [`admit_gate_with`] waits for host load for `gate`: its
+/// `resource_wait_seconds`, capped at [`MAX_LOAD_WAIT_SECONDS`]. Zero (no wait
+/// budget) still means the gate is never held for load.
+pub(crate) fn load_wait_bound(gate: &Gate) -> Duration {
+    Duration::from_secs(gate.resource_wait_seconds.min(MAX_LOAD_WAIT_SECONDS))
+}
 
 /// How often the load is re-read while waiting. The kernel refreshes the
 /// load average roughly every five seconds, so polling faster sees nothing new.
@@ -198,7 +215,7 @@ pub(crate) fn admit_gate_with(
     admit(
         &gate.name,
         effective_max_load_per_cpu(gate.cost, gate.max_load_per_cpu),
-        Duration::from_secs(gate.resource_wait_seconds),
+        load_wait_bound(gate),
         host,
         progress,
     )
@@ -212,7 +229,7 @@ pub(crate) fn load_would_wait(gate: &Gate, host: &dyn AdmissionHost) -> bool {
     let Some(max) = effective_max_load_per_cpu(gate.cost, gate.max_load_per_cpu) else {
         return false;
     };
-    gate.resource_wait_seconds > 0 && host.sample().is_some_and(|sample| sample.per_cpu() > max)
+    !load_wait_bound(gate).is_zero() && host.sample().is_some_and(|sample| sample.per_cpu() > max)
 }
 
 pub(crate) fn admit(
@@ -528,6 +545,43 @@ mod tests {
         );
         assert!(host.slept.borrow().is_empty());
         assert!(lines.take().is_empty());
+    }
+
+    /// A managed-cache gate's resource wait outlasts a whole run of the
+    /// longest gate sharing its cache (7500 s here), but that is a wait for a
+    /// lease: its wait for host load keeps the 900 s bound every gate had
+    /// before, and a shorter resource wait still bounds it as it did.
+    #[test]
+    fn a_long_resource_wait_does_not_lengthen_the_load_wait() {
+        let gate = |wait: u64| {
+            crate::gates::parse_gates(&format!(
+                "[[gate]]\nname='g'\ncommand='true'\ncost=3\nresource_wait_seconds={wait}\n"
+            ))
+            .unwrap()
+            .remove(0)
+        };
+        let lines = Lines::default();
+        let host = ScriptedHost::new(&[Some(9.0)]);
+        let admission = admit_gate_with(&gate(7500), &lines, &host);
+        assert!(
+            matches!(admission, Admission::BoundReached { waited, .. } if waited == Duration::from_secs(900)),
+            "{admission:?}"
+        );
+        assert_eq!(
+            host.total_slept(),
+            Duration::from_secs(MAX_LOAD_WAIT_SECONDS)
+        );
+        assert_eq!(load_wait_bound(&gate(7500)), Duration::from_secs(900));
+        assert_eq!(load_wait_bound(&gate(1200)), Duration::from_secs(900));
+        assert_eq!(load_wait_bound(&gate(120)), Duration::from_secs(120));
+        assert_eq!(load_wait_bound(&gate(0)), Duration::ZERO);
+        // No wait budget still never waits for load, and is never a reason to
+        // give a verification slot back.
+        assert!(!load_would_wait(&gate(0), &ScriptedHost::new(&[Some(9.0)])));
+        assert!(load_would_wait(
+            &gate(7500),
+            &ScriptedHost::new(&[Some(9.0)])
+        ));
     }
 
     #[test]

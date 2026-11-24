@@ -279,9 +279,11 @@ impl Broker {
             progress.subphase("executing gates");
         }
         let storage = self.storage_context().gate_storage_locations();
+        let trash = self.verification_slot_trasher(verifier);
         let handoff = crate::verification::PooledSlotHandoff::new(
             slot, &main, namespace, size, &root_plan, &tip, progress,
-        );
+        )
+        .with_trash(&trash);
         let gates_run = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main,
@@ -529,8 +531,15 @@ impl Broker {
                 if let Some(progress) = progress {
                     progress.phase("waiting for shared verification");
                 }
+                // The leader verifies against the base's gate policy; follow
+                // it for as long as that policy lets one verification take.
+                let gates = GitRepo::discover(main)
+                    .ok()
+                    .and_then(|repo| crate::gates::load_gates_at_commit(&repo, base).ok())
+                    .map(|(_, gates)| gates);
+                let deadline = queue::follow_deadline(gates.as_deref());
                 let phase = crate::phase_telemetry::span("submit_queued_batch_follow");
-                if let Some(receipt) = ticket.follow()
+                if let Some(receipt) = ticket.follow(deadline)
                     && self.queued_receipt_is_current(coordinator, entry, &receipt)
                 {
                     record_queued_batch("follower", "verified", Some(receipt.members.len()));

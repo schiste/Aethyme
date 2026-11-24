@@ -2334,6 +2334,9 @@ impl Broker {
         if let Some(progress) = progress {
             progress.subphase("executing gates");
         }
+        // A slot the gates give back goes to the trash in one rename, as the
+        // final one does below, so it frees at once.
+        let trash = self.verification_slot_trasher(entry.session_id);
         let handoff = crate::verification::PooledSlotHandoff::new(
             &mut verification_slot,
             &main_root,
@@ -2342,7 +2345,8 @@ impl Broker {
             &worktree_root_plan,
             merge_commit,
             progress,
-        );
+        )
+        .with_trash(&trash);
         let gate_outcomes = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main_root,
@@ -2360,7 +2364,7 @@ impl Broker {
         // One rename into the trash instead of Git deleting the whole tree
         // inline (21 s a submit on the busiest repository); Git's removal
         // stays the fallback. After a handoff this is the slot held now; a
-        // slot given back was cleaned up when it was released.
+        // slot given back was trashed (or cleaned up) when it was released.
         if let Some(slot) = verification_slot.as_mut()
             && !self.trash_verification_slot(slot.path(), entry.session_id)
         {

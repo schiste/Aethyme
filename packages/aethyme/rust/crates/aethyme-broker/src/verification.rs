@@ -620,6 +620,11 @@ impl ExactTreeVerificationSlot {
     /// Let a caller leave the wait upon discovering that its pending work
     /// has been claimed elsewhere. The observer first runs only when every
     /// slot is busy. Reporting remains on the original heartbeat cadence.
+    ///
+    /// A new arrival defers to every live [`SlotReservation`] of the pool: it
+    /// takes a free slot only while more slots are free than gates holding a
+    /// reservation, so a gate that already holds its host resources and is
+    /// waiting for a slot again gets the next one first.
     pub(crate) fn acquire_pooled_until(
         main_root: &Path,
         namespace: &str,
@@ -628,6 +633,51 @@ impl ExactTreeVerificationSlot {
         report_every: Duration,
         on_busy: &mut dyn FnMut(Duration, bool) -> bool,
     ) -> Result<Option<Self>, BrokerOpError> {
+        Self::acquire_pooled_in_turn(
+            main_root,
+            namespace,
+            size,
+            root_plan,
+            report_every,
+            None,
+            on_busy,
+        )
+    }
+
+    /// [`Self::acquire_pooled_until`] for a holder of `reservation`, which
+    /// defers only to reservations made before it, so re-acquirers take slots
+    /// in the order they reserved them and ahead of every new arrival.
+    pub(crate) fn acquire_pooled_reserved(
+        main_root: &Path,
+        namespace: &str,
+        size: usize,
+        root_plan: &crate::WorktreeRootPlan,
+        report_every: Duration,
+        reservation: &SlotReservation,
+        on_busy: &mut dyn FnMut(Duration, bool) -> bool,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        Self::acquire_pooled_in_turn(
+            main_root,
+            namespace,
+            size,
+            root_plan,
+            report_every,
+            Some(reservation),
+            on_busy,
+        )
+    }
+
+    fn acquire_pooled_in_turn(
+        main_root: &Path,
+        namespace: &str,
+        size: usize,
+        root_plan: &crate::WorktreeRootPlan,
+        report_every: Duration,
+        reservation: Option<&SlotReservation>,
+        on_busy: &mut dyn FnMut(Duration, bool) -> bool,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let reservations = slot_reservations_directory(main_root, namespace);
+        let own = reservation.map(|reservation| reservation.name.as_str());
         let placements = (0..size.max(1))
             .map(|index| {
                 let name = if index == 0 {
@@ -640,11 +690,21 @@ impl ExactTreeVerificationSlot {
             .collect::<Vec<_>>();
         let started = std::time::Instant::now();
         let mut next_report = Duration::ZERO;
+        let mut deferred = false;
         loop {
-            for placement in &placements {
-                if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
+            let ahead = live_slot_reservations_ahead(&reservations, own);
+            match Self::try_acquire_beyond(main_root, &placements, ahead)? {
+                SlotProbe::Acquired(slot) => {
+                    if deferred {
+                        crate::phase_telemetry::add(
+                            "verification_slot_deferred_to_reservation",
+                            started.elapsed(),
+                        );
+                    }
                     return Ok(Some(slot));
                 }
+                SlotProbe::Deferred => deferred = true,
+                SlotProbe::Busy => {}
             }
             let waited = started.elapsed();
             let report = waited >= next_report;
@@ -658,12 +718,56 @@ impl ExactTreeVerificationSlot {
         }
     }
 
+    /// Take a free slot only when more than `ahead` are free: the first
+    /// `ahead` free slots are left to the reservations ahead of this caller.
+    /// Free slots counted and left are locked only for the count and released
+    /// untouched (their checkouts are never cleaned by a caller that does not
+    /// keep them).
+    fn try_acquire_beyond(
+        main_root: &Path,
+        placements: &[SlotPlacement],
+        ahead: usize,
+    ) -> Result<SlotProbe, BrokerOpError> {
+        if ahead == 0 {
+            for placement in placements {
+                if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
+                    return Ok(SlotProbe::Acquired(slot));
+                }
+            }
+            return Ok(SlotProbe::Busy);
+        }
+        let mut free = Vec::with_capacity(ahead + 1);
+        for placement in placements {
+            if let Some(lock) = Self::try_lock_at(main_root, placement)? {
+                if free.len() == ahead {
+                    return Ok(SlotProbe::Acquired(Self::held(main_root, placement, lock)));
+                }
+                free.push(lock);
+            }
+        }
+        Ok(if free.is_empty() {
+            SlotProbe::Busy
+        } else {
+            SlotProbe::Deferred
+        })
+    }
+
     /// Take the lock on an already chosen placement, or `None` if it is held.
     fn try_acquire_at(
         main_root: &Path,
         placement: SlotPlacement,
     ) -> Result<Option<Self>, BrokerOpError> {
-        let lock_path = Self::prepare_lock_path(main_root, &placement)?;
+        Ok(Self::try_lock_at(main_root, &placement)?
+            .map(|lock| Self::held(main_root, &placement, lock)))
+    }
+
+    /// The bare lock of a placement, or `None` if it is held. Dropping it
+    /// releases the slot without touching its checkout.
+    fn try_lock_at(
+        main_root: &Path,
+        placement: &SlotPlacement,
+    ) -> Result<Option<ExclusiveFileLock>, BrokerOpError> {
+        let lock_path = Self::prepare_lock_path(main_root, placement)?;
         let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
             path: lock_path.clone(),
             source,
@@ -672,11 +776,15 @@ impl ExactTreeVerificationSlot {
             path: lock_path,
             source,
         })?;
-        Ok(lock.map(|lock| Self {
+        Ok(lock)
+    }
+
+    fn held(main_root: &Path, placement: &SlotPlacement, lock: ExclusiveFileLock) -> Self {
+        Self {
             repository_root: main_root.to_path_buf(),
             path: placement.directory.join("slot"),
             _lock: lock,
-        }))
+        }
     }
 
     fn prepare_lock_path(
@@ -944,9 +1052,19 @@ pub(crate) struct PooledSlotHandoff<'a> {
     root_plan: &'a crate::WorktreeRootPlan,
     commit: &'a str,
     progress: Option<&'a crate::submit_progress::SubmitProgress>,
+    /// Moves a released slot's checkout into the trash in one rename, so the
+    /// slot frees at once instead of after Git removes the whole tree inline.
+    /// `false` (or no trash) leaves the removal to the slot's own cleanup.
+    trash: Option<SlotTrash<'a>>,
+    /// How long a re-acquire waits for a slot before it gives up, so the gate
+    /// can hand its held resources on and queue for them again.
+    hold_bound: Duration,
     releases: std::cell::Cell<u64>,
     reacquires: std::cell::Cell<u64>,
 }
+
+/// Moves a verification slot's checkout into the trash; true when moved.
+pub(crate) type SlotTrash<'a> = &'a dyn Fn(&crate::BrokerStore, &Path) -> bool;
 
 impl<'a> PooledSlotHandoff<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -967,9 +1085,25 @@ impl<'a> PooledSlotHandoff<'a> {
             root_plan,
             commit,
             progress,
+            trash: None,
+            hold_bound: crate::gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION,
             releases: std::cell::Cell::new(0),
             reacquires: std::cell::Cell::new(0),
         }
+    }
+
+    /// Hand a released slot's checkout to `trash` instead of removing it
+    /// inline.
+    pub(crate) fn with_trash(mut self, trash: SlotTrash<'a>) -> Self {
+        self.trash = Some(trash);
+        self
+    }
+
+    /// Wait at most `bound` for a slot on each re-acquire.
+    #[cfg(test)]
+    pub(crate) fn with_hold_bound(mut self, bound: Duration) -> Self {
+        self.hold_bound = bound;
+        self
     }
 
     /// How many times the slot was given back and taken again.
@@ -990,36 +1124,193 @@ impl<'a> PooledSlotHandoff<'a> {
 }
 
 impl crate::gates::VerificationSlotHandoff for PooledSlotHandoff<'_> {
-    fn release(&self) {
-        // Dropping the slot removes its checkout and then its lock, so the
-        // next holder starts from an empty directory.
-        drop(self.slot.borrow_mut().take());
+    fn release(&self, store: &crate::BrokerStore) {
+        let Some(slot) = self.slot.borrow_mut().take() else {
+            return;
+        };
+        // One rename into the trash when possible; dropping the slot then
+        // finds nothing left to remove and releases its lock at once.
+        // Otherwise dropping it removes its checkout and then its lock, so
+        // the next holder starts from an empty directory either way.
+        if let Some(trash) = self.trash {
+            trash(store, slot.path());
+        }
+        drop(slot);
         self.releases.set(self.releases.get() + 1);
     }
 
-    fn reacquire(&self, keepalive: &mut dyn FnMut()) -> Result<GitRepo, BrokerOpError> {
-        let mut slot = ExactTreeVerificationSlot::acquire_pooled_until(
-            self.main_root,
-            self.namespace,
-            self.size,
-            self.root_plan,
-            crate::gates::heartbeat_interval(),
-            &mut |waited, report| {
-                keepalive();
-                if report && let Some(progress) = self.progress {
-                    progress.report_slot_wait(self.main_root, waited);
-                }
-                false
-            },
-        )?
-        .expect("this slot acquisition never redirects");
+    fn reacquire(&self, keepalive: &mut dyn FnMut()) -> Result<Option<GitRepo>, BrokerOpError> {
+        // Without a reservation (its directory unwritable) the wait still
+        // works, as an ordinary arrival.
+        let reservation = {
+            let _span = crate::phase_telemetry::span("gate_slot_reservation");
+            SlotReservation::create(self.main_root, self.namespace)
+        };
+        if reservation.is_err() {
+            crate::phase_telemetry::add("gate_slot_reservation_unavailable", Duration::ZERO);
+        }
+        let mut on_busy = |waited: Duration, report: bool| {
+            keepalive();
+            if report && let Some(progress) = self.progress {
+                progress.report_slot_wait(self.main_root, waited);
+            }
+            waited >= self.hold_bound
+        };
+        let slot = match &reservation {
+            Ok(reservation) => ExactTreeVerificationSlot::acquire_pooled_reserved(
+                self.main_root,
+                self.namespace,
+                self.size,
+                self.root_plan,
+                crate::gates::heartbeat_interval(),
+                reservation,
+                &mut on_busy,
+            )?,
+            Err(_) => ExactTreeVerificationSlot::acquire_pooled_until(
+                self.main_root,
+                self.namespace,
+                self.size,
+                self.root_plan,
+                crate::gates::heartbeat_interval(),
+                &mut on_busy,
+            )?,
+        };
+        drop(reservation);
+        let Some(mut slot) = slot else {
+            return Ok(None);
+        };
         let repository = GitRepo::discover(self.main_root)?;
         let checkout = slot.materialize(&repository, self.commit);
         // Held even when materializing failed, so the caller cleans it up.
         **self.slot.borrow_mut() = Some(slot);
         self.reacquires.set(self.reacquires.get() + 1);
-        checkout
+        checkout.map(Some)
     }
+}
+
+/// What one pass over a pool found.
+enum SlotProbe {
+    Acquired(ExactTreeVerificationSlot),
+    /// Some slot was free, but no more than the reservations ahead.
+    Deferred,
+    Busy,
+}
+
+const SLOT_RESERVATION_SUFFIX: &str = ".reservation";
+
+static SLOT_RESERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Where a pool's reservations live: the repository's gate runtime directory,
+/// beside the gate owner locks, never inside a slot or a checkout.
+fn slot_reservations_directory(main_root: &Path, namespace: &str) -> PathBuf {
+    crate::gates::running_dir(main_root)
+        .join("slot-reservations")
+        .join(namespace)
+}
+
+/// A gate's claim on the next free slot of a pool, held while it waits for a
+/// slot with its host resources and owner locks already taken.
+///
+/// A reservation is a file holding its own `flock`: new arrivals defer to
+/// every live one, and re-acquirers to the ones made before theirs (names sort
+/// by creation time). A holder that dies releases the lock with its process,
+/// and the next reader removes the file, so a crash never leaves a pool
+/// reserved. Dropping it removes the file.
+pub(crate) struct SlotReservation {
+    path: PathBuf,
+    name: String,
+    _lock: ExclusiveFileLock,
+}
+
+impl SlotReservation {
+    pub(crate) fn create(main_root: &Path, namespace: &str) -> std::io::Result<Self> {
+        let directory = slot_reservations_directory(main_root, namespace);
+        std::fs::create_dir_all(&directory)?;
+        let name = format!(
+            "{:039}-{:010}-{:010}{SLOT_RESERVATION_SUFFIX}",
+            crate::file_lock::host_monotonic_ns(),
+            std::process::id(),
+            SLOT_RESERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        // Locked under a hidden name and then renamed, so no reader ever sees
+        // the reservation unlocked and takes it for a dead one.
+        let pending = directory.join(format!(".{name}.pending"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&pending)?;
+        let lock = match ExclusiveFileLock::try_acquire(file) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                std::fs::remove_file(&pending).ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "a new slot reservation was locked by someone else",
+                ));
+            }
+            Err(error) => {
+                std::fs::remove_file(&pending).ok();
+                return Err(error);
+            }
+        };
+        let path = directory.join(&name);
+        if let Err(error) = std::fs::rename(&pending, &path) {
+            std::fs::remove_file(&pending).ok();
+            return Err(error);
+        }
+        Ok(Self {
+            path,
+            name,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        // Removed while still locked, so no reader judges it dead first.
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+/// Live reservations in `directory` made before `own` (all of them when
+/// `own` is `None`), removing the ones whose holder is gone.
+fn live_slot_reservations_ahead(directory: &Path, own: Option<&str>) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut ahead = 0;
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') || !name.ends_with(SLOT_RESERVATION_SUFFIX) {
+            continue;
+        }
+        if own.is_some_and(|own| name.as_str() >= own) {
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        match ExclusiveFileLock::try_acquire(file) {
+            Ok(None) => ahead += 1,
+            Ok(Some(_dead)) => {
+                // Its holder is gone. Best effort: another reader may have
+                // removed it first.
+                std::fs::remove_file(entry.path()).ok();
+                crate::phase_telemetry::add("gate_slot_reservation_reaped", Duration::ZERO);
+            }
+            Err(_) => {}
+        }
+    }
+    ahead
 }
 
 #[cfg(test)]
@@ -1617,6 +1908,145 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a released slot was never taken");
         assert_eq!(path, held_path);
+    }
+
+    /// A gate that already holds its host resources and is waiting for a slot
+    /// again gets the next free one, even when a new submit was polling for a
+    /// slot first: otherwise new arrivals could take every freed slot while
+    /// the re-acquirer sits on an exclusive build cache. The new submit gets a
+    /// slot once the re-acquirer no longer needs one.
+    #[test]
+    fn a_reacquiring_gate_takes_a_freed_slot_ahead_of_a_new_arrival() {
+        let fx = fixture();
+        let plan = default_worktree_root_plan(&fx.main);
+        let held = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 1).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // The new arrival starts polling first.
+        let arrival = std::thread::spawn({
+            let (main, plan, sender) = (fx.main.clone(), plan.clone(), sender.clone());
+            move || {
+                let slot = ExactTreeVerificationSlot::acquire_pooled_until(
+                    &main,
+                    "merge-sim",
+                    1,
+                    &plan,
+                    Duration::MAX,
+                    &mut |_, _| false,
+                )
+                .unwrap()
+                .unwrap();
+                sender.send("arrival").unwrap();
+                drop(slot);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (reserved, reservation_made) = std::sync::mpsc::channel();
+        let (release_reacquired, reacquired_may_go) = std::sync::mpsc::channel::<()>();
+        let reacquirer = std::thread::spawn({
+            let (main, plan) = (fx.main.clone(), plan.clone());
+            move || {
+                let reservation = SlotReservation::create(&main, "merge-sim").unwrap();
+                reserved.send(()).unwrap();
+                let slot = ExactTreeVerificationSlot::acquire_pooled_reserved(
+                    &main,
+                    "merge-sim",
+                    1,
+                    &plan,
+                    Duration::MAX,
+                    &reservation,
+                    &mut |_, _| false,
+                )
+                .unwrap()
+                .unwrap();
+                drop(reservation);
+                sender.send("reacquirer").unwrap();
+                reacquired_may_go.recv().unwrap();
+                drop(slot);
+            }
+        });
+        reservation_made.recv().unwrap();
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)),
+            Ok("reacquirer"),
+            "the freed slot went to the new arrival instead of the re-acquirer"
+        );
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(600)).is_err(),
+            "the new arrival entered a slot the re-acquirer holds"
+        );
+        release_reacquired.send(()).unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)),
+            Ok("arrival"),
+            "the new arrival never got the slot once the re-acquirer was done"
+        );
+        reacquirer.join().unwrap();
+        arrival.join().unwrap();
+    }
+
+    /// A reservation whose holder is gone (its lock is free) is removed by the
+    /// next reader and never holds a slot back; one still locked does.
+    #[test]
+    fn a_dead_reservation_is_reaped_and_a_live_one_defers_arrivals() {
+        let fx = fixture();
+        let directory = slot_reservations_directory(&fx.main, "merge-sim");
+        std::fs::create_dir_all(&directory).unwrap();
+        let dead = directory.join(format!(
+            "{:039}-0000000001-0000000000{SLOT_RESERVATION_SUFFIX}",
+            1
+        ));
+        std::fs::write(&dead, "").unwrap();
+        assert_eq!(live_slot_reservations_ahead(&directory, None), 0);
+        assert!(
+            !dead.exists(),
+            "a reservation nobody holds was left in place"
+        );
+
+        let live = SlotReservation::create(&fx.main, "merge-sim").unwrap();
+        assert_eq!(live_slot_reservations_ahead(&directory, None), 1);
+        // A reservation never defers to itself or to later ones.
+        assert_eq!(
+            live_slot_reservations_ahead(&directory, Some(&live.name)),
+            0
+        );
+        let later = SlotReservation::create(&fx.main, "merge-sim").unwrap();
+        assert_eq!(
+            live_slot_reservations_ahead(&directory, Some(&later.name)),
+            1
+        );
+        let plan = default_worktree_root_plan(&fx.main);
+        let deferred = ExactTreeVerificationSlot::acquire_pooled_until(
+            &fx.main,
+            "merge-sim",
+            2,
+            &plan,
+            Duration::MAX,
+            &mut |waited, _| waited >= Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(
+            deferred.is_none(),
+            "a new arrival took one of two free slots both live reservations need"
+        );
+        drop(later);
+        let admitted = ExactTreeVerificationSlot::acquire_pooled_until(
+            &fx.main,
+            "merge-sim",
+            2,
+            &plan,
+            Duration::MAX,
+            &mut |waited, _| waited >= Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            admitted.is_some(),
+            "the slot beyond the live reservation stayed closed"
+        );
+        let path = live.path.clone();
+        drop(live);
+        assert!(!path.exists(), "a dropped reservation left its file behind");
     }
 
     /// A free slot is taken without a word; a full pool says so at once and

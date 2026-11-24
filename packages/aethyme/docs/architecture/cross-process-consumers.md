@@ -1066,21 +1066,55 @@ tree the earlier gates judged, and the host resource lease is renewed while
 waiting for the slot and once more before the gate runs. A gate that needs no
 wait keeps its slot, and a gate with `resource_wait_seconds = 0` keeps its
 fail-fast behavior. Batch verification (queued leaders and `merge-batch`)
-uses the same handoff.
+uses the same handoff. A released checkout is moved into the slot pool's
+trash in one rename (the same path the final slot of a submit takes), so the
+slot frees at once; Git's inline removal stays the fallback.
+
+A gate waiting for a slot again holds its resources, so it takes precedence
+over new arrivals: it holds a reservation, a file under
+`.aethyme/run/gates/slot-reservations/<pool>/` that keeps its own `flock`. A
+new submit takes a free slot only while more slots are free than live
+reservations, and re-acquirers take slots in reservation order. A holder that
+dies releases the lock with its process and the next reader removes the
+file. The wait for a slot while holding resources is bounded at 300 s
+(`gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION`): past it the gate releases its
+lease and owner locks and queues for them again at the back of the FIFO
+resource queue, so it never sits on an exclusive cache while the slots stay
+busy.
+
+The wait for host load is bounded separately from the resource wait: a gate
+waits for load at most `min(resource_wait_seconds, 900)` seconds
+(`gate_admission::MAX_LOAD_WAIT_SECONDS`), the effective bound every gate had
+before the managed-cache gates raised `resource_wait_seconds` to 7500 s and
+1200 s. A follower of a queued batch now waits for a live leader as long as
+the base's gate policy lets one verification take (each gate's load bound,
+resource wait, slot bound and longest scaled timeout, summed), and never less
+than the previous 30 minutes.
 
 Command metrics add these phases. `gate_slot_admission_probe` times the
 single in-slot attempt (one load reading, owner locks and resources tried
 without waiting). `gate_slot_release` counts slot releases and times the
 release, including the removal of the released checkout. The
 `gate_slot_release_trigger` attachment counts releases by the wait that
-caused them (`load`, `owner_locks` or `resources`), and the release progress
-line names the same trigger.
+caused them (`load`, `owner_locks`, `resources`, or `probe_error` when the
+in-slot attempt failed in a way the established path would retry), and the
+release progress line names the same trigger.
 `gate_admission_wait_outside_slot` times the load, owner-lock and resource
 waits a released gate spends with no slot. `gate_slot_reacquire` counts
 re-acquisitions and times the wait for a slot plus the new checkout. The
 `verification_slot_handoff` attachment (`releases`, `reacquires`) totals both
 counts for one submit verification and is present only when a handoff
-happened. Consumers must tolerate the additive phases and attachment; no
+happened. `gate_slot_reservation` times creating the reservation, and
+`gate_slot_reservation_unavailable` counts re-acquires that waited without one
+(the directory could not be written; they wait as ordinary arrivals).
+`gate_slot_reservation_reaped` counts reservations removed because their
+holder was gone. `verification_slot_deferred_to_reservation` counts
+acquisitions that left a free slot to a reservation at least once, with the
+time until they got one. `gate_resource_requeue` times handing held resources
+back when no slot freed within the bound, and `gate_slot_wait_requeues`
+counts those re-queues. The released checkout's trash move reuses the
+existing `verification_slot_trash`, `verification_slot_trashed` and
+`verification_slot_trash_fell_back_to_git` metrics. Consumers must tolerate the additive phases and attachment; no
 existing field changes.
 
 ## Git wrapper probe verdict cache (2026-11-15)

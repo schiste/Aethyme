@@ -19,7 +19,23 @@ const MAX_PATHS: usize = 128;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const CLAIM_DEADLINE: Duration = Duration::from_millis(50);
+/// The shortest a follower waits for a live leader. The real bound comes from
+/// the gate policy ([`follow_deadline`]).
 const FOLLOW_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// How long a follower keeps waiting for a leader that is still alive: as
+/// long as the leader's verification can take when every gate waits as long
+/// as admission allows and then runs to its longest deadline
+/// ([`crate::gates::longest_verification_seconds`]), and never less than
+/// [`FOLLOW_DEADLINE`]. A leader waiting for a busy build cache is within its
+/// bounds; giving up on it made every member verify the same tree again.
+/// Without a readable policy the floor applies.
+pub(super) fn follow_deadline(gates: Option<&[crate::gates::Gate]>) -> Duration {
+    gates
+        .map(|gates| Duration::from_secs(crate::gates::longest_verification_seconds(gates)))
+        .unwrap_or_default()
+        .max(FOLLOW_DEADLINE)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Waiter {
@@ -322,9 +338,10 @@ impl Ticket {
         .unwrap_or(false)
     }
 
-    /// Wait only for an accepted leader, with no slot held. Failures and
-    /// crashed leaders send the original submit down its ordinary path once.
-    pub(super) fn follow(&self) -> Option<Receipt> {
+    /// Wait only for an accepted leader, with no slot held, while it is alive
+    /// and for at most `deadline` ([`follow_deadline`]). Failures and crashed
+    /// leaders send the original submit down its ordinary path once.
+    pub(super) fn follow(&self, deadline: Duration) -> Option<Receipt> {
         let started = Instant::now();
         loop {
             if !self.waiter.alive(&self.directory) {
@@ -353,7 +370,7 @@ impl Ticket {
             match outcome {
                 Handoff::Verified(receipt) => return Some(receipt),
                 Handoff::Fallback => return None,
-                Handoff::Pending if started.elapsed() >= FOLLOW_DEADLINE => return None,
+                Handoff::Pending if started.elapsed() >= deadline => return None,
                 Handoff::Pending => std::thread::sleep(Duration::from_millis(125)),
             }
         }
@@ -709,5 +726,58 @@ mod tests {
             first.admit(host_monotonic_ns()).unwrap(),
             Admission::Single
         ));
+    }
+
+    /// A leader still waiting for a busy build cache is within its bounds:
+    /// its followers keep following it, past the old fixed half hour when the
+    /// gate policy lets one verification take longer, and take its receipt
+    /// when it finishes instead of verifying the same tree again.
+    #[test]
+    fn a_follower_keeps_following_a_live_leader_until_the_policy_deadline() {
+        let root = fixture();
+        let leader = enqueue(root.path(), 1, "a");
+        let follower = enqueue(root.path(), 2, "b");
+        let Admission::Leader(request) = leader.admit(host_monotonic_ns()).unwrap() else {
+            panic!("the coordinator did not lead a two-member batch");
+        };
+        // Still pending at a short deadline: the follower waits all of it.
+        let started = Instant::now();
+        assert!(follower.follow(Duration::from_millis(400)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        let following = std::thread::spawn(move || follower.follow(Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !following.is_finished(),
+            "the follower gave up on a live leader"
+        );
+        let receipt = Receipt {
+            coordinator: 1,
+            verifier: 1,
+            base: request.base.clone(),
+            members: request.members.clone(),
+            candidate: "candidate".into(),
+            tree: "tree".into(),
+            gates: serde_json::Value::Null,
+        };
+        assert!(leader.complete(Some(receipt)).unwrap().is_some());
+        let followed = following.join().unwrap();
+        assert!(
+            followed.is_some_and(|receipt| receipt.members == request.members),
+            "the follower did not take the leader's receipt"
+        );
+
+        // The deadline comes from the policy: a workspace gate that may wait
+        // 7500 s for its cache and run 2400 s at up to three times load keeps
+        // followers for its whole bound, far past the old 30 minutes.
+        let gates = crate::gates::parse_gates(
+            "[[gate]]\nname='workspace'\ncommand='true'\ncost=3\ntimeout_seconds=2400\nresource_wait_seconds=7500\n",
+        )
+        .unwrap();
+        assert_eq!(
+            follow_deadline(Some(&gates)),
+            Duration::from_secs(900 + 7500 + 300 + 7200)
+        );
+        assert_eq!(follow_deadline(None), FOLLOW_DEADLINE);
+        assert_eq!(follow_deadline(Some(&[])), FOLLOW_DEADLINE);
     }
 }
