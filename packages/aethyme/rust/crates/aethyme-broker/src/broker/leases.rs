@@ -3661,10 +3661,15 @@ impl Broker {
                     }
                 }
             }
+            // Asked only inside this block: a Landed close of a session whose
+            // holder has no task lease and has not moved on never reaches it.
             // The landed lanes already proved the work landed, so only a
             // running preparation, or one that cannot be ruled out, keeps the
-            // session: the declaration and the record answer that. Every
-            // other lane keeps the full status, input hashes included.
+            // session: the declaration and the record answer that. An invalid
+            // or unknown answer is `operation_unknown`, so past the landed
+            // window a merged-pull-request session is retried in the Landed
+            // lane, which may skip this block. Every other lane keeps the
+            // full status, input hashes included.
             let preparation = if require_landed {
                 self.preparation_activity(&current).map_err(drop)
             } else {

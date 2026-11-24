@@ -1366,21 +1366,28 @@ impl Broker {
     /// looked up and no runtime is resolved. Nothing here says the prepared
     /// state is usable; [`Self::preparation_status`] answers that.
     ///
-    /// The caller holds the session's operation claim, so no admitted
-    /// command is preparing; the record covers one that outlived its command
-    /// or whose cleanup is unverified. Fails closed: a declaration that
-    /// cannot be read or validated is `Invalid`, and a record that cannot be
-    /// read, names another session or holds a state no preparation writes is
-    /// an error. The record is read even without a declaration, which may
-    /// have been removed while a preparation ran.
+    /// The caller holds the session's operation claim exclusively, so no
+    /// guarded `aethyme` CLI command is preparing it. That claim does not
+    /// cover a library caller, an older binary, or a child that outlived its
+    /// broker; the record does, and fails closed: a declaration that cannot
+    /// be read or validated is `Invalid`, and a record that cannot be read,
+    /// names another session or holds a state no preparation writes is an
+    /// error.
+    ///
+    /// The record is read even without a declaration, which may have been
+    /// removed while a preparation ran. Such a record, when it names no host
+    /// lease, has no lease that could prove its end. It is idle once it was
+    /// started before the current boot (past [`crate::host_boot`]'s margin),
+    /// the rule guarded-exec receipts use: no process survives a restart. A
+    /// record with a declaration keeps the full status's rule.
     pub(crate) fn preparation_activity(
         &self,
         session: &crate::Session,
     ) -> Result<PreparationActivity, PreparationError> {
         let _span = crate::phase_telemetry::span("preparation_record_check");
-        if load_config(Path::new(&session.worktree_path)).is_err() {
+        let Ok(config) = load_config(Path::new(&session.worktree_path)) else {
             return Ok(PreparationActivity::Invalid);
-        }
+        };
         let path = record_path(self.main_root(), session.id);
         let Some(record) = read_record(&path)? else {
             return Ok(PreparationActivity::Idle);
@@ -1392,15 +1399,25 @@ impl Broker {
         if record.session_id != session.id {
             return Err(invalid("the record names another session".into()));
         }
-        match record.state {
-            PreparationState::InProgress if self.preparation_host_lease_released(&record) => {
+        match self.in_progress_record_state(&record) {
+            Some(PreparationState::Interrupted) => return Ok(PreparationActivity::Idle),
+            Some(_) => {
+                let pre_boot_without_lease = config.is_none()
+                    && record.host_lease_id.is_none()
+                    && crate::host_boot::pre_boot_cutoff_ms()
+                        .is_some_and(|cutoff| record.started_at < cutoff);
+                if !pre_boot_without_lease {
+                    return Ok(PreparationActivity::InProgress);
+                }
                 crate::phase_telemetry::add(
-                    "preparation_judged_interrupted",
+                    "preparation_pre_boot_without_lease",
                     std::time::Duration::ZERO,
                 );
-                Ok(PreparationActivity::Idle)
+                return Ok(PreparationActivity::Idle);
             }
-            PreparationState::InProgress => Ok(PreparationActivity::InProgress),
+            None => {}
+        }
+        match record.state {
             PreparationState::Current | PreparationState::Failed => Ok(PreparationActivity::Idle),
             other => Err(invalid(format!(
                 "unexpected recorded state {}",
@@ -1511,6 +1528,9 @@ impl Broker {
             .as_ref()
             .map(|record| record.runtimes.clone())
             .unwrap_or_default();
+        let running = record
+            .as_ref()
+            .and_then(|record| self.in_progress_record_state(record));
         let (state, reason, recorded_digest, recorded_source_digest) = match record {
             None => (
                 PreparationState::Required,
@@ -1518,27 +1538,18 @@ impl Broker {
                 None,
                 None,
             ),
-            Some(record)
-                if record.state == PreparationState::InProgress
-                    && self.preparation_host_lease_released(&record) =>
-            {
-                crate::phase_telemetry::add(
-                    "preparation_judged_interrupted",
-                    std::time::Duration::ZERO,
-                );
-                (
-                    PreparationState::Interrupted,
-                    format!(
-                        "a prior preparation was interrupted: its host lease {} generation {} \
-                         is released, so no preparer holds it; prepare again",
-                        record.host_lease_id.as_deref().unwrap_or("none"),
-                        record.host_lease_generation.unwrap_or(0)
-                    ),
-                    Some(record.digest),
-                    Some(record.source_digest),
-                )
-            }
-            Some(record) if record.state == PreparationState::InProgress => (
+            Some(record) if running == Some(PreparationState::Interrupted) => (
+                PreparationState::Interrupted,
+                format!(
+                    "a prior preparation was interrupted: its host lease {} generation {} \
+                     is released, so no preparer holds it; prepare again",
+                    record.host_lease_id.as_deref().unwrap_or("none"),
+                    record.host_lease_generation.unwrap_or(0)
+                ),
+                Some(record.digest),
+                Some(record.source_digest),
+            ),
+            Some(record) if running == Some(PreparationState::InProgress) => (
                 PreparationState::InProgress,
                 format!(
                     "a prior preparation was interrupted; inspect host lease {} generation {} before retrying",
@@ -1634,6 +1645,22 @@ impl Broker {
             package_store,
             runtimes: recorded_runtimes,
         })
+    }
+
+    /// What an `in_progress` record means now: `Interrupted` once its host
+    /// lease proves the preparer stopped, `InProgress` until then; `None` for
+    /// a record in any other state. Each interrupted answer is counted
+    /// (`preparation_judged_interrupted`), by the full status and by the
+    /// landed lanes' [`Self::preparation_activity`] alike.
+    fn in_progress_record_state(&self, record: &PreparationRecord) -> Option<PreparationState> {
+        if record.state != PreparationState::InProgress {
+            return None;
+        }
+        if !self.preparation_host_lease_released(record) {
+            return Some(PreparationState::InProgress);
+        }
+        crate::phase_telemetry::add("preparation_judged_interrupted", std::time::Duration::ZERO);
+        Some(PreparationState::Interrupted)
     }
 
     /// Whether an `in_progress` record's preparer provably stopped: the host

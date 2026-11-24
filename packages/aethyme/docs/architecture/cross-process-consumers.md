@@ -5163,25 +5163,46 @@ test
 
 ### Record-only preparation check in the landed lanes (changed 2026-11-24)
 
-Under the operation claim, the landed and merged-pull-request lanes no longer
-read the full `preparation_status` of a session. They load its declaration and
-its preparation record only (span `preparation_record_check`): no declared
-input is hashed, no output looked up, no runtime resolved. A running
-preparation (an `in_progress` record whose host lease is not proved released)
-still keeps the session, as `preparation_in_progress`; an unreadable or
-invalid declaration as `preparation_invalid`; a record that cannot be read,
-names another session or holds a state no preparation writes as
-`preparation_unknown`. The record is now read even without a declaration, so
-an `in_progress` record outlives a removed one.
+The landed and merged-pull-request lanes no longer read the full
+`preparation_status` of a session. They load its declaration and its
+preparation record only (span `preparation_record_check`): no declared input
+is hashed, no output looked up, no runtime resolved. A running preparation (an
+`in_progress` record whose host lease is not proved released) still keeps the
+session, as `preparation_in_progress`; an unreadable or invalid declaration as
+`preparation_invalid`; a record that cannot be read, names another session or
+holds a state no preparation writes as `preparation_unknown`.
 
-What this allows: a landed session whose declared input or runtime is missing
-or unreadable, or whose declared output is a symlink or unreadable, was kept
-before and may now close, after every other check. Those conditions describe
-whether the prepared state is usable, not whether anyone is preparing. The close
-itself deletes nothing; checkout retirement, which a budgeted pass may try
-right after the close, applies its own proofs and never read this status.
-The abandonment and no-work lanes, `finish`, hooks, `submit prepare` and the
+When it runs: under the session's operation claim, and only for a
+merged-pull-request close, or a Landed close whose holder has a task-lease
+binding or has moved on. A Landed close of a legacy holder never asked about
+preparation and still does not. `preparation_invalid` and
+`preparation_unknown` are `operation_unknown` declines, so a
+merged-pull-request session past `session_landed_after_hours` is retried in
+the Landed lane, which may not ask again; `preparation_in_progress` is
+`operation_active` and is not retried. The operation claim excludes guarded
+`aethyme` CLI commands only, not a library caller, an older binary or a child
+that outlived its broker; the record covers those.
+
+What this allows: a landed session whose declared input or runtime is missing,
+symlinked or unreadable, or whose declared output is a symlink or unreadable,
+was kept and may now close, after every other check. A merged-pull-request
+session with a missing input may now close at `session_merged_after_hours`
+instead of waiting for the Landed retry. Those conditions describe whether the
+prepared state is usable, not whether anyone is preparing. The close itself
+deletes nothing; checkout retirement, which a budgeted pass may try right
+after the close, applies its own proofs and never read this status. The
+abandonment and no-work lanes, `finish`, hooks, `submit prepare` and the
 cleanup and removal lanes are unchanged.
+
+What this keeps that closed before: the record is read even when the
+declaration is absent (`not_configured`, which did not look at it). An
+`in_progress` record that names a host lease ends by the lease rule; one
+without a lease ends when its `started_at` predates the current boot by ten
+minutes (counter `preparation_pre_boot_without_lease`), and until then the
+abandonment window, which still reads `not_configured`, may close it.
+
+`preparation_judged_interrupted` is counted by two paths: the full status and
+this check.
 
 New phase spans, for the checks after the landing proof:
 `session_close_process_listing`, `session_close_operation_guard`,
@@ -5199,9 +5220,17 @@ pass is one command), numbers only, absent when empty. Its first key,
 `landed_sessions_examined`, stands beside the `phase_counts` entry of the same
 name, which counts every judgement, repeats included.
 
+After a release, read the count and time of `preparation_record_check`, and
+`landed_session_retirement` minus `landed_proof` and
+`landed_reproof_before_claims`, per `landed_sessions_examined`.
+
 Covered by `session_auto_close.rs` tests
-`a_landed_close_hashes_no_preparation_input` and
-`a_landed_close_keeps_a_session_whose_preparation_may_run`, `preparation.rs`
+`a_landed_close_hashes_no_preparation_input`,
+`a_landed_close_keeps_a_session_whose_preparation_may_run`,
+`a_landed_close_ignores_unusable_inputs_and_outputs`,
+`the_landed_lane_asks_the_record_for_a_task_lease_holder_only`,
+`the_abandonment_and_no_work_lanes_still_read_the_full_status` and
+`a_lease_less_record_without_a_declaration_ends_with_its_boot`, `preparation.rs`
 test `the_record_check_reads_an_interrupted_preparation_as_idle` and
 `phase_telemetry.rs` test
 `distinct_counts_count_each_id_once_and_attach_no_id`.
