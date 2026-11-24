@@ -723,3 +723,204 @@ fn a_slice_whose_sessions_all_left_tombstones_lists_no_archives() {
     );
     assert!(branch_exists(&root, "agent/retired"));
 }
+
+/// Binds the repository's pool (by starting a session there) and returns it.
+fn bind_pool(fixture: &mut Fixture) -> std::path::PathBuf {
+    git(&fixture.root, &["config", "user.name", "t"]);
+    git(
+        &fixture.root,
+        &["config", "user.email", "t@example.invalid"],
+    );
+    fixture
+        .broker
+        .start_worktree("bind the pool", None)
+        .unwrap();
+    fixture
+        .broker
+        .validate_bound_repository_worktree_root()
+        .unwrap()
+        .expect("the pool is bound")
+}
+
+/// A merged branch of a cleaned session; the session's id.
+fn merged_branch(fixture: &mut Fixture) -> i64 {
+    git(&fixture.root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false)
+}
+
+fn kept(summary: &MergedBranchSummary, reason: &str) -> Option<u64> {
+    summary.kept_by_reason.get(reason).copied()
+}
+
+/// With no pool bound the host root is the only one, and nothing is unknown.
+#[test]
+fn a_repository_with_no_pool_bound_still_deletes() {
+    let mut fixture = fixture();
+    merged_branch(&mut fixture);
+    assert_eq!(
+        fixture.broker.checked_recovery_archive_roots(),
+        Some(vec![fixture.broker.recovery_archive_root().unwrap()])
+    );
+
+    let (summary, _) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
+
+/// A bound pool that never held an archive adds no root and nothing unknown.
+#[test]
+fn a_bound_pool_without_an_archive_directory_still_deletes() {
+    let mut fixture = fixture();
+    bind_pool(&mut fixture);
+    merged_branch(&mut fixture);
+
+    let (summary, _) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
+
+/// An archive held only by the pool keeps the branch, also when the archive
+/// directory's marker names another repository.
+#[test]
+fn an_archive_only_on_the_pool_keeps_the_branch() {
+    let mut fixture = fixture();
+    bind_pool(&mut fixture);
+    let session = merged_branch(&mut fixture);
+    let pool_root = fixture.broker.pool_recovery_archive_root(true).unwrap();
+    std::fs::create_dir_all(pool_root.join(format!("{session}-archive"))).unwrap();
+    let recovery_marker = pool_root
+        .parent()
+        .unwrap()
+        .join(".aethyme-recovery-archives-root.json");
+    for other_owner in [false, true] {
+        if other_owner {
+            std::fs::write(&recovery_marker, r#"{"repository_key":"other"}"#).unwrap();
+        }
+
+        let (summary, counts) = run_counted(&fixture);
+
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+        assert!(
+            !counts.contains_key("merged_branches_archive_roots_unknown"),
+            "{counts:?}"
+        );
+    }
+}
+
+/// A bound pool that is not there, or whose archive marker cannot be read, is
+/// unknown to the judging, not empty.
+#[test]
+fn an_unresolved_pool_root_keeps_the_branch_when_judging() {
+    let mut fixture = fixture();
+    let pool = bind_pool(&mut fixture);
+    merged_branch(&mut fixture);
+    let pool_root = fixture.broker.pool_recovery_archive_root(true).unwrap();
+    let marker = pool_root
+        .parent()
+        .unwrap()
+        .join(".aethyme-recovery-archives-root.json");
+    let readable = std::fs::read(&marker).unwrap();
+    let away = pool.with_file_name("pool-away");
+    for pool_away in [false, true] {
+        if pool_away {
+            std::fs::write(&marker, &readable).unwrap();
+            std::fs::rename(&pool, &away).unwrap();
+        } else {
+            std::fs::write(&marker, "not json").unwrap();
+        }
+
+        let (summary, counts) = run_counted(&fixture);
+
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+        assert_eq!(
+            counts.get("merged_branches_archive_roots_unknown"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert!(
+            !counts.contains_key("merged_branches_archive_listing_fresh"),
+            "{counts:?}"
+        );
+    }
+    std::fs::rename(&away, &pool).unwrap();
+    let (summary, _) = run_counted(&fixture);
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
+
+/// The same under the claim: the pool went away after the judging.
+#[test]
+fn an_unresolved_pool_root_keeps_the_branch_under_the_claim() {
+    let mut fixture = fixture();
+    let pool = bind_pool(&mut fixture);
+    merged_branch(&mut fixture);
+    let away = pool.with_file_name("pool-away");
+
+    let summary = run_with_change_after_judging(&fixture, move || {
+        std::fs::rename(&pool, &away).unwrap();
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(kept(&summary, "unknown"), Some(1), "{summary:?}");
+    assert!(branch_exists(&fixture.root, "agent/merged"));
+}
+
+/// The session's archive record: one that cannot be read, or whose archive
+/// directory's parent is gone, keeps the branch; an archive known to be gone
+/// does not.
+#[test]
+fn an_archive_record_that_cannot_be_checked_keeps_the_branch() {
+    let mut fixture = fixture();
+    let session = merged_branch(&mut fixture);
+    let parent = fixture.root.with_file_name("old-archives");
+    let recorded = serde_json::json!({
+        (session.to_string()): parent.join("archive").to_string_lossy()
+    })
+    .to_string();
+    for text in ["not json", recorded.as_str()] {
+        fixture
+            .broker
+            .store_ref()
+            .meta_set("checkout_retirement.archived_sessions", text)
+            .unwrap();
+        let (summary, _) = run_counted(&fixture);
+        assert_eq!(summary.deleted, 0, "{summary:?}");
+        assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+    }
+    std::fs::create_dir_all(&parent).unwrap();
+    let (summary, _) = run_counted(&fixture);
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
+
+/// Host state not created yet is reachable; host state on a volume that is
+/// not there is not.
+#[test]
+fn host_state_is_reachable_when_present_or_only_not_created_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("state");
+    assert!(crate::cleanup_resolve::host_state_reachable(&base));
+    assert!(!crate::cleanup_resolve::host_state_reachable(
+        &base.join("nested")
+    ));
+    std::fs::write(&base, "a file").unwrap();
+    assert!(!crate::cleanup_resolve::host_state_reachable(&base));
+    std::fs::remove_file(&base).unwrap();
+    std::fs::create_dir(&base).unwrap();
+    assert!(crate::cleanup_resolve::host_state_reachable(&base));
+}
+
+/// A dangling link where an archive root belongs is unknown, not empty.
+#[test]
+fn a_dangling_archive_root_keeps_the_branch() {
+    let mut fixture = fixture();
+    merged_branch(&mut fixture);
+    let archive_root = fixture.broker.recovery_archive_root().unwrap();
+    std::fs::create_dir_all(archive_root.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(archive_root.with_file_name("gone"), &archive_root).unwrap();
+
+    let (summary, _) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+}

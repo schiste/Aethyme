@@ -256,17 +256,28 @@ impl SliceArchives {
 impl crate::Broker {
     /// Whether `wanted` accepts the owner of a finished recovery archive in
     /// either archive directory (the pool-side one and the host state one),
-    /// stopping at the first it does. `None` when a directory that exists or
-    /// one of its entries cannot be read.
+    /// stopping at the first it does. `None` when a directory cannot be
+    /// resolved, or one that exists or one of its entries cannot be read.
     fn any_archive_owner(&self, mut wanted: impl FnMut(&str) -> bool) -> Option<bool> {
         let roots = {
             let _span = crate::phase_telemetry::span("merged_branches_archive_roots");
-            self.recovery_archive_roots()
+            self.checked_recovery_archive_roots()
+        };
+        let Some(roots) = roots else {
+            crate::phase_telemetry::add("merged_branches_archive_roots_unknown", Duration::ZERO);
+            return None;
         };
         for root in roots {
             let listing = match std::fs::read_dir(&root) {
                 Ok(listing) => listing,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                // Nothing there at all; a link that leads nowhere is unknown.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::fs::symlink_metadata(&root)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
                 Err(_) => return None,
             };
             for entry in listing {
@@ -315,7 +326,7 @@ impl crate::Broker {
         // same path: recorded with the session, and marked by a tombstone.
         let recorded = {
             let _span = crate::phase_telemetry::span("merged_branches_archive_record");
-            self.session_restorable_archive(session.id).is_some()
+            self.session_archive_recorded(session.id)?
         };
         if recorded {
             return Some(true);
@@ -504,9 +515,9 @@ impl crate::Broker {
         // their directories for the slice), the sessions and checkouts
         // listed above. Holding the claim for that kept a foreground
         // `finish` or `start` waiting for the whole slice budget (7 to 26 s
-        // per run on the busiest repository). A branch judged for deletion is judged again under
-        // the claim, just before the delete, which itself refuses a tip that
-        // moved; nothing judged kept is touched.
+        // per run on the busiest repository). A branch judged for deletion is
+        // judged again under the claim, just before the delete, which itself
+        // refuses a tip that moved; nothing judged kept is touched.
         let archives = SliceArchives::default();
         let mut judged = 0usize;
         let mut to_delete = Vec::new();
