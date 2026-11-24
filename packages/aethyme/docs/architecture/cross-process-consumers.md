@@ -5013,3 +5013,23 @@ reload only when the state file changes, timed by
 members when known and records `role` (`leader`, `follower`, or `single`) and
 `outcome` (`verified`, `fallback`, or `no_cohort`). Executed work appears once
 on the verifier's `batch_verification` attachment.
+
+### Landed proof without the ignored-path listing (changed 2026-11-24)
+
+The landed and merged-pull-request lanes' proof 3 (span
+`landed_proof_worktree_clean`, inner span `proof_uncommitted_check`) now asks
+only what closing a session can lose: uncommitted or untracked paths, an
+operation in progress, or a stash on the session branch. It no longer runs
+`git status --ignored=matching`, so the inner span `proof_ignored_check` and
+the counters `landed_worktree_unclean_ignored_content` and
+`landed_worktree_unclean_ignored_content_unverified` are no longer produced by
+these lanes (the counter names stay valid). Closing deletes nothing: the
+checkout-removal lanes (automatic removal and checkout retirement) still list
+and classify ignored content before any deletion, so a checkout holding
+unknown ignored content stays on disk with keep code `ignored_content`. The
+re-check under the claims already used the same listing. On the busiest
+repository the ignored listing took 45 s per checkout against 0.1 s without
+it, which turned proofs into `budget_exhausted` and `proof_timed_out` declines
+(2,193 and 458 in two days, of 4,722 landed judgements) and kept 501 sessions
+for regenerable leftovers. Covered by `session_auto_close.rs` test
+`ignored_content_keeps_the_checkout_but_not_the_session`.

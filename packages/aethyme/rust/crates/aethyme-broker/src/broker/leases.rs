@@ -249,7 +249,7 @@ pub(crate) enum LandedSessionDecline {
     NotLanded,
     /// The landing rule could not be evaluated.
     LandingUnknown,
-    /// Uncommitted, untracked, in-progress or protected ignored content.
+    /// Uncommitted, untracked or in-progress content, or a stash.
     WorktreeUnclean,
     /// HEAD or the worktree's index/HEAD activity changed between the proof
     /// and the close: the agent committed or worked meanwhile.
@@ -2265,8 +2265,10 @@ impl Broker {
     /// holds every commit of its HEAD by the landing rule `finish` uses (a
     /// representation recorded against that branch, ancestry, or
     /// `default_branch_landing`, whose `landing_covers` keeps a follow-up
-    /// commit after a squash unlanded), and the worktree is clean under the
-    /// shared cleanup classifier.
+    /// commit after a squash unlanded), and the worktree holds nothing
+    /// uncommitted, untracked, in progress or stashed. Ignored content does
+    /// not keep a close: the checkout-removal lane classifies it before any
+    /// deletion.
     ///
     /// The content search runs only when a merged pull request, a
     /// representation or ancestry already suggests a landing, stops at
@@ -2700,8 +2702,17 @@ impl Broker {
         let clean = {
             // Proof 3, timed on its own: an uncommitted-path listing that
             // crawled on a loaded host was the untimed part of `landed_proof`.
+            // Closing deletes nothing, so the proof asks only what a close
+            // can lose: uncommitted or untracked paths, an operation in
+            // progress, a stash. Ignored content is the checkout-removal
+            // lane's question, which lists and classifies it again before
+            // anything is deleted. The ignored listing walks every dependency
+            // and build directory: on the busiest repository it took 45 s
+            // per checkout against 0.1 s without it, so proofs ran out of
+            // budget (`budget_exhausted`, `proof_timed_out`) or were kept
+            // for regenerable leftovers instead of closing.
             let _span = crate::phase_telemetry::span("landed_proof_worktree_clean");
-            crate::auto_cleanup::unclean_reason(
+            crate::auto_cleanup::uncommitted_reason(
                 worktree,
                 Some(session.branch.as_str()),
                 self.main_root(),
@@ -2767,8 +2778,8 @@ impl Broker {
     /// Re-check a landed proof under the session and lifecycle claims without
     /// searching again: the preconditions still hold, HEAD is the proved
     /// head, the default branch has not moved, and nothing uncommitted,
-    /// untracked or in progress appeared. Ignored content was classified by
-    /// the proof and is classified again by the checkout-removal lane.
+    /// untracked or in progress appeared. Ignored content is left to the
+    /// checkout-removal lane, as in the proof.
     fn landed_proof_still_holds(
         &self,
         session: &crate::Session,
