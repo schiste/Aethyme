@@ -28,36 +28,53 @@ pub(crate) const TOMBSTONE_HEADER: &str = "aethyme: retired session checkout";
 /// The longest a tombstone file may be.
 const TOMBSTONE_MAX_BYTES: u64 = 16 * 1024;
 
-/// Whether `path` is a tombstone: a real directory holding exactly one
-/// entry, [`TOMBSTONE_FILE`], a small regular file starting with
-/// [`TOMBSTONE_HEADER`]. Anything else is not one (a live checkout, or a
-/// folder with content).
+/// Whether `path` is a tombstone (see [`read_checkout_tombstone`]). What
+/// cannot be read is not one: a caller that loses something by that asks
+/// [`read_checkout_tombstone`] instead.
 pub(crate) fn is_checkout_tombstone(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(mut entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    let Some(Ok(only)) = entries.next() else {
-        return false;
-    };
-    if entries.next().is_some() || only.file_name() != TOMBSTONE_FILE {
-        return false;
-    }
-    let file = only.path();
-    std::fs::symlink_metadata(&file)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= TOMBSTONE_MAX_BYTES)
-        && std::fs::read_to_string(&file).is_ok_and(|text| text.starts_with(TOMBSTONE_HEADER))
+    matches!(read_checkout_tombstone(path), Ok(Some(_)))
 }
 
-/// The archive a tombstone names, if any (its `archive:` line).
-pub(crate) fn tombstone_archive(path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path.join(TOMBSTONE_FILE)).ok()?;
-    text.lines()
+/// Whether `start --reuse` should ask for `path` to be restored: nothing is
+/// there, a tombstone is, or it cannot be told.
+pub(crate) fn may_be_retired_checkout(path: &Path) -> bool {
+    !path.exists() || !matches!(read_checkout_tombstone(path), Ok(None))
+}
+
+/// The note of the tombstone at `path`: a real directory holding exactly one
+/// entry, [`TOMBSTONE_FILE`], a small regular file starting with
+/// [`TOMBSTONE_HEADER`]. Anything else is not one (a live checkout, or a
+/// folder with content); an error when that cannot be read.
+pub(crate) fn read_checkout_tombstone(path: &Path) -> std::io::Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let mut entries = std::fs::read_dir(path)?;
+    let Some(only) = entries.next().transpose()? else {
+        return Ok(None);
+    };
+    if only.file_name() != TOMBSTONE_FILE || entries.next().transpose()?.is_some() {
+        return Ok(None);
+    }
+    let file = only.path();
+    let metadata = std::fs::symlink_metadata(&file)?;
+    if !metadata.is_file() || metadata.len() > TOMBSTONE_MAX_BYTES {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(std::fs::read(&file)?)
+        .ok()
+        .filter(|note| note.starts_with(TOMBSTONE_HEADER)))
+}
+
+/// The recovery archive a tombstone's note names, if any (its `archive:`
+/// line).
+pub(crate) fn note_archive(note: &str) -> Option<PathBuf> {
+    note.lines()
         .find_map(|line| line.strip_prefix("archive: "))
         .map(|archive| PathBuf::from(archive.trim()))
 }
@@ -73,8 +90,6 @@ pub(crate) fn restore_command(path: &Path) -> String {
 /// Where a retired checkout's work is saved, for its tombstone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SavedIn {
-    /// All committed, on its branch.
-    Branch,
     /// Its uncommitted work in a verified recovery archive that `start
     /// --reuse` restores.
     Recovery(PathBuf),
@@ -93,17 +108,8 @@ pub(crate) fn write_checkout_tombstone(
     session: &Session,
     saved: &SavedIn,
 ) -> std::io::Result<()> {
-    std::fs::create_dir(worktree)?;
     let command = restore_command(worktree);
     let (saved_text, way_back, archive_line) = match saved {
-        SavedIn::Branch => (
-            format!(
-                "All of its work is saved: it was all committed, on branch {}.",
-                session.branch
-            ),
-            format!("Bring it back here, exactly as it was, with one command:\n\n    {command}"),
-            String::new(),
-        ),
         SavedIn::Recovery(archive) => (
             format!(
                 "All of its work is saved: its commits on branch {}, and its staged and unstaged \
@@ -145,8 +151,14 @@ pub(crate) fn write_checkout_tombstone(
         id = session.id,
         at = crate::clock::epoch_ms(),
     );
+    write_tombstone_note(worktree, &body)
+}
+
+/// Write a tombstone holding `note` at `worktree`, where nothing is.
+pub(crate) fn write_tombstone_note(worktree: &Path, note: &str) -> std::io::Result<()> {
+    std::fs::create_dir(worktree)?;
     let file = worktree.join(TOMBSTONE_FILE);
-    let written = std::fs::write(&file, body);
+    let written = std::fs::write(&file, note);
     if written.is_err() {
         if std::fs::symlink_metadata(&file).is_ok() {
             crate::warn_unrecorded(
@@ -165,15 +177,84 @@ pub(crate) fn write_checkout_tombstone(
 /// Remove the tombstone at `path` (never anything that is not one).
 /// Returns whether one was removed.
 pub(crate) fn remove_checkout_tombstone(path: &Path) -> bool {
-    if !is_checkout_tombstone(path) {
+    matches!(
+        read_checkout_tombstone(path),
+        Ok(Some(note)) if remove_checkout_tombstone_holding(path, &note)
+    )
+}
+
+/// Remove the tombstone at `path` if its note is still `note`; a directory
+/// that cannot be removed gets its note back.
+pub(crate) fn remove_checkout_tombstone_holding(path: &Path, note: &str) -> bool {
+    if !matches!(read_checkout_tombstone(path), Ok(Some(current)) if current == note) {
         return false;
     }
-    std::fs::remove_file(path.join(TOMBSTONE_FILE)).is_ok() && std::fs::remove_dir(path).is_ok()
+    let file = path.join(TOMBSTONE_FILE);
+    if std::fs::remove_file(&file).is_err() {
+        return false;
+    }
+    let removed = std::fs::remove_dir(path).is_ok();
+    if !removed {
+        crate::warn_unrecorded("put a tombstone's note back", std::fs::write(&file, note));
+    }
+    removed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tombstone whose directory cannot be removed keeps its note.
+    /// Mutation caught: not writing the note back.
+    #[cfg(unix)]
+    #[test]
+    fn a_tombstone_whose_directory_stays_keeps_its_note() {
+        use std::os::unix::fs::PermissionsExt;
+        // Permissions do not stop root.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkout");
+        let note = format!("{TOMBSTONE_HEADER}\narchive: /x/y\n");
+        write_tombstone_note(&path, &note).unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o500);
+        let removed = remove_checkout_tombstone(&path);
+        mode(0o700);
+        assert!(!removed);
+        assert_eq!(read_checkout_tombstone(&path).unwrap(), Some(note));
+    }
+
+    /// What cannot be read is an error, not a folder without a tombstone.
+    /// Mutation caught: reading an unreadable directory as none.
+    #[cfg(unix)]
+    #[test]
+    fn a_tombstone_that_cannot_be_read_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkout");
+        assert!(may_be_retired_checkout(&path));
+        write_tombstone_note(&path, TOMBSTONE_HEADER).unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o000);
+        let read = read_checkout_tombstone(&path);
+        let asked = may_be_retired_checkout(&path);
+        mode(0o700);
+        assert!(read.is_err());
+        assert!(asked);
+        std::fs::write(path.join("work.txt"), "content\n").unwrap();
+        assert!(!may_be_retired_checkout(&path));
+    }
 
     #[test]
     fn only_a_lone_tombstone_file_is_a_tombstone() {
@@ -187,7 +268,8 @@ mod tests {
         )
         .unwrap();
         assert!(is_checkout_tombstone(&path));
-        assert_eq!(tombstone_archive(&path), Some(PathBuf::from("/x/y")));
+        let note = read_checkout_tombstone(&path).unwrap().unwrap();
+        assert_eq!(note_archive(&note), Some(PathBuf::from("/x/y")));
         std::fs::write(path.join("work.txt"), "content\n").unwrap();
         assert!(
             !is_checkout_tombstone(&path),

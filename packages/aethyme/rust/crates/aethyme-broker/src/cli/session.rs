@@ -1330,8 +1330,8 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     warn_stale_broker_binary(&broker);
     // A retired checkout is not a Git repository until it is restored. Its
     // recorded path must not be the main checkout, even for reuse.
-    let restoring = mode == crate::AdoptMode::Reuse
-        && (!path.exists() || crate::broker::is_checkout_tombstone(&path));
+    let restoring =
+        mode == crate::AdoptMode::Reuse && crate::broker::may_be_retired_checkout(&path);
     if restoring && !parsed.allow_main_checkout {
         let main = broker.main_root_path();
         let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
@@ -1355,7 +1355,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 crate::broker::restore_incomplete_reason(&absolute),
             ));
         }
-        if !path.exists() || crate::broker::is_checkout_tombstone(&path) {
+        if crate::broker::may_be_retired_checkout(&path) {
             broker.recreate_retired_checkout(&absolute)?;
             checkout_restored = crate::broker::take_last_checkout_restore();
         }
