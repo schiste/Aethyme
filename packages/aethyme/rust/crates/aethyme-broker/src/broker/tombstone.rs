@@ -38,7 +38,35 @@ pub(crate) fn is_checkout_tombstone(path: &Path) -> bool {
 /// Whether `start --reuse` should ask for `path` to be restored: nothing is
 /// there, a tombstone is, or it cannot be told.
 pub(crate) fn may_be_retired_checkout(path: &Path) -> bool {
-    !path.exists() || !matches!(read_checkout_tombstone(path), Ok(None))
+    !path.exists()
+        || !matches!(read_checkout_tombstone(path), Ok(None))
+        || is_tombstone_leftover(path)
+}
+
+/// Whether `path` is what is left of a tombstone whose removal or writing was
+/// cut short: a real directory holding nothing, or only an empty note.
+pub(crate) fn is_tombstone_leftover(path: &Path) -> bool {
+    let empty_note = |entry: std::fs::DirEntry| {
+        entry.file_name() == TOMBSTONE_FILE
+            && std::fs::symlink_metadata(entry.path())
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+    };
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::read_dir(path).is_ok_and(|mut entries| match entries.next() {
+            None => true,
+            Some(only) => only.is_ok_and(empty_note) && entries.next().is_none(),
+        })
+}
+
+/// Remove what [`is_tombstone_leftover`] found (never anything else).
+/// Returns whether the path is free.
+pub(crate) fn remove_tombstone_leftover(path: &Path) -> bool {
+    if !is_tombstone_leftover(path) {
+        return false;
+    }
+    let file = path.join(TOMBSTONE_FILE);
+    (std::fs::symlink_metadata(&file).is_err() || std::fs::remove_file(&file).is_ok())
+        && std::fs::remove_dir(path).is_ok()
 }
 
 /// The note of the tombstone at `path`: a real directory holding exactly one
@@ -252,6 +280,8 @@ mod tests {
         mode(0o700);
         assert!(read.is_err());
         assert!(asked);
+        std::fs::remove_file(path.join(TOMBSTONE_FILE)).unwrap();
+        assert!(may_be_retired_checkout(&path));
         std::fs::write(path.join("work.txt"), "content\n").unwrap();
         assert!(!may_be_retired_checkout(&path));
     }

@@ -552,8 +552,9 @@ was retired, that its work is saved, and the one command that restores it
 there, `aethyme broker start --reuse '<path>'`. When it cannot be told whether
 an archive still holds the session's work (its volume is not mounted, its
 directory or manifest cannot be read), the command refuses and changes
-nothing: make the archive's volume available and run it again. Only an archive
-proven gone leaves the branch to restore from. Restoring is idempotent; the
+nothing: it says what to do (usually, make the archive's volume available) and
+the command to run again. Only an archive proven gone leaves the branch to
+restore from. Restoring is idempotent; the
 restored checkout's preparation reads stale until it is prepared again. A
 session whose agent is still running and still bound to it (holder live,
 not moved on) is never closed, archived or removed by these lanes, and a
