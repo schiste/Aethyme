@@ -5160,3 +5160,7 @@ judgements) and kept 501 sessions for regenerable leftovers. Covered by
 `ignored_content_keeps_the_checkout_but_not_the_session` and `auto_cleanup.rs`
 test
 `unknown_ignored_content_keeps_the_checkout_and_the_session_only_under_the_sweep`.
+
+The optional phase span `content_gate_v2_final_newline_check` measures native
+portable-verdict final-newline comparisons when a phase recorder is installed.
+Its name contains no source text, paths, gate IDs or entity IDs.
