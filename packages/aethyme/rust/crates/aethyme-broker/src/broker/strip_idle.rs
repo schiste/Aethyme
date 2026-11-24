@@ -509,11 +509,20 @@ pub(crate) fn recent_file_activity(
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|modified| modified >= since)
     };
+    let index_head_decides = || {
+        crate::worktree_status_activity::note_deciding_evidence(
+            crate::worktree_status_activity::IDLE_STRIP_LOOK,
+            true,
+            false,
+        );
+    };
     if let Some(admin) = git_admin_dir(worktree) {
         if newer(&admin.join("index")) {
+            index_head_decides();
             return Some("git_index");
         }
         if newer(&admin.join("HEAD")) {
+            index_head_decides();
             return Some("git_head");
         }
     }

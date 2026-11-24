@@ -5281,3 +5281,39 @@ Covered by `session_auto_close.rs` tests
 test `the_record_check_reads_an_interrupted_preparation_as_idle` and
 `phase_telemetry.rs` test
 `distinct_counts_count_each_id_once_and_attach_no_id`.
+
+### The checkout activity probe is timed by lane and look
+
+Added 2026-11-24, telemetry only. Each key is from a fixed set and each value
+is `{count, total_ms, max_ms}` (metric attachments):
+
+- `worktree_activity_look`: one look at a checkout's activity (the Git index,
+  `HEAD` and the changed-file probe), by lane and look: `abandonment`,
+  `landed`, `merged_pull_request` or `no_work`, followed by `_first` (before
+  any proof), `_claimed` (under the operation claim) or `_close` (the landed
+  lanes' last look), and `idle_strip`, whose only look is timed without the
+  index and `HEAD` reads before it.
+- `worktree_activity_look_timed_out`: the looks whose `git status` ran out of
+  time, now or earlier in the same process (then without running Git).
+- `worktree_activity_index_head_decides`: looks the index or `HEAD` alone
+  already decided; for `_close`, one newer than the claimed look's evidence.
+  A session its own age keeps is not counted. `idle_strip` runs no probe then;
+  the close lanes do.
+- `worktree_activity_probe_changed_verdict`: looks where only a completed
+  probe, newer than the index, `HEAD` and the other activity, kept the
+  session. In a landed lane such a probe found a changed path, which the clean
+  check lists too, so it is not split by that check's verdict: learning that
+  verdict takes another Git call.
+- `worktree_activity_after_first_look_timed_out`: how a close judgement whose
+  first look timed out ended: `closed`, or the existing counter name of its
+  keep (`session_abandonment_kept_*`, `session_no_work_kept_*`,
+  `landed_sessions_declined_*`). The idle strip's answer after a timeout is
+  already counted by the `worktree_mtime_walk_*` counters.
+- `landed_proof_worktree_clean_by_probe`: the landed proof's uncommitted-path
+  check (not the one that also lists ignored content for
+  `ignored_directory_sweep`), by what ran before it on the same thread and
+  checkout within 30 s: `after_probe`, `after_timed_out_probe` or `no_probe`.
+
+The looks run on the thread that judges the session, which is the thread that
+records; none is handed to a worker thread. Covered by
+`worktree_status_activity.rs` and `broker/leases.rs` tests.

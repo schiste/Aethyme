@@ -14537,7 +14537,7 @@ mod tests {
             "the admin directory can have a name independent of the checkout"
         );
         assert!(
-            crate::broker::checked_worktree_activity_ms(broker.main_root(), &current)
+            crate::broker::checked_worktree_activity(broker.main_root(), &current)
                 .unwrap()
                 .is_some()
         );
