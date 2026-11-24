@@ -1558,13 +1558,7 @@ impl Broker {
     /// Ask for a retirement run as soon as the worker can take it: a
     /// checkout went into the trash, or a session closed.
     pub(crate) fn request_checkout_retirement_run(&self) {
-        crate::warn_unrecorded(
-            "request a checkout retirement run",
-            self.store_ref().meta_set(
-                CHECKOUT_RETIREMENT_DUE_KEY,
-                &crate::clock::epoch_ms().to_string(),
-            ),
-        );
+        request_checkout_retirement_run_in(self.store_ref());
     }
 
     /// Whether the retirement lane is due at `now_ms`.
@@ -1590,31 +1584,12 @@ impl Broker {
     pub(super) fn update_meta_json<T>(
         &self,
         key: &str,
-        mut change: impl FnMut(&mut T),
+        change: impl FnMut(&mut T),
     ) -> Result<(), String>
     where
         T: serde::de::DeserializeOwned + serde::Serialize + Default,
     {
-        for _ in 0..32 {
-            let current = self
-                .store_ref()
-                .meta_get(key)
-                .map_err(|error| error.to_string())?;
-            let mut value = current
-                .as_deref()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or_default();
-            change(&mut value);
-            let next = serde_json::to_string(&value).map_err(|error| error.to_string())?;
-            if self
-                .store_ref()
-                .meta_compare_and_set(key, current.as_deref(), &next)
-                .map_err(|error| error.to_string())?
-            {
-                return Ok(());
-            }
-        }
-        Err(format!("{key} kept changing under concurrent writers"))
+        update_store_meta_json(self.store_ref(), key, change)
     }
 
     /// The trash entries this repository recorded.
@@ -1629,14 +1604,7 @@ impl Broker {
         entry: &str,
         row: crate::checkout_trash::TrashRow,
     ) -> Result<(), String> {
-        self.update_meta_json(
-            CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
-            |rows: &mut crate::checkout_trash::TrashRows| {
-                rows.entry(trash_dir.to_path_buf())
-                    .or_default()
-                    .insert(entry.to_string(), row);
-            },
-        )
+        record_checkout_trash_row_in(self.store_ref(), trash_dir, entry, row)
     }
 
     /// Move a submit verification slot's worktree into the trash of the
@@ -1658,58 +1626,39 @@ impl Broker {
         )
     }
 
-    /// [`Self::trash_verification_slot`] with the temporary-directory slot
-    /// fallback named explicitly (tests place slots there).
-    fn trash_verification_slot_with_temporary_root(
+    /// [`Self::trash_verification_slot`] for slots released while the
+    /// broker's store is lent to the gates: the gates pass their store in.
+    /// The repository handle is opened only when a slot is trashed.
+    pub(crate) fn verification_slot_trasher(
         &self,
-        slot: &Path,
         session_id: i64,
-        temporary_root: &Path,
-    ) -> bool {
-        let _span = crate::phase_telemetry::span("verification_slot_trash");
-        // A slot placed in the system temporary directory's fallback
-        // (`<temp>/aethyme-run/`, used when no worktree root can hold it)
-        // keeps Git's removal: a reboot or the system cleaner can empty that
-        // directory, trash and all.
-        if slot_is_under_temporary_root(slot, temporary_root) {
-            crate::phase_telemetry::add(
-                "verification_slot_trash_skipped_temporary",
-                std::time::Duration::ZERO,
-            );
-            return false;
-        }
-        let Some(pool) = slot.parent() else {
-            crate::phase_telemetry::add(
-                "verification_slot_trash_fell_back_to_git",
-                std::time::Duration::ZERO,
-            );
-            return false;
-        };
-        let moved = self
+    ) -> impl Fn(&crate::BrokerStore, &Path) -> bool + use<> {
+        self.verification_slot_trasher_with_temporary_root(
+            session_id,
+            std::env::temp_dir().join("aethyme-run"),
+        )
+    }
+
+    /// [`Self::verification_slot_trasher`] with the temporary-directory slot
+    /// fallback named explicitly (tests place slots there).
+    fn verification_slot_trasher_with_temporary_root(
+        &self,
+        session_id: i64,
+        temporary_root: PathBuf,
+    ) -> impl Fn(&crate::BrokerStore, &Path) -> bool + use<> {
+        let main_root = self.main_root.clone();
+        let common_dir = self
             .main_git_common_dir()
-            .map_err(|error| error.to_string())
-            .and_then(|common_dir| {
-                crate::checkout_trash::move_verification_worktree_to_trash(
-                    &self.repo,
-                    &common_dir,
-                    pool,
-                    slot,
-                    session_id,
-                    &mut |trash_dir, entry, row| {
-                        self.record_checkout_trash_row(trash_dir, entry, row)
-                    },
-                )
-            });
-        match moved {
-            Ok(trashed) => {
-                crate::warn_unrecorded(
-                    "confirm a verification slot's trash entry",
-                    self.record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, trashed.row),
-                );
-                self.request_checkout_retirement_run();
-                crate::phase_telemetry::add("verification_slot_trashed", std::time::Duration::ZERO);
-                true
-            }
+            .map_err(|error| error.to_string());
+        move |store: &crate::BrokerStore, slot: &Path| match GitRepo::discover(&main_root) {
+            Ok(repo) => trash_verification_slot_in(
+                &repo,
+                common_dir.clone(),
+                store,
+                slot,
+                session_id,
+                &temporary_root,
+            ),
             Err(_) => {
                 crate::phase_telemetry::add(
                     "verification_slot_trash_fell_back_to_git",
@@ -1718,6 +1667,25 @@ impl Broker {
                 false
             }
         }
+    }
+
+    /// [`Self::trash_verification_slot`] with the temporary-directory slot
+    /// fallback named explicitly (tests place slots there).
+    fn trash_verification_slot_with_temporary_root(
+        &self,
+        slot: &Path,
+        session_id: i64,
+        temporary_root: &Path,
+    ) -> bool {
+        trash_verification_slot_in(
+            &self.repo,
+            self.main_git_common_dir()
+                .map_err(|error| error.to_string()),
+            self.store_ref(),
+            slot,
+            session_id,
+            temporary_root,
+        )
     }
 
     /// Confirm a checkout just moved into the trash and ask for a run.
@@ -5087,6 +5055,128 @@ pub(crate) use lane::{RETIRE_LANE_IDLE_ADVICE_AT, RetirementLaneRecord};
 
 /// Whether `slot` lies under `temporary` (the system temporary directory's
 /// slot fallback), comparing resolved paths where they resolve.
+/// [`Broker::trash_verification_slot`] over a store handle, so a caller
+/// that lends the broker's store elsewhere (the gates, while they hand a slot
+/// back) can still trash a slot.
+pub(crate) fn trash_verification_slot_in(
+    repo: &GitRepo,
+    common_dir: Result<PathBuf, String>,
+    store: &crate::BrokerStore,
+    slot: &Path,
+    session_id: i64,
+    temporary_root: &Path,
+) -> bool {
+    let _span = crate::phase_telemetry::span("verification_slot_trash");
+    // A slot placed in the system temporary directory's fallback
+    // (`<temp>/aethyme-run/`, used when no worktree root can hold it)
+    // keeps Git's removal: a reboot or the system cleaner can empty that
+    // directory, trash and all.
+    if slot_is_under_temporary_root(slot, temporary_root) {
+        crate::phase_telemetry::add(
+            "verification_slot_trash_skipped_temporary",
+            std::time::Duration::ZERO,
+        );
+        return false;
+    }
+    let Some(pool) = slot.parent() else {
+        crate::phase_telemetry::add(
+            "verification_slot_trash_fell_back_to_git",
+            std::time::Duration::ZERO,
+        );
+        return false;
+    };
+    let moved = common_dir.and_then(|common_dir| {
+        crate::checkout_trash::move_verification_worktree_to_trash(
+            repo,
+            &common_dir,
+            pool,
+            slot,
+            session_id,
+            &mut |trash_dir, entry, row| record_checkout_trash_row_in(store, trash_dir, entry, row),
+        )
+    });
+    match moved {
+        Ok(trashed) => {
+            crate::warn_unrecorded(
+                "confirm a verification slot's trash entry",
+                record_checkout_trash_row_in(
+                    store,
+                    &trashed.trash_dir,
+                    &trashed.entry,
+                    trashed.row,
+                ),
+            );
+            request_checkout_retirement_run_in(store);
+            crate::phase_telemetry::add("verification_slot_trashed", std::time::Duration::ZERO);
+            true
+        }
+        Err(_) => {
+            crate::phase_telemetry::add(
+                "verification_slot_trash_fell_back_to_git",
+                std::time::Duration::ZERO,
+            );
+            false
+        }
+    }
+}
+
+/// [`Broker::request_checkout_retirement_run`] over a store handle.
+fn request_checkout_retirement_run_in(store: &crate::BrokerStore) {
+    crate::warn_unrecorded(
+        "request a checkout retirement run",
+        store.meta_set(
+            CHECKOUT_RETIREMENT_DUE_KEY,
+            &crate::clock::epoch_ms().to_string(),
+        ),
+    );
+}
+
+/// [`Broker::record_checkout_trash_row`] over a store handle.
+fn record_checkout_trash_row_in(
+    store: &crate::BrokerStore,
+    trash_dir: &Path,
+    entry: &str,
+    row: crate::checkout_trash::TrashRow,
+) -> Result<(), String> {
+    update_store_meta_json(
+        store,
+        CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+        |rows: &mut crate::checkout_trash::TrashRows| {
+            rows.entry(trash_dir.to_path_buf())
+                .or_default()
+                .insert(entry.to_string(), row);
+        },
+    )
+}
+
+/// Change the JSON value at `key` atomically: read, change, then
+/// compare-and-set, retried when another writer got in between.
+fn update_store_meta_json<T>(
+    store: &crate::BrokerStore,
+    key: &str,
+    mut change: impl FnMut(&mut T),
+) -> Result<(), String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Default,
+{
+    for _ in 0..32 {
+        let current = store.meta_get(key).map_err(|error| error.to_string())?;
+        let mut value = current
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or_default();
+        change(&mut value);
+        let next = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        if store
+            .meta_compare_and_set(key, current.as_deref(), &next)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+    }
+    Err(format!("{key} kept changing under concurrent writers"))
+}
+
 fn slot_is_under_temporary_root(slot: &Path, temporary: &Path) -> bool {
     let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let temporary = resolve(temporary);
@@ -7105,6 +7195,77 @@ mod tests {
         let drained = broker
             .drain_checkout_trash_with_lock(Some(&lock), Instant::now() + Duration::from_secs(600));
         assert_eq!(drained.entries_removed, 1, "{drained:?}");
+    }
+
+    /// A slot the gates give back while they wait goes into the trash with
+    /// one rename and its trash row, through the same path as a submit's
+    /// final slot, and the gate's re-acquire then materializes the same
+    /// commit at that slot path again.
+    #[test]
+    fn a_slot_handed_back_by_the_gates_is_trashed_and_taken_again_in_place() {
+        use crate::gates::VerificationSlotHandoff as _;
+        let (_owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("handing a slot back", None).unwrap();
+        let main = broker.main_root().to_path_buf();
+        let head = broker.repo_handle().head_commit().unwrap();
+        let plan = crate::verification::default_worktree_root_plan(&main);
+        let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
+            &main,
+            "handoff-trash",
+            1,
+            &plan,
+            Duration::MAX,
+            &mut |_, _| false,
+        )
+        .unwrap();
+        let checkout = slot
+            .as_mut()
+            .unwrap()
+            .materialize(broker.repo_handle(), &head)
+            .unwrap();
+        std::fs::write(checkout.root().join("gate-output.log"), "built\n").unwrap();
+        let path = slot.as_ref().unwrap().path().to_path_buf();
+        let canonical = path.canonicalize().unwrap();
+        let trash = broker.verification_slot_trasher_with_temporary_root(
+            session.id,
+            PathBuf::from("/no-such-temporary-root"),
+        );
+        let handoff = crate::verification::PooledSlotHandoff::new(
+            &mut slot,
+            &main,
+            "handoff-trash",
+            1,
+            &plan,
+            &head,
+            None,
+        )
+        .with_trash(&trash);
+
+        handoff.release(broker.store_ref());
+        assert!(
+            !path.exists(),
+            "the released slot's checkout was not moved away"
+        );
+        let rows = broker
+            .checkout_trash_rows()
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].stripped && !rows[0].pending && rows[0].session_id == session.id);
+
+        let again = handoff
+            .reacquire(&mut || {})
+            .unwrap()
+            .expect("the only slot was free again");
+        assert_eq!(again.root().canonicalize().unwrap(), canonical);
+        assert!(again.root().join("base.txt").exists());
+        assert!(
+            !again.root().join("gate-output.log").exists(),
+            "the re-acquired checkout kept the released one's output"
+        );
+        assert_eq!(handoff.counts(), (1, 1));
+        assert!(slot.is_some(), "the slot taken again is the caller's");
     }
 
     /// Two submits in a row reuse one slot path, each moving it into the

@@ -125,11 +125,18 @@ impl Broker {
         self.check_submission_root_before_planning()?;
         let main = self.main_root_path();
         let repo = GitRepo::discover(&main)?;
+        let root_plan = self.worktree_root_plan()?;
         let mut standalone_slot;
-        let (slot, verifier, progress) = if let Some(execution) = execution {
-            (execution.slot, execution.verifier, execution.progress)
+        // The pool a slot handed back by the gates is re-acquired from.
+        let (slot, verifier, progress, namespace, size) = if let Some(execution) = execution {
+            (
+                execution.slot,
+                execution.verifier,
+                execution.progress,
+                MERGE_VERIFICATION_NAMESPACE,
+                MERGE_VERIFICATION_SLOTS,
+            )
         } else {
-            let root_plan = self.worktree_root_plan()?;
             let Some(slot) =
                 crate::verification::ExactTreeVerificationSlot::try_acquire_with_worktree_root_plan(
                     &main,
@@ -140,8 +147,8 @@ impl Broker {
                 report.state = "busy";
                 return Ok(report);
             };
-            standalone_slot = slot;
-            (&mut standalone_slot, coordinator_id, None)
+            standalone_slot = Some(slot);
+            (&mut standalone_slot, coordinator_id, None, "merge-batch", 1)
         };
         let Some(history) =
             capture_submission_plan_history_view(&main, self.repo_handle(), self.store_ref())
@@ -241,7 +248,10 @@ impl Broker {
         drop(compose);
 
         let checkout = crate::phase_telemetry::span("submit_batch_checkout");
-        let candidate = slot.materialize(&repo, &tip)?;
+        let candidate = slot
+            .as_mut()
+            .expect("the verifier holds its slot until the gates run")
+            .materialize(&repo, &tip)?;
         if !self.batch_is_current(&repo, &report.base, &report.members)?
             || validate_submission_history_view(
                 &main,
@@ -269,7 +279,12 @@ impl Broker {
             progress.subphase("executing gates");
         }
         let storage = self.storage_context().gate_storage_locations();
-        report.gates = crate::gates::run_affected_for_submit_in(
+        let trash = self.verification_slot_trasher(verifier);
+        let handoff = crate::verification::PooledSlotHandoff::new(
+            slot, &main, namespace, size, &root_plan, &tip, progress,
+        )
+        .with_trash(&trash);
+        let gates_run = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main,
             &candidate,
@@ -280,8 +295,13 @@ impl Broker {
             cache,
             progress,
             storage,
-        )?;
-        slot.cleanup();
+            Some(&handoff),
+        );
+        handoff.record_telemetry();
+        report.gates = gates_run?;
+        if let Some(slot) = slot.as_mut() {
+            slot.cleanup();
+        }
         drop(verify);
 
         let _finalize = crate::phase_telemetry::span("submit_batch_revalidate");
@@ -347,7 +367,10 @@ impl Broker {
 }
 
 struct QueuedBatchExecution<'a> {
-    slot: &'a mut crate::verification::ExactTreeVerificationSlot,
+    /// The leader's pooled slot. Its gates may give it back while they wait
+    /// for admission, so it is `None` afterwards when they did not get one
+    /// again.
+    slot: &'a mut Option<crate::verification::ExactTreeVerificationSlot>,
     verifier: i64,
     progress: Option<&'a crate::submit_progress::SubmitProgress>,
 }
@@ -379,7 +402,7 @@ impl Broker {
             let mut report = report_wait;
             crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
                 main,
-                "merge-sim",
+                MERGE_VERIFICATION_NAMESPACE,
                 MERGE_VERIFICATION_SLOTS,
                 root_plan,
                 crate::gates::heartbeat_interval(),
@@ -393,7 +416,7 @@ impl Broker {
         let mut attempted = false;
         let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_until(
             main,
-            "merge-sim",
+            MERGE_VERIFICATION_NAMESPACE,
             MERGE_VERIFICATION_SLOTS,
             root_plan,
             crate::gates::heartbeat_interval(),
@@ -449,18 +472,19 @@ impl Broker {
                 if let Some(progress) = progress {
                     progress.phase(crate::submit_progress::PHASE_VERIFYING);
                 }
-                let slot = slot.as_mut().expect("a batch verifier holds the slot");
                 let verified = self.verify_batch_in_slot(
                     coordinator,
                     request,
                     cache,
                     Some(QueuedBatchExecution {
-                        slot,
+                        slot: &mut slot,
                         verifier: entry.session_id,
                         progress,
                     }),
                 );
-                if verified.is_err() {
+                if verified.is_err()
+                    && let Some(slot) = slot.as_mut()
+                {
                     slot.cleanup();
                 }
                 let receipt = match verified {
@@ -507,8 +531,15 @@ impl Broker {
                 if let Some(progress) = progress {
                     progress.phase("waiting for shared verification");
                 }
+                // The leader verifies against the base's gate policy; follow
+                // it for as long as that policy lets one verification take.
+                let gates = GitRepo::discover(main)
+                    .ok()
+                    .and_then(|repo| crate::gates::load_gates_at_commit(&repo, base).ok())
+                    .map(|(_, gates)| gates);
+                let deadline = queue::follow_deadline(gates.as_deref());
                 let phase = crate::phase_telemetry::span("submit_queued_batch_follow");
-                if let Some(receipt) = ticket.follow()
+                if let Some(receipt) = ticket.follow(deadline)
                     && self.queued_receipt_is_current(coordinator, entry, &receipt)
                 {
                     record_queued_batch("follower", "verified", Some(receipt.members.len()));
@@ -525,9 +556,16 @@ impl Broker {
             Ok(queue::Admission::Single) => record_queued_batch("single", "no_cohort", None),
             _ => record_queued_batch("single", "fallback", None),
         }
-        Ok(QueuedAdmission::Single(
-            slot.expect("a redirect follows the accepted verifier"),
-        ))
+        match slot {
+            Some(slot) => Ok(QueuedAdmission::Single(slot)),
+            // The leader's gates gave the slot back and did not get one again.
+            None => {
+                if let Some(progress) = progress {
+                    progress.phase(crate::submit_progress::PHASE_WAITING_FOR_SLOT);
+                }
+                acquire_single()
+            }
+        }
     }
 
     fn queued_receipt_is_current(

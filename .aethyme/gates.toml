@@ -117,7 +117,24 @@ command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;;
 cache = false
 cost = 2
 timeout_seconds = 2400
-resource_wait_seconds = 900
+# 2026-11-24: a gate waiting for its managed cache can outwait one whole run
+# of the longest gate that shares the cache. A waiting submit no longer holds
+# a verification slot (`gates::VerificationSlotHandoff`), so a long wait
+# delays only the gate that needs the cache; at 900 s a healthy holder made
+# its waiters give up and defer the submit. The longest holder of
+# rust-workspace-v3 is `cargo-test`: cost 3 makes it load-admitted at the
+# default 3.0 load per CPU, so its 2400 s timeout scales to at most 7200 s
+# (`gate_admission::timeout_seconds_for_load`, capped at 4x). The 300 s on
+# top covers cache preparation, rotation and release around that run.
+# `gate_policy.rs` (`managed_cache_waits_outlast_the_longest_holder_of_their_cache`)
+# keeps every wait at or above its cache's longest holder.
+# This bounds the wait for the cache lease only. The wait for host load stays
+# at most 900 s whatever this value (`gate_admission::MAX_LOAD_WAIT_SECONDS`),
+# and a gate holding the lease waits at most 300 s for a verification slot
+# before it hands the lease on and queues again
+# (`gates::SLOT_WAIT_WHILE_HOLDING_ADMISSION`), at most twice before it is
+# deferred (`gates::MAX_SLOT_WAIT_REQUEUES`).
+resource_wait_seconds = 7500
 triggers = [
     ".aethyme/gates.toml",
     "packages/aethyme/scripts/prepush-selection.sh",
@@ -219,7 +236,8 @@ cost = 3
 # repositories' builds held the load average at 30-70. The limit exists to
 # stop a hung gate, not to time a healthy one under load.
 timeout_seconds = 2400
-resource_wait_seconds = 900
+# Outwaits the longest holder of rust-workspace-v3; see `fast-guards`.
+resource_wait_seconds = 7500
 # Changes to gate policy still exercise the full local gate. Other changes
 # run the contract and fast guards locally; main CI runs the complete suite.
 triggers = [".aethyme/gates.toml"]
@@ -242,7 +260,8 @@ name = "script-contract"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract installer_ && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test pilot_report'
 cost = 1
 timeout_seconds = 300
-resource_wait_seconds = 900
+# Outwaits the longest holder of rust-workspace-v3; see `fast-guards`.
+resource_wait_seconds = 7500
 triggers = ["install.sh", "scripts/pilot-*.jq", "packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs", "packages/aethyme/rust/crates/aethyme-testkit/tests/pilot_report.rs"]
 
 [gate.managed_cache]
@@ -279,7 +298,8 @@ name = "workflow-contract"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract --test ci_validation && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
 cost = 1
 timeout_seconds = 600
-resource_wait_seconds = 900
+# Outwaits the longest holder of rust-workspace-v3; see `fast-guards`.
+resource_wait_seconds = 7500
 triggers = [".github/workflows/**"]
 
 [gate.managed_cache]
@@ -317,7 +337,8 @@ name = "gate-policy"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
 cost = 1
 timeout_seconds = 600
-resource_wait_seconds = 900
+# Outwaits the longest holder of rust-workspace-v3; see `fast-guards`.
+resource_wait_seconds = 7500
 triggers = [".aethyme/gates.toml"]
 
 [gate.managed_cache]
@@ -369,7 +390,10 @@ command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;;
 cost = 1
 cache = false
 timeout_seconds = 300
-resource_wait_seconds = 900
+# See `fast-guards`: one run of this gate, the only holder of its cache, is
+# at most 300 s x 3 (its load threshold) = 900 s, plus the same margin. Its
+# load wait stays at 900 s, as for every gate.
+resource_wait_seconds = 1200
 # This cost-1 gate is still load-sensitive: measured runs above 3 load/CPU
 # were much more likely to fail or time out, so opt it into load admission.
 # Its 300s deadline scales proportionally to start load/CPU, up to this
