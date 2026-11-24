@@ -1054,6 +1054,27 @@ The comparison base is not part of that identity: a gate that reads
 commands"), so a session's verdict for a tree satisfies a submission of the
 same tree.
 
+## Completed vitest failures despite environment text (2026-11-24)
+
+A gate log that contains environment text (such as "permission denied") is
+normally `error`/`environment`. When the command exits with an ordinary failing
+code (1 to 125, except 124), and the log's final vitest summary is complete,
+consistent and reports failing tests, the result is now `fail`/`test_failure`.
+Timeouts, capture, resource and storage errors keep precedence. A partial,
+contradictory or ambiguous log (an `Errors` line, a run that never reported, a
+later passing summary, environment text after the summary) keeps
+`error`/`environment`. Nothing becomes a pass, and the submission is rejected
+either way; its exit code is now the verification-failure code instead of the
+environment code.
+
+Such a result is stored cleared, with `cleared_reason` `test failure log
+contained environment error text; rerun instead of reusing this failure`, so no
+cache lookup or shared verdict replays it and the gate runs again.
+`gate.fail` events replace `gate.error` for these runs, and consumers that
+count `environment` failures see fewer of them. The
+`gate_environment_text_test_failure` count in `phase_counts` (always 0 in
+`phase_timings_ms`) records each reclassified run.
+
 ## Gate admission waits outside the verification slot (2026-11-24)
 
 A submit verifies in one of four pooled verification slots. A gate that would

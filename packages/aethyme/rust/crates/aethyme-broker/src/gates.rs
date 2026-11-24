@@ -38,6 +38,7 @@ use crate::store::BrokerStore;
 use crate::types::{GateEnvironment, GateFailureClass, GateStatus, NewGateResult};
 
 pub(crate) mod bounded_log;
+mod vitest_summary;
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;
@@ -5101,14 +5102,16 @@ where
         let reusable_profile = cache_provenance
             .as_ref()
             .filter(|_| !early_verification || gate_status == GateStatus::Pass);
-        let cache_bypass_reason = (!early_verification
-            && should_bypass_timeout_text_test_failure_cache(
-                gate.cache,
-                gate_status,
-                failure_class,
-                &log_path,
-            ))
-        .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+        let cache_bypass_reason = test_failure_cache_bypass_reason(
+            early_verification,
+            gate.cache,
+            gate_status,
+            failure_class,
+            &log_path,
+        );
+        if cache_bypass_reason == Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON) {
+            crate::phase_telemetry::add("gate_environment_text_test_failure", Duration::ZERO);
+        }
         let run_id = store.record_gate_result_with_execution_profile_and_cache_bypass(
             &NewGateResult {
                 gate_name: gate.name.clone(),
@@ -5422,6 +5425,20 @@ fn classify_gate_result(
             exit_code: Some(code),
             resource_error: None,
             ..
+        }) if (1..126).contains(&code)
+            && has_environment_error_diagnostic(log_path)
+            && vitest_summary::complete_failure(log_path) =>
+        {
+            (
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                Some(code as i64),
+            )
+        }
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+            ..
         }) if is_environment_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Environment),
@@ -5493,6 +5510,38 @@ fn cached_failure_class(status: GateStatus) -> Option<GateFailureClass> {
 
 const TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON: &str =
     "test output contained timeout text; rerun instead of reusing this failure";
+
+const ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON: &str =
+    "test failure log contained environment error text; rerun instead of reusing this failure";
+
+/// Why this completed test failure must not satisfy a later cache lookup.
+///
+/// Environment text in the log of a test failure means a vitest summary
+/// settled the class. The tests did fail, but an environment problem may be
+/// why, so the row is cleared whatever the gate's cache setting: advisory
+/// readers of uncleared failures do not know that setting.
+fn test_failure_cache_bypass_reason(
+    early_verification: bool,
+    cache_enabled: bool,
+    status: GateStatus,
+    failure_class: Option<GateFailureClass>,
+    log_path: &Path,
+) -> Option<&'static str> {
+    if status == GateStatus::Fail
+        && failure_class == Some(GateFailureClass::TestFailure)
+        && has_environment_error_diagnostic(log_path)
+    {
+        return Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+    }
+    (!early_verification
+        && should_bypass_timeout_text_test_failure_cache(
+            cache_enabled,
+            status,
+            failure_class,
+            log_path,
+        ))
+    .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+}
 
 fn should_bypass_timeout_text_test_failure_cache(
     cache_enabled: bool,
@@ -5718,18 +5767,23 @@ fn is_environment_error(exit_code: i32, log_path: &Path) -> bool {
     has_environment_error_diagnostic(log_path)
 }
 
+const ENVIRONMENT_ERROR_PATTERNS: &[&str] = &[
+    ": command not found",
+    "command not found",
+    "not found on path",
+    "executable file not found",
+    "permission denied",
+    "cannot execute",
+];
+
 fn has_environment_error_diagnostic(log_path: &Path) -> bool {
-    log_contains_any(
-        log_path,
-        &[
-            ": command not found",
-            "command not found",
-            "not found on path",
-            "executable file not found",
-            "permission denied",
-            "cannot execute",
-        ],
-    )
+    log_contains_any(log_path, ENVIRONMENT_ERROR_PATTERNS)
+}
+
+fn contains_environment_error(lowercase: &str) -> bool {
+    ENVIRONMENT_ERROR_PATTERNS
+        .iter()
+        .any(|pattern| lowercase.contains(pattern))
 }
 
 fn log_contains_any(log_path: &Path, patterns: &[&str]) -> bool {
@@ -10429,6 +10483,234 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    const FAILED_VITEST_WITH_ENVIRONMENT_TEXT: &str = " RUN  v4.1.11 /work/app\n\nstderr | a.test.ts\nEACCES: permission denied\n\n Test Files  1 failed | 2 passed (3)\n      Tests  1 failed | 8 passed (9)\n   Start at  10:11:12\n   Duration  1.00s\n";
+
+    #[test]
+    fn completed_vitest_failure_outranks_environment_text_for_normal_exits_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (code, status, class) in [
+            (1, GateStatus::Fail, GateFailureClass::TestFailure),
+            (124, GateStatus::Error, GateFailureClass::Timeout),
+            (126, GateStatus::Error, GateFailureClass::Environment),
+            (127, GateStatus::Error, GateFailureClass::Environment),
+            (130, GateStatus::Error, GateFailureClass::Environment),
+            (137, GateStatus::Error, GateFailureClass::Environment),
+        ] {
+            std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+            assert_eq!(
+                classify_gate_result("pnpm test", &log, Ok(command_outcome(Some(code), false))),
+                (status, Some(class), Some(i64::from(code))),
+                "exit {code}"
+            );
+        }
+        // Never a verdict from a run that exited zero or was killed.
+        std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+        for (code, status) in [(Some(0), GateStatus::Pass), (None, GateStatus::Cancelled)] {
+            let (actual, class, _) =
+                classify_gate_result("pnpm test", &log, Ok(command_outcome(code, false)));
+            assert_eq!((actual, class), (status, None));
+        }
+    }
+
+    #[test]
+    fn incomplete_vitest_summary_keeps_the_environment_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (from, to) in [
+            ("(9)", "(10)"),
+            ("1 failed | 8 passed (9)", "9 passed (9)"),
+            ("   Duration  1.00s\n", ""),
+        ] {
+            assert!(FAILED_VITEST_WITH_ENVIRONMENT_TEXT.contains(from));
+            std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT.replace(from, to)).unwrap();
+            assert_eq!(
+                classify_gate_result("pnpm test", &log, Ok(command_outcome(Some(1), false))),
+                (
+                    GateStatus::Error,
+                    Some(GateFailureClass::Environment),
+                    Some(1)
+                ),
+                "{from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vitest_failure_never_overrides_explicit_infrastructure_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (kind, expected) in [
+            ("timeout", GateFailureClass::Timeout),
+            ("capture", GateFailureClass::Environment),
+            ("resource", GateFailureClass::ResourceContention),
+            ("storage", GateFailureClass::ResourceContention),
+            ("database", GateFailureClass::ResourceContention),
+        ] {
+            let extra = match kind {
+                "storage" => "No space left on device\n",
+                "database" => "database is locked\n",
+                _ => "",
+            };
+            std::fs::write(
+                &log,
+                format!("{extra}{FAILED_VITEST_WITH_ENVIRONMENT_TEXT}"),
+            )
+            .unwrap();
+            let mut outcome = command_outcome(Some(1), kind == "timeout");
+            if kind == "capture" {
+                outcome.capture_error = Some("incomplete pipe".into());
+            }
+            if kind == "resource" {
+                outcome.resource_error = Some("lease lost".into());
+            }
+            let (status, class, _) = classify_gate_result("pnpm test", &log, Ok(outcome));
+            assert_eq!(
+                (status, class),
+                (GateStatus::Error, Some(expected)),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_text_has_its_own_unconditional_cache_bypass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        let fail = (GateStatus::Fail, Some(GateFailureClass::TestFailure));
+        let reason = |early, cache, (status, class)| {
+            test_failure_cache_bypass_reason(early, cache, status, class, &log)
+        };
+        std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+        for early in [false, true] {
+            for cache in [false, true] {
+                assert_eq!(
+                    reason(early, cache, fail),
+                    Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+                );
+            }
+        }
+        for other in [
+            (GateStatus::Pass, None),
+            (GateStatus::Error, Some(GateFailureClass::Environment)),
+            (GateStatus::Fail, Some(GateFailureClass::BuildFailure)),
+        ] {
+            assert_eq!(reason(false, true, other), None);
+        }
+        std::fs::write(&log, "Test timed out in 5000ms\n").unwrap();
+        assert_eq!(
+            reason(false, true, fail),
+            Some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+        );
+        assert_eq!(reason(true, true, fail), None);
+        assert_eq!(reason(false, false, fail), None);
+        std::fs::write(&log, "1 failed\n").unwrap();
+        assert_eq!(reason(false, true, fail), None);
+    }
+
+    /// The same failure without environment text is the control: it is reused.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclassified_failure_is_counted_and_never_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        // The gate's own logs must not change the tree between the two runs.
+        std::fs::create_dir_all(checkout_root.join(".git/info")).unwrap();
+        std::fs::write(checkout_root.join(".git/info/exclude"), ".aethyme/\n").unwrap();
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        struct Quiet;
+        impl GateProgressSink for Quiet {
+            fn report(&self, _line: &str) {}
+        }
+        for (name, output, reused, counted) in [
+            (
+                "reclassified",
+                FAILED_VITEST_WITH_ENVIRONMENT_TEXT.to_string(),
+                false,
+                Some(2),
+            ),
+            (
+                "ordinary",
+                FAILED_VITEST_WITH_ENVIRONMENT_TEXT.replace("permission denied", "refused"),
+                true,
+                None,
+            ),
+        ] {
+            let source = root.path().join(format!("{name}.txt"));
+            std::fs::write(&source, output).unwrap();
+            let mut store = BrokerStore::open(&root.path().join(format!("{name}.db"))).unwrap();
+            let gate = synthetic_gate(name, true, &format!("cat '{}'; exit 1", source.display()));
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let mut run = || {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                run_selections_with_profile_capture(
+                    &mut store,
+                    &checkout_root,
+                    &checkout,
+                    vec![Selection {
+                        gate: &gate,
+                        triggered_by: None,
+                        owner_paths: Vec::new(),
+                    }],
+                    None,
+                    CachePolicy::Use,
+                    GateRuntimeContext {
+                        fresh_checkout: false,
+                        slot_handoff: None,
+                        progress: &Quiet,
+                        admission_host: &SequencedAdmissionHost::new(vec![None]),
+                        deadline: None,
+                        comparison_base: None,
+                        storage: GateStorageLocations::default(),
+                    },
+                    |_, _| None,
+                    |_, _, _, _| None,
+                    |_, _| profile.clone(),
+                )
+                .unwrap()
+                .remove(0)
+            };
+            let first = run();
+            let second = run();
+            assert_eq!(first.status, GateStatus::Fail, "{name}");
+            assert_eq!(
+                first.failure_class,
+                Some(GateFailureClass::TestFailure),
+                "{name}"
+            );
+            assert!(!first.is_host_fault(), "{name} is rejected, not deferred");
+            assert_eq!(second.status, GateStatus::Fail, "{name}");
+            assert_eq!(second.cached, reused, "{name}");
+            let (_, counts) = recorder.totals();
+            assert_eq!(
+                counts.get("gate_environment_text_test_failure").copied(),
+                counted,
+                "{name}: {counts:?}"
+            );
+            // Every store lookup, whatever identity it binds.
+            assert_eq!(
+                store
+                    .cached_gate_result(&gate.name, &first.tree_hash)
+                    .unwrap()
+                    .is_some(),
+                reused
+            );
+            assert_eq!(
+                store
+                    .cached_gate_result_for_definition(
+                        &gate.name,
+                        &first.tree_hash,
+                        &gate.definition_hash,
+                    )
+                    .unwrap()
+                    .is_some(),
+                reused
+            );
+        }
     }
 
     const FAILED_TAP: &str = "TAP version 13\n# Subtest: computes a value\nnot ok 1 - computes a value\n  ---\n  error: assertion failed\n  ...\n1..1\n# tests 1\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n";
