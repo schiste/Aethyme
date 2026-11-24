@@ -786,3 +786,27 @@ fn every_rust_gate_draws_its_cost_from_the_host_build_pool() {
         );
     }
 }
+
+/// A queued build must be able to wait for a preceding long-running build.
+#[test]
+fn managed_build_gates_wait_for_long_running_peers() {
+    let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
+    let builds: Vec<_> = gates
+        .iter()
+        .filter(|gate| gate.managed_cache.is_some())
+        .collect();
+    let longest = builds
+        .iter()
+        .filter_map(|gate| gate.timeout_seconds)
+        .max()
+        .expect("build timeout");
+    for gate in builds {
+        assert!(
+            gate.resource_wait_seconds >= longest * 2,
+            "{} waits {}s, less than two longest build slots of {}s",
+            gate.name,
+            gate.resource_wait_seconds,
+            longest
+        );
+    }
+}

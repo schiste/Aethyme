@@ -117,7 +117,7 @@ command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;;
 cache = false
 cost = 2
 timeout_seconds = 2400
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 triggers = [
     ".aethyme/gates.toml",
     "packages/aethyme/scripts/prepush-selection.sh",
@@ -219,7 +219,7 @@ cost = 3
 # repositories' builds held the load average at 30-70. The limit exists to
 # stop a hung gate, not to time a healthy one under load.
 timeout_seconds = 2400
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 # Changes to gate policy still exercise the full local gate. Other changes
 # run the contract and fast guards locally; main CI runs the complete suite.
 triggers = [".aethyme/gates.toml"]
@@ -242,7 +242,7 @@ name = "script-contract"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract installer_ && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test pilot_report'
 cost = 1
 timeout_seconds = 300
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 triggers = ["install.sh", "scripts/pilot-*.jq", "packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs", "packages/aethyme/rust/crates/aethyme-testkit/tests/pilot_report.rs"]
 
 [gate.managed_cache]
@@ -279,7 +279,7 @@ name = "workflow-contract"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract --test ci_validation && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
 cost = 1
 timeout_seconds = 600
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 triggers = [".github/workflows/**"]
 
 [gate.managed_cache]
@@ -317,7 +317,7 @@ name = "gate-policy"
 command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
 cost = 1
 timeout_seconds = 600
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 triggers = [".aethyme/gates.toml"]
 
 [gate.managed_cache]
@@ -368,7 +368,7 @@ command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;;
 cost = 1
 cache = false
 timeout_seconds = 300
-resource_wait_seconds = 900
+resource_wait_seconds = 5400
 # This cost-1 gate is still load-sensitive: measured runs above 3 load/CPU
 # were much more likely to fail or time out, so opt it into load admission.
 # Its 300s deadline scales proportionally to start load/CPU, up to this
