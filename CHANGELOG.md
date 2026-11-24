@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.168] - 2026-11-24
+
+### Changed
+
+- Background retirement of landed and merged-PR sessions asks the preparation record whether a preparation is running, instead of the full preparation status, which hashes every declared input, resolves runtimes and looks up outputs with no deadline. In one sample (the first 30 `gc` rows of 0.8.166 in one repository) 73 full checks took 505 s. That is an unsplit upper bound: the same span covers the abandonment and no-work lanes, so no gain is claimed until it is measured. Abandonment, no-work, `finish`, hooks, `submit prepare`, cleanup and removal are unchanged (#1997).
+- These lanes can now close a session whose declared input is missing, symlinked, not a regular file, unreadable or changing, whose runtime cannot be resolved, or whose output is symlinked or unreadable. A merged-PR session in that state may close at the merged-PR window. In-progress records not proved ended, an unreadable or invalid declaration, and unreadable, mismatched or unexpected records keep the session where the check runs (#1997).
+- The record is read without a declaration too. An in-progress record with no declaration and no host lease counts as ended once its start predates the current boot by more than 10 minutes; a record kept for unverified cleanup counts as ended too. An unknown boot time or a start time of zero or less keeps the session (#1997).
+
+### Added
+
+- Spans `preparation_record_check`, `session_close_*`, `landed_proof_recheck`, `landed_close_head_and_activity`, `landed_merged_pr_evidence_recheck` and `landed_close_last_look`; counter `preparation_pre_boot_without_lease`; attachment `phase_distinct_counts` with the distinct sessions examined per command (#1997).
+
+### Known issues
+
+- The check runs for a merged-PR close, or a landed close whose holder has a task lease or has moved on. A landed close of a legacy holder does not ask, as before, and a merged-PR session kept as unknown can be retried that way past the landed window.
+- A forward clock step of more than 10 minutes, or another host or container sharing the repository state, can make a running lease-less preparation without a declaration look ended.
+
 ## [0.8.167] - 2026-11-24
 
 ### Added
