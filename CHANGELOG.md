@@ -4,6 +4,36 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.164] - 2026-11-23
+
+### Changed
+
+- Read-only Git queries for refs and ancestry are answered in-process. On the busiest repository 0.8.162 started 323,258 git processes in about 13 hours, most of them one-line reads such as `rev-parse --verify` and `merge-base --is-ancestor`. The broker now resolves refs, reads HEAD, reads a commit's tree and checks ancestry through gitoxide (`gix` 0.90.0, `sha1` and `revision` features only, no network). These four helpers sit behind several hundred call sites in gc, status, agents, submit, finish and exec. Only answers that can be proven equal to Git's are given in-process. Anything else runs the same git command as before: missing objects or parents, grafts, replace refs, shallow or promisor ancestry, SHA-256, non-file ref storage, unknown repository extensions, reduced trust, routing `GIT_*` variables, an active Git deadline, a changed packed-refs file, malformed loose refs and mistyped tags (#1974).
+- Committed-configuration reads are answered in-process as well: the default branch through `refs/remotes/origin/HEAD`, symbolic refs, listing and reading `.aethyme/config.*` at a revision, and checking a path at a revision. These were about 43% of the git processes started by `broker status --full` on the busiest repository. Git still answers any absent ref, an `origin/HEAD` beyond the one-hop fast path, a path through a file or submodule, a final entry that is not a regular file, a non-canonical mode, a malformed tree, a blob over the caller's limit or over 64 MiB, any missing object (partial clones are never fetched in-process), any non-ASCII path (macOS converts decomposed Unicode in git's arguments to the composed form), and any pathspec environment variable (#1977).
+- A preparation that takes the shared package cache alone for the hourly budget check now holds it alone only for recovery, the check and any rotation. It then takes a share for its install steps. Before, it kept the cache alone through its steps (40–270 s holds), and preparations arriving meanwhile waited 17–93 s each. The share is taken with a wait of at least 10 s, whatever `--wait` says, so a `--wait 0s` preparation cannot newly fail after its inventory. A due check skips the foreground inventory when a trustworthy background measurement is already queued for the store: no failed walks, a back-off ending within 15 minutes, and queued less than 3 hours ago. Under storage pressure the retired package store is renamed and handed to the storage worker instead of being removed inline (#1976).
+
+### Fixed
+
+- Content-gate comparison independently verifies collection outcomes, plain-text word counts, plain-text character counts and plain-text paragraph verdicts (#1978, #1981, #1982, #1985). The collection check passes clippy again, which had turned Linux CI's lint job red on main (#1987).
+
+### Documentation
+
+- The skills explain how stale integration reconciliation works (#1984).
+
+### Added
+
+- Gates, preparation steps and guarded exec commands run for a session get `NODE_COMPILE_CACHE`. It points to one host-wide directory with a subdirectory per UTC day, and is set only when the caller's environment does not already set it. Daily directories expire after 14 days and are evicted least recently used first under the tool-cache budget. `[node] compile_cache = false` turns it off. Counters `node_compile_cache_*` say how many commands got it and why the rest did not (#1976).
+- `[git] in_process` (default on) and `AETHYME_GIT_IN_PROCESS` (only `1`, `true`, `on` or `yes` enable it; any other value runs git). Span `git_read_inprocess` and attachment `git_read` count in-process answers and fallbacks by reason (#1974). New query kinds `symbolic_ref`, `origin_head_default`, `config_tree_entries`, `blob_bytes`, `file_at_revision`, `path_exists_at` and fallback reasons `unsupported_path`, `path_through_non_tree`, `not_a_regular_file`, `malformed_tree`, `not_a_blob`, `too_large`, `unexpected_target`, `non_ascii_path` (#1977).
+- Counter `shared_cache_downgrade_wait_floor` (#1976).
+
+### Upgrade notes
+
+- To rule out in-process Git reads while diagnosing a problem, set `AETHYME_GIT_IN_PROCESS=0` or `[git] in_process = false`.
+
+### Known issues
+
+- The Node.js compile cache is keyed by absolute path. It pays for repeated runs in one checkout and for tools at a fixed path, not across session worktrees. Its gain is not measured yet; `node_compile_cache_set` in command metrics is the measurement after release.
+
 ## [0.8.163] - 2026-11-23
 
 ### Fixed
