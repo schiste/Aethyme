@@ -374,6 +374,47 @@ mod tests {
         );
     }
     #[test]
+    fn each_composed_status_is_checked_independently() {
+        let mut p = policy();
+        p["gates"].as_array_mut().unwrap().extend([
+            json!({"kind":"character_count", "id":"chars", "severity":"warning", "blocking":false, "min":4, "max":4, "ignore_whitespace":true}),
+            json!({"kind":"paragraph_character_length", "id":"paragraph_chars", "severity":"warning", "blocking":false, "max_chars":5}),
+            json!({"kind":"heading_length", "id":"heading_chars", "severity":"warning", "blocking":false, "max_chars":5}),
+        ]);
+        let names = [
+            "words",
+            "paragraphs",
+            "length",
+            "heading",
+            "hierarchy",
+            "chars",
+            "paragraph_chars",
+            "heading_chars",
+        ];
+        for wrong in 0..names.len() {
+            let values: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        format!("gate:7:article:{name}"),
+                        json!({"status": if index == wrong {"failed"} else {"passed"}}),
+                    )
+                })
+                .collect();
+            let checks: BTreeMap<_, _> = values
+                .iter()
+                .map(|(id, check)| (id.as_str(), check))
+                .collect();
+            assert!(
+                verify(&p, &json!({"findings":[]}), &[item(projection())], &checks).is_err(),
+                "forged {}",
+                names[wrong]
+            );
+        }
+    }
+
+    #[test]
     fn malformed_gate_is_rejected_even_when_not_checked() {
         let mut p = policy();
         p["gates"][2]["max_words"] = json!(0);
