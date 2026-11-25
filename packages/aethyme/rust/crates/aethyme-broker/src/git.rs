@@ -7269,31 +7269,6 @@ impl GitRepo {
             .count()
     }
 
-    /// Every commit `head` has and `excluded` lacks with its parents, parents
-    /// before children.
-    pub(crate) fn parents_excluding_oldest(
-        &self,
-        head: &str,
-        excluded: &str,
-    ) -> Result<Vec<(String, Vec<String>)>, GitError> {
-        let args = [
-            "rev-list",
-            "--topo-order",
-            "--reverse",
-            "--parents",
-            head,
-            "--not",
-            excluded,
-        ];
-        Ok(run_git(&self.root, &args)?
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace().map(str::to_string);
-                Some((fields.next()?, fields.collect()))
-            })
-            .collect())
-    }
-
     /// The commits of two sides whose patch ids can decide patch equivalence
     /// between them: those with a parent whose changed-path set also occurs
     /// on the opposite side.

@@ -5608,22 +5608,23 @@ repository lifecycle claim. In a repository that lands work only through pull
 requests that ref is stale, and the plan hashed every commit between it and the
 session's HEAD.
 
-- `carried_ownership.pending_owned_commits` counts owned commits that the
-  integration view holds pending and the fetched remote default branch
-  (`refs/remotes/origin/HEAD` only, never the main checkout's `@{upstream}`) does
-  not prove delivered: by ancestry, by an exact sync merge, or by exactly one
-  patch-equivalent commit that is not an ancestor of the owned commit. An earlier
-  landing the owned commit descends from (a reland after a revert) proves nothing.
-  An ambiguous match, or a default branch that cannot be read or compared, leaves
-  the commit owned; without `origin/HEAD` the answer is integration's alone.
-- A commit that landed and was then reverted on the default branch reads as
-  delivered while the session has not been rebased onto, or applied it again on
-  top of, the revert.
-- Where the full plan answered, the count is lower or the same, and
-  `carried_ownership` is omitted when nothing is left. Where the plan failed on
-  history it did not need (an unreadable inherited blob, a timeout), ownership was
-  dropped and is now carried, and `integration_drift` can name commits that are
-  safe to submit. Otherwise `integration_drift` is unchanged, its base included.
+- `carried_ownership.pending_owned_commits` is the submission plan's pending owned
+  count against the integration view, minus the commits reachable from the fetched
+  remote default branch. Only reachability counts there, never a patch match: a
+  patch cannot tell a landed commit from the same change applied again after a
+  revert. Squash- and rebase-landed commits stay carried, as before.
+- The default branch is `refs/remotes/origin/HEAD` only, never the main checkout's
+  `@{upstream}`; origin is trusted as the landing remote, as auto-cleanup does.
+  Without it, when it names the previous session's own branch, or when it cannot
+  be read, the answer is integration's alone.
+- A wrongly omitted commit loses its owner: `adoption_base`, `diff_base` and
+  `adopted_head` all become `HEAD`, submit replays nothing and the unsubmitted and
+  unpushed guards of `finish` no longer see the work. A patch match against
+  integration still omits a commit exactly as the plan does, reland included.
+- Where the plan failed on history it did not need (an unreadable inherited blob,
+  a timeout), ownership was dropped and is now carried, and `integration_drift`
+  can name commits that are safe to submit. Otherwise `integration_drift` is
+  unchanged, its base included.
 - Only adoption changed. Other commands that build a submission plan, `finish`
   among them, still hash the history they did.
 - Span `adopt_carried_ownership` covers the ownership carry and span
@@ -5634,6 +5635,10 @@ session's HEAD.
   `drift_commits_hashed`, the commits each one handed to patch hashing, counted
   before the attempt so a timeout is not 0. A key is absent
   when that step did not run. Counts only: no path, id or branch name.
+- Counter `adopt_carried_ownership_error`: the carry ended in an error, which
+  leaves the baseline at `HEAD`, as opposed to nothing pending. Counter
+  `adopt_carried_default_unreadable`: the listing with the default branch failed
+  and was retried without it.
 
 Readers must accept the new spans and attachment. Covered by tests in
 `submission_ownership.rs`.
