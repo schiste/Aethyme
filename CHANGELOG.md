@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.177] - 2026-11-25
+
+### Fixed
+
+- A background measurement of the shared preparation cache that reaches its 30-minute deadline makes that store wait 6 hours, then 24 hours after each further deadline without a completed walk in between. Before, it was walked again after 10 minutes, doubling. On the busiest repository since 0.8.160, 11 such walks took 19,803 s for no answer; the answers used saved at most about 750 s. The wait is one record per cache root, bound to the store's identity: a new, coalesced or rewritten request does not shorten it; another store identity, a completed walk of the store or a rotation of it by `submit prepare` ends it. What decides a budget and the other interruptions' back-off are unchanged, and `prepare` keeps its own bounded inventory during the wait (#2018).
+
+### Added
+
+- Counters `preparation_cache_measurement_deadline_wait_set` and `_deadline_wait_restored`, duration `preparation_cache_measurement_walk_cpu`, object `preparation_cache_measurement_progress`, request field `unanswered_deadlines` (omitted when zero) (#2018).
+
+### Known issues
+
+- An oversized store whose walk reaches the deadline is noticed later than before (#2018).
+- A remount that renumbers the device reads as another store and allows one walk (#2018).
+
 ## [0.8.176] - 2026-11-25
 
 ### Fixed
