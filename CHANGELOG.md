@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.178] - 2026-11-25
+
+### Fixed
+
+- `start --adopt` after a closed session no longer hashes the patches of every commit the branch has beyond a stale local integration branch. In a repository that lands only by pull request that branch does not move; on the busiest repository it was about 21,000 commits behind, and the scan took 160 to 272 s in three 0.8.176 runs, all while holding the lifecycle lock (18 such runs since 0.8.157 held it for 4,716 s). The same scan, reproduced by hand, took 200 s of CPU. Only the session's own undelivered commits are judged now, and only commits sharing a changed-path set with a candidate are hashed (#2022).
+- The scan for renamed files in the same command runs one listing instead of one Git process per owned commit (#2022).
+
+### Changed
+
+- Commits reachable from `origin/HEAD` no longer count as owned and pending when a session is re-adopted. Work landed by squash or rebase stays with the session, as before. A session with nothing pending but commits that integration holds only by patch match keeps its boundary when other owned commits were left out this way (#2022).
+
+### Added
+
+- Spans `adopt_carried_ownership`, `adopt_drift_report`, `adopt_ownership_candidates` and `session_renamed_targets`; counters `adopt_carried_ownership_error` and `adopt_carried_default_unreadable`; attachment `adopt_ownership` (#2022).
+
+### Known issues
+
+- A commit that integration already holds by one patch match can still be left out of a re-adopted session when nothing was left out by reachability, as before.
+- `finish` still builds the full plan against the local integration branch in one check.
+- One step still walks commit headers in proportion to how far integration is behind.
+
 ## [0.8.177] - 2026-11-25
 
 ### Fixed
