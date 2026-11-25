@@ -4,6 +4,33 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.176] - 2026-11-25
+
+### Fixed
+
+- A recovery archive no longer takes an ignored file twice when Git lists both a directory and the files in it. Before, the copy failed with "File exists" on the second one, after copying what came before it: on one repository 6 of 23 kept checkouts, one after a 312 s copy, and the retirement lane retired nothing in 53 runs (1,955 s) (#2016).
+- An unfinished archive of an earlier state of a checkout no longer always blocks that checkout (9 of the 23). It is removed only when its record names this session, checkout path and branch, its commits are in what the plan archives, none of its prerequisite refs exists, and it holds only the record, the current patches and files the checkout still starts with byte for byte. Anything established to be otherwise keeps it, and the archive uses one alternate staging name; with both kept the apply refuses and says what an owner can do. A failure to judge removes nothing and opens no alternate (#2016).
+- A truncated manifest in unfinished staging no longer stops the release of prerequisite refs in its archive root when its retirement record is sound (#2016).
+
+### Changed
+
+- A plan whose file lists are not unique and sorted is refused before anything is copied (#2016).
+- Reports name a blocking ignored directory once, without its files (#2016).
+
+### Added
+
+- `storage status` (`recovery_archives_by_location.unfinished_staging`) and `storage archives` list unfinished staging, from sizes already recorded (#2016).
+- Counters `recovery_archive_ignored_duplicates_dropped`, `recovery_archive_plan_file_list_refused`, `recovery_archive_stale_partial_removed`, `_kept`, `_undecided`; span `recovery_archive_apply_stale_partial` (#2016).
+
+### Upgrade notes
+
+- `storage` JSON output only gains fields.
+
+### Known issues
+
+- Kept unfinished staging is never expired, at most two per session; staging with a Git bundle is always kept (#2016).
+- A staged copy that can never be read refuses every attempt on its checkout (#2016).
+
 ## [0.8.175] - 2026-11-25
 
 ### Fixed
