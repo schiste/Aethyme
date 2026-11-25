@@ -60,8 +60,8 @@
 //!   up to a day). A walk that reached its deadline found no answer in 30
 //!   minutes and a second one rarely does: the store then waits 6 hours, and
 //!   a day after each further deadline. That wait is kept in a record of its
-//!   own, bound to the store's identity, so nothing that drops, replaces or
-//!   coalesces the request shortens it. Directory order is not stable across
+//!   own per cache root, bound to the store's identity, so nothing that drops,
+//!   replaces or coalesces the request shortens it. Directory order is not stable across
 //!   opens and the tree changes between runs, so a resumed partial sum would
 //!   add up two different snapshots.
 //!
@@ -93,8 +93,10 @@ use crate::{Broker, BrokerOpError};
 pub(crate) const REQUEST_KEY: &str = "preparation.shared_cache_measurement.request";
 /// Broker metadata key of the last completed measurement (JSON, or `null`).
 pub(crate) const RESULT_KEY: &str = "preparation.shared_cache_measurement.result";
-/// Broker metadata key of the wait after a deadline (JSON, or `null`).
-pub(crate) const DEADLINE_WAIT_KEY: &str = "preparation.shared_cache_measurement.deadline_wait";
+/// Broker metadata key prefix of the wait after a deadline (JSON, or `null`),
+/// suffixed with the cache root's key like the budget-check stamp: a
+/// repository can have a store under more than one root.
+const DEADLINE_WAIT_KEY_PREFIX: &str = "preparation.shared_cache_measurement.deadline_wait.";
 pub(crate) const REQUEST_SCHEMA: &str = "aethyme.preparation-cache-measurement-request/v1";
 pub(crate) const RESULT_SCHEMA: &str = "aethyme.preparation-cache-measurement/v1";
 /// Shortest and longest trust a result gets. The shortest is the
@@ -254,6 +256,15 @@ pub struct SharedCacheMeasurementRequest {
     pub consecutive_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_store_identity: Option<String>,
+    /// Deadlines of the store before this request, which inherited their
+    /// wait: no answer is expected soon. Kept out of `consecutive_failures`,
+    /// which sets the back-off of this request's own interruptions.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unanswered_deadlines: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// A request older than this is not expected to answer a budget check.
@@ -266,6 +277,7 @@ impl SharedCacheMeasurementRequest {
     /// walks, no long back-off, and not waiting for hours.
     fn expected_soon(&self, now: i64) -> bool {
         self.consecutive_failures == 0
+            && self.unanswered_deadlines == 0
             && self
                 .retry_after_ms
                 .is_none_or(|retry| retry <= now.saturating_add(PENDING_TRUST_MAX_RETRY_MS))
@@ -286,20 +298,30 @@ impl SharedCacheMeasurementRequest {
     }
 
     fn due(&self, now: i64) -> bool {
-        !self.running(now) && self.retry_after_ms.is_none_or(|after| after <= now)
+        !self.running(now)
+            && self
+                .retry_after_ms
+                .is_none_or(|after| !still_waiting(after, now))
     }
+}
+
+/// Whether a wait until `until` is still on. One that would last longer than
+/// the longest there is was written under a clock far ahead: it is over.
+fn still_waiting(until: i64, now: i64) -> bool {
+    until > now && until <= now.saturating_add(MAX_RETRY_AFTER_MS)
 }
 
 /// The wait after walks of one store reached their deadline. Kept apart from
 /// the request, which a rotation recovery, a changed root or another root's
-/// request drops or replaces: only another store identity, an answer or a
-/// completed rotation ends it.
+/// request drops or replaces: only another store identity, a completed
+/// measurement of this store or a rotation of it by a `prepare` ends it. A
+/// rotation that crash recovery finishes is seen as another store identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DeadlineWait {
     repository: String,
     cache_root_key: String,
     store_identity: String,
-    /// Deadlines of this store since its last answer.
+    /// Deadlines of this store since its last completed measurement.
     consecutive: u32,
     until_ms: i64,
 }
@@ -310,6 +332,15 @@ impl DeadlineWait {
             && self.cache_root_key == cache_root_key
             && self.store_identity == store_identity
     }
+
+    /// Until when the store waits, if it still does.
+    fn until(&self, now: i64) -> Option<i64> {
+        still_waiting(self.until_ms, now).then_some(self.until_ms)
+    }
+}
+
+fn deadline_wait_key(cache_root_key: &str) -> String {
+    format!("{DEADLINE_WAIT_KEY_PREFIX}{cache_root_key}")
 }
 
 /// The wait after the `consecutive`-th deadline of one store.
@@ -604,22 +635,22 @@ impl Broker {
         (raw, result)
     }
 
-    fn read_deadline_wait(&self) -> Option<DeadlineWait> {
+    fn read_deadline_wait(&self, cache_root_key: &str) -> Option<DeadlineWait> {
         parse(
             self.store_ref()
-                .meta_get(DEADLINE_WAIT_KEY)
+                .meta_get(&deadline_wait_key(cache_root_key))
                 .ok()
                 .flatten()
                 .as_deref(),
         )
     }
 
-    fn write_deadline_wait(&mut self, wait: Option<&DeadlineWait>) {
+    fn write_deadline_wait(&mut self, cache_root_key: &str, wait: Option<&DeadlineWait>) {
         let written = serde_json::to_string(&wait)
             .map_err(|error| error.to_string())
             .and_then(|value| {
                 self.store()
-                    .meta_set(DEADLINE_WAIT_KEY, &value)
+                    .meta_set(&deadline_wait_key(cache_root_key), &value)
                     .map_err(|error| error.to_string())
             });
         crate::warn_unrecorded("record the measurement's wait after a deadline", written);
@@ -628,9 +659,10 @@ impl Broker {
     /// The deadline record of the live store at `cache_root`/`repository`,
     /// whether or not its wait is over.
     fn deadline_wait_of_store(&self, repository: &str, cache_root: &Path) -> Option<DeadlineWait> {
-        let wait = self.read_deadline_wait()?;
+        let key = cache_root_key(cache_root);
+        let wait = self.read_deadline_wait(&key)?;
         let store_identity = identity_digest(&cache_root.join(repository))?;
-        wait.is_for(repository, &cache_root_key(cache_root), &store_identity)
+        wait.is_for(repository, &key, &store_identity)
             .then_some(wait)
     }
 
@@ -641,13 +673,14 @@ impl Broker {
         request: &SharedCacheMeasurementRequest,
         cache_root: &Path,
     ) -> bool {
-        self.read_deadline_wait().is_some_and(|wait| {
-            request.retry_after_ms == Some(wait.until_ms)
-                && wait.repository == request.repository
-                && wait.cache_root_key == request.cache_root_key
-                && identity_digest(&cache_root.join(&request.repository))
-                    .is_some_and(|live| live != wait.store_identity)
-        })
+        self.read_deadline_wait(&request.cache_root_key)
+            .is_some_and(|wait| {
+                request.retry_after_ms == Some(wait.until_ms)
+                    && wait.repository == request.repository
+                    && wait.cache_root_key == request.cache_root_key
+                    && identity_digest(&cache_root.join(&request.repository))
+                        .is_some_and(|live| live != wait.store_identity)
+            })
     }
 
     /// A walk of `store_identity` reached its deadline at `now`: record and
@@ -659,19 +692,20 @@ impl Broker {
         now: i64,
     ) -> i64 {
         let consecutive = self
-            .read_deadline_wait()
+            .read_deadline_wait(&request.cache_root_key)
             .filter(|wait| {
                 wait.is_for(&request.repository, &request.cache_root_key, store_identity)
             })
             .map_or(1, |wait| wait.consecutive.saturating_add(1));
         let delay = deadline_wait_ms(consecutive);
-        self.write_deadline_wait(Some(&DeadlineWait {
+        let wait = DeadlineWait {
             repository: request.repository.clone(),
             cache_root_key: request.cache_root_key.clone(),
             store_identity: store_identity.to_string(),
             consecutive,
             until_ms: now.saturating_add(delay),
-        }));
+        };
+        self.write_deadline_wait(&request.cache_root_key, Some(&wait));
         crate::phase_telemetry::add(
             "preparation_cache_measurement_deadline_wait_set",
             Duration::ZERO,
@@ -679,11 +713,21 @@ impl Broker {
         delay
     }
 
-    /// The store a deadline wait names is gone (a rotation completed) or was
-    /// answered: the next deadline is a first one again.
-    pub(crate) fn end_shared_cache_deadline_wait(&mut self) {
-        if self.read_deadline_wait().is_some() {
-            self.write_deadline_wait(None);
+    /// The store `store_identity` under the cache root was rotated away or
+    /// measured: its wait is over and its next deadline a first one. A wait
+    /// of another repository, root or store stays.
+    pub(super) fn end_deadline_wait(
+        &mut self,
+        repository: &str,
+        cache_root_key: &str,
+        store_identity: Option<&str>,
+    ) {
+        let ended = store_identity.is_some_and(|identity| {
+            self.read_deadline_wait(cache_root_key)
+                .is_some_and(|wait| wait.is_for(repository, cache_root_key, identity))
+        });
+        if ended {
+            self.write_deadline_wait(cache_root_key, None);
         }
     }
 
@@ -741,7 +785,7 @@ impl Broker {
 
     /// Drop the request and the result: the store they describe was, or may
     /// have been, rotated away. A deadline wait stays, bound to its store's
-    /// identity; see [`Self::end_shared_cache_deadline_wait`].
+    /// identity; see [`Self::end_deadline_wait`].
     pub(crate) fn forget_shared_cache_measurement(&mut self) {
         for key in [REQUEST_KEY, RESULT_KEY] {
             let written = self
@@ -813,8 +857,8 @@ impl Broker {
                     (pending, "preparation_cache_measurement_coalesced")
                 }
                 _ => {
-                    // The failure count keeps a budget check from counting
-                    // on a walk that has not been able to answer.
+                    // `unanswered_deadlines` keeps a budget check from
+                    // counting on a walk that has not been able to answer.
                     let wait = self.deadline_wait_of_store(repository, cache_root);
                     (
                         SharedCacheMeasurementRequest {
@@ -827,15 +871,13 @@ impl Broker {
                             queued_at_ms: now,
                             times_queued: 1,
                             attempts: 0,
-                            retry_after_ms: wait
-                                .as_ref()
-                                .map(|wait| wait.until_ms)
-                                .filter(|until| *until > now),
+                            retry_after_ms: wait.as_ref().and_then(|wait| wait.until(now)),
                             last_interruption: None,
                             running_since_ms: None,
                             running_pid: None,
-                            consecutive_failures: wait.as_ref().map_or(0, |wait| wait.consecutive),
-                            failure_store_identity: wait.map(|wait| wait.store_identity),
+                            consecutive_failures: 0,
+                            failure_store_identity: None,
+                            unanswered_deadlines: wait.map_or(0, |wait| wait.consecutive),
                         },
                         "preparation_cache_measurement_queued",
                     )
@@ -1105,20 +1147,27 @@ impl Broker {
             );
             return Ok(MeasurementLaneOutcome::AlreadyRunning);
         }
-        if request.retry_after_ms.is_some_and(|after| after > now) {
+        if request
+            .retry_after_ms
+            .is_some_and(|after| still_waiting(after, now))
+        {
             return Ok(MeasurementLaneOutcome::NotDue);
         }
         let binding = bindings
             .iter()
             .find(|binding| cache_root_key(&binding.path) == request.cache_root_key);
-        if let Some(until) = binding
+        if let Some((wait, until)) = binding
             .and_then(|binding| self.deadline_wait_of_store(&request.repository, &binding.path))
-            .map(|wait| wait.until_ms)
-            .filter(|until| *until > now)
+            .and_then(|wait| wait.until(now).map(|until| (wait, until)))
         {
             // The request lost its wait (written over by an older broker or a
             // walk that took it over): restore it instead of walking.
+            crate::phase_telemetry::add(
+                "preparation_cache_measurement_deadline_wait_restored",
+                Duration::ZERO,
+            );
             request.retry_after_ms = Some(until);
+            request.unanswered_deadlines = wait.consecutive;
             request.running_since_ms = None;
             request.running_pid = None;
             let written = self.replace_measurement_request(raw.as_deref(), Some(&request));
@@ -1302,7 +1351,13 @@ impl Broker {
                 result.trust_reason = trust_reason.to_string();
                 let value = serde_json::to_string(&result)?;
                 self.store().meta_set(RESULT_KEY, &value)?;
-                self.end_shared_cache_deadline_wait();
+                // Any completed walk of the waiting store ends its wait, an
+                // unconfirmed over budget included; an absent store does not.
+                self.end_deadline_wait(
+                    &result.repository,
+                    &result.cache_root_key,
+                    result.store_identity.as_deref(),
+                );
                 let awaiting_confirmation = result.outcome == MeasurementOutcome::OverBudget
                     && !result.over_budget_confirmed;
                 // Clear the request (a coalesce during the walk is answered
@@ -1317,6 +1372,7 @@ impl Broker {
                         last_interruption: None,
                         consecutive_failures: 0,
                         failure_store_identity: None,
+                        unanswered_deadlines: 0,
                         ..current
                     })
                 });
@@ -1836,17 +1892,7 @@ mod tests {
         /// A walk with no time at all: it always reaches its deadline.
         fn reach_deadline(&mut self) -> SharedCacheMeasurementRequest {
             let bindings = self.bindings();
-            let host = self.host.path().to_path_buf();
-            let outcome = self
-                .broker
-                .run_preparation_cache_measurement_lane_hooked(
-                    Some(&host),
-                    &bindings,
-                    None,
-                    Duration::ZERO,
-                    &mut |_| {},
-                )
-                .unwrap();
+            let outcome = self.run_lane_on(&bindings, Duration::ZERO);
             assert_eq!(
                 interrupted(outcome).reason,
                 MeasurementInterruptionReason::Deadline
@@ -1854,11 +1900,43 @@ mod tests {
             self.broker.shared_cache_measurement_request().unwrap()
         }
 
+        fn run_lane_on(
+            &mut self,
+            bindings: &[PreparationCacheRootBinding],
+            max_elapsed: Duration,
+        ) -> MeasurementLaneOutcome {
+            let host = self.host.path().to_path_buf();
+            self.broker
+                .run_preparation_cache_measurement_lane_hooked(
+                    Some(&host),
+                    bindings,
+                    None,
+                    max_elapsed,
+                    &mut |_| {},
+                )
+                .unwrap()
+        }
+
+        fn deadline_wait(&self) -> Option<DeadlineWait> {
+            self.broker
+                .read_deadline_wait(&cache_root_key(&self.cache_root))
+        }
+
+        fn write_wait(&mut self, wait: &DeadlineWait) {
+            self.broker
+                .write_deadline_wait(&wait.cache_root_key, Some(wait));
+        }
+
+        fn pending(&self) -> bool {
+            self.broker
+                .shared_cache_measurement_pending(REPOSITORY, &self.cache_root, now_ms())
+        }
+
         /// Let a deadline's wait elapse, as time passing would.
         fn expire_deadline_wait(&mut self) {
-            let mut wait = self.broker.read_deadline_wait().unwrap();
+            let mut wait = self.deadline_wait().unwrap();
             wait.until_ms = 0;
-            self.broker.write_deadline_wait(Some(&wait));
+            self.write_wait(&wait);
             self.expire_retry();
         }
 
@@ -2756,10 +2834,10 @@ mod tests {
             fixture.expire_deadline_wait();
             assert_eq!(wait_of(&fixture.reach_deadline()), MAX_RETRY_AFTER_MS);
         }
-        // An answer ends the streak.
+        // A completed walk ends the streak.
         fixture.expire_deadline_wait();
         assert_eq!(completed(fixture.run_lane()).bytes, 300);
-        assert_eq!(fixture.broker.read_deadline_wait(), None);
+        assert_eq!(fixture.deadline_wait(), None);
         fixture.queue(10_000);
         assert_eq!(wait_of(&fixture.reach_deadline()), RETRY_AFTER_DEADLINE_MS);
     }
@@ -2867,15 +2945,197 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_rotation_ends_a_deadline_wait() {
+    fn only_the_rotated_store_s_own_deadline_wait_ends() {
         let mut fixture = fixture(3, 100);
         fixture.queue(10_000);
         let _pacing = pacer(vec![calm()]);
         fixture.reach_deadline();
+        let wait = fixture.deadline_wait().unwrap();
+        let (key, identity) = (wait.cache_root_key.as_str(), wait.store_identity.as_str());
+        for (repository, key, identity) in [
+            ("another", key, Some(identity)),
+            (REPOSITORY, "another", Some(identity)),
+            (REPOSITORY, key, Some("another")),
+            (REPOSITORY, key, None),
+        ] {
+            fixture.broker.end_deadline_wait(repository, key, identity);
+            assert_eq!(fixture.deadline_wait().as_ref(), Some(&wait));
+        }
+        fixture
+            .broker
+            .end_deadline_wait(REPOSITORY, key, Some(identity));
+        assert_eq!(fixture.deadline_wait(), None);
         fixture.broker.forget_shared_cache_measurement();
-        fixture.broker.end_shared_cache_deadline_wait();
         fixture.queue(10_000);
         assert!(fixture.broker.shared_cache_measurement_due(now_ms()));
+    }
+
+    #[test]
+    fn another_root_s_deadline_and_answer_leave_this_root_s_wait() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let until = fixture.reach_deadline().retry_after_ms;
+        let wait = fixture.deadline_wait();
+
+        let other_root = fixture.cache_root.with_file_name("second-cache");
+        let other_store = other_root.join(REPOSITORY);
+        fs::create_dir_all(&other_store).unwrap();
+        fs::write(other_store.join("file"), vec![0_u8; 50]).unwrap();
+        let mut bindings = fixture.bindings();
+        bindings.push(PreparationCacheRootBinding {
+            path: other_root.clone(),
+            identity: None,
+            instance_nonce: None,
+            root_guard: None,
+        });
+        let queue_other = |fixture: &mut Fixture| {
+            assert!(fixture.broker.queue_shared_cache_measurement(
+                REPOSITORY,
+                &other_root,
+                10_000,
+                "inconclusive_time_limit",
+            ));
+        };
+
+        // The other root's walk reaches its deadline too.
+        queue_other(&mut fixture);
+        assert_eq!(
+            interrupted(fixture.run_lane_on(&bindings, Duration::ZERO)).reason,
+            MeasurementInterruptionReason::Deadline
+        );
+        assert_eq!(fixture.deadline_wait(), wait);
+        fixture.queue(10_000);
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(request.retry_after_ms, until);
+
+        // Then it is measured.
+        let other_key = cache_root_key(&other_root);
+        let mut other_wait = fixture.broker.read_deadline_wait(&other_key).unwrap();
+        other_wait.until_ms = 0;
+        fixture.write_wait(&other_wait);
+        queue_other(&mut fixture);
+        let answer = completed(fixture.run_lane_on(&bindings, MAX_WALK_DURATION));
+        assert_eq!(
+            (answer.cache_root_key.as_str(), answer.bytes),
+            (other_key.as_str(), 50)
+        );
+        assert_eq!(fixture.broker.read_deadline_wait(&other_key), None);
+        assert_eq!(fixture.deadline_wait(), wait);
+        fixture.queue(10_000);
+        assert_eq!(
+            fixture.run_lane_on(&bindings, MAX_WALK_DURATION),
+            MeasurementLaneOutcome::NotDue
+        );
+    }
+
+    #[test]
+    fn a_restored_wait_restores_that_no_answer_is_expected() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let until = fixture.reach_deadline().retry_after_ms;
+        // What an older broker would have queued: no wait, no failure.
+        fixture.broker.forget_shared_cache_measurement();
+        fixture.queue(10_000);
+        let mut request = fixture.broker.shared_cache_measurement_request().unwrap();
+        request.retry_after_ms = None;
+        request.unanswered_deadlines = 0;
+        fixture.write_request(&request);
+        assert!(fixture.pending());
+        assert_eq!(fixture.run_lane(), MeasurementLaneOutcome::NotDue);
+        let mut request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(request.retry_after_ms, until);
+        assert_eq!(request.unanswered_deadlines, 1);
+        // The last minutes of the wait.
+        request.retry_after_ms = Some(now_ms() + 60_000);
+        fixture.write_request(&request);
+        assert!(!fixture.pending());
+    }
+
+    #[test]
+    fn a_wait_set_under_a_clock_far_ahead_is_over() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let mut request = fixture.reach_deadline();
+        let mut wait = fixture.deadline_wait().unwrap();
+        wait.until_ms = now_ms() + 2 * MAX_RETRY_AFTER_MS;
+        fixture.write_wait(&wait);
+        request.retry_after_ms = Some(wait.until_ms);
+        fixture.write_request(&request);
+        assert!(fixture.broker.shared_cache_measurement_due(now_ms()));
+        // A new request does not inherit it either.
+        fixture.broker.forget_shared_cache_measurement();
+        fixture.queue(10_000);
+        let inherited = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(inherited.retry_after_ms, None);
+        // The walk starts from the copy as it was written.
+        fixture.write_request(&request);
+        assert_eq!(completed(fixture.run_lane()).bytes, 300);
+        // The longest wait there is holds.
+        let now = now_ms();
+        assert!(still_waiting(now + MAX_RETRY_AFTER_MS, now));
+        assert!(!still_waiting(now, now));
+    }
+
+    #[test]
+    fn an_absent_store_does_not_end_the_wait_of_the_store() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let until = fixture.reach_deadline().retry_after_ms;
+        let wait = fixture.deadline_wait();
+        let aside = fixture.cache_root.join("aside");
+        fs::rename(fixture.store(), &aside).unwrap();
+        fixture.expire_retry();
+        let absent = completed(fixture.run_lane());
+        assert_eq!((absent.store_identity, absent.bytes), (None, 0));
+        assert_eq!(fixture.deadline_wait(), wait);
+        fs::rename(&aside, fixture.store()).unwrap();
+        fixture.queue(10_000);
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(request.retry_after_ms, until);
+    }
+
+    #[test]
+    fn inherited_deadlines_do_not_lengthen_another_back_off() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        fixture.reach_deadline();
+        fixture.expire_deadline_wait();
+        fixture.reach_deadline();
+        fixture.broker.forget_shared_cache_measurement();
+        fixture.queue(10_000);
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(
+            (request.unanswered_deadlines, request.consecutive_failures),
+            (2, 0)
+        );
+        fixture.expire_deadline_wait();
+        make_fifo(&fixture.store().join("nested").join("fifo"));
+        let refused = interrupted(fixture.run_lane());
+        assert_eq!(refused.reason, MeasurementInterruptionReason::ScanRefused);
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(request.consecutive_failures, 1);
+        assert_eq!(wait_of(&request), RETRY_AFTER_INTERRUPTION_MS);
+    }
+
+    #[test]
+    fn an_unconfirmed_over_budget_walk_between_two_deadlines_restarts_the_wait() {
+        let mut fixture = fixture(20, 100);
+        fixture.queue(150);
+        let _pacing = pacer(vec![calm()]);
+        for _ in 0..2 {
+            let over = completed(fixture.run_lane());
+            assert_eq!(over.outcome, MeasurementOutcome::OverBudget);
+            assert!(!over.over_budget_confirmed, "a deadline resets the count");
+            assert_eq!(fixture.deadline_wait(), None);
+            fixture.expire_retry();
+            assert_eq!(wait_of(&fixture.reach_deadline()), RETRY_AFTER_DEADLINE_MS);
+            fixture.expire_deadline_wait();
+        }
     }
 
     #[test]

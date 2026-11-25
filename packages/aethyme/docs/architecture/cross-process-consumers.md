@@ -3363,14 +3363,23 @@ directory identity (device, inode, filesystem identifier).
   `root_changed` interruption drops the request; repeated `scan_refused` walks
   of one store back off from 10 minutes, doubling, up to 24 hours. Since
   2026-11-25 a `deadline` walk waits 6 hours, and 24 hours after each further
-  one of the same store without an answer in between.
-- `preparation.shared_cache_measurement.deadline_wait`: JSON or `null`, that
-  wait: `repository`, `cache_root_key`, `store_identity`, `consecutive` and
-  `until_ms`. Written by the worker at a deadline, set to `null` by a
-  completed measurement or a completed rotation. While `until_ms` is ahead and
-  the live store's identity matches, a new request inherits it as
-  `retry_after_ms` (and `consecutive` as its failure count) and the worker walks nothing; another store identity starts
-  afresh. The budget check does not count on a waiting request: it runs its
+  one of the same store without a completed walk in between.
+- `preparation.shared_cache_measurement.deadline_wait.<cache_root_key>`: JSON
+  or `null`, that wait for one cache root: `repository`, `cache_root_key`,
+  `store_identity`, `consecutive` and `until_ms`. Written by the worker at a
+  deadline. Set to `null` by a completed measurement of the same store (an
+  unconfirmed `over_budget` included, so a deadline of the confirming walk
+  waits 6 hours again, and so on while the two alternate; an absent store does
+  not count) and by a `submit prepare` that rotates it. A rotation finished by
+  crash recovery leaves the record: the new store's identity no longer
+  matches it. While `until_ms` is ahead, by at most 24 hours (a longer wait
+  was written under a wrong clock and is ignored, as is such a
+  `retry_after_ms`), and the live store's identity matches, a new request
+  inherits it as `retry_after_ms`, with `consecutive` as
+  `unanswered_deadlines` (omitted when zero), and the worker walks nothing
+  and restores both on a request that lost them. Another store identity
+  starts afresh. The budget check does not count on a request whose
+  `consecutive_failures` or `unanswered_deadlines` is not zero: it runs its
   own bounded inventory.
 - `preparation.shared_cache_measurement.result`: JSON or `null`, the last
   completed measurement. Schema `aethyme.preparation-cache-measurement/v1`
@@ -3389,8 +3398,9 @@ directory identity (device, inode, filesystem identifier).
   `at_most_half_of_budget`, `at_most_80_percent_of_budget`,
   `above_80_percent_of_budget` or `not_within_budget`), `times_used` and,
   once a budget check decided from it, `used_at_ms`. Interrupted walks never
-  replace it, but reset `over_budget_walks`. A completed rotation sets all
-  records to `null`.
+  replace it, but reset `over_budget_walks`. A `submit prepare` that rotates
+  the store, or recovers a rotation while it gives up its share, sets this
+  record and the request to `null`.
 
 Readers ignore unknown fields and treat a malformed record as absent. A
 budget check uses a result only when its `repository`, `cache_root_key` and
@@ -3434,9 +3444,11 @@ confirmed over budget). Metrics add, in `phase_counts`,
 `preparation_cache_measurement_pacer_load_wait` and
 `preparation_cache_measurement_scan_limiter_sleep`, and
 `artifact_worker_pacer_scan_limiter_sleep`. Since 2026-11-25 `phase_counts`
-adds `preparation_cache_measurement_deadline_wait_set`, `phase_timings_ms`
-adds `preparation_cache_measurement_walk_cpu` (the walking thread's CPU time,
-a part of `_walk`; what is left after the pacer's waits is I/O and scheduling
+adds `preparation_cache_measurement_deadline_wait_set` and
+`preparation_cache_measurement_deadline_wait_restored` (the worker put a lost
+wait back on the request instead of walking), `phase_timings_ms` adds
+`preparation_cache_measurement_walk_cpu` (the walking thread's CPU time, a
+part of `_walk`; what is left after the pacer's waits is I/O and scheduling
 wait), and the metric adds the object
 `preparation_cache_measurement_progress` with the `entries` and `bytes` seen
 by the walk, answered or interrupted.
