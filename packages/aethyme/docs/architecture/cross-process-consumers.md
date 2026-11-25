@@ -3372,7 +3372,7 @@ directory identity (device, inode, filesystem identifier).
   waits 6 hours again, and so on while the two alternate; an absent store does
   not count) and by a `submit prepare` that rotates it. A rotation finished by
   crash recovery leaves the record: the new store's identity no longer
-  matches it. While `until_ms` is ahead, by at most 24 hours (a longer wait
+  matches it. While `until_ms` is ahead, by at most 24 hours and 10 minutes (a longer wait
   was written under a wrong clock and is ignored, as is such a
   `retry_after_ms`), and the live store's identity matches, a new request
   inherits it as `retry_after_ms`, with `consecutive` as

@@ -120,6 +120,9 @@ pub(crate) const CONFIRMATION_DELAY_MS: i64 = 2 * 60_000;
 /// refused walks of one store double it up to a day.
 pub(crate) const RETRY_AFTER_INTERRUPTION_MS: i64 = 10 * 60_000;
 pub(crate) const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
+/// How far the clock may step back before a fresh longest wait reads as one
+/// written under a clock far ahead.
+const CLOCK_STEP_SLACK_MS: i64 = 10 * 60 * 1000;
 /// Wait after the first walk of a store that reached its deadline; after each
 /// further one without an answer in between it is [`MAX_RETRY_AFTER_MS`].
 pub(crate) const RETRY_AFTER_DEADLINE_MS: i64 = 6 * 60 * 60 * 1000;
@@ -308,7 +311,7 @@ impl SharedCacheMeasurementRequest {
 /// Whether a wait until `until` is still on. One that would last longer than
 /// the longest there is was written under a clock far ahead: it is over.
 fn still_waiting(until: i64, now: i64) -> bool {
-    until > now && until <= now.saturating_add(MAX_RETRY_AFTER_MS)
+    until > now && until <= now.saturating_add(MAX_RETRY_AFTER_MS + CLOCK_STEP_SLACK_MS)
 }
 
 /// The wait after walks of one store reached their deadline. Kept apart from
@@ -3076,6 +3079,8 @@ mod tests {
         // The longest wait there is holds.
         let now = now_ms();
         assert!(still_waiting(now + MAX_RETRY_AFTER_MS, now));
+        // A clock stepped back a little does not end a fresh longest wait.
+        assert!(still_waiting(now + MAX_RETRY_AFTER_MS + 2_000, now));
         assert!(!still_waiting(now, now));
     }
 
