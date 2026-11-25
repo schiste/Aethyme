@@ -5081,6 +5081,12 @@ mod lane_tests {
         (outcome, taken, keys("worktree_activity_look_avoided"))
     }
 
+    /// Run `change` just before each first probe on this test thread.
+    fn before_probe(change: impl FnMut() + 'static) {
+        crate::broker::BEFORE_ACTIVITY_PROBE
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(change)));
+    }
+
     fn close_landed_directly(
         broker: &mut crate::Broker,
         session: &crate::Session,
@@ -5151,12 +5157,32 @@ mod lane_tests {
             std::fs::write(&deep, "work\n").unwrap();
             age(&mut broker, &session, hours);
             std::fs::write(&deep, "more work\n").unwrap();
+            if lane == "merged_pull_request" {
+                // Its proof comes first: an unclean checkout needs no probe.
+                assert_eq!(
+                    judge(&mut broker),
+                    (
+                        declined(crate::broker::LandedSessionDecline::WorktreeUnclean),
+                        Vec::new(),
+                        vec![format!("{look}.worktree_unclean")]
+                    )
+                );
+                // Work that starts after the proof is the probe's to see.
+                std::fs::remove_dir_all(deep.parent().unwrap()).unwrap();
+                age(&mut broker, &session, hours);
+                let deep = deep.clone();
+                before_probe(move || {
+                    std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+                    std::fs::write(&deep, "late work\n").unwrap();
+                });
+            }
             assert_eq!(
                 judge(&mut broker),
                 (Outcome::NotDue, vec![look.clone()], Vec::new()),
                 "{lane}"
             );
             assert!(is_open(&broker, session.id), "{lane}");
+            crate::broker::BEFORE_ACTIVITY_PROBE.with(|hook| *hook.borrow_mut() = None);
 
             std::fs::remove_dir_all(deep.parent().unwrap()).unwrap();
             age(&mut broker, &session, hours);
@@ -5340,5 +5366,237 @@ mod lane_tests {
             assert!(!attached.contains_key("worktree_activity_look_avoided"));
             assert_eq!(phase_count(&recorder, "worktree_status_activity"), 0);
         }
+    }
+
+    /// The merged-pull-request lane: a refusal before the operation claim
+    /// runs no probe. The worktree-unclean one is in
+    /// `every_close_lane_probes_only_when_the_index_does_not_decide`.
+    #[test]
+    fn a_late_merged_refusal_runs_no_probe() {
+        use crate::broker::LandedSessionDecline as Decline;
+        let (_owner, _storage, mut broker) = fixture("");
+        let avoided = |reason: Decline| {
+            (
+                declined(reason),
+                Vec::new(),
+                vec![format!("merged_pull_request_first.{}", reason.code())],
+            )
+        };
+        let (held, _) = merged_candidate(&mut broker, "its holder runs");
+        let mut table = held_by_live_holder(&mut broker, &held, &live_holder(), 3);
+        assert_eq!(
+            looks("merged_pull_request_first", || close_directly(
+                &mut broker,
+                &held,
+                &mut table
+            )),
+            avoided(Decline::HolderAlive)
+        );
+
+        let (unlisted, _) = merged_candidate(&mut broker, "process listing refused");
+        quiet(&mut broker, &unlisted, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.queue_denied_process_table_for_test();
+        assert_eq!(
+            looks("merged_pull_request_first", || close_directly(
+                &mut broker,
+                &unlisted,
+                &mut table
+            )),
+            avoided(Decline::HolderUnknown)
+        );
+
+        let (late, _) = merged_candidate(&mut broker, "the pass is out of time");
+        quiet(&mut broker, &late, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let spent = std::time::Instant::now();
+        assert_eq!(
+            looks("merged_pull_request_first", || close_merged(
+                &mut broker,
+                &late,
+                &mut table,
+                Some(spent)
+            )),
+            avoided(Decline::BudgetExhausted)
+        );
+    }
+
+    /// A tool call just before the late probe keeps a merged session, and
+    /// without it the same session closes. Mutation caught: the hook not read
+    /// after the probe (the look under the claim does not read it).
+    #[test]
+    fn a_hook_touched_before_the_late_probe_keeps_a_merged_session() {
+        use crate::broker::AbandonedSessionCloseOutcome as Outcome;
+        let (_owner, _storage, mut broker) = fixture("");
+        let (merged, _) = merged_candidate(&mut broker, "tool call after the proof");
+        quiet(&mut broker, &merged, 3);
+        let root = broker.main_root().to_path_buf();
+        let session_id = merged.id;
+        before_probe(move || crate::agent_hook::record_hook_activity(&root, session_id));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let touched = looks("merged_pull_request_first", || {
+            close_directly(&mut broker, &merged, &mut table)
+        });
+        crate::broker::BEFORE_ACTIVITY_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            touched,
+            (
+                Outcome::NotDue,
+                vec!["merged_pull_request_first".to_string()],
+                Vec::new()
+            )
+        );
+        std::fs::remove_file(
+            broker
+                .main_root()
+                .join(format!(".git/aethyme/hook-activity-{session_id}.json")),
+        )
+        .unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &merged, &mut table),
+            Outcome::Closed
+        );
+    }
+
+    /// A holder that moved on by the index and `HEAD` is asked again with the
+    /// probe's time: a file changed after its newer binding, though older
+    /// than the window, keeps the session as its holder's. Mutation caught:
+    /// the holder not asked again before the claim (it would be kept as
+    /// `changed`, under it).
+    #[test]
+    fn a_moved_on_holder_is_judged_again_with_the_late_probe() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (old, worktree) = merged_candidate(&mut broker, "worked on after the holder left");
+        let mut table = held_by_live_holder(&mut broker, &old, &holder, 5);
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        let newer_binding = bind_holder(&mut broker, &newer, &holder);
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE events SET ts = ?1 WHERE id = ?2",
+                rusqlite::params![now_ms() - 4 * HOUR_MS, newer_binding],
+            )
+            .unwrap();
+        let late = worktree.join("new");
+        before_probe(move || {
+            std::fs::create_dir_all(&late).unwrap();
+            std::fs::write(late.join("late.txt"), "work\n").unwrap();
+            crate::worktree_status_activity::age_tree_for_test(
+                &late,
+                std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60),
+            );
+        });
+        let judged = looks("merged_pull_request_first", || {
+            close_directly(&mut broker, &old, &mut table)
+        });
+        crate::broker::BEFORE_ACTIVITY_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            judged,
+            (
+                declined(crate::broker::LandedSessionDecline::HolderAlive),
+                vec!["merged_pull_request_first".to_string()],
+                Vec::new()
+            )
+        );
+        assert!(is_open(&broker, old.id));
+    }
+
+    /// The pass deadline that runs out between the proof and the late probe
+    /// keeps the merged session without a probe; with time left it closes.
+    /// Mutation caught: the exit before the probe left out (it would probe).
+    #[test]
+    fn a_deadline_spent_after_the_proof_keeps_a_merged_session_unprobed() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (merged, _) = merged_candidate(&mut broker, "out of time after the proof");
+        quiet(&mut broker, &merged, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        crate::broker::DEADLINE_AT_LATE_PROBE
+            .with(|deadline| deadline.set(Some(std::time::Instant::now())));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let judged = looks("merged_pull_request_first", || {
+            close_directly(&mut broker, &merged, &mut table)
+        });
+        crate::broker::DEADLINE_AT_LATE_PROBE.with(|deadline| deadline.set(None));
+        assert_eq!(
+            judged,
+            (
+                declined(crate::broker::LandedSessionDecline::BudgetExhausted),
+                Vec::new(),
+                vec!["merged_pull_request_first.budget_exhausted".to_string()]
+            )
+        );
+        assert!(is_open(&broker, merged.id));
+        // The proof had concluded: it is remembered.
+        assert!(
+            broker
+                .store_ref()
+                .meta_get(&format!("landed_lane.landed.{}", merged.id))
+                .unwrap()
+                .is_some()
+        );
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            assert_eq!(
+                close_directly(&mut broker, &merged, &mut table),
+                crate::broker::AbandonedSessionCloseOutcome::Closed
+            );
+        }
+        assert!(phase_count(&recorder, "worktree_status_activity") > 0);
+    }
+
+    /// A merged checkout that cannot be read at the late probe keeps its
+    /// session; the look is taken, not avoided.
+    #[test]
+    fn a_checkout_unreadable_at_the_late_probe_keeps_a_merged_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (merged, worktree) = merged_candidate(&mut broker, "unreadable after the proof");
+        quiet(&mut broker, &merged, 3);
+        let pointer = worktree.join(".git");
+        before_probe(move || std::fs::remove_file(&pointer).unwrap());
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            close_directly(&mut broker, &merged, &mut table)
+        };
+        crate::broker::BEFORE_ACTIVITY_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            outcome,
+            crate::broker::AbandonedSessionCloseOutcome::WorktreeActivityUnavailable
+        );
+        assert!(is_open(&broker, merged.id));
+        let attached = recorder.attachments();
+        assert_eq!(
+            attached["worktree_activity_look"]["merged_pull_request_first"]["count"],
+            1
+        );
+        assert!(!attached.contains_key("worktree_activity_look_avoided"));
+        assert_eq!(phase_count(&recorder, "worktree_status_activity"), 0);
+    }
+
+    /// A missing merged checkout is kept by the proof: no look, none avoided.
+    #[test]
+    fn a_missing_merged_checkout_is_kept_by_the_proof() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (merged, worktree) = merged_candidate(&mut broker, "checkout gone");
+        quiet(&mut broker, &merged, 3);
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let judged = looks("merged_pull_request_first", || {
+            close_directly(&mut broker, &merged, &mut table)
+        });
+        assert_eq!(
+            judged,
+            (
+                declined(crate::broker::LandedSessionDecline::WorktreeUnavailable),
+                Vec::new(),
+                Vec::new()
+            )
+        );
+        assert!(is_open(&broker, merged.id));
     }
 }

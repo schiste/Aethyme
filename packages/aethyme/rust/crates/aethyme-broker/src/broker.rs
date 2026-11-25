@@ -3964,7 +3964,8 @@ pub(crate) use leases::{
 };
 #[cfg(test)]
 pub(crate) use leases::{
-    LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
+    BEFORE_ACTIVITY_PROBE, DEADLINE_AT_LATE_PROBE, LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget,
+    landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) use retire::StaleTrashReconcile;
