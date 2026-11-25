@@ -1113,6 +1113,22 @@ pub fn archive_bound_state(host_state: &Path, repository: &str) -> ArchiveBoundS
         .unwrap_or_default()
 }
 
+/// Archive staging directories (`.partial`) the bound passes last listed, with
+/// the size each was last measured at: being written, or left unfinished. Reads
+/// the recorded states only.
+pub fn unfinished_archive_staging(host_state: &Path) -> BTreeMap<PathBuf, Option<u64>> {
+    recovery_archive_usage(host_state)
+        .keys()
+        .flat_map(|repository| archive_bound_state(host_state, repository).unowned_sizes)
+        .map(|(path, size)| (PathBuf::from(path), size.bytes))
+        .filter(|(path, _)| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(is_partial_archive_name)
+        })
+        .collect()
+}
+
 /// Record `repository`'s [`ArchiveBoundState`], written atomically.
 pub fn record_archive_bound_state(
     host_state: &Path,

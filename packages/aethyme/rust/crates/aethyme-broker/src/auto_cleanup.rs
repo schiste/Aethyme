@@ -1662,6 +1662,28 @@ pub struct AutoRemovedCheckout {
     pub ownership_reproof: Option<String>,
 }
 
+/// `blockers` without a path inside another listed directory: Git lists a
+/// directory holding only files ignored by a pattern, and each of them. Only
+/// for reports: a remembered keep's fingerprint needs every listed path.
+fn outermost_blockers(blockers: &[String]) -> Vec<&str> {
+    blockers
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            !blockers.iter().any(|listed| {
+                listed.ends_with('/') && listed != path && path.starts_with(listed.as_str())
+            })
+        })
+        .collect()
+}
+
+fn serialize_outermost_blockers<S: serde::Serializer>(
+    blockers: &[String],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&outermost_blockers(blockers), serializer)
+}
+
 /// One candidate auto-cleanup kept, and why.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AutoKeptCheckout {
@@ -1675,7 +1697,12 @@ pub struct AutoKeptCheckout {
     /// Ignored paths, relative to the checkout, that keep it (code
     /// `ignored_content`). Each is a root Git listed as ignored that no
     /// built-in witness or `[cleanup] regenerable` glob recognises.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Serialized without a path inside a listed directory.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_outermost_blockers"
+    )]
     pub ignored_blockers: Vec<String>,
     /// Set to `device_renumber` when the device-renumber ownership re-proof
     /// was tried for this checkout and refused (code
@@ -4766,13 +4793,6 @@ pub(crate) fn ignored_content_blockers(
             );
             ensure_ignored_content_before(deadline)?;
             if let Err(reason) = verdict {
-                // Git lists a directory holding only files ignored by a
-                // pattern, and each of them: the directory says it once.
-                if blockers.iter().any(|(listed, _): &(String, String)| {
-                    listed.ends_with('/') && relative.starts_with(listed.as_str())
-                }) {
-                    continue;
-                }
                 blockers.push((relative, reason));
                 if blockers.len() >= limit.max(1) {
                     break;
@@ -5255,8 +5275,8 @@ fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
         if !Path::new(worktree).is_dir() {
             continue;
         }
-        for blocker in &entry.blockers {
-            *counts.entry(blocker.as_str()).or_default() += 1;
+        for blocker in outermost_blockers(&entry.blockers) {
+            *counts.entry(blocker).or_default() += 1;
         }
     }
     let mut rows = counts
@@ -11365,7 +11385,8 @@ mod tests {
     }
 
     /// Git lists a directory holding only pattern-ignored files and each of
-    /// them: the directory is reported once, and a sibling still is.
+    /// them: the directory is reported once and a sibling still is, while the
+    /// fingerprint of a remembered keep covers the nested paths.
     #[test]
     fn a_blocking_directory_is_not_reported_again_for_its_files() {
         let temporary = tempfile::tempdir().unwrap();
@@ -11379,12 +11400,28 @@ mod tests {
         let blockers =
             super::ignored_content_blockers(root, &AutoCleanupPolicy::default(), 16).unwrap();
 
-        let paths = blockers.iter().map(|(path, _)| path.as_str());
-        assert_eq!(
-            paths.collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from(["logs/", "logs-standalone.log"])
-        );
-        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        let ignored_blockers = blockers
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let fingerprint = super::keep_memo_fingerprint(root, &ignored_blockers);
+        for nested in ["logs/deep", "logs/deep/b.log"] {
+            assert!(
+                fingerprint
+                    .iter()
+                    .any(|part| part.starts_with(&format!("{nested}="))),
+                "{nested}: {fingerprint:?}"
+            );
+        }
+        let kept = super::AutoKeptCheckout {
+            ignored_blockers,
+            ..Default::default()
+        };
+        let reported = serde_json::to_value(&kept).unwrap();
+        let mut reported =
+            serde_json::from_value::<Vec<String>>(reported["ignored_blockers"].clone()).unwrap();
+        reported.sort();
+        assert_eq!(reported, ["logs-standalone.log", "logs/"]);
     }
 
     #[cfg(unix)]

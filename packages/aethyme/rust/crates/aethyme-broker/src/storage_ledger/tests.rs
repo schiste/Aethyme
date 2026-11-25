@@ -1841,3 +1841,50 @@ fn old_node_compile_cache_days_expire_while_tool_caches_are_under_budget() {
         "{plan:?}"
     );
 }
+
+/// Archive staging the bound pass listed is shown with what it measured;
+/// archives are not.
+#[test]
+fn unfinished_archive_staging_is_listed_and_counted() {
+    let host = tempfile::tempdir().unwrap();
+    let repository = "/example/repository";
+    super::record_recovery_archive_usage(
+        host.path(),
+        repository,
+        super::RecoveryArchiveUsage::default(),
+    )
+    .unwrap();
+    let sized = |bytes| super::UnownedArchiveSize {
+        bytes,
+        ..Default::default()
+    };
+    let state = super::ArchiveBoundState {
+        unowned_sizes: [
+            (
+                "/archives/1.retirement-v6.partial".to_string(),
+                sized(Some(7)),
+            ),
+            (
+                "/archives/2.retirement-v6-next.partial".to_string(),
+                sized(None),
+            ),
+            ("/archives/3-unowned".to_string(), sized(Some(100))),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    super::record_archive_bound_state(host.path(), repository, &state).unwrap();
+
+    let status = super::cli::status_value(host.path());
+    assert_eq!(
+        status["classes"]["recovery_archives_by_location"]["unfinished_staging"],
+        serde_json::json!({"directories": 2, "bytes": 7, "unmeasured": 1})
+    );
+    assert_eq!(
+        super::cli::archives_value(host.path())["unfinished_staging"],
+        serde_json::json!([
+            {"path": "/archives/1.retirement-v6.partial", "bytes": 7},
+            {"path": "/archives/2.retirement-v6-next.partial", "bytes": null},
+        ])
+    );
+}

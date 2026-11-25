@@ -5535,19 +5535,32 @@ Recovery archive file lists and earlier retirement staging:
   `recovery_archive_plan_file_list_refused`.
 - Staging left by an earlier state of the same session, checkout path and branch
   (`<session>.retirement-v6.partial`, no longer matching the content identity;
-  9 of those 15 keeps) is removed only when it holds nothing but its record, the
+  9 of those 15 keeps) is removed only when every commit its record names is one
+  the plan archives or in its history, it holds nothing but its record, the
   checkout's current patches, and files the plan archives from the same path
-  whose checkout file starts with every byte staged (links: the same link), and
-  none of its prerequisite refs exists. An empty staging directory is removed
-  too. Counter `recovery_archive_stale_partial_removed`.
-- Staging not so proven (a manifest, a bundle, a file the checkout lost or
-  changed) is left untouched and the archive is written in
+  whose checkout file starts with every staged byte (links: the same link), and
+  none of its prerequisite refs exists. An empty staging directory, and one that
+  holds only a record cut short, are removed too. Counter
+  `recovery_archive_stale_partial_removed`. A removal that stops midway keeps the
+  record and whatever it had not reached, and is proven again next time.
+- Staging established to hold something else (a manifest, a bundle, a file the
+  checkout lost or changed) is kept and the archive is written in
   `<session>.retirement-v6-next.partial`, the only other staging name; counter
-  `recovery_archive_stale_partial_kept`. With both retained the apply is refused
-  before any copy. Staging of another checkout, or with an unreadable record, is
-  refused as before. No lane expires retained staging.
+  `recovery_archive_stale_partial_kept`. With both kept the apply is refused
+  before any copy. A failure to judge (I/O, Git, time) establishes nothing: the
+  attempt ends and the alternate is not opened; counter
+  `recovery_archive_stale_partial_undecided`. Staging of another checkout, or
+  with another unreadable record, is refused as before. The staging place an
+  apply does not use is settled the same way for up to 10 s, whatever comes of it.
+- No lane expires kept staging. It is listed as `unfinished_staging` by
+  `storage archives` (path, bytes) and counted under
+  `recovery_archives_by_location` by `storage status`, from the sizes the archive
+  bound pass recorded; staging being written is listed too.
+- Releasing prerequisite refs reads a staging directory's `retirement.json` when
+  its manifest cannot be parsed, and still refuses without a sound record.
 - Span `recovery_archive_apply_stale_partial` covers that proof.
 
 Whether the `archive_failed` keeps above follow from deadline cuts is not
-verified. Readers must accept the new keep reasons, field, counters and spans.
-Covered by `broker/retire.rs` tests.
+verified. Readers must accept the new keep reasons, fields, counters and spans.
+Covered by tests in `broker/retire.rs`, `cleanup_resolve.rs`, `auto_cleanup.rs`
+and `storage_ledger/tests.rs`.

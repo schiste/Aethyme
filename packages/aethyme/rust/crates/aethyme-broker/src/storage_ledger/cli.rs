@@ -225,6 +225,7 @@ pub fn status_value(host_state: &Path) -> Value {
     let checkouts = super::checkout_counts(host_state);
     let scratch = super::session_scratch_usage(host_state);
     let archive_usage = super::recovery_archive_usage(host_state);
+    let staging = super::unfinished_archive_staging(host_state);
     let mut classes = serde_json::to_value(&classes).unwrap_or_else(|_| json!({}));
     // Recovery archives by location: the pool's volume (new archives) and
     // host state (older ones), as the retirement lane last measured them.
@@ -248,6 +249,11 @@ pub fn status_value(host_state: &Path) -> Value {
                 "evicted_bytes_total": archive_usage.values().map(|usage| usage.evicted_bytes_total).sum::<u64>(),
                 "partial": archive_usage.values().any(|usage| usage.partial),
                 "repositories": archive_usage,
+                "unfinished_staging": {
+                    "directories": staging.len(),
+                    "bytes": staging.values().flatten().sum::<u64>(),
+                    "unmeasured": staging.values().filter(|bytes| bytes.is_none()).count(),
+                },
                 "why_not": "measured by checkout retirement; over [cleanup] recovery_archive_bound_gib only fully landed archives are removed",
             }),
         );
@@ -395,6 +401,14 @@ fn status(json_output: bool) -> u8 {
                     .unwrap_or_default()
             );
         }
+    }
+    let staging = &value["classes"]["recovery_archives_by_location"]["unfinished_staging"];
+    if staging["directories"].as_u64().unwrap_or(0) > 0 {
+        println!(
+            "unfinished archive staging: {} director(ies), {} measured (see `aethyme storage archives`)",
+            staging["directories"],
+            human(staging["bytes"].as_u64().unwrap_or(0))
+        );
     }
     if let Some(over) = value["over_budget"].as_array() {
         for entry in over {
@@ -1005,10 +1019,15 @@ pub fn archives_value(host_state: &Path) -> Value {
             }));
         }
     }
+    let staging: Vec<Value> = super::unfinished_archive_staging(host_state)
+        .into_iter()
+        .map(|(path, bytes)| json!({"path": path.to_string_lossy(), "bytes": bytes}))
+        .collect();
     json!({
         "schema": "aethyme.storage-archives/v1",
         "unlanded_archive_days": budgets.unlanded_archive_days,
         "archives": rows,
+        "unfinished_staging": staging,
     })
 }
 
@@ -1041,6 +1060,16 @@ fn archives(json_output: bool) -> u8 {
                 .as_u64()
                 .map_or_else(|| "never".to_string(), |ms| ms.to_string()),
             if row["kept"] == true { "  kept" } else { "" }
+        );
+    }
+    let staging = value["unfinished_staging"].as_array();
+    for entry in staging.into_iter().flatten() {
+        println!(
+            "  unfinished staging  {}  {}  (copies of an attempt that did not finish; never expired)",
+            entry["path"].as_str().unwrap_or("?"),
+            entry["bytes"]
+                .as_u64()
+                .map_or_else(|| "size unknown".to_string(), human)
         );
     }
     crate::exit_status::SUCCESS
