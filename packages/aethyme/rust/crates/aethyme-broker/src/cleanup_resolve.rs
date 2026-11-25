@@ -39,6 +39,7 @@ use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
 mod restore;
+mod stale_partial;
 pub(crate) use restore::{
     ArchiveRestore, restore_incomplete, restore_incomplete_marker, restore_recovery_archive,
     restore_staging_path,
@@ -914,16 +915,32 @@ fn ignored_inventory(
         reason,
     };
     let mut roots = Vec::new();
-    let mut files = Vec::new();
+    // Git lists a directory that holds only files ignored by a pattern as
+    // the directory and again as each file and nested directory in it.
+    // Sorted, a directory comes before everything under it, so its walk
+    // takes (and bounds) each file once; a listed file is skipped only when
+    // that exact path was taken.
+    let mut preserved = std::collections::BTreeMap::<String, ArchivedFile>::new();
+    let mut expanded = Vec::<String>::new();
+    let mut duplicates = 0_usize;
     let mut preserved_directory_budget = PreservedDirectoryBudget::default();
     check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
-    for relative in checkout.ignored_paths_readonly()? {
+    let mut listed = checkout.ignored_paths_readonly()?;
+    listed.sort_unstable();
+    let listed_count = listed.len();
+    listed.dedup();
+    duplicates += listed_count - listed.len();
+    for relative in listed {
         check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
         let trimmed = relative.trim_end_matches('/');
         if !is_contained_relative(trimmed) {
             return Err(refuse(format!(
                 "Git reported an ignored path outside the worktree: {relative:?}"
             )));
+        }
+        if preserved.contains_key(&relative) {
+            duplicates += 1;
+            continue;
         }
         let full = worktree.join(trimmed);
         let metadata = std::fs::symlink_metadata(&full).map_err(|error| io_error(&full, error))?;
@@ -967,6 +984,15 @@ fn ignored_inventory(
                 // every file in it is archived (a link as the link), so the
                 // plan preserves the directory instead of refusing the
                 // whole checkout.
+                if expanded.iter().any(|parent| {
+                    trimmed
+                        .strip_prefix(parent.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                }) {
+                    // The walk of that directory took everything in here.
+                    duplicates += 1;
+                    continue;
+                }
                 for file in preserved_ignored_directory_files(
                     worktree,
                     trimmed,
@@ -975,12 +1001,9 @@ fn ignored_inventory(
                 )
                 .map_err(refuse)?
                 {
-                    roots.push(IgnoredPath {
-                        path: file.path.clone(),
-                        classification: IgnoredPathClassification::PreservedFile,
-                    });
-                    files.push(file);
+                    preserved.insert(file.path.clone(), file);
                 }
+                expanded.push(trimmed.to_owned());
                 continue;
             }
             crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_) => {
@@ -991,8 +1014,8 @@ fn ignored_inventory(
                         "ignored path {relative} is neither a regular file nor a symbolic link"
                     )));
                 };
-                files.push(file);
-                IgnoredPathClassification::PreservedFile
+                preserved.insert(file.path.clone(), file);
+                continue;
             }
             crate::auto_cleanup::RecoveryIgnoredClassification::StrictRefusal => {
                 return Err(refuse(format!(
@@ -1005,8 +1028,19 @@ fn ignored_inventory(
             classification,
         });
     }
+    // One occurrence per path dropped.
+    for _ in 0..duplicates {
+        crate::phase_telemetry::add(
+            "recovery_archive_ignored_duplicates_dropped",
+            Duration::ZERO,
+        );
+    }
+    roots.extend(preserved.keys().map(|path| IgnoredPath {
+        path: path.clone(),
+        classification: IgnoredPathClassification::PreservedFile,
+    }));
     roots.sort_by(|left, right| left.path.cmp(&right.path));
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let files = preserved.into_values().collect::<Vec<_>>();
     let opaque_directories = roots
         .iter()
         .filter(|root| root.classification == IgnoredPathClassification::DisposableDirectory)
@@ -1846,6 +1880,19 @@ impl Broker {
             session_id,
             context.deadline,
         )?;
+        // The rules the written archive is verified against, before anything
+        // is copied: a plan that breaks them can only fail after its copy.
+        validate_planned_files(&untracked_files, &ignored_paths, &ignored_files).map_err(
+            |reason| {
+                crate::phase_telemetry::add(
+                    "recovery_archive_plan_file_list_refused",
+                    Duration::ZERO,
+                );
+                refuse(format!(
+                    "the checkout's files cannot be archived as listed: {reason}"
+                ))
+            },
+        )?;
         let ignored_bytes = checked_archived_file_bytes(&ignored_files)
             .ok_or_else(|| refuse("the total ignored archive size overflows u64".into()))?;
         let ignored_policy_bytes =
@@ -2356,16 +2403,6 @@ impl Broker {
                 archive_staging_nonce()
             )
         };
-        let partial_name = if plan.recovery_archive_schema_version
-            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        {
-            format!("{session_id}.retirement-v6.partial")
-        } else if retirement_mode {
-            format!("{session_id}.retirement.partial")
-        } else {
-            format!("{name}.partial")
-        };
-        let partial_path = archive_root.join(&partial_name);
         let archive = archive_root.join(&name);
         let checkout = GitRepo::discover(Path::new(&plan.worktree_path))?;
         let mut archive_reused = false;
@@ -2418,6 +2455,42 @@ impl Broker {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(&archive, error)),
         }
+
+        let partial_name = if plan.recovery_archive_schema_version
+            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
+            if archive_reused {
+                let names = stale_partial::retirement_staging_names(session_id);
+                stale_partial::settle_spare_staging(
+                    self.repo_handle(),
+                    &archive_root,
+                    &plan,
+                    operation_deadline,
+                    &names,
+                );
+                names[0].clone()
+            } else {
+                stale_partial::settle_retirement_staging(
+                    self.repo_handle(),
+                    &archive_root,
+                    &plan,
+                    operation_deadline,
+                )
+                .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_root
+                        .join(&stale_partial::retirement_staging_names(session_id)[0])
+                        .to_string_lossy()
+                        .into_owned(),
+                    reason,
+                })?
+            }
+        } else if retirement_mode {
+            format!("{session_id}.retirement.partial")
+        } else {
+            format!("{name}.partial")
+        };
+        let partial_path = archive_root.join(&partial_name);
 
         if !archive_reused {
             match std::fs::symlink_metadata(&partial_path) {
@@ -3905,6 +3978,49 @@ fn validate_archived_files(label: &str, files: &[ArchivedFile]) -> Result<(), St
     Ok(())
 }
 
+/// The ignored roots are sorted and unique, and their preserved files are
+/// exactly `files`.
+fn validate_ignored_roots(roots: &[IgnoredPath], files: &[ArchivedFile]) -> Result<(), String> {
+    let mut previous: Option<&str> = None;
+    let mut preserved = Vec::new();
+    for path in roots {
+        let trimmed = path.path.trim_end_matches('/');
+        if !is_contained_relative(trimmed)
+            || previous.is_some_and(|previous| previous >= path.path.as_str())
+        {
+            return Err("schema v2/v3/v4/v5 ignored roots are invalid or unsorted".into());
+        }
+        if path.classification == IgnoredPathClassification::PreservedFile {
+            if path.path.ends_with('/') {
+                return Err("schema v2/v3/v4/v5 preserved ignored path is a directory".into());
+            }
+            preserved.push(path.path.as_str());
+        }
+        previous = Some(&path.path);
+    }
+    if preserved.len() != files.len()
+        || preserved
+            .iter()
+            .zip(files)
+            .any(|(path, file)| *path != file.path)
+    {
+        return Err("schema v2/v3 ignored classifications do not match ignored_files".into());
+    }
+    Ok(())
+}
+
+/// Whether a plan's file lists satisfy what the archive's own verification
+/// requires of its manifest.
+fn validate_planned_files(
+    untracked: &[ArchivedFile],
+    ignored_roots: &[IgnoredPath],
+    ignored: &[ArchivedFile],
+) -> Result<(), String> {
+    validate_archived_files("untracked", untracked)?;
+    validate_archived_files("ignored", ignored)?;
+    validate_ignored_roots(ignored_roots, ignored)
+}
+
 fn validate_archived_file_modes(
     label: &str,
     files: &[ArchivedFile],
@@ -4015,35 +4131,7 @@ fn recovery_archive_expected_files(
                         .into(),
                 );
             }
-            let mut previous: Option<&str> = None;
-            let mut preserved = Vec::new();
-            for path in ignored_paths {
-                let trimmed = path.path.trim_end_matches('/');
-                if !is_contained_relative(trimmed)
-                    || previous.is_some_and(|previous| previous >= path.path.as_str())
-                {
-                    return Err("schema v2/v3/v4/v5 ignored roots are invalid or unsorted".into());
-                }
-                if path.classification == IgnoredPathClassification::PreservedFile {
-                    if path.path.ends_with('/') {
-                        return Err(
-                            "schema v2/v3/v4/v5 preserved ignored path is a directory".into()
-                        );
-                    }
-                    preserved.push(path.path.as_str());
-                }
-                previous = Some(&path.path);
-            }
-            if preserved.len() != files.len()
-                || preserved
-                    .iter()
-                    .zip(files)
-                    .any(|(path, file)| *path != file.path)
-            {
-                return Err(
-                    "schema v2/v3 ignored classifications do not match ignored_files".into(),
-                );
-            }
+            validate_ignored_roots(ignored_paths, files)?;
             files
         }
         version => return Err(format!("manifest schema {version} is not supported")),
@@ -5527,6 +5615,11 @@ fn run_recovery_git_output_with_input_limited(
     Ok(output)
 }
 
+/// [`list_recovery_prerequisite_refs`]'s refusal of what it read, unlike a
+/// failure to read it.
+const MALFORMED_PREREQUISITE_NAMESPACE: &str =
+    "recovery prerequisite namespace contains a malformed or symbolic ref";
+
 fn list_recovery_prerequisite_refs(
     repository: &GitRepo,
     expected: &[RecoveryArchivePrerequisiteRef],
@@ -5573,9 +5666,7 @@ fn list_recovery_prerequisite_refs(
             || !symbolic_target.is_empty()
             || refs.insert(name.to_owned(), object_id.to_owned()).is_some()
         {
-            return Err(
-                "recovery prerequisite namespace contains a malformed or symbolic ref".into(),
-            );
+            return Err(MALFORMED_PREREQUISITE_NAMESPACE.into());
         }
     }
     Ok(refs)
@@ -5818,6 +5909,10 @@ fn refuse_duplicate_recovery_prerequisite_refs(
                     .into(),
             );
         }
+        // Staging cut short while its manifest was written: its record, which
+        // the manifest takes its refs from and which is complete before
+        // anything else, then has to decide.
+        let mut record_decides = false;
         for (file_name, max_bytes, schema_version) in [
             (
                 MANIFEST_FILE,
@@ -5833,7 +5928,9 @@ fn refuse_duplicate_recovery_prerequisite_refs(
             let file_path = path.join(file_name);
             let bytes = match read_regular_file_no_follow(&file_path, max_bytes) {
                 Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !record_decides => {
+                    continue;
+                }
                 Err(error) => {
                     return Err(format!(
                         "cannot safely read archive sibling {} while checking prerequisite refs; refs were retained: {error}",
@@ -5841,18 +5938,39 @@ fn refuse_duplicate_recovery_prerequisite_refs(
                     ));
                 }
             };
-            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-                format!(
-                    "cannot parse archive sibling {} while checking prerequisite refs; refs were retained: {error}",
-                    file_path.display()
-                )
-            })?;
+            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_)
+                    if file_name == MANIFEST_FILE
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "partial") =>
+                {
+                    record_decides = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot parse archive sibling {} while checking prerequisite refs; refs were retained: {error}",
+                        file_path.display()
+                    ));
+                }
+            };
+            if record_decides {
+                // The whole record, not only its refs, has to be sound.
+                read_retirement_archive_record(&path).map_err(|reason| {
+                    format!(
+                        "archive sibling {} has no readable manifest or record; prerequisite refs were retained: {reason}",
+                        path.display()
+                    )
+                })?;
+            }
             let is_v6 = value
                 .get("schema_version")
                 .and_then(serde_json::Value::as_u64)
                 == Some(u64::from(schema_version));
             let Some(refs_value) = value.get("prerequisite_refs") else {
-                if is_v6 {
+                if is_v6 || record_decides {
                     return Err(format!(
                         "schema v6 sibling {} is missing prerequisite refs; refs were retained",
                         file_path.display()
@@ -7477,7 +7595,7 @@ mod tests {
     }
 
     #[test]
-    fn retirement_partial_preserves_checkout_when_source_content_changes() {
+    fn retirement_partial_is_kept_whole_when_source_content_changes() {
         let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
             closed_unique_commit_fixture("retirement partial source change");
         let reviewed_plan = broker
@@ -7534,19 +7652,16 @@ mod tests {
             .cleanup_resolve_retirement_plan(session.id, false)
             .unwrap();
         assert_ne!(reviewed_plan.digest, changed_plan.digest);
-        let restart = broker
+        let outcome = broker
             .cleanup_resolve_retirement_apply(session.id, &changed_plan.digest, false)
-            .unwrap_err();
-        assert!(
-            matches!(&restart, BrokerOpError::RecoveryArchiveUnverified { .. }),
-            "a new confirmation must not replace staging for changed source content: {restart}"
-        );
-
-        assert!(worktree.is_dir());
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
         assert_eq!(
-            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            std::fs::read(outcome.archive.join("untracked/preserve.txt")).unwrap(),
             b"changed after review\n"
         );
+
         assert!(partial.is_dir());
         assert_eq!(
             std::fs::read(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE)).unwrap(),
@@ -7555,6 +7670,909 @@ mod tests {
         assert_eq!(
             std::fs::read(partial.join(BUNDLE_FILE)).unwrap(),
             bundle_before
+        );
+    }
+
+    /// A closed checkout whose staging holds `preserve.txt` and empty patches
+    /// as an earlier, stopped apply left them, and whose source then changed.
+    fn stale_staging(
+        broker: &mut Broker,
+        session_id: i64,
+        worktree: &Path,
+        name: &str,
+        fill: impl FnOnce(&Path),
+    ) -> PathBuf {
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session_id, false)
+            .unwrap();
+        let root = prepare_archive_root(&plan.archive_root).unwrap();
+        let partial = create_exclusive_archive_directory(&root, name).unwrap();
+        create_retirement_archive_record(&partial, &plan).unwrap();
+        for (cached, file) in [(true, STAGED_PATCH_FILE), (false, UNSTAGED_PATCH_FILE)] {
+            let patch = GitRepo::discover(worktree)
+                .unwrap()
+                .recovery_patch(cached)
+                .unwrap();
+            create_new_archive_file(&partial, file, &patch).unwrap();
+        }
+        create_new_archive_file(&partial, "untracked/preserve.txt", b"uncommitted ").unwrap();
+        create_exclusive_archive_directory(&partial, IGNORED_DIRECTORY).unwrap();
+        fill(&partial);
+        let path = worktree.join("preserve.txt");
+        let mut grown = std::fs::read(&path).unwrap();
+        grown.extend_from_slice(b"one more line\n");
+        std::fs::write(&path, grown).unwrap();
+        partial
+    }
+
+    fn stale_names(session_id: i64) -> [String; 2] {
+        stale_partial::retirement_staging_names(session_id)
+    }
+
+    /// A copy cut short whose source only grew holds nothing the checkout
+    /// does not: the staging is removed and the checkout retires.
+    #[test]
+    fn stale_staging_the_checkout_still_holds_is_removed() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging held");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+                .unwrap()
+        };
+
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!partial.exists());
+        assert_eq!(
+            std::fs::read(outcome.archive.join("untracked/preserve.txt")).unwrap(),
+            b"uncommitted recovery data\none more line\n"
+        );
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("recovery_archive_stale_partial_removed"),
+            Some(&1),
+            "{counts:?}"
+        );
+    }
+
+    /// What only the earlier staging holds is never removed: the checkout
+    /// retires through the alternate staging place and the staging stays.
+    #[test]
+    fn stale_staging_with_the_only_copy_of_a_file_is_kept() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging only copy");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |partial| {
+            create_new_archive_file(partial, "ignored/lost.log", b"only here\n").unwrap();
+        });
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+                .unwrap()
+        };
+
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert_eq!(
+            std::fs::read(partial.join("ignored/lost.log")).unwrap(),
+            b"only here\n"
+        );
+        assert_eq!(
+            std::fs::read(partial.join("untracked/preserve.txt")).unwrap(),
+            b"uncommitted "
+        );
+        let mut left = std::fs::read_dir(outcome.archive.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        left.retain(|path| path.is_dir() && *path != outcome.archive);
+        assert_eq!(left, vec![partial], "only the retained staging is left");
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("recovery_archive_stale_partial_kept"),
+            Some(&1),
+            "{counts:?}"
+        );
+    }
+
+    /// With both staging places retained the apply refuses before copying,
+    /// and no third one appears.
+    #[test]
+    fn stale_staging_in_both_places_refuses() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging bound");
+        let names = stale_names(session.id);
+        for name in &names {
+            stale_staging(&mut broker, session.id, &worktree, name, |partial| {
+                create_new_archive_file(partial, "ignored/lost.log", b"only here\n").unwrap();
+            });
+        }
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let error = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("both staging places"), "{error}");
+        assert!(error.contains("ignored/lost.log"), "{error}");
+        assert!(
+            error.contains("finish cleanup resolve") && error.contains("--archive"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        let mut held = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".partial"))
+            .collect::<Vec<_>>();
+        held.sort();
+        let mut expected = names.to_vec();
+        expected.sort();
+        assert_eq!(held, expected);
+    }
+
+    /// Each thing that cannot be proven keeps the whole staging directory.
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_that_cannot_be_proven_is_never_removed() {
+        type Fill = fn(&Path, &Path);
+        let cases: [(&str, Fill); 9] = [
+            ("differs", |partial, _| {
+                std::fs::write(partial.join("untracked/preserve.txt"), "another text").unwrap();
+            }),
+            ("not wholly in the checkout", |partial, _| {
+                std::fs::write(
+                    partial.join("untracked/preserve.txt"),
+                    "uncommitted recovery data\none more line\nand more\n",
+                )
+                .unwrap();
+            }),
+            ("another kind of file", |partial, worktree| {
+                let copy = partial.join("untracked/preserve.txt");
+                std::fs::remove_file(&copy).unwrap();
+                std::os::unix::fs::symlink(worktree.join("preserve.txt"), &copy).unwrap();
+            }),
+            ("cannot be compared", |partial, _| {
+                std::fs::write(partial.join(MANIFEST_FILE), "{}").unwrap();
+            }),
+            ("cannot be compared", |partial, _| {
+                std::fs::write(partial.join(BUNDLE_FILE), "bundle").unwrap();
+            }),
+            ("cannot be compared", |partial, _| {
+                std::fs::write(partial.join("stray"), "stray").unwrap();
+            }),
+            ("does not archive", |partial, _| {
+                // The name decides before the content that sorts before it.
+                std::fs::write(partial.join("untracked/preserve.txt"), "another").unwrap();
+                std::fs::write(partial.join("untracked/unplanned"), "x").unwrap();
+            }),
+            ("not the checkout's current one", |partial, _| {
+                std::fs::write(partial.join(STAGED_PATCH_FILE), "a patch").unwrap();
+            }),
+            ("special file", |partial, _| {
+                assert!(
+                    Command::new("mkfifo")
+                        .arg(partial.join("ignored/pipe"))
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }),
+        ];
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging unproven");
+        let names = stale_names(session.id);
+        for (expected, fill) in cases {
+            std::fs::write(worktree.join("preserve.txt"), "uncommitted recovery data\n").unwrap();
+            let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+            fill(&partial, &worktree);
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+            let before = recovery_archive_file_set_until(&partial, None).ok();
+
+            let refusal =
+                stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap_err();
+            assert!(
+                matches!(refusal, stale_partial::Unproven::Fact(_)),
+                "{refusal:?}"
+            );
+            assert!(
+                refusal.to_string().contains(expected),
+                "{expected}: {refusal}"
+            );
+            let name = stale_partial::settle_retirement_staging(
+                broker.repo_handle(),
+                &plan.archive_root,
+                &plan,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(name, names[1], "{expected}");
+            assert!(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE).is_file());
+            assert_eq!(
+                recovery_archive_file_set_until(&partial, None).ok(),
+                before,
+                "{expected}"
+            );
+            std::fs::remove_dir_all(&partial).unwrap();
+        }
+    }
+
+    /// A parent directory of the source that became a link would compare
+    /// with a file outside the checkout.
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_is_never_proven_through_a_linked_directory() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging linked parent");
+        std::fs::create_dir(worktree.join("notes")).unwrap();
+        std::fs::write(worktree.join("notes/a.txt"), "note\n").unwrap();
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |partial| {
+            create_new_archive_file(partial, "untracked/notes/a.txt", b"note\n").unwrap();
+        });
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(worktree.join("notes"), outside.path().join("notes")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("notes"), worktree.join("notes")).unwrap();
+
+        let refusal =
+            stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap_err();
+
+        assert!(
+            refusal.to_string().contains("not under a real directory"),
+            "{refusal}"
+        );
+    }
+
+    /// Staging of another checkout, or with a record nobody can read, is left
+    /// for the apply to refuse: nothing is written beside it.
+    #[test]
+    fn staging_not_proven_to_be_this_checkouts_is_refused_whole() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("staging of another");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let record_path = partial.join(RETIREMENT_ARCHIVE_RECORD_FILE);
+        let (record, _) = read_retirement_archive_record(&partial).unwrap();
+        let mut elsewhere = record.clone();
+        elsewhere.worktree_path = format!("{}-other", record.worktree_path);
+        let mut other_branch = record;
+        other_branch.branch_ref = "refs/heads/other".into();
+        for bytes in [
+            serde_json::to_vec(&elsewhere).unwrap(),
+            serde_json::to_vec(&other_branch).unwrap(),
+            b"{".to_vec(),
+        ] {
+            std::fs::write(&record_path, &bytes).unwrap();
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+
+            let error = broker
+                .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("not proven to belong"), "{error}");
+            assert!(worktree.is_dir());
+            assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+            assert!(partial.join("untracked/preserve.txt").is_file());
+            assert!(!plan.archive_root.join(&names[1]).exists());
+        }
+    }
+
+    /// A proof that ran out of time removes nothing and opens no alternate.
+    #[test]
+    fn stale_staging_is_kept_when_time_runs_out() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging deadline");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let error = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            Some(Instant::now()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("deadline"), "{error}");
+        assert!(partial.join("untracked/preserve.txt").is_file());
+    }
+
+    /// Staging whose prerequisite refs were installed is kept with them.
+    #[test]
+    fn stale_staging_with_prerequisite_refs_is_kept() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging refs");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let (record, _) = read_retirement_archive_record(&partial).unwrap();
+        let pins = record.prerequisite_refs.unwrap();
+        let pin = &pins[0];
+        git(&repository, &["update-ref", &pin.ref_name, &pin.object_id]);
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let name = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(name, names[1]);
+        assert!(partial.join("untracked/preserve.txt").is_file());
+
+        // A symbolic ref in that namespace is as much a fact.
+        git(
+            &repository,
+            &["symbolic-ref", &pin.ref_name, "refs/heads/main"],
+        );
+        let name = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap();
+        assert_eq!(name, names[1]);
+        assert!(partial.join("untracked/preserve.txt").is_file());
+    }
+
+    /// Copies of an ignored file and of a link, and an empty copy, are proven
+    /// like any other; a link to another target is not.
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_proves_ignored_files_links_and_empty_copies() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging kinds");
+        std::fs::create_dir_all(repository.join(".git/info")).unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), "*.keep\n").unwrap();
+        std::fs::write(worktree.join("own.keep"), "ignored text\n").unwrap();
+        std::os::unix::fs::symlink("preserve.txt", worktree.join("link")).unwrap();
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |partial| {
+            create_new_archive_file(partial, "ignored/own.keep", b"").unwrap();
+            std::os::unix::fs::symlink("preserve.txt", partial.join("untracked/link")).unwrap();
+        });
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(
+            plan.ignored_files
+                .iter()
+                .any(|file| file.path == "own.keep"),
+            "{:?}",
+            plan.ignored_files
+        );
+        stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap();
+        std::fs::write(partial.join("ignored/own.keep"), "ignored text\n").unwrap();
+        stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap();
+        std::fs::remove_file(partial.join("untracked/link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere.txt", partial.join("untracked/link")).unwrap();
+
+        let refusal =
+            stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap_err();
+
+        assert!(refusal.to_string().contains("another link"), "{refusal}");
+    }
+
+    /// A removal that stops keeps its record, and a later attempt proves what
+    /// is left and finishes. What nobody proved is never removed.
+    #[test]
+    fn a_stopped_staging_removal_is_resumed() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging resumed");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        for stray in ["untracked/late.txt", "late.txt"] {
+            let tree =
+                stale_partial::prove_partial_held_by_checkout(&partial, &plan, None).unwrap();
+            std::fs::write(partial.join(stray), "arrived late").unwrap();
+
+            let stopped = stale_partial::remove_proven_partial(&partial, &tree, None).unwrap_err();
+
+            assert!(
+                matches!(stopped, stale_partial::Unproven::Fact(_))
+                    && stopped.to_string().contains("gained a file"),
+                "{stopped:?}"
+            );
+            assert!(!partial.join("untracked/preserve.txt").exists());
+            assert!(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE).is_file());
+            std::fs::remove_file(partial.join(stray)).unwrap();
+        }
+
+        let name = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(name, names[0]);
+        assert!(!partial.exists());
+    }
+
+    /// An I/O failure establishes nothing: the attempt ends, the staging
+    /// stays and the alternate is not opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_proof_is_not_a_reason_to_open_the_alternate() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("stale staging unreadable");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let copy = partial.join("untracked/preserve.txt");
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&copy).is_ok() {
+            // Run with the right to read anything: nothing to observe.
+            return;
+        }
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let error = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not be judged"), "{error}");
+        assert!(copy.is_file());
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap();
+        assert!(!partial.exists());
+    }
+
+    /// The other staging place is settled too, and only what is proven goes.
+    #[test]
+    fn spare_staging_is_settled_without_deciding_the_apply() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("spare staging");
+        let names = stale_names(session.id);
+        for (name, left) in [(&names[0], false), (&names[1], false), (&names[1], true)] {
+            let partial = stale_staging(&mut broker, session.id, &worktree, name, |partial| {
+                if left {
+                    create_new_archive_file(partial, "ignored/lost.log", b"only here\n").unwrap();
+                }
+            });
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+
+            let used = stale_partial::settle_retirement_staging(
+                broker.repo_handle(),
+                &plan.archive_root,
+                &plan,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(used, names[0]);
+            assert_eq!(partial.exists(), left, "{name}");
+        }
+    }
+
+    /// A finished archive whose checkout stayed is reused: spare staging is
+    /// settled, even with a record that still matches, and a spare nobody can
+    /// judge does not stop the apply. The archive and its refs are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn reusing_an_archive_settles_spare_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        for unreadable in [false, true] {
+            let (
+                _owner,
+                repository,
+                _storage,
+                mut broker,
+                session,
+                worktree,
+                _base,
+                _head,
+                _branch,
+            ) = closed_unique_commit_fixture("archive reuse spare staging");
+            let names = stale_names(session.id);
+            let preserve = worktree.join("preserve.txt");
+            let original = std::fs::read(&preserve).unwrap();
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+            let changed = preserve.clone();
+            let kept = broker
+                .cleanup_resolve_apply_with_bundle_writer_mode(
+                    session.id,
+                    &plan.digest,
+                    move || std::fs::write(&changed, "changed under the archive\n").unwrap(),
+                    sync_archive_directory,
+                    |_, _| {
+                        Some(crate::disk_headroom::DiskHeadroom {
+                            bytes: u64::MAX,
+                            inodes: None,
+                        })
+                    },
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    RecoveryBundleWriter {
+                        max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                        write_to: write_recovery_bundle_to_file,
+                    },
+                )
+                .unwrap();
+            assert!(!kept.worktree_removed, "{kept:?}");
+            let manifest = std::fs::read(kept.archive.join(MANIFEST_FILE)).unwrap();
+            std::fs::write(&preserve, &original).unwrap();
+            // The staging's own refs are those of the new delivery targets,
+            // not the archive's installed ones.
+            git(&repository, &["merge", "-q", "--ff-only", &session.branch]);
+            let partial = stale_staging(&mut broker, session.id, &worktree, &names[1], |_| {});
+            std::fs::write(&preserve, &original).unwrap();
+            let copy = partial.join("untracked/preserve.txt");
+            if unreadable {
+                std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+                if std::fs::File::open(&copy).is_ok() {
+                    // Run with the right to read anything: nothing to observe.
+                    return;
+                }
+            }
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+            verify_retirement_archive_record_for_content_identity(&partial, &plan).unwrap();
+
+            let outcome = broker
+                .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+                .unwrap();
+
+            assert!(outcome.worktree_removed, "{outcome:?}");
+            assert_eq!(outcome.archive, kept.archive, "the archive is reused");
+            assert_eq!(partial.exists(), unreadable);
+            assert_eq!(
+                std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap(),
+                manifest
+            );
+            let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+            assert!(!owned.prerequisite_refs.is_empty());
+            for pin in &owned.prerequisite_refs {
+                assert_eq!(
+                    git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+                    pin.object_id
+                );
+            }
+        }
+    }
+
+    /// Settling spare staging never uses the time the apply reserves.
+    #[test]
+    fn spare_staging_leaves_the_apply_its_reserve() {
+        let now = Instant::now();
+        let after = |seconds| now + Duration::from_secs(seconds);
+        for (operation, expected) in [
+            (None, Some(after(10))),
+            (Some(after(60)), Some(after(10))),
+            (Some(after(15)), Some(after(5))),
+            (Some(after(11)), Some(after(1))),
+            (Some(after(10)), None),
+            (Some(now), None),
+        ] {
+            assert_eq!(stale_partial::spare_deadline(now, operation), expected);
+        }
+    }
+
+    /// Staging whose record names a commit outside what the plan archives is
+    /// kept; one in its history is not a reason to keep it.
+    #[test]
+    fn stale_staging_of_another_history_is_kept() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, _branch) =
+            closed_unique_commit_fixture("stale staging history");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let (mut record, _) = read_retirement_archive_record(&partial).unwrap();
+        let tree = format!("{head}^{{tree}}");
+        let other = git_output(
+            &repository,
+            &["commit-tree", &tree, "-p", &base, "-m", "dropped"],
+        );
+        for (tip, held) in [
+            (base.as_str(), true),
+            (other.as_str(), false),
+            ("1111111111111111111111111111111111111111", false),
+        ] {
+            record.branch_tip = Some(tip.to_owned());
+            let proof =
+                stale_partial::prove_recorded_tips_held(broker.repo_handle(), &record, &plan, None);
+            if held {
+                proof.unwrap();
+            } else {
+                assert!(
+                    matches!(proof, Err(stale_partial::Unproven::Fact(_))),
+                    "{tip}: {proof:?}"
+                );
+            }
+        }
+    }
+
+    /// A record cut short with nothing beside it goes like an empty
+    /// directory; with anything beside it, or wrong in any other way, it stays.
+    #[test]
+    fn a_lone_cut_short_staging_record_is_removed() {
+        let (_owner, _repository, _storage, broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("cut short record");
+        let names = stale_names(session.id);
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let root = prepare_archive_root(&plan.archive_root).unwrap();
+        for (record, stray, removed) in [
+            ("", false, true),
+            ("{\"schema_version\":3,", false, true),
+            ("", true, false),
+            ("not a record", false, false),
+            ("{}", false, false),
+        ] {
+            let partial = create_exclusive_archive_directory(&root, &names[0]).unwrap();
+            std::fs::write(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE), record).unwrap();
+            if stray {
+                std::fs::write(partial.join("stray"), "data").unwrap();
+            }
+
+            stale_partial::settle_retirement_staging(broker.repo_handle(), &root, &plan, None)
+                .unwrap();
+
+            assert_eq!(!partial.exists(), removed, "{record:?} {stray}");
+            if partial.exists() {
+                std::fs::remove_dir_all(&partial).unwrap();
+            }
+        }
+    }
+
+    /// A manifest cut short in staging leaves the duplicate check to the
+    /// staging's record; without a sound one it still refuses.
+    #[test]
+    fn a_cut_short_staging_manifest_leaves_the_ref_check_to_its_record() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("cut short manifest");
+        let names = stale_names(session.id);
+        let partial = stale_staging(&mut broker, session.id, &worktree, &names[0], |_| {});
+        std::fs::write(partial.join(MANIFEST_FILE), "{\"schema_version\":6,").unwrap();
+        let root = partial.parent().unwrap().to_path_buf();
+        let removed = root.join("removed-archive");
+        let (record, _) = read_retirement_archive_record(&partial).unwrap();
+        let own = record.prerequisite_refs.unwrap();
+        let mut unrelated = own.clone();
+        for pin in &mut unrelated {
+            pin.ref_name = format!("{}-other", pin.ref_name);
+        }
+        let check = |refs: &[RecoveryArchivePrerequisiteRef]| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            refuse_duplicate_recovery_prerequisite_refs(&root, &removed, refs, deadline)
+        };
+
+        check(&unrelated).unwrap();
+        assert!(check(&own).unwrap_err().contains("also references"));
+        let record_path = partial.join(RETIREMENT_ARCHIVE_RECORD_FILE);
+        let sound = std::fs::read(&record_path).unwrap();
+        let mut without_refs: serde_json::Value = serde_json::from_slice(&sound).unwrap();
+        without_refs
+            .as_object_mut()
+            .unwrap()
+            .remove("prerequisite_refs");
+        for unsound in [b"{".to_vec(), serde_json::to_vec(&without_refs).unwrap()] {
+            std::fs::write(&record_path, unsound).unwrap();
+            assert!(check(&unrelated).is_err());
+        }
+        std::fs::remove_file(&record_path).unwrap();
+        assert!(check(&unrelated).is_err());
+        std::fs::write(&record_path, sound).unwrap();
+        std::fs::rename(&partial, root.join("finished-archive")).unwrap();
+        assert!(check(&unrelated).is_err(), "only for staging");
+    }
+
+    /// A catalogued directory inside an expanded one keeps its files: the
+    /// walk took them, and each is planned once.
+    #[test]
+    fn a_catalogued_directory_inside_an_expanded_one_is_planned_once() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(repository.join("logs/node_modules/pkg")).unwrap();
+        std::fs::write(repository.join("logs/a.log"), "a\n").unwrap();
+        std::fs::write(repository.join("logs/node_modules/pkg/x.js"), "x\n").unwrap();
+        let checkout = GitRepo::discover(repository).unwrap();
+        let mut listed = checkout.ignored_paths_readonly().unwrap();
+        listed.sort();
+        assert_eq!(listed, ["logs/", "logs/a.log", "logs/node_modules/"]);
+        let _opted_in = ArchiveIgnoredDirectoriesScope::enter();
+
+        let (roots, files) = ignored_inventory(
+            &checkout,
+            repository,
+            &crate::AutoCleanupPolicy::default(),
+            1,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["logs/a.log", "logs/node_modules/pkg/x.js"]
+        );
+        assert!(roots.iter().any(|root| root.path == "logs/node_modules/"
+            && root.classification == IgnoredPathClassification::DisposableDirectory));
+        validate_planned_files(&[], &roots, &files).unwrap();
+    }
+
+    /// An empty staging directory holds nothing: it no longer blocks.
+    #[test]
+    fn empty_retirement_staging_is_reused() {
+        let (_owner, _repository, _storage, broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("empty staging");
+        let names = stale_names(session.id);
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let root = prepare_archive_root(&plan.archive_root).unwrap();
+        create_exclusive_archive_directory(&root, &names[0]).unwrap();
+
+        let name =
+            stale_partial::settle_retirement_staging(broker.repo_handle(), &root, &plan, None)
+                .unwrap();
+
+        assert_eq!(name, names[0]);
+        assert!(!root.join(&name).exists());
+    }
+
+    /// Git prints a directory holding only pattern-ignored files, every
+    /// nested directory and every file: each path is planned once and the
+    /// bounds count each file once.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_listed_with_its_files_is_planned_once() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "*.log\n.DS_Store\nnode_modules/\n",
+        )
+        .unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(repository.join("logs/deep/er")).unwrap();
+        std::fs::create_dir_all(repository.join("mixed")).unwrap();
+        std::fs::write(repository.join("logs/a.log"), "a\n").unwrap();
+        std::fs::write(repository.join("logs/.DS_Store"), "finder\n").unwrap();
+        std::fs::write(repository.join("logs/deep/b.log"), "b\n").unwrap();
+        std::fs::write(repository.join("logs/deep/er/c.log"), "c\n").unwrap();
+        std::os::unix::fs::symlink("a.log", repository.join("logs/latest.log")).unwrap();
+        std::fs::write(repository.join("mixed/m.log"), "m\n").unwrap();
+        std::fs::write(repository.join("mixed/new.txt"), "untracked\n").unwrap();
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let listed = checkout.ignored_paths_readonly().unwrap();
+        for path in ["logs/", "logs/a.log", "logs/deep/", "logs/deep/b.log"] {
+            assert!(listed.iter().any(|entry| entry == path), "{listed:?}");
+        }
+        let _opted_in = ArchiveIgnoredDirectoriesScope::enter();
+        let policy = crate::AutoCleanupPolicy::default();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let (roots, files) = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            ignored_inventory(&checkout, repository, &policy, 1, None).unwrap()
+        };
+
+        let expected = vec![
+            "logs/.DS_Store",
+            "logs/a.log",
+            "logs/deep/b.log",
+            "logs/deep/er/c.log",
+            "logs/latest.log",
+            "mixed/m.log",
+        ];
+        let paths = files.iter().map(|file| file.path.as_str());
+        assert_eq!(paths.collect::<Vec<_>>(), expected);
+        assert!(files[4].symlink);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.path.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        validate_planned_files(&[], &roots, &files).unwrap();
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("recovery_archive_ignored_duplicates_dropped"),
+            // All but the expanded root and the standalone file.
+            Some(&(listed.len() as u64 - 2)),
+            "{counts:?}"
+        );
+    }
+
+    /// The archive's own rule for its file lists, applied to the plan.
+    #[test]
+    fn a_plan_with_a_repeated_or_unsorted_path_is_refused() {
+        let file = |path: &str| ArchivedFile {
+            path: path.into(),
+            bytes: 0,
+            sha256: sha256_hex(b""),
+            symlink: false,
+            mode: Some(0o600),
+        };
+        let root = |path: &str| IgnoredPath {
+            path: path.into(),
+            classification: IgnoredPathClassification::PreservedFile,
+        };
+        validate_planned_files(
+            &[file("a"), file("b")],
+            &[root("c"), root("d")],
+            &[file("c"), file("d")],
+        )
+        .unwrap();
+        for untracked in [["a", "a"], ["b", "a"], ["a", "a/b"]] {
+            assert!(validate_planned_files(&untracked.map(file), &[], &[]).is_err());
+        }
+        for ignored in [["a", "a"], ["b", "a"], ["a", "a/b"]] {
+            assert!(validate_planned_files(&[], &ignored.map(root), &ignored.map(file)).is_err());
+        }
+        assert!(
+            validate_planned_files(&[], &[root("a"), root("a")], &[file("a")]).is_err(),
+            "a repeated root"
         );
     }
 

@@ -5877,9 +5877,9 @@ mod tests {
         let record = read_record(&plan.home, &plan.repository_uuid, plan.uid).unwrap();
         let later = now_unix_ms().unwrap() + TICK_BLOCKED_AFTER_MS + 60_000;
         assert!(blocked_tick_advice(&record, plan.uid, later, |_, _| TickProcess::Alive).is_none());
-        // A pid that cannot be signalled, with no native listing here, is
-        // unverified: never blocked, never ended.
-        assert_eq!(tick_process(0, Some(1)), TickProcess::Unverified);
+        // A pid that cannot be signalled, and no start time to look up in the
+        // native listing, is unverified: never blocked, never ended.
+        assert_eq!(tick_process(0, None), TickProcess::Unverified);
     }
 
     #[test]
