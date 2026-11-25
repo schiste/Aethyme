@@ -4,6 +4,16 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.173] - 2026-11-25
+
+### Changed
+
+- The merged-pull-request close lane takes its first changed-file activity probe (one Git status, at most 2 s) just before the operation claim instead of before the holder check and the landing proof. A close still requires it; the holder is judged again with its time, the index, `HEAD` and hook are read fresh around it, and the look under the claim is unchanged. A pass out of time before the probe keeps the session. On the busiest repository's 0.8.172 runs, 151 such first looks took 280 s in 26 runs and 37 reached the look under the claim. The net gain is unknown: the proof's clean check and the look under the claim may cost more. It is judged per run on `worktree_status_activity`, `landed_proof_worktree_clean` and `session_close_checkout_activity` together, and the change is reverted without a net drop (#2010).
+
+### Upgrade notes
+
+- `worktree_activity_look` `merged_pull_request_first` counts only looks taken; sessions the lane declines before its probe are in `worktree_activity_look_avoided` (#2010).
+
 ## [0.8.172] - 2026-11-25
 
 ### Changed
