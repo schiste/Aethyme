@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.180] - 2026-11-26
+
+### Changed
+
+- The background lane that closes abandoned sessions now looks first at reasons that are cheap to read and keep a session anyway: a held explicit claim, an active merge-queue entry, a running gate or an unresolved command. These are read only in holder states where the full judgement would reach the same check. Before, they were read after the activity probe, the work class, the remote safety check, the process listing and the open-file check. On Aethyme's own repository 48 cleanup passes made 1,142 such judgements in 2,613 s and closed none; 713 kept for a held claim, 186 for the merge queue. The early look only keeps: every check before a close still runs, unchanged, under the claim, and any read error falls through to the full judgement (#2026).
+
+### Added
+
+- Span `session_close_early_look`, counters `session_close_early_kept` and `session_close_early_look_unreadable`, attachment `session_close_early_kept_by_reason` (#2026).
+
+### Upgrade notes
+
+- A session kept by the early look may report that reason instead of an earlier one such as recent activity, and counts as deferred work, so the retirement request stays armed. Its stale-work class and closing-soon time stay as last recorded until a full judgement runs (#2026).
+
+### Known issues
+
+- Sessions kept for an active build-output producer still pay the full judgement: the only check takes the producer's reclaim lock.
+- The remote safety check asks the remote once per session, about 0.9 s each.
+
 ## [0.8.179] - 2026-11-25
 
 ### Changed
