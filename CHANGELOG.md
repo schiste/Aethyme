@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.172] - 2026-11-25
+
+### Changed
+
+- The automatic session-close lanes ask cheap keeps before the changed-file activity probe (one Git status, at most 2 s). Every lane first asks whether activity already known from the session row, last merge, hook, index or `HEAD` is recent; the landed lane also asks for an unmerged pull request, the cleanup policy and no session commits; the no-work lane for its holder, unresolved operations and explicit claims. Every check is still asked where it was, and the index, `HEAD` and hook are read fresh around the probe. In nine 0.8.171 passes over a minute on the busiest repository the probe's looks took about 440 s, nearly all in looks that timed out. The avoidable share there is estimated at about 13% of the timed-out looks, and some skipped probes may be paid by a later lane, so the gain is read after release (#2008).
+
+### Added
+
+- Attachments `worktree_activity_look_avoided` and `session_no_work_kept_other_by_reason`, and span `session_close_before_probe` (#2008).
+
+### Upgrade notes
+
+- Kept-reason counts can shift, because a cheaper reason may be reported first. `worktree_activity_look` `_first` entries no longer count avoided looks, so compare total `worktree_status_activity` across versions instead (#2008).
+
 ## [0.8.171] - 2026-11-25
 
 ### Fixed
