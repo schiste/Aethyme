@@ -4768,6 +4768,134 @@ mod lane_tests {
         assert!(is_open(&broker, claimed.id));
     }
 
+    /// A moved-on live holder whose task lease expired long ago, with the
+    /// expiry opt-in on, is no keep for its claim: the early look leaves it
+    /// to the full judgement, which classifies the claim by the task-lease
+    /// expiry and closes the session past its grace, as before. Mutation
+    /// caught: the expired-task-lease guard of the early look removed (the
+    /// claim reads as a running holder's and is kept early forever).
+    #[test]
+    fn an_expired_task_lease_holders_claim_is_not_kept_early() {
+        let (_owner, _storage, mut broker) = fixture("expire_abandoned_task_leases = true\n");
+        let holder = live_holder();
+        let (claimed, _) = session(&mut broker, "moved on, task lease expired", false);
+        broker
+            .store()
+            .claim_lease(claimed.id, "base.txt", None)
+            .unwrap();
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(claimed.id),
+                Some(&crate::events::session_holder_task_lease_bound_payload(
+                    &holder, "fixture", None,
+                )),
+            )
+            .unwrap();
+        let event_id = broker
+            .store_ref()
+            .latest_session_holder_event(claimed.id)
+            .unwrap()
+            .unwrap()
+            .id;
+        age(&mut broker, &claimed, 80);
+        // Bound as long ago as its last activity: its 24 h task lease and the
+        // stale grace after it ended days ago.
+        let old = broker
+            .store_ref()
+            .session(claimed.id)
+            .unwrap()
+            .last_activity_at;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE events SET ts = ?1 WHERE id = ?2",
+                rusqlite::params![old, event_id],
+            )
+            .unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_holder_process_table_for_test(
+            claimed.id,
+            event_id,
+            crate::session_holder::ProcessTable::parse(&format!(
+                "{} 1 {} {}\n",
+                holder.pid, holder.started, holder.command
+            )),
+        );
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        let (outcome, _, phases, _) = judged_early(&mut broker, &claimed, &mut table);
+
+        assert_eq!(phases["session_close_early_look"], 1);
+        assert_eq!(phases["session_close_early_kept"], 0);
+        assert_eq!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
+        assert!(!is_open(&broker, claimed.id));
+    }
+
+    /// A gone holder bound without the task-lease protocol never has its
+    /// operations asked by the abandonment window, so an unresolved command
+    /// does not keep its session, early or late: it closes as before.
+    /// Mutation caught: the task-lease-binding guard of the early gate and
+    /// operation checks removed (the receipt keeps the session early as
+    /// `operation_unresolved`, forever).
+    #[test]
+    fn a_legacy_gone_holders_unresolved_command_is_not_kept_early() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "legacy holder gone, receipt left", false);
+        quiet(&mut broker, &session, 80);
+        left_receipt(
+            &mut broker,
+            session.id,
+            "9123456789abcdef0123456789abcdef",
+            "outcome_unknown",
+            now_ms(),
+        );
+        let mut table = gone_holder_table(&broker, &session);
+
+        let (outcome, _, phases, _) = judged_early(&mut broker, &session, &mut table);
+
+        assert_eq!(phases["session_close_early_look"], 1);
+        assert_eq!(phases["session_close_early_kept"], 0);
+        assert_eq!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
+        assert!(!is_open(&broker, session.id));
+    }
+
+    /// A gate running for a gone task-lease holder's session keeps it in the
+    /// early look, before the dear checks. Mutation caught: the early gate
+    /// check removed, or its deadline read as expired (the full judgement
+    /// keeps the session after the probe and the claim).
+    #[test]
+    fn a_running_gate_is_kept_early() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (gated, _) = session(&mut broker, "gate running, holder gone", false);
+        quiet_with_task_lease(&mut broker, &gated, 80);
+        let mut table = gone_holder_table(&broker, &gated);
+        let run_dir = crate::gates::running_dir(broker.main_root());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // SAFETY: getpgrp only reads this process's group id.
+        let group = unsafe { libc::getpgrp() };
+        let pidfile = run_dir.join(format!("{}-fixture.pid", gated.id));
+        std::fs::write(&pidfile, format!("{group} fixture-tree\n")).unwrap();
+
+        let (outcome, kept_for, phases, by_reason) = judged_early(&mut broker, &gated, &mut table);
+        std::fs::remove_file(&pidfile).unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        assert_eq!(
+            kept_for,
+            Some(crate::broker::AbandonmentKeepReason::GateRunning)
+        );
+        assert_eq!(phases, kept_early_only());
+        assert_eq!(by_reason["gate_running"]["count"], 1);
+        assert!(is_open(&broker, gated.id));
+    }
+
     /// `session_abandoned_after_hours = 0` turns the no-work window off too
     /// (`RetentionPolicy::no_work_abandonment_window_ms`), so a foreground
     /// view finds nothing due and queues nothing; `stale_session_auto_close

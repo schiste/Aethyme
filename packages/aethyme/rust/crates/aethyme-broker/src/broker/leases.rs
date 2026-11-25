@@ -2917,6 +2917,7 @@ impl Broker {
         decision_now_ms: i64,
         process_table: &mut crate::session_holder::RecordedHolderProcessTable,
         lane: SessionCloseLane,
+        deadline: Option<std::time::Instant>,
     ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
         use crate::session_holder::RecordedHolderLiveness as Liveness;
         match lane {
@@ -2928,6 +2929,7 @@ impl Broker {
                     metadata_ms,
                     decision_now_ms,
                     process_table,
+                    deadline,
                 );
             }
             // Its probe is put off until after the holder and the proof.
@@ -3010,23 +3012,30 @@ impl Broker {
     /// The abandonment window's early look (span `session_close_early_look`):
     /// running work that keeps the session whatever the changed-file probe,
     /// the work class, the early-close safety rule and the open-file
-    /// observation would show. It reads only the database, the gate run
-    /// directory and a process table this pass already took for this binding
-    /// (none is taken here). It only keeps: every check is asked again where
+    /// observation would show. It reads only the database, the lease policy
+    /// (`[leases]` in `broker.toml`), the gate run directory (probing each recorded gate's
+    /// process group with signal 0, within the pass deadline) and a process
+    /// table this pass already took for this binding (none is taken here).
+    /// It only keeps: every check is asked again where
     /// it was, under the operation claim, before any close, and anything
     /// unreadable here falls through to that path. Each check is asked only
     /// for a holder whose state lets the later path reach it, and each keep
     /// is one the landed lane would make on the same evidence, so a session
     /// kept here and not offered to that lane loses no close. A session kept
     /// here is not classified in this pass: its remembered work class and
-    /// due time stay as last recorded. Artifact producers are not asked: the
-    /// only check takes their reclaim lock.
+    /// due time stay as last recorded. An early keep (a held claim or running
+    /// work) counts as deferred in the retirement summary, as the same keep
+    /// did later, also where the full judgement could have ended not due
+    /// first (recent activity, work class not due), which was not deferred.
+    /// Artifact producers are not asked: the only check takes their reclaim
+    /// lock.
     fn abandonment_keep_before_probe(
         &self,
         candidate: &crate::Session,
         metadata_ms: i64,
         decision_now_ms: i64,
         process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        deadline: Option<std::time::Instant>,
     ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
         let _span = crate::phase_telemetry::span("session_close_early_look");
         let mut unreadable = false;
@@ -3035,6 +3044,7 @@ impl Broker {
             metadata_ms,
             decision_now_ms,
             process_table,
+            deadline,
             &mut unreadable,
         );
         if unreadable {
@@ -3060,6 +3070,7 @@ impl Broker {
         metadata_ms: i64,
         decision_now_ms: i64,
         process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        deadline: Option<std::time::Instant>,
         unreadable: &mut bool,
     ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
         use crate::session_holder::RecordedHolderLiveness as Liveness;
@@ -3117,7 +3128,7 @@ impl Broker {
             match crate::gates::checked_running_session_gates_until(
                 self.main_root(),
                 session_id,
-                || false,
+                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
                 256,
             ) {
                 Some(gates) if !gates.is_empty() => {
@@ -3628,6 +3639,7 @@ impl Broker {
                     decision_now_ms,
                     process_table,
                     lane,
+                    deadline,
                 )
             }
         };

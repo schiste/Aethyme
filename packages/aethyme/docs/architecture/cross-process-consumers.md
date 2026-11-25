@@ -5687,8 +5687,11 @@ Readers must accept the new spans and attachment. Covered by tests in
 The abandonment window now asks a few cheap keeps before its first activity
 probe, the work class, the early-close safety rule (with its remote lookup),
 the operation claim and the open-file observation. They read only the
-database, the gate run directory and a process table the pass already took
-for the session's binding; none is taken there. Each is asked only for a
+database, the lease policy (`[leases]` in the repository's `broker.toml`, as the
+claim check reads it),
+the gate run directory, probing each recorded gate's process group (and its
+leader) with signal 0 and stopping at the pass deadline, and a process table
+the pass already took for the session's binding; none is taken there. Each is asked only for a
 holder whose state lets the later path reach the same check:
 
 - a running gate and an unresolved operation, for a task-lease holder that is
@@ -5728,5 +5731,11 @@ lane would also make on the same evidence; where the full judgement would
 have ended with a not-due or live-process answer first (a probe showing
 recent activity, a holder the probe shows not moved on), the session is now
 reported under the early code and is not offered to the landed lane in that
-pass, which would have kept it too. A held claim is reported as `lease_held`
-with its existing deferred reason. Covered by `session_auto_close.rs` tests.
+pass, which would have kept it too. An early keep counts as deferred in the
+retirement summary, as the same keep did later in the full judgement: a held
+claim under the deferred reason `LeaseLivenessUnavailable`, running work
+under `OperationActive`. Where the full judgement could have ended first as not
+due (`recent_activity`, `work_class_not_due`), which is not deferred, the
+pass now reports deferred work: the retirement request stays armed, the
+retirement issue reads as actionable, and the checkout-cleanup generation is
+not completed as having no deferred work. Covered by `session_auto_close.rs` tests.
