@@ -478,6 +478,19 @@ pub(crate) fn process_use_failure(
 /// started only with at least this much of the lane's deadline left;
 /// otherwise the lap stops at that checkout and the next run starts with it.
 const RETIRE_ARCHIVE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The keep of a plan or archive its deadline cut short after it had been
+/// `granted` this long: remembered (`out_of_time`) when that was a fair
+/// share, so it is not redone from nothing every slice; otherwise `deadline`,
+/// no verdict, judged again by the next lap.
+fn out_of_time_keep(granted: std::time::Duration) -> &'static str {
+    if granted >= RETIRE_ARCHIVE_MIN_BUDGET {
+        "out_of_time"
+    } else {
+        "deadline"
+    }
+}
+
 /// Keep details are cut to this many bytes.
 const RETIRE_KEEP_DETAIL_MAX: usize = 400;
 /// Inline retirement after an automatic close runs only with at least this
@@ -761,6 +774,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+type BeforeRetireArchive = Box<dyn FnMut(&mut RetireRun)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once an archive was granted its time, before it starts.
+    static BEFORE_RETIRE_ARCHIVE: std::cell::RefCell<Option<BeforeRetireArchive>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_retire_archive(run: &mut RetireRun) {
+    BEFORE_RETIRE_ARCHIVE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(run);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_retire_archive(_run: &mut RetireRun) {}
+
 /// Use `cap` as the archive cap on this test thread until the guard drops.
 #[cfg(test)]
 pub(crate) fn retire_archive_cap_for_test(cap: u64) -> RetireArchiveCapRestore {
@@ -918,6 +953,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "archive_environment_denied" => "checkout_retirement_kept_archive_environment_denied",
         "archive_cleanup_failed" => "checkout_retirement_kept_archive_cleanup_failed",
         "deadline" => "checkout_retirement_kept_deadline",
+        "out_of_time" => "checkout_retirement_kept_out_of_time",
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
         "archive_deferred" => "checkout_retirement_kept_archive_deferred",
         "volume_turn_unavailable" => "checkout_retirement_kept_volume_turn_unavailable",
@@ -997,6 +1033,7 @@ fn remembered_keep(code: &str) -> bool {
             | "orphan_cleanup_refused"
             | "plan_refused"
             | "inspection_failed"
+            | "out_of_time"
             | "archive_too_large"
             | "archive_failed"
             | "archive_cleanup_failed"
@@ -1062,6 +1099,13 @@ pub(crate) struct RetireRun {
     /// Git inspection at a time runs on the checkouts' volume (the
     /// retirement lane process sets it); `None` judges without it.
     volume_turn: Option<PathBuf>,
+    /// When the lane process itself ends, while its run may still give one
+    /// judgement longer than its slice; `None` outside the lane process and
+    /// once that judgement was taken.
+    long_judgement_cap: Option<Instant>,
+    /// The judgement under way is the long one: the move into the trash
+    /// takes its own open-file observation instead of reusing the run's.
+    long_judgement: bool,
 }
 
 /// How long one lap inspection's Git listing (the eligibility `git status`
@@ -2216,6 +2260,19 @@ impl Broker {
         );
     }
 
+    /// How many attempts in a row ran out of time on `session`'s checkout as
+    /// it is now (same HEAD and index); 0 when the last keep was another.
+    fn out_of_time_attempts(&self, session: &Session) -> u32 {
+        self.checkout_retirement_keeps()
+            .remove(&session.id)
+            .filter(|keep| {
+                keep.reason == "out_of_time"
+                    && checkout_keep_key(Path::new(&session.worktree_path)).as_deref()
+                        == Some(keep.key.as_str())
+            })
+            .map_or(0, |keep| keep.attempts)
+    }
+
     fn forget_keep(&self, session_id: i64) {
         if self.checkout_retirement_keeps().contains_key(&session_id) {
             crate::warn_unrecorded(
@@ -2674,6 +2731,8 @@ impl Broker {
             archive_environment_denied: false,
             inspections: InspectionStats::default(),
             volume_turn: None,
+            long_judgement_cap: None,
+            long_judgement: false,
         }))
     }
 
@@ -2688,22 +2747,84 @@ impl Broker {
         let _lane = RetirementLaneScope::enter();
         run.keep_detail = None;
         run.saved_in = None;
+        // A checkout earlier attempts ran out of time on gets a longer one,
+        // in the lane process only and once per lane run. Anything else
+        // leaves it to a later lane run, instead of one more attempt that
+        // cannot finish and only lengthens its back-off. (Only a closed
+        // session's checkout makes a worker start the lane, so the worker
+        // still judges a cleaned session's leftover as usual.)
+        let long_budget = match self.store_ref().session(session_id) {
+            Ok(session) => match self.out_of_time_attempts(&session) {
+                0 => None,
+                attempts => {
+                    let budget = lane::long_judgement_budget(attempts);
+                    let fits = run
+                        .long_judgement_cap
+                        .is_some_and(|cap| Instant::now() + budget <= cap);
+                    let in_worker = run.volume_turn.is_none();
+                    if fits {
+                        Some(budget)
+                    } else if in_worker
+                        && session.cleanup_state == crate::SessionCleanupState::Cleaned
+                    {
+                        None
+                    } else {
+                        let kept = RetireOutcome::Kept("deferred_to_lane");
+                        crate::phase_telemetry::add(kept.counter(), std::time::Duration::ZERO);
+                        return Ok(kept);
+                    }
+                }
+            },
+            Err(_) => None,
+        };
         // One judgement at a time on this volume, host-wide, when the run
-        // asks for it: waited for until the run's deadline.
-        let _volume_turn = match run.volume_turn.clone() {
-            Some(path) => match lane::take_volume_turn(&path, run.deadline) {
-                Some(turn) => Some(turn),
-                None => {
+        // asks for it.
+        let volume_turn = match run.volume_turn.clone() {
+            Some(path) => {
+                let wait = crate::phase_telemetry::span("checkout_retirement_volume_turn_wait");
+                let turn =
+                    lane::take_volume_turn(&path, Instant::now() + lane::RETIRE_LANE_TURN_WAIT);
+                drop(wait);
+                if turn.is_none() {
                     crate::phase_telemetry::add(
                         "checkout_retirement_volume_turn_unavailable",
                         std::time::Duration::ZERO,
                     );
                     return Ok(RetireOutcome::Kept("volume_turn_unavailable"));
                 }
-            },
+                turn
+            }
             None => None,
         };
-        let outcome = self.retire_closed_checkout_inner(session_id, run)?;
+        let _turn_held = volume_turn
+            .as_ref()
+            .map(|_| crate::phase_telemetry::span("checkout_retirement_volume_turn_held"));
+        let slice_deadlines = (run.deadline, run.archive_deadline);
+        if let Some(budget) = long_budget
+            && let Some(cap) = run.long_judgement_cap.take()
+        {
+            crate::phase_telemetry::add(
+                "checkout_retirement_long_judgement",
+                std::time::Duration::ZERO,
+            );
+            let until = (Instant::now() + budget).min(cap);
+            run.deadline = until;
+            run.archive_deadline = until;
+            run.long_judgement = true;
+            run.process_use = None;
+        } else if volume_turn.is_some()
+            && run.deadline.saturating_duration_since(Instant::now()) < RETIRE_INSPECTION_MIN_LEFT
+        {
+            // The turn came with the slice nearly over: the next slice
+            // starts with this checkout.
+            let kept = RetireOutcome::Kept("inspection_deferred");
+            crate::phase_telemetry::add(kept.counter(), std::time::Duration::ZERO);
+            return Ok(kept);
+        }
+        let outcome = self.retire_closed_checkout_inner(session_id, run);
+        (run.deadline, run.archive_deadline) = slice_deadlines;
+        run.long_judgement = false;
+        let outcome = outcome?;
         crate::phase_telemetry::add(outcome.counter(), std::time::Duration::ZERO);
         // Why `finish` left this checkout, when it said: carried into the
         // remembered keep's detail, so a keep is never judged blind of it.
@@ -3110,7 +3231,10 @@ impl Broker {
                 Err(_) => return Ok(Kept("operation_state_unknown")),
             }
         };
-        let _run_process_use = RunProcessUseScope::enter(run_process_use);
+        // A long judgement would reuse an observation up to 20 minutes old
+        // for the move: it takes a fresh one there instead.
+        let _run_process_use =
+            (!run.long_judgement).then(|| RunProcessUseScope::enter(run_process_use));
         if abandoned_operation {
             if run
                 .archive_deadline
@@ -3120,6 +3244,11 @@ impl Broker {
                 return Ok(Kept("archive_deferred"));
             }
             drop(git_deadline);
+            // Never longer than a slice: the whole archive is written under
+            // the lifecycle claim.
+            run.archive_deadline = run
+                .archive_deadline
+                .min(Instant::now() + lane::RETIRE_LANE_SLICE);
             let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
             let _phase =
                 crate::phase_telemetry::span("checkout_retirement_phase_operation_archive");
@@ -3162,6 +3291,7 @@ impl Broker {
             });
             run.inspections.started += 1;
             let inspection_started = Instant::now();
+            let granted = run.deadline.saturating_duration_since(inspection_started);
             let planned = self.cleanup_resolve_retirement_plan_with_context(
                 session_id,
                 false,
@@ -3179,10 +3309,11 @@ impl Broker {
                     let detail = error.to_string();
                     run.keep_detail = Some(detail.clone());
                     // The lap's own deadline cut the inspection short: no
-                    // verdict at all, judged again when the lap comes back.
+                    // verdict, judged again when the lap comes back, unless
+                    // it had a fair share and would only be cut again.
                     if Instant::now() >= run.deadline {
                         run.inspections.cut_by_deadline += 1;
-                        return Ok(Kept("deadline"));
+                        return Ok(Kept(out_of_time_keep(granted)));
                     }
                     // An inspection that failed or timed out on its own (a
                     // `git status` slower than its limit) is not a refusal
@@ -3310,15 +3441,20 @@ impl Broker {
             return Ok(Kept("archive_environment_denied"));
         }
         let digest = plan.digest.clone();
+        let granted = run
+            .archive_deadline
+            .saturating_duration_since(Instant::now());
+        run_before_retire_archive(run);
         drop(git_deadline);
         let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
         let _phase = crate::phase_telemetry::span("checkout_retirement_phase_archive");
         // The archive writer writes and reads back the archive, re-plans
         // under the lifecycle claim, and only then moves the checkout into
         // the trash (with the checks of `prepare_checkout_for_trash`); any
-        // failure keeps the checkout and the archive. A failure the lane's
-        // deadline caused is retried next run (the verified archive is
-        // reused), not remembered for an hour.
+        // failure keeps the checkout and the archive. One the deadline
+        // caused is remembered as `out_of_time`: the lane process gives the
+        // next attempt longer. A complete archive is then reused once it is
+        // verified again; an incomplete one is removed and written again.
         crate::cleanup_resolve::take_archive_destination_denied();
         let applied = self.cleanup_resolve_retirement_apply(session_id, &digest, false);
         // Decided where the archive destination is created, never from the
@@ -3337,7 +3473,7 @@ impl Broker {
             Ok(outcome) => {
                 run.keep_detail = outcome.cleanup_error;
                 Ok(Kept(if out_of_time {
-                    "deadline"
+                    out_of_time_keep(granted)
                 } else {
                     "archive_cleanup_failed"
                 }))
@@ -3356,7 +3492,7 @@ impl Broker {
                     return Ok(Kept("archive_environment_denied"));
                 }
                 Ok(Kept(if out_of_time {
-                    "deadline"
+                    out_of_time_keep(granted)
                 } else {
                     "archive_failed"
                 }))
@@ -3420,6 +3556,9 @@ impl Broker {
             }
         };
         let archive_root = self.retirement_archive_root()?;
+        let granted = run
+            .archive_deadline
+            .saturating_duration_since(Instant::now());
         let archived = super::retire_operation::write_operation_archive(
             &super::retire_operation::OperationArchiveRequest {
                 session_id: session.id,
@@ -3442,7 +3581,7 @@ impl Broker {
             Err(super::retire_operation::OperationArchiveError::Refused(reason)) => {
                 run.keep_detail = Some(reason);
                 return Ok(Kept(if Instant::now() >= run.archive_deadline {
-                    "deadline"
+                    out_of_time_keep(granted)
                 } else {
                     "operation_archive_failed"
                 }));
@@ -9022,6 +9161,334 @@ mod tests {
         let stored = broker.checkout_retirement_lane_record();
         assert_eq!(stored.last_end_reason, lane.end_reason);
         assert!(stored.last_at_ms > 0);
+    }
+
+    /// Runs `hook` once an archive was granted its time, until dropped.
+    struct BeforeArchive;
+
+    impl BeforeArchive {
+        fn set(hook: impl FnMut(&mut RetireRun) + 'static) -> Self {
+            super::BEFORE_RETIRE_ARCHIVE.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for BeforeArchive {
+        fn drop(&mut self) {
+            super::BEFORE_RETIRE_ARCHIVE.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    /// A closed checkout that needs an archive.
+    fn closed_needing_archive(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf) {
+        closed(broker, label, |worktree| {
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        })
+    }
+
+    /// Remember that `attempts` attempts ran out of time on `session`'s
+    /// checkout, long enough ago to be judged again.
+    fn ran_out_of_time(broker: &crate::Broker, session: &crate::Session, attempts: u32) {
+        let key = super::checkout_keep_key(Path::new(&session.worktree_path)).unwrap();
+        broker
+            .update_meta_json(
+                CHECKOUT_RETIREMENT_KEEPS_KEY,
+                |keeps: &mut std::collections::BTreeMap<i64, RetireKeep>| {
+                    keeps.insert(
+                        session.id,
+                        RetireKeep {
+                            key: key.clone(),
+                            reason: "out_of_time".into(),
+                            at_ms: 0,
+                            attempts,
+                            detail: None,
+                        },
+                    );
+                },
+            )
+            .unwrap();
+    }
+
+    fn lane_run(broker: &crate::Broker, host: &Path, left: Duration) -> RetireRun {
+        let mut run = broker
+            .begin_checkout_retirement_run(Instant::now() + Duration::from_secs(60))
+            .unwrap()
+            .expect("open paths resolve");
+        run.deadline = Instant::now() + left;
+        run.archive_deadline = run.deadline;
+        run.volume_turn = Some(host.join("checkout-retirement-volume-1.lock"));
+        run.long_judgement_cap = Some(Instant::now() + Duration::from_secs(60 * 60));
+        run
+    }
+
+    /// Only an attempt that had a fair share of time is remembered; one cut
+    /// by a short remainder is no verdict, and neither is the old reason.
+    #[test]
+    fn only_a_fair_share_cut_short_is_remembered() {
+        assert_eq!(
+            super::out_of_time_keep(super::RETIRE_ARCHIVE_MIN_BUDGET),
+            "out_of_time"
+        );
+        assert_eq!(
+            super::out_of_time_keep(super::RETIRE_ARCHIVE_MIN_BUDGET - Duration::from_secs(1)),
+            "deadline"
+        );
+        assert!(remembered_keep("out_of_time"));
+        assert!(!remembered_keep("deadline"));
+        assert_eq!(
+            kept_counter("out_of_time"),
+            "checkout_retirement_kept_out_of_time"
+        );
+    }
+
+    /// An archive its deadline cut after a fair share is remembered: the
+    /// next lap does not redo it, and a changed checkout is judged again.
+    #[test]
+    fn an_archive_cut_by_its_deadline_is_not_redone_every_slice() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_needing_archive(&mut broker, "cut archive");
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let mut run = broker
+            .begin_checkout_retirement_run(deadline)
+            .unwrap()
+            .expect("open paths resolve");
+        let mut lap = |broker: &mut crate::Broker| {
+            run.archive_deadline = deadline;
+            let mut report = CheckoutRetirementReport::default();
+            broker
+                .retirement_lap(&mut run, &mut report, false, deadline)
+                .unwrap();
+            report
+        };
+
+        let cut = BeforeArchive::set(|run| run.archive_deadline = Instant::now());
+        let first = lap(&mut broker);
+        assert_eq!(first.kept.get("out_of_time"), Some(&1), "{first:#?}");
+        let keep = broker
+            .checkout_retirement_keeps()
+            .remove(&session.id)
+            .expect("remembered");
+        assert_eq!((keep.reason.as_str(), keep.attempts), ("out_of_time", 1));
+
+        let second = lap(&mut broker);
+        assert_eq!(second.examined, 0, "{second:#?}");
+        assert_eq!(second.keep_memo_skips, 1, "{second:#?}");
+        drop(cut);
+
+        git(&worktree, &["add", "notes.txt"]);
+        let third = lap(&mut broker);
+        assert_eq!(third.retired_archived, 1, "{third:#?}");
+        assert!(retired_away(&worktree));
+    }
+
+    /// In the lane process the next attempt gets 10 minutes, the ones after
+    /// 20, whatever is left of the slice, which keeps its own deadline; one
+    /// per lane run.
+    #[test]
+    fn a_checkout_that_ran_out_of_time_gets_longer_once_per_lane_run() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (first, first_worktree) = closed_needing_archive(&mut broker, "long first");
+        let (second, _) = closed_needing_archive(&mut broker, "long second");
+        ran_out_of_time(&broker, &first, 1);
+        ran_out_of_time(&broker, &second, 2);
+        let host = tempfile::tempdir().unwrap();
+        let granted = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let seen = granted.clone();
+        let _hook = BeforeArchive::set(move |run| {
+            seen.set(
+                run.archive_deadline
+                    .saturating_duration_since(Instant::now()),
+            );
+        });
+        // Less than an archive needs: only the longer deadline allows it.
+        let mut run = lane_run(&broker, host.path(), Duration::from_secs(30));
+        let slice = run.deadline;
+
+        let outcome = broker.retire_closed_checkout(first.id, &mut run).unwrap();
+
+        assert!(outcome.retired(), "{outcome:?}");
+        assert!(retired_away(&first_worktree));
+        assert!(
+            granted.get() > Duration::from_secs(8 * 60)
+                && granted.get() <= Duration::from_secs(10 * 60),
+            "{:?}",
+            granted.get()
+        );
+        assert_eq!((run.deadline, run.archive_deadline), (slice, slice));
+        assert_eq!(
+            broker.retire_closed_checkout(second.id, &mut run).unwrap(),
+            RetireOutcome::Kept("deferred_to_lane"),
+            "one long judgement per lane run"
+        );
+
+        let mut next = lane_run(&broker, host.path(), Duration::from_secs(30));
+        let outcome = broker.retire_closed_checkout(second.id, &mut next).unwrap();
+        assert!(outcome.retired(), "{outcome:?}");
+        assert!(
+            granted.get() > Duration::from_secs(18 * 60)
+                && granted.get() <= Duration::from_secs(20 * 60),
+            "{:?}",
+            granted.get()
+        );
+    }
+
+    /// Outside the lane process, and in one that ends too soon, the
+    /// checkout waits for a lane run and its back-off does not grow.
+    #[test]
+    fn a_checkout_that_ran_out_of_time_waits_for_a_lane_with_room() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_needing_archive(&mut broker, "long waits");
+        ran_out_of_time(&broker, &session, 1);
+
+        let report = run(&mut broker);
+        assert_eq!(report.kept.get("deferred_to_lane"), Some(&1), "{report:#?}");
+
+        let host = tempfile::tempdir().unwrap();
+        let mut ending = lane_run(&broker, host.path(), Duration::from_secs(300));
+        ending.long_judgement_cap = Some(Instant::now() + Duration::from_secs(300));
+        assert_eq!(
+            broker
+                .retire_closed_checkout(session.id, &mut ending)
+                .unwrap(),
+            RetireOutcome::Kept("deferred_to_lane")
+        );
+        assert_eq!(broker.checkout_retirement_keeps()[&session.id].attempts, 1);
+        assert!(worktree.exists());
+    }
+
+    /// A long judgement does not move the checkout on its run's open-file
+    /// observation: a process that arrived meanwhile keeps it.
+    #[test]
+    fn a_long_judgement_observes_open_files_again_before_the_move() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_needing_archive(&mut broker, "long observed");
+        ran_out_of_time(&broker, &session, 1);
+        let host = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(&worktree).unwrap();
+        let _hook = BeforeArchive::set(move |_| {
+            crate::session_holder::set_process_use_snapshot_for_tests(Some(
+                crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "build".into(),
+                    descriptor: "cwd".into(),
+                    file_type: Some("DIR".into()),
+                    path: path.clone(),
+                }]),
+            ));
+        });
+        let mut run = lane_run(&broker, host.path(), Duration::from_secs(300));
+
+        let outcome = broker.retire_closed_checkout(session.id, &mut run).unwrap();
+
+        assert!(!outcome.retired(), "{outcome:?}");
+        assert!(worktree.join("notes.txt").exists());
+    }
+
+    /// A lane whose turn stays held elsewhere ends after one bounded wait
+    /// with its own reason and is not counted as an idle lane.
+    #[test]
+    fn a_lane_without_its_volume_turn_ends_after_one_wait() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree) = closed(&mut broker, "turn never comes", |_| {});
+        let host = tempfile::tempdir().unwrap();
+        let pool = broker
+            .require_bound_repository_worktree_root("test")
+            .unwrap();
+        let _held = super::lane::take_volume_turn(
+            &host.path().join(format!(
+                "checkout-retirement-volume-{}.lock",
+                super::lane::volume_key(&pool)
+            )),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("free turn");
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let lane = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.run_checkout_retirement_lane_process(host.path(), calm_host)
+        };
+
+        assert_eq!(lane.end_reason, "volume_turn_unavailable", "{lane:#?}");
+        assert_eq!(lane.slices, 1, "{lane:#?}");
+        assert!(worktree.exists());
+        let (_, counts) = recorder.totals();
+        for name in [
+            "checkout_retirement_volume_turn_wait",
+            "checkout_retirement_lane_end_volume_turn_unavailable",
+        ] {
+            assert_eq!(counts.get(name), Some(&1), "{name}: {counts:#?}");
+        }
+        assert!(!counts.contains_key("checkout_retirement_volume_turn_held"));
+        let record = broker.checkout_retirement_lane_record();
+        assert_eq!(record.runs_without_retirement, 0);
+        assert_eq!(record.last_end_reason, "volume_turn_unavailable");
+        // One that inspected something before it lost the turn still counts.
+        let inspected = super::lane::RetirementLaneReport {
+            inspections_started: 1,
+            ..lane
+        };
+        assert_eq!(
+            super::lane::next_lane_record(&record, &inspected, 1).runs_without_retirement,
+            1
+        );
+    }
+
+    /// A turn that comes with the slice over is no verdict: the checkout is
+    /// left to the next slice with the cursor before it.
+    #[test]
+    fn a_turn_that_comes_as_the_slice_ends_leaves_the_checkout_to_the_next() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree) = closed(&mut broker, "late turn", |_| {});
+        let host = tempfile::tempdir().unwrap();
+        let mut run = lane_run(&broker, host.path(), Duration::ZERO);
+        let mut report = CheckoutRetirementReport::default();
+
+        let complete = broker
+            .retirement_lap(
+                &mut run,
+                &mut report,
+                false,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert!(!complete, "{report:#?}");
+        assert_eq!(report.closed_stop, "inspection_deferred", "{report:#?}");
+        assert!(worktree.exists());
+    }
+
+    /// The archive phase's steps are told apart.
+    #[test]
+    fn an_archived_retirement_records_each_step() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _) = closed_needing_archive(&mut broker, "archive spans");
+        let host = tempfile::tempdir().unwrap();
+        let mut run = lane_run(&broker, host.path(), Duration::from_secs(300));
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.retire_closed_checkout(session.id, &mut run).unwrap()
+        };
+
+        assert!(outcome.retired(), "{outcome:?}");
+        let (_, counts) = recorder.totals();
+        for name in [
+            "checkout_retirement_volume_turn_wait",
+            "checkout_retirement_volume_turn_held",
+            "recovery_archive_apply_plan",
+            "recovery_archive_apply_copy",
+            "recovery_archive_apply_read_back",
+            "recovery_archive_apply_sync",
+            "recovery_archive_apply_replan_under_claim",
+            "recovery_archive_apply_verify_under_claim",
+        ] {
+            assert!(counts.contains_key(name), "{name}: {counts:#?}");
+        }
     }
 
     /// Implicit (diff-derived) leases left on a closed session do not keep

@@ -17,7 +17,11 @@
 //!   laps to let go.
 //! - One judgement at a time per volume, host-wide (a per-volume turn lock
 //!   held for each judgement), so a volume never runs two of the lane's Git
-//!   inspections at once.
+//!   inspections at once. A turn that stays unavailable for
+//!   [`RETIRE_LANE_TURN_WAIT`] ends the run.
+//! - At most one judgement per run is given longer than its slice (a
+//!   checkout an earlier attempt ran out of time on; see
+//!   [`long_judgement_budget`]).
 //! - Paced by host pressure (a gap between slices while loaded or at
 //!   memory warning). It ends at critical memory pressure, once both laps
 //!   reach their end (everything judgeable was judged), or after 60
@@ -29,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// One slice: the open sessions' paths and the run's open-file observation
 /// are taken once per slice, so neither is older than this.
-const RETIRE_LANE_SLICE: Duration = Duration::from_secs(5 * 60);
+pub(super) const RETIRE_LANE_SLICE: Duration = Duration::from_secs(5 * 60);
 /// The longest one lane process runs; the next worker starts another while
 /// closed checkouts still wait.
 const RETIRE_LANE_MAX: Duration = Duration::from_secs(60 * 60);
@@ -42,8 +46,23 @@ const RETIRE_LANE_LISTING_PROBE_BUDGET: Duration = Duration::from_secs(10);
 /// process listing (epoch ms): retirement waits for an unsandboxed runner.
 pub(crate) const CHECKOUT_RETIREMENT_LISTING_REFUSED_KEY: &str =
     "checkout_retirement.listing_refused_at_ms";
+/// How long a judgement waits for its volume's turn before the lane run
+/// ends (the next worker starts another). It waits asleep, outside the
+/// slice's deadline; well under a slice, so the first judgement of a slice
+/// always keeps most of it.
+#[cfg(not(test))]
+pub(super) const RETIRE_LANE_TURN_WAIT: Duration = Duration::from_secs(2 * 60);
+#[cfg(test)]
+pub(super) const RETIRE_LANE_TURN_WAIT: Duration = Duration::from_secs(1);
 /// How often a judgement asks again for its volume's turn.
 const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
+
+/// How long the judgement of a checkout may take after `attempts` attempts
+/// in a row ran out of time: 10 minutes after the first, then 20, twice and
+/// four times a slice and at most a third of [`RETIRE_LANE_MAX`].
+pub(super) fn long_judgement_budget(attempts: u32) -> Duration {
+    Duration::from_secs(if attempts < 2 { 10 * 60 } else { 20 * 60 })
+}
 
 /// What one lane process did, recorded as `checkout_retirement_lane` on
 /// its metric row.
@@ -60,8 +79,8 @@ pub(crate) struct RetirementLaneReport {
     pub slices: usize,
     pub paced_slices: usize,
     /// `backlog_done`, `cap`, `pressure`, `process_use_unknown`,
-    /// `process_listing_refused`, `open_paths_unresolved`, `lane_present`,
-    /// `no_pool` or `error`.
+    /// `process_listing_refused`, `open_paths_unresolved`,
+    /// `volume_turn_unavailable`, `lane_present`, `no_pool` or `error`.
     pub end_reason: &'static str,
     pub elapsed_ms: u64,
 }
@@ -128,7 +147,8 @@ pub(crate) struct RetirementLaneRecord {
 }
 
 /// The record after a lane run: a run that retired one resets the count;
-/// one that ran no slice (another lane, no pool, refused listing) leaves it.
+/// one that ran no slice (another lane, no pool, refused listing), or that
+/// ended waiting for its volume's turn without inspecting anything, leaves it.
 pub(crate) fn next_lane_record(
     previous: &RetirementLaneRecord,
     lane: &RetirementLaneReport,
@@ -136,7 +156,9 @@ pub(crate) fn next_lane_record(
 ) -> RetirementLaneRecord {
     let runs_without_retirement = if lane.retired > 0 {
         0
-    } else if lane.slices > 0 {
+    } else if lane.slices > 0
+        && (lane.end_reason != "volume_turn_unavailable" || lane.inspections_started > 0)
+    {
         previous.runs_without_retirement.saturating_add(1)
     } else {
         previous.runs_without_retirement
@@ -252,14 +274,14 @@ fn lock_key(root: &Path) -> String {
 /// The volume `path` is on, as a lock name component (the device number;
 /// `0` where it cannot be read).
 #[cfg(unix)]
-fn volume_key(path: &Path) -> u64 {
+pub(super) fn volume_key(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).map_or(0, |metadata| metadata.dev())
 }
 
 /// No device number on this platform: one turn for every volume.
 #[cfg(not(unix))]
-fn volume_key(_path: &Path) -> u64 {
+pub(super) fn volume_key(_path: &Path) -> u64 {
     0
 }
 
@@ -367,6 +389,7 @@ impl Broker {
                 "pressure" => "checkout_retirement_lane_end_pressure",
                 "process_use_unknown" => "checkout_retirement_lane_end_process_use_unknown",
                 "open_paths_unresolved" => "checkout_retirement_lane_end_open_paths_unresolved",
+                "volume_turn_unavailable" => "checkout_retirement_lane_end_volume_turn_unavailable",
                 "lane_present" => "checkout_retirement_lane_end_lane_present",
                 "no_pool" => "checkout_retirement_lane_end_no_pool",
                 "process_listing_refused" => "checkout_retirement_lane_end_process_listing_refused",
@@ -414,9 +437,12 @@ impl Broker {
             volume_key(&pool)
         ));
         let cap = Instant::now() + RETIRE_LANE_MAX;
+        // Until the run's one long judgement is taken.
+        let mut long_judgement_cap = Some(cap);
         let mut succeeded_ms = Vec::new();
         loop {
-            if Instant::now() >= cap {
+            // Too little left for an inspection: a slice would only defer.
+            if Instant::now() + RETIRE_INSPECTION_MIN_LEFT >= cap {
                 return "cap";
             }
             let pressure = {
@@ -446,6 +472,7 @@ impl Broker {
             };
             run.archive_deadline = slice_deadline;
             run.volume_turn = Some(volume_turn.clone());
+            run.long_judgement_cap = long_judgement_cap;
             let mut report = CheckoutRetirementReport::default();
             let closed_complete =
                 match self.retirement_lap(&mut run, &mut report, false, slice_deadline) {
@@ -458,6 +485,7 @@ impl Broker {
                     Ok(complete) => complete,
                     Err(_) => return "error",
                 };
+            long_judgement_cap = run.long_judgement_cap;
             lane.examined += report.examined;
             lane.retired +=
                 report.retired_clean + report.retired_archived + report.retired_operation_archived;
@@ -477,6 +505,11 @@ impl Broker {
             .median_succeeded_ms();
             if report.process_use_unavailable {
                 return "process_use_unknown";
+            }
+            // Another repository's lane kept the turn for the whole wait:
+            // the next worker's lane starts with the same checkout.
+            if report.kept.contains_key("volume_turn_unavailable") {
+                return "volume_turn_unavailable";
             }
             if closed_complete && cleaned_complete {
                 return "backlog_done";

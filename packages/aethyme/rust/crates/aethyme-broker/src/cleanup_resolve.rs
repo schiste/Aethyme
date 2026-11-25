@@ -2288,6 +2288,7 @@ impl Broker {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
+        let plan_span = crate::phase_telemetry::span("recovery_archive_apply_plan");
         let retirement_context = if retirement_mode {
             Some(self.cleanup_resolve_retirement_context_until(operation_deadline)?)
         } else {
@@ -2313,6 +2314,7 @@ impl Broker {
         } else {
             self.cleanup_resolve_revalidation_plan(session_id)?
         };
+        drop(plan_span);
         if plan.digest != confirm {
             return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                 id: session_id,
@@ -2378,6 +2380,7 @@ impl Broker {
             Ok(metadata)
                 if retirement_mode && metadata.is_dir() && !metadata.file_type().is_symlink() =>
             {
+                let _span = crate::phase_telemetry::span("recovery_archive_apply_verify_existing");
                 if plan.recovery_archive_schema_version
                     == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 {
@@ -2431,11 +2434,16 @@ impl Broker {
                         && metadata.is_dir()
                         && !metadata.file_type().is_symlink() =>
                 {
-                    match verify_recovery_archive_payload_for_plan(
-                        self.repo_handle(),
-                        &partial_path,
-                        &plan,
-                    ) {
+                    let verified = {
+                        let _span =
+                            crate::phase_telemetry::span("recovery_archive_apply_verify_existing");
+                        verify_recovery_archive_payload_for_plan(
+                            self.repo_handle(),
+                            &partial_path,
+                            &plan,
+                        )
+                    };
+                    match verified {
                         Ok(()) => {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
@@ -2478,6 +2486,8 @@ impl Broker {
                                         "incomplete retirement staging is not proven to belong to the current source identity; it was retained: {verification_error}; {marker_error}"
                                     ),
                                 })?;
+                            let restart_span =
+                                crate::phase_telemetry::span("recovery_archive_apply_restart_plan");
                             let revalidation_context =
                                 self.cleanup_resolve_retirement_context_until(operation_deadline)?;
                             let current_plan =
@@ -2494,6 +2504,7 @@ impl Broker {
                                         &revalidation_context,
                                     )?
                                 };
+                            drop(restart_span);
                             if current_plan.digest != plan.digest {
                                 return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                                     id: session_id,
@@ -2709,6 +2720,7 @@ impl Broker {
                     path: archive_parent.to_string_lossy().into_owned(),
                     reason: "archive root has no storage anchor to sync".into(),
                 })?;
+        let roots_span = crate::phase_telemetry::span("recovery_archive_apply_sync");
         for (label, path) in [
             ("archive root", archive_root.as_path()),
             ("archive parent", archive_parent),
@@ -2720,6 +2732,7 @@ impl Broker {
                 reason: format!("cannot sync {label} before worktree removal: {error}"),
             })?;
         }
+        drop(roots_span);
         if operation_deadline.is_some_and(|deadline| {
             deadline.saturating_duration_since(Instant::now()) < AUTO_COMPACTION_STAGING_RESERVE
         }) {
@@ -6128,6 +6141,7 @@ fn sync_archive_directories_bottom_up_until<S>(
 where
     S: Fn(&Path) -> std::io::Result<()>,
 {
+    let _span = crate::phase_telemetry::span("recovery_archive_apply_sync");
     let deadline = effective_archive_deadline(deadline);
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut directories = Vec::new();
@@ -6260,6 +6274,7 @@ where
     B: Fn(&GitRepo, &[String], &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
 {
     check_archive_deadline(deadline, "recovery archive write")?;
+    let copy_span = crate::phase_telemetry::span("recovery_archive_apply_copy");
     require_real_directory(dir)?;
     let dir = dir
         .canonicalize()
@@ -6508,7 +6523,11 @@ where
         ));
     }
     create_new_archive_file(&dir, README_FILE, readme.as_bytes())?;
-    verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    drop(copy_span);
+    {
+        let _span = crate::phase_telemetry::span("recovery_archive_apply_read_back");
+        verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    }
     check_archive_deadline(deadline, "recovery archive durability sync")?;
     sync_archive_directories_bottom_up_until(&dir, sync_directory, deadline)?;
     Ok(())
