@@ -19,8 +19,7 @@
 //!   held for each judgement), so a volume never runs two of the lane's Git
 //!   inspections at once.
 //! - At most one judgement per run is given longer than its slice (a
-//!   checkout an earlier attempt ran out of time on; see
-//!   [`long_judgement_budget`]).
+//!   checkout an earlier attempt ran out of time on).
 //! - Paced by host pressure (a gap between slices while loaded or at
 //!   memory warning). It ends at critical memory pressure, once both laps
 //!   reach their end (everything judgeable was judged), or after 60
@@ -31,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// One slice: the open sessions' paths and the run's open-file observation
-/// are taken once per slice, so neither is older than this.
+/// are taken once per slice. A judgement that runs past its slice may hold
+/// them longer; its move into the trash takes a fresh observation.
 pub(super) const RETIRE_LANE_SLICE: Duration = Duration::from_secs(5 * 60);
 /// The longest one lane process runs; the next worker starts another while
 /// closed checkouts still wait.
@@ -46,20 +46,11 @@ const RETIRE_LANE_LISTING_PROBE_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) const CHECKOUT_RETIREMENT_LISTING_REFUSED_KEY: &str =
     "checkout_retirement.listing_refused_at_ms";
 /// How often a judgement asks again for its volume's turn.
-pub(super) const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
+const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
 
-/// How long the judgement of a checkout may take after `attempts` attempts
-/// in a row ran out of time: 10 minutes after the first, then 20, twice and
-/// four times a slice and at most a third of [`RETIRE_LANE_MAX`].
-pub(super) fn long_judgement_budget(attempts: u32) -> Duration {
-    Duration::from_secs(if attempts < 2 { 10 * 60 } else { 20 * 60 })
-}
-
-/// Whether the lane ends (`cap`): what is left until `cap` is too little for
-/// an inspection, so a slice would only defer.
-pub(super) fn lane_is_over(now: Instant, cap: Instant) -> bool {
-    now + RETIRE_INSPECTION_MIN_LEFT >= cap
-}
+/// How long the judgement of a checkout earlier attempts ran out of time on
+/// may take from its plan: four slices, a third of [`RETIRE_LANE_MAX`].
+pub(super) const RETIRE_LONG_JUDGEMENT: Duration = Duration::from_secs(20 * 60);
 
 /// What one lane process did, recorded as `checkout_retirement_lane` on
 /// its metric row.
@@ -139,6 +130,7 @@ pub(crate) struct RetirementLaneRecord {
     pub last_inspections_cut_by_deadline: usize,
     #[serde(default)]
     pub last_end_reason: String,
+    /// The last run that ran a slice.
     #[serde(default)]
     pub last_at_ms: i64,
 }
@@ -150,9 +142,10 @@ pub(crate) fn next_lane_record(
     lane: &RetirementLaneReport,
     now_ms: i64,
 ) -> RetirementLaneRecord {
+    let ran = lane.slices > 0;
     let runs_without_retirement = if lane.retired > 0 {
         0
-    } else if lane.slices > 0 {
+    } else if ran {
         previous.runs_without_retirement.saturating_add(1)
     } else {
         previous.runs_without_retirement
@@ -165,7 +158,7 @@ pub(crate) fn next_lane_record(
         last_inspections_failed: lane.inspections_failed,
         last_inspections_cut_by_deadline: lane.inspections_cut_by_deadline,
         last_end_reason: lane.end_reason.to_string(),
-        last_at_ms: now_ms,
+        last_at_ms: if ran { now_ms } else { previous.last_at_ms },
     }
 }
 
@@ -433,7 +426,8 @@ impl Broker {
         let mut short_cuts = std::collections::BTreeSet::new();
         let mut succeeded_ms = Vec::new();
         loop {
-            if lane_is_over(Instant::now(), cap) {
+            // Too little left for an inspection: slices would only defer.
+            if Instant::now() + RETIRE_INSPECTION_MIN_LEFT >= cap {
                 return "cap";
             }
             let pressure = {

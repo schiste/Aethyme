@@ -5470,31 +5470,38 @@ span. Now:
   kept as `out_of_time` (counter `checkout_retirement_kept_out_of_time`),
   remembered with the keep back-off (1 h, 6 h, 24 h) and its key (HEAD and
   index): a checkout whose HEAD or index changed is judged again at once.
+- A plan that leaves less than 90 s for its archive is such a cut in the lane
+  (elsewhere it stays `archive_deferred`).
 - A shorter cut in the lane is `cut_short` (counter
   `checkout_retirement_kept_cut_short`, not remembered) and stops the lap with
   its cursor before the checkout (`closed_stop` `cut_short`). The next slice
-  gives that checkout 5 minutes from its turn, once per lane run; a second short
+  gives that checkout 5 minutes from its plan, once per lane run; a second short
   cut (the lane ending) is `deadline`, as is every cut in the worker or at close.
-- The remembered keep adds `out_of_time`, the number of its attempts that ran
-  out of time (absent: 0). Attempts of one key go on through `out_of_time`,
+- The remembered keep adds `out_of_time`: one of its attempts ran out of time
+  (absent: false). Attempts of one key go on through `out_of_time`,
   `archive_failed` and `archive_cleanup_failed`, so neither back-off nor budget
   starts again when they alternate.
-- Once the back-off is over, the lane gives such a checkout's whole judgement 10
-  minutes after one `out_of_time` attempt and 20 after more (counter
-  `checkout_retirement_long_judgement`), only with that much left before its own
-  end, once per lane run. A judgement that ends before its plan, or within 5
-  minutes with a keep that is not remembered, leaves the long one to the next
-  checkout. An abandoned operation's archive never gets more than 5 minutes (it
-  is written under the lifecycle claim). Otherwise the lane keeps the checkout as
-  `deferred_to_lane`. The worker does too while a lane run was recorded in the
-  last 2 hours and did not end `error`; without one it tries the checkout.
-- A judgement past its slice takes a fresh open-file observation (10 s) under the
-  claim before the move, instead of reusing the run's. Every other proof, the
-  archive format and the 60 s bound of the proofs under the claim are unchanged.
-  Memory pressure is read between slices, so a long judgement is not stopped by
-  critical memory pressure.
-- A turn held elsewhere is waited for as before. One that came late, with too
-  little of the slice left for an inspection, is `inspection_deferred`. A turn
+- A keep whose reason is `out_of_time` does not take the checkout from the other
+  cleanup lanes.
+- Once the back-off is over, the lane gives such a checkout 20 minutes from its
+  plan, only with that much left before its own end and once per lane run; lane
+  runs can follow each other, and the back-off bounds each checkout. A judgement
+  that ends within 5 minutes with a keep that is not remembered leaves it to the
+  next checkout; one that spends it counts `checkout_retirement_long_judgement`.
+  An abandoned operation's archive stays within its slice (it is written under
+  the lifecycle claim). Otherwise the lane keeps the checkout as
+  `deferred_to_lane`. The worker does too while a lane run had a slice in the
+  last 2 hours (`last_at_ms` of the lane record, now set only by such a run);
+  without one it tries the checkout.
+- A judgement past its slice takes a fresh open-file observation before the move,
+  under the claim, between the re-plan and the rename, for up to 30 s (added to
+  the 60 s of proofs there) instead of reusing the run's. The archive's
+  verification and read-back, the re-plan under the claim and its 60 s, the
+  deletion rules and the archive format are unchanged. The lease, gate and
+  unresolved-operation checks are made only at the judgement's start, as before,
+  so they can now be about 20 minutes old at the move. Memory pressure is read
+  between slices, so a long judgement is not stopped by critical memory pressure.
+- A turn held elsewhere is waited for as before. A turn
   lock that cannot be opened is `volume_turn_error` (counter
   `checkout_retirement_kept_volume_turn_error`) and ends the lane `error`. A lane
   with too little left for an inspection before its 60 minutes ends `cap`.
