@@ -2865,15 +2865,23 @@ pub(crate) struct OwnedRecoveryArchive {
 #[derive(Debug)]
 pub(crate) struct RecoveryArchiveScan {
     pub root: PathBuf,
+    /// The pool-side directory, when a pool is bound and identified.
+    pub pool_root: Option<PathBuf>,
     pub owned: Vec<OwnedRecoveryArchive>,
     /// Everything else, with why the broker cannot vouch for it.
     pub unowned: Vec<(PathBuf, String)>,
+    /// How many of the first `unowned` entries are archive directories whose
+    /// own listing failed: what is in them is in no other field.
+    pub root_failures: usize,
     /// Entries not classified because the scan reached its deadline.
     pub skipped_by_budget: usize,
     /// Those entries, in the order a resumed listing would reach them.
     pub not_listed: Vec<PathBuf>,
-    /// The last entry classified: where an interrupted listing resumes.
+    /// The last entry the rotation classified: where an interrupted listing
+    /// resumes. Never an entry classified ahead of it.
     pub last_listed: Option<PathBuf>,
+    /// Entries classified ahead of the rotation (no size known yet).
+    pub listed_first: usize,
 }
 
 /// How much of an archive [`Broker::owned_recovery_archive_with`] proves.
@@ -2887,6 +2895,36 @@ pub(crate) enum ArchiveProof {
     /// archive's content is relied on or destroyed.
     Full { deadline: Option<Instant> },
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: a scan with a deadline stops, as if it had passed, once its
+    /// rotation classified this many entries.
+    pub(crate) static LISTING_STOPS_AFTER_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn listing_stopped_for_test(listed: usize) -> bool {
+    LISTING_STOPS_AFTER_FOR_TEST.with(|stop| stop.get().is_some_and(|stop| listed >= stop))
+}
+
+#[cfg(not(test))]
+fn listing_stopped_for_test(_listed: usize) -> bool {
+    false
+}
+
+/// Whether an archive, by path, already has a usable size.
+type HasSize<'a> = &'a dyn Fn(&Path) -> bool;
+
+/// The listing's share of what its deadline leaves once the directory
+/// entries are read, as `(numerator, denominator)`; the rest is for the
+/// caller's size walks. A listing that used it all left none, so nothing it
+/// reached was ever walked until some listing completed.
+const LISTING_SHARE: (u32, u32) = (3, 4);
+/// The part of that share, of the same whole, that entries with no size yet
+/// may use ahead of the rotation: the rotation always keeps the larger part.
+const LISTING_FIRST_SHARE: (u32, u32) = (1, 4);
 
 thread_local! {
     /// Full archive proofs run on this thread, so tests can prove a path
@@ -4845,23 +4883,31 @@ impl Broker {
 
     /// Every archive classified from cheap metadata only (directory
     /// listing, manifest, session record; no content is read or hashed),
-    /// stopping at `deadline`. Listing starts after `resume_after` (the
-    /// last archive an earlier, interrupted listing reached) and wraps, so
-    /// a listing that keeps hitting its deadline still reaches every
-    /// archive over several runs. Anything acted on must be proven again
+    /// stopping at [`LISTING_SHARE`] of what `deadline` leaves once the
+    /// directory entries are read. Entries for which `has_size` is false go
+    /// first, within [`LISTING_FIRST_SHARE`]. The rest starts after
+    /// `resume_after` (the last archive an earlier, interrupted listing
+    /// reached) and wraps, so a listing that keeps hitting its deadline
+    /// still reaches every archive over several runs; entries listed first
+    /// do not move that cursor. Anything acted on must be proven again
     /// with [`Self::owned_recovery_archive`] first.
     pub(crate) fn recovery_archive_listing(
         &self,
         deadline: Instant,
         resume_after: Option<&Path>,
+        has_size: HasSize<'_>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        self.recovery_archive_scan(ArchiveProof::Metadata, Some(deadline), resume_after)
+        self.recovery_archive_scan(
+            ArchiveProof::Metadata,
+            Some((deadline, has_size)),
+            resume_after,
+        )
     }
 
     fn recovery_archive_scan(
         &self,
         proof: ArchiveProof,
-        deadline: Option<Instant>,
+        bounded: Option<(Instant, HasSize<'_>)>,
         resume_after: Option<&Path>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let roots = self.inspected_recovery_archive_roots();
@@ -4870,37 +4916,69 @@ impl Broker {
         let mut unowned = Vec::new();
         // Host state first, then the pool side, each in name order.
         let mut paths = archive_entries_under(&host_root, &mut unowned);
-        if let Some(pool) = self.pool_recovery_archive_root(false) {
-            paths.extend(archive_entries_under(&pool, &mut unowned));
+        let pool_root = self.pool_recovery_archive_root(false);
+        if let Some(pool) = &pool_root {
+            paths.extend(archive_entries_under(pool, &mut unowned));
         }
+        let root_failures = unowned.len();
         drop(entries_span);
         let start = resume_after.map_or(0, |cursor| listing_resume_index(&paths, cursor));
         paths.rotate_left(start);
         let mut owned = Vec::new();
+        let mut classify = |path: &Path| {
+            crate::phase_telemetry::add("recovery_archive_listed", Duration::ZERO);
+            match self.owned_recovery_archive_with(path, &roots, proof) {
+                Ok(archive) => owned.push(archive),
+                Err(reason) => unowned.push((path.to_path_buf(), reason)),
+            }
+        };
+        // The shares are taken here, after the roots are inspected and the
+        // entries read: a slow start shortens the listing, never to nothing
+        // while `deadline` is not reached.
+        let share = |(numerator, denominator): (u32, u32)| {
+            bounded.map(|(deadline, _)| {
+                let now = Instant::now();
+                now + deadline.saturating_duration_since(now) * numerator / denominator
+            })
+        };
+        let deadline = share(LISTING_SHARE);
+        let first_deadline = share(LISTING_FIRST_SHARE);
+        let mut listed_first = std::collections::HashSet::new();
+        if let Some((_, has_size)) = bounded {
+            for path in paths.iter().filter(|path| !has_size(path)) {
+                if first_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break;
+                }
+                classify(path);
+                listed_first.insert(path.clone());
+            }
+        }
+        paths.retain(|path| !listed_first.contains(path));
         let mut last_listed = None;
         let mut not_listed = Vec::new();
         let mut paths = paths.into_iter();
-        for path in paths.by_ref() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        for (rotated, path) in paths.by_ref().enumerate() {
+            if deadline.is_some_and(|deadline| {
+                Instant::now() >= deadline || listing_stopped_for_test(rotated)
+            }) {
                 crate::phase_telemetry::add("recovery_archive_listing_budget_stop", Duration::ZERO);
                 not_listed.push(path);
                 break;
             }
-            crate::phase_telemetry::add("recovery_archive_listed", Duration::ZERO);
-            match self.owned_recovery_archive_with(&path, &roots, proof) {
-                Ok(archive) => owned.push(archive),
-                Err(reason) => unowned.push((path.clone(), reason)),
-            }
+            classify(&path);
             last_listed = Some(path);
         }
         not_listed.extend(paths);
         Ok(RecoveryArchiveScan {
             root: host_root,
+            pool_root,
             owned,
             unowned,
+            root_failures,
             skipped_by_budget: not_listed.len(),
             not_listed,
             last_listed,
+            listed_first: listed_first.len(),
         })
     }
 }

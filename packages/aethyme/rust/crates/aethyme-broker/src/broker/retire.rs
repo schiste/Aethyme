@@ -145,9 +145,12 @@ const RETIRE_ARCHIVE_BOUND_INTERVAL_MS: i64 = 30 * 60 * 1_000;
 
 /// Whether the recovery-archive bound is due this run: this run wrote a
 /// recovery archive, none is recorded, or the last pass found the archives
-/// over the bound, did not measure them all (`partial`: its total may
-/// undercount), is at least [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or
-/// the clock went back.
+/// over the bound, does not know their total (an archive it neither measured
+/// nor had a usable earlier size of, or a failed listing; an absent pool
+/// alone waits), removed some and left aged-out archives to remove when its budget ended, is at least
+/// [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or the clock went back. A
+/// `partial` pass that knows the total waits like a complete one: its
+/// listing's cursor resumes at the interval.
 fn archive_bound_due(
     last: Option<super::archive_bound::LastArchiveBound>,
     archived_this_run: bool,
@@ -156,7 +159,8 @@ fn archive_bound_due(
     archived_this_run
         || last.is_none_or(|last| {
             last.over_bound
-                || last.partial
+                || !(last.total_known || last.only_pool_absent)
+                || last.eviction_unfinished
                 || now_ms < last.observed_at_ms
                 || now_ms - last.observed_at_ms >= RETIRE_ARCHIVE_BOUND_INTERVAL_MS
         })
@@ -3669,12 +3673,14 @@ impl Broker {
         // recorded in the storage ledger by location. It runs before the
         // drain, which may use the rest of the lane, with at least its own
         // small reserve; it bounds itself further inside. While the last
-        // pass measured every archive and found them within the bound, and
-        // this run's laps (which ran above) wrote no archive, it runs at
-        // most every `RETIRE_ARCHIVE_BOUND_INTERVAL_MS`.
+        // pass knew the size of every archive (measured then or earlier) and
+        // found them within the bound, and this run's laps (which ran above)
+        // wrote no archive, it runs at most every
+        // `RETIRE_ARCHIVE_BOUND_INTERVAL_MS`.
         let archived_this_run = report.retired_archived + report.retired_operation_archived > 0;
+        let last_archive_bound = self.last_recovery_archive_bound();
         if archive_bound_due(
-            self.last_recovery_archive_bound(),
+            last_archive_bound,
             archived_this_run,
             crate::clock::epoch_ms(),
         ) {
@@ -3687,6 +3693,12 @@ impl Broker {
                 "checkout_retirement_archive_bound_not_due",
                 std::time::Duration::ZERO,
             );
+            if last_archive_bound.is_some_and(|last| last.partial) {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_archive_bound_not_due_partial",
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         let drain_deadline = trash_drain_deadline(deadline, Instant::now(), window, trash_behind);
         if drain_deadline > deadline && !self.checkout_trash_rows().is_empty() {
@@ -9328,6 +9340,9 @@ mod tests {
             observed_at_ms,
             over_bound: false,
             partial: false,
+            total_known: true,
+            only_pool_absent: false,
+            eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(None, false, now));
         assert!(!super::archive_bound_due(
@@ -9364,16 +9379,82 @@ mod tests {
             observed_at_ms: now - 60_000,
             over_bound: false,
             partial: true,
+            total_known: false,
+            only_pool_absent: false,
+            eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(Some(partial), false, now));
         assert!(!super::archive_bound_due(
             Some(super::super::archive_bound::LastArchiveBound {
                 partial: false,
+                total_known: true,
                 ..partial
             }),
             false,
             now
         ));
+    }
+
+    /// A partial pass whose total is known from earlier sizes waits the
+    /// normal interval, unless over the bound, archived since, or the clock
+    /// went back.
+    #[test]
+    fn a_partial_archive_bound_record_with_a_known_total_waits() {
+        let now = 10 * super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS;
+        let known = super::super::archive_bound::LastArchiveBound {
+            observed_at_ms: now - 60_000,
+            over_bound: false,
+            partial: true,
+            total_known: true,
+            only_pool_absent: false,
+            eviction_unfinished: false,
+        };
+        assert!(!super::archive_bound_due(Some(known), false, now));
+        assert!(super::archive_bound_due(Some(known), true, now));
+        // Not known for an absent pool alone waits too; over the bound and
+        // at the interval it does not.
+        let absent = super::super::archive_bound::LastArchiveBound {
+            total_known: false,
+            only_pool_absent: true,
+            ..known
+        };
+        assert!(!super::archive_bound_due(Some(absent), false, now));
+        for due in [
+            super::super::archive_bound::LastArchiveBound {
+                over_bound: true,
+                ..absent
+            },
+            super::super::archive_bound::LastArchiveBound {
+                observed_at_ms: now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS,
+                ..absent
+            },
+            super::super::archive_bound::LastArchiveBound {
+                only_pool_absent: false,
+                ..absent
+            },
+        ] {
+            assert!(super::archive_bound_due(Some(due), false, now), "{due:?}");
+        }
+        for due in [
+            super::super::archive_bound::LastArchiveBound {
+                over_bound: true,
+                ..known
+            },
+            super::super::archive_bound::LastArchiveBound {
+                eviction_unfinished: true,
+                ..known
+            },
+            super::super::archive_bound::LastArchiveBound {
+                observed_at_ms: now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS,
+                ..known
+            },
+            super::super::archive_bound::LastArchiveBound {
+                observed_at_ms: now + 60_000,
+                ..known
+            },
+        ] {
+            assert!(super::archive_bound_due(Some(due), false, now), "{due:?}");
+        }
     }
 
     /// A run whose laps wrote a recovery archive runs the bound, however
@@ -9385,6 +9466,9 @@ mod tests {
             observed_at_ms: now - 60_000,
             over_bound: false,
             partial: false,
+            total_known: true,
+            only_pool_absent: false,
+            eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(Some(recent), true, now));
         assert!(!super::archive_bound_due(Some(recent), false, now));
@@ -10679,6 +10763,466 @@ mod tests {
         assert!(!older.exists());
     }
 
+    /// One bound pass, within the bound, whose rotation stops after
+    /// `stop` archives and which starts `walks` size walks at most.
+    fn interrupted_pass(
+        broker: &crate::Broker,
+        stop: Option<usize>,
+        walks: Option<usize>,
+    ) -> (
+        crate::storage_ledger::RecoveryArchiveUsage,
+        serde_json::Value,
+    ) {
+        crate::cleanup_resolve::LISTING_STOPS_AFTER_FOR_TEST.with(|cell| cell.set(stop));
+        super::super::archive_bound::WALKS_LEFT_FOR_TEST.with(|cell| cell.set(walks));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let usage = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now() + Duration::from_secs(60))
+        };
+        crate::cleanup_resolve::LISTING_STOPS_AFTER_FOR_TEST.with(|cell| cell.set(None));
+        super::super::archive_bound::WALKS_LEFT_FOR_TEST.with(|cell| cell.set(None));
+        let pass = recorder.attachments()["recovery_archive_bound_pass"].clone();
+        (usage, pass)
+    }
+
+    fn archive_bytes(usage: &crate::storage_ledger::RecoveryArchiveUsage) -> (usize, u64) {
+        (
+            usage.pool.archives + usage.host_state.archives,
+            usage.pool.bytes + usage.host_state.bytes,
+        )
+    }
+
+    fn forget_archive_bound_state(broker: &crate::Broker) -> (PathBuf, String) {
+        let host_state = broker.storage_context().host_state_dir.clone().unwrap();
+        let repository = broker.main_root().to_string_lossy().into_owned();
+        crate::storage_ledger::record_archive_bound_state(
+            &host_state,
+            &repository,
+            &crate::storage_ledger::ArchiveBoundState::default(),
+        )
+        .unwrap();
+        (host_state, repository)
+    }
+
+    /// An archive the broker cannot vouch for, in host state (listed first).
+    fn unowned_archive(broker: &crate::Broker) -> PathBuf {
+        let archive = broker
+            .recovery_archive_root()
+            .unwrap()
+            .join("990010-unowned");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(archive.join("content"), vec![0_u8; 1000]).unwrap();
+        archive
+    }
+
+    /// A partial pass counts an archive it cannot vouch for, and did not
+    /// reach or could not walk, with its last measured size: the total is
+    /// whole and known. Reached with budget, it is walked afresh. Mutations
+    /// caught: not carrying its size, taking it instead of a new walk.
+    #[test]
+    fn an_unwalked_unowned_archive_counts_with_its_last_size() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["carry one", "carry two"] {
+            retired_with_archive(&mut broker, label);
+        }
+        let unowned = unowned_archive(&broker);
+        let (host_state, repository) = forget_archive_bound_state(&broker);
+        let (complete, pass) = interrupted_pass(&broker, None, None);
+        assert!(!complete.partial && complete.total_known, "{pass}");
+        assert_eq!(pass["total_from_earlier_sizes"], false, "{pass}");
+        assert_eq!(archive_bytes(&complete).0, 3);
+
+        // It grew, but its walk runs out of budget: the last size counts.
+        std::fs::write(unowned.join("more"), vec![0_u8; 500]).unwrap();
+        let (fell_back, pass) = interrupted_pass(&broker, None, Some(0));
+        assert!(fell_back.partial && fell_back.total_known, "{pass}");
+        assert_eq!(pass["walk_fell_back"], 1, "{pass}");
+        assert_eq!(pass["size_unknown"], 0, "{pass}");
+        assert_eq!(archive_bytes(&fell_back), archive_bytes(&complete));
+
+        // Reached with budget (the first listed): walked afresh, and the
+        // two not reached count from their sizes.
+        let (walked, pass) = interrupted_pass(&broker, Some(1), None);
+        assert!(walked.partial && walked.total_known, "{pass}");
+        assert_eq!(pass["size_measured"], 1, "{pass}");
+        assert_eq!(pass["counted_from_earlier_size"], 2, "{pass}");
+        assert_eq!(pass["total_from_earlier_sizes"], true, "{pass}");
+        assert_eq!(
+            archive_bytes(&walked),
+            (3, archive_bytes(&complete).1 + 500)
+        );
+
+        // The listing resumes after it: not reached, its new size counts,
+        // and the cursor moves on every pass.
+        let cursor =
+            || crate::storage_ledger::archive_bound_state(&host_state, &repository).listing_cursor;
+        let before = cursor();
+        let (resumed, pass) = interrupted_pass(&broker, Some(1), None);
+        assert!(resumed.partial && resumed.total_known, "{pass}");
+        assert_eq!(pass["counted_from_earlier_size"], 2, "{pass}");
+        assert_eq!(archive_bytes(&resumed), archive_bytes(&walked));
+        assert_ne!(cursor(), before);
+
+        // Gone: no longer counted, from any size.
+        std::fs::remove_dir_all(&unowned).unwrap();
+        let (gone, pass) = interrupted_pass(&broker, Some(1), None);
+        assert!(gone.total_known, "{pass}");
+        assert_eq!(archive_bytes(&gone).0, 2, "{pass}");
+        assert!(
+            crate::storage_ledger::archive_bound_state(&host_state, &repository)
+                .unowned_sizes
+                .is_empty()
+        );
+    }
+
+    /// An archive no pass measured leaves the total unknown (the next run
+    /// is due), whether the listing reached it or not.
+    #[test]
+    fn an_unmeasured_new_archive_leaves_the_total_unknown() {
+        let (_owner, _storage, mut broker) = fixture();
+        retired_with_archive(&mut broker, "measured before");
+        forget_archive_bound_state(&broker);
+        let (known, pass) = interrupted_pass(&broker, None, None);
+        assert!(known.total_known, "{pass}");
+        retired_with_archive(&mut broker, "measured never");
+        // The run that archived it measured it too: forget that size alone.
+        let host_state = broker.storage_context().host_state_dir.clone().unwrap();
+        let repository = broker.main_root().to_string_lossy().into_owned();
+        let mut state = crate::storage_ledger::archive_bound_state(&host_state, &repository);
+        assert_eq!(state.sizes.len(), 2);
+        let newest = state
+            .sizes
+            .iter()
+            .max_by_key(|(_, size)| size.created_at_ms)
+            .map(|(path, _)| path.clone());
+        state.sizes.remove(&newest.unwrap());
+        state.listing_cursor = None;
+        crate::storage_ledger::record_archive_bound_state(&host_state, &repository, &state)
+            .unwrap();
+        let (unwalked, pass) = interrupted_pass(&broker, None, Some(0));
+        assert!(!unwalked.total_known, "{pass}");
+        assert_eq!(pass["size_unknown"], 1, "{pass}");
+        let (measured, pass) = interrupted_pass(&broker, None, None);
+        assert!(measured.total_known, "{pass}");
+        // A rotation that lists nothing is no progress: not known either.
+        let (stalled, pass) = interrupted_pass(&broker, Some(0), None);
+        assert_eq!(pass["size_unknown"], 0, "{pass}");
+        assert!(!stalled.total_known, "{pass}");
+    }
+
+    /// The bound state, changed in place by `change`.
+    fn change_archive_bound_state(
+        broker: &crate::Broker,
+        change: impl FnOnce(&mut crate::storage_ledger::ArchiveBoundState),
+    ) -> crate::storage_ledger::ArchiveBoundState {
+        let host_state = broker.storage_context().host_state_dir.clone().unwrap();
+        let repository = broker.main_root().to_string_lossy().into_owned();
+        let mut state = crate::storage_ledger::archive_bound_state(&host_state, &repository);
+        change(&mut state);
+        crate::storage_ledger::record_archive_bound_state(&host_state, &repository, &state)
+            .unwrap();
+        state
+    }
+
+    fn read_archive_bound_state(
+        broker: &crate::Broker,
+    ) -> crate::storage_ledger::ArchiveBoundState {
+        change_archive_bound_state(broker, |_| {})
+    }
+
+    /// A new archive far behind the cursor costs one pass: it is listed and
+    /// walked first, once, and the cursor moves over the rotation alone.
+    #[test]
+    fn a_new_archive_is_listed_first_and_leaves_the_cursor_alone() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["first one", "first two", "first three"] {
+            retired_with_archive(&mut broker, label);
+        }
+        forget_archive_bound_state(&broker);
+        let (complete, _) = interrupted_pass(&broker, None, None);
+        let mut order = read_archive_bound_state(&broker)
+            .sizes
+            .into_keys()
+            .collect::<Vec<_>>();
+        order.sort();
+        interrupted_pass(&broker, Some(1), None);
+        let state = change_archive_bound_state(&broker, |state| {
+            state.sizes.remove(&order[2]);
+        });
+        assert_eq!(state.listing_cursor.as_ref(), Some(&order[0]));
+        let (usage, pass) = interrupted_pass(&broker, Some(1), None);
+        assert!(usage.partial && usage.total_known, "{pass}");
+        assert_eq!(pass["listed_first"], 1, "{pass}");
+        assert_eq!(pass["listed"], 2, "{pass}");
+        assert_eq!(pass["size_measured"], 1, "{pass}");
+        assert_eq!(archive_bytes(&usage), archive_bytes(&complete));
+        let state = read_archive_bound_state(&broker);
+        assert_eq!(state.listing_cursor.as_ref(), Some(&order[1]));
+        // Listed first is not progress of the rotation.
+        change_archive_bound_state(&broker, |state| {
+            state.sizes.remove(&order[0]);
+        });
+        let (stalled, pass) = interrupted_pass(&broker, Some(0), None);
+        assert_eq!(pass["listed_first"], 1, "{pass}");
+        assert!(!stalled.total_known, "{pass}");
+        let state = read_archive_bound_state(&broker);
+        assert_eq!(state.listing_cursor.as_ref(), Some(&order[1]));
+    }
+
+    /// An earlier unowned size older than a day still counts, but no longer
+    /// makes the total known; nor does one whose walk failed since.
+    #[test]
+    fn an_old_or_failed_unowned_size_leaves_the_total_unknown() {
+        let (_owner, _storage, broker) = fixture();
+        let unowned = unowned_archive(&broker);
+        forget_archive_bound_state(&broker);
+        let (complete, _) = interrupted_pass(&broker, None, None);
+        assert_eq!(archive_bytes(&complete), (1, 1000));
+        let skewed = |ms: i64| {
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(ms));
+            let result = interrupted_pass(&broker, None, Some(0));
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(0));
+            result
+        };
+        let (recent, pass) = skewed(23 * 60 * 60 * 1_000);
+        assert!(recent.total_known, "{pass}");
+        let (old, pass) = skewed(25 * 60 * 60 * 1_000);
+        assert!(!old.total_known, "{pass}");
+        assert_eq!(pass["size_stale"], 1, "{pass}");
+        assert_eq!(pass["listed_first"], 1, "{pass}");
+        assert_eq!(archive_bytes(&old), (1, 1000));
+
+        super::super::archive_bound::FAILED_WALKS_FOR_TEST.with(|fail| fail.set(true));
+        let (failed, pass) = interrupted_pass(&broker, None, None);
+        super::super::archive_bound::FAILED_WALKS_FOR_TEST.with(|fail| fail.set(false));
+        assert!(!failed.total_known, "{pass}");
+        assert_eq!(archive_bytes(&failed), (1, 1000));
+        // Still so until a walk completes.
+        let (unwalked, pass) = interrupted_pass(&broker, None, Some(0));
+        assert!(!unwalked.total_known, "{pass}");
+        let (walked, pass) = interrupted_pass(&broker, None, None);
+        assert!(walked.total_known, "{pass}");
+        std::fs::remove_dir_all(&unowned).unwrap();
+    }
+
+    /// With time for one walk a pass, unowned archives take turns, and an
+    /// owned one whose walk ran out of budget before waits behind them.
+    #[test]
+    fn walks_take_turns_and_deferred_owned_archives_go_last() {
+        let (_owner, _storage, mut broker) = fixture();
+        retired_with_archive(&mut broker, "too large");
+        forget_archive_bound_state(&broker);
+        interrupted_pass(&broker, None, None);
+        let first = unowned_archive(&broker);
+        let second = first.with_file_name("990011-unowned");
+        std::fs::create_dir_all(&second).unwrap();
+        let mut owned = String::new();
+        change_archive_bound_state(&broker, |state| {
+            owned = state.sizes.keys().next().unwrap().clone();
+            state.sizes.clear();
+            state.size_deferred_at_ms.insert(owned.clone(), 1);
+        });
+        let one_walk = || {
+            interrupted_pass(&broker, None, Some(1));
+            read_archive_bound_state(&broker)
+        };
+        let state = one_walk();
+        let measured = |state: &crate::storage_ledger::ArchiveBoundState, path: &Path| {
+            state.unowned_sizes[&path.to_string_lossy().into_owned()]
+                .bytes
+                .is_some()
+        };
+        assert!(state.sizes.is_empty(), "{state:?}");
+        assert!(measured(&state, &first) && !measured(&state, &second));
+        assert!(
+            state.size_deferred_at_ms.contains_key(&owned),
+            "kept while not tried"
+        );
+        let state = one_walk();
+        assert!(measured(&state, &first) && measured(&state, &second));
+        // Not deferred, it goes first.
+        change_archive_bound_state(&broker, |state| state.size_deferred_at_ms.clear());
+        assert!(one_walk().sizes.contains_key(&owned));
+    }
+
+    /// What a path no longer holds is not counted: an archive's size goes
+    /// when another replaced it, an unowned size when the archive is owned.
+    #[test]
+    fn sizes_of_what_a_path_held_before_are_dropped() {
+        let (_owner, _storage, mut broker) = fixture();
+        retired_with_archive(&mut broker, "replaced");
+        forget_archive_bound_state(&broker);
+        let (complete, _) = interrupted_pass(&broker, None, None);
+        let mut path = String::new();
+        change_archive_bound_state(&broker, |state| {
+            path = state.sizes.keys().next().unwrap().clone();
+            state.unowned_sizes.insert(
+                path.clone(),
+                crate::storage_ledger::UnownedArchiveSize {
+                    bytes: Some(999_999_999),
+                    measured_at_ms: crate::clock::epoch_ms(),
+                    tried_at_ms: crate::clock::epoch_ms(),
+                },
+            );
+        });
+        let (owned, pass) = interrupted_pass(&broker, None, None);
+        assert_eq!(archive_bytes(&owned), archive_bytes(&complete), "{pass}");
+        assert!(read_archive_bound_state(&broker).unowned_sizes.is_empty());
+
+        change_archive_bound_state(&broker, |state| {
+            state.sizes.get_mut(&path).unwrap().created_at_ms -= 1;
+        });
+        let (replaced, pass) = interrupted_pass(&broker, None, Some(0));
+        assert!(!replaced.total_known, "{pass}");
+        assert!(read_archive_bound_state(&broker).sizes.is_empty());
+    }
+
+    /// An archive directory that cannot be listed, or a pool that is gone,
+    /// makes the total unknown and keeps what was measured in it.
+    #[test]
+    fn an_unlistable_root_or_absent_pool_leaves_the_total_unknown() {
+        let (_owner, _storage, mut broker) = fixture();
+        retired_with_archive(&mut broker, "on the pool");
+        unowned_archive(&broker);
+        forget_archive_bound_state(&broker);
+        let (complete, _) = interrupted_pass(&broker, None, None);
+        assert!(complete.total_known);
+        let before = read_archive_bound_state(&broker);
+
+        let host = broker.recovery_archive_root().unwrap();
+        let aside = host.with_file_name("aside");
+        std::fs::rename(&host, &aside).unwrap();
+        std::fs::write(&host, "not a directory").unwrap();
+        let (failed, pass) = interrupted_pass(&broker, None, None);
+        assert!(!failed.total_known, "{pass}");
+        assert_eq!(pass["root_failures"], 1, "{pass}");
+        assert_eq!(
+            read_archive_bound_state(&broker).unowned_sizes,
+            before.unowned_sizes
+        );
+        std::fs::remove_file(&host).unwrap();
+        std::fs::rename(&aside, &host).unwrap();
+
+        let parent = broker
+            .pool_recovery_archive_root(false)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let away = parent.with_file_name(".archives-unmounted");
+        std::fs::rename(&parent, &away).unwrap();
+        for _ in 0..2 {
+            let (absent, pass) = interrupted_pass(&broker, None, None);
+            assert!(!absent.total_known && absent.only_pool_absent, "{pass}");
+            assert_eq!(pass["pool_absent"], true, "{pass}");
+            assert_eq!(read_archive_bound_state(&broker).sizes, before.sizes);
+        }
+        // With something else unknown too, it is not the only reason.
+        let (stale, pass) = {
+            change_archive_bound_state(&broker, |state| state.unowned_sizes.clear());
+            interrupted_pass(&broker, None, Some(0))
+        };
+        assert!(!stale.total_known && !stale.only_pool_absent, "{pass}");
+        std::fs::rename(&away, &parent).unwrap();
+        let (back, pass) = interrupted_pass(&broker, None, None);
+        assert!(back.total_known, "{pass}");
+        assert_eq!(pass["size_cached"], 1, "{pass}");
+
+        // Gone, with nothing recorded in it: forgotten, the total is known.
+        std::fs::rename(&parent, &away).unwrap();
+        change_archive_bound_state(&broker, |state| state.sizes.clear());
+        let (gone, pass) = interrupted_pass(&broker, None, None);
+        assert!(gone.total_known && !gone.only_pool_absent, "{pass}");
+        assert_eq!(read_archive_bound_state(&broker).pool_root, None);
+        std::fs::rename(&away, &parent).unwrap();
+    }
+
+    /// A size carried for an unowned archive puts the total over the bound
+    /// but removes nothing by itself; walked afresh, it counts for removal.
+    #[test]
+    fn a_carried_unowned_size_removes_no_archive() {
+        let (_owner, _storage, mut broker) = fixture();
+        let archive = retired_then_landed(&mut broker, "landed beside unowned");
+        unowned_archive(&broker);
+        forget_archive_bound_state(&broker);
+        let (complete, _) = interrupted_pass(&broker, None, None);
+        let bound = archive_bytes(&complete).1 - 500;
+        let pass = |walks| {
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST
+                .with(|skew| skew.set(30 * 86_400_000));
+            super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|cell| cell.set(Some(bound)));
+            let result = interrupted_pass(&broker, None, walks);
+            super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|cell| cell.set(None));
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(0));
+            result
+        };
+        let (carried, telemetry) = pass(Some(0));
+        assert!(carried.over_bound, "{telemetry}");
+        assert_eq!(carried.evicted, 0, "{telemetry}");
+        assert!(archive.exists());
+        let (walked, telemetry) = pass(None);
+        assert_eq!(walked.evicted, 1, "{telemetry}");
+        assert!(!archive.exists());
+    }
+
+    /// Removals that made some and stop on their budget with an aged-out
+    /// archive left say so, which keeps the next pass due; a pass that
+    /// removed nothing does not (those left may never land).
+    #[test]
+    fn an_unfinished_expiry_is_recorded() {
+        let (_owner, _storage, mut broker) = fixture();
+        let first = retired_then_landed(&mut broker, "aged out first");
+        let second = retired_then_landed(&mut broker, "aged out second");
+        let pass = |removals| {
+            super::super::archive_bound::REMOVALS_LEFT_FOR_TEST.with(|cell| cell.set(removals));
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST
+                .with(|skew| skew.set(100 * 86_400_000));
+            let result = interrupted_pass(&broker, None, None);
+            super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(0));
+            super::super::archive_bound::REMOVALS_LEFT_FOR_TEST.with(|cell| cell.set(None));
+            result.0
+        };
+        let none = pass(Some(0));
+        assert_eq!(none.evicted, 0, "{none:?}");
+        assert!(!none.eviction_unfinished, "{none:?}");
+        assert!(first.exists() && second.exists());
+        let stopped = pass(Some(1));
+        assert_eq!(stopped.evicted, 1, "{stopped:?}");
+        assert!(stopped.eviction_unfinished, "{stopped:?}");
+        assert!(!first.exists() && second.exists());
+        let finished = pass(None);
+        assert!(!finished.eviction_unfinished, "{finished:?}");
+        assert!(!second.exists());
+    }
+
+    /// Over the bound by earlier sizes alone is over the bound, and due.
+    #[test]
+    fn a_partial_pass_over_the_bound_by_earlier_sizes_stays_due() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["over one", "over two"] {
+            retired_with_archive(&mut broker, label);
+        }
+        forget_archive_bound_state(&broker);
+        interrupted_pass(&broker, None, None);
+        super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|bound| bound.set(Some(1)));
+        let (usage, pass) = interrupted_pass(&broker, Some(1), None);
+        super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|bound| bound.set(None));
+        assert!(usage.over_bound && usage.total_known, "{usage:?} {pass}");
+        assert!(super::archive_bound_due(
+            Some(super::super::archive_bound::LastArchiveBound {
+                observed_at_ms: usage.observed_at_ms,
+                over_bound: usage.over_bound,
+                partial: usage.partial,
+                total_known: usage.total_known,
+                only_pool_absent: usage.only_pool_absent,
+                eviction_unfinished: usage.eviction_unfinished,
+            }),
+            false,
+            usage.observed_at_ms + 1,
+        ));
+    }
+
     /// A listing resumes after the archive an interrupted listing reached
     /// last, and wraps, so every archive is reached over several runs.
     #[test]
@@ -10688,7 +11232,9 @@ mod tests {
             retired_with_archive(&mut broker, label);
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        let full = broker.recovery_archive_listing(deadline, None).unwrap();
+        let full = broker
+            .recovery_archive_listing(deadline, None, &|_| true)
+            .unwrap();
         let order = full
             .owned
             .iter()
@@ -10698,7 +11244,7 @@ mod tests {
         assert_eq!(full.last_listed.as_ref(), Some(&order[2]));
         assert!(full.not_listed.is_empty());
         let resumed = broker
-            .recovery_archive_listing(deadline, Some(&order[0]))
+            .recovery_archive_listing(deadline, Some(&order[0]), &|_| true)
             .unwrap();
         let resumed_order = resumed
             .owned
@@ -10711,7 +11257,7 @@ mod tests {
         );
         // Out of budget: nothing listed, everything left for the next run.
         let stopped = broker
-            .recovery_archive_listing(Instant::now(), Some(&order[1]))
+            .recovery_archive_listing(Instant::now(), Some(&order[1]), &|_| true)
             .unwrap();
         assert!(stopped.owned.is_empty());
         assert_eq!(
