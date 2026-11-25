@@ -4766,6 +4766,13 @@ pub(crate) fn ignored_content_blockers(
             );
             ensure_ignored_content_before(deadline)?;
             if let Err(reason) = verdict {
+                // Git lists a directory holding only files ignored by a
+                // pattern, and each of them: the directory says it once.
+                if blockers.iter().any(|(listed, _): &(String, String)| {
+                    listed.ends_with('/') && relative.starts_with(listed.as_str())
+                }) {
+                    continue;
+                }
                 blockers.push((relative, reason));
                 if blockers.len() >= limit.max(1) {
                     break;
@@ -11355,6 +11362,29 @@ mod tests {
             "{reason}"
         );
         assert!(root.join("opaque/nested/user-data.json").exists());
+    }
+
+    /// Git lists a directory holding only pattern-ignored files and each of
+    /// them: the directory is reported once, and a sibling still is.
+    #[test]
+    fn a_blocking_directory_is_not_reported_again_for_its_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        touch(root, "logs/a.log");
+        touch(root, "logs/deep/b.log");
+        touch(root, "logs-standalone.log");
+
+        let blockers =
+            super::ignored_content_blockers(root, &AutoCleanupPolicy::default(), 16).unwrap();
+
+        let paths = blockers.iter().map(|(path, _)| path.as_str());
+        assert_eq!(
+            paths.collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["logs/", "logs-standalone.log"])
+        );
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
     }
 
     #[cfg(unix)]

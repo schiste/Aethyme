@@ -5521,6 +5521,33 @@ span. Now:
   `recovery_archive_apply_verify_under_claim`. The other ref installs and the
   wait for the claim (`lifecycle_lock_wait`) are in none of these.
 
+Recovery archive file lists and earlier retirement staging:
+
+- Git lists a directory that holds only files ignored by a pattern, and again
+  each file and nested directory in it. A plan takes each path once; counter
+  `recovery_archive_ignored_duplicates_dropped` (one per dropped path). Before,
+  6 of the 15 `archive_failed` keeps of one repository (0.8.175: 53 lane runs,
+  0 retired, 1,366 s in archives) were the second copy of such a file. A path
+  that differs only by case or Unicode form is never dropped. `ignored_blockers`
+  lists such a directory without the files in it.
+- A plan whose file lists are not sorted and unique (the archive's own
+  verification rule) is refused before any copy: `plan_refused`, counter
+  `recovery_archive_plan_file_list_refused`.
+- Staging left by an earlier state of the same session, checkout path and branch
+  (`<session>.retirement-v6.partial`, no longer matching the content identity;
+  9 of those 15 keeps) is removed only when it holds nothing but its record, the
+  checkout's current patches, and files the plan archives from the same path
+  whose checkout file starts with every byte staged (links: the same link), and
+  none of its prerequisite refs exists. An empty staging directory is removed
+  too. Counter `recovery_archive_stale_partial_removed`.
+- Staging not so proven (a manifest, a bundle, a file the checkout lost or
+  changed) is left untouched and the archive is written in
+  `<session>.retirement-v6-next.partial`, the only other staging name; counter
+  `recovery_archive_stale_partial_kept`. With both retained the apply is refused
+  before any copy. Staging of another checkout, or with an unreadable record, is
+  refused as before. No lane expires retained staging.
+- Span `recovery_archive_apply_stale_partial` covers that proof.
+
 Whether the `archive_failed` keeps above follow from deadline cuts is not
 verified. Readers must accept the new keep reasons, field, counters and spans.
 Covered by `broker/retire.rs` tests.
