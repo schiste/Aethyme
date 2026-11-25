@@ -1015,6 +1015,9 @@ thread_local! {
     /// Test seam between the keeps asked before the activity probe and it.
     pub(crate) static BEFORE_ACTIVITY_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
+    /// Test seam: the abandonment window's early look reads as unreadable.
+    pub(crate) static EARLY_LOOK_UNREADABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Test seam: the pass deadline the late probe is asked under.
     pub(crate) static DEADLINE_AT_LATE_PROBE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
@@ -2917,9 +2920,16 @@ impl Broker {
     ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
         use crate::session_holder::RecordedHolderLiveness as Liveness;
         match lane {
-            // The work class comes next there: it runs Git, and its record
-            // and due time must not be lost to a cheaper keep.
-            SessionCloseLane::Abandonment => return None,
+            // Only running work that keeps the session past every later
+            // check; otherwise the work class, which runs Git, comes next.
+            SessionCloseLane::Abandonment => {
+                return self.abandonment_keep_before_probe(
+                    candidate,
+                    metadata_ms,
+                    decision_now_ms,
+                    process_table,
+                );
+            }
             // Its probe is put off until after the holder and the proof.
             SessionCloseLane::MergedPullRequest => return None,
             // Only declines that, like recent activity, still let the
@@ -2995,6 +3005,225 @@ impl Broker {
                 AbandonmentKeepReason::NoWorkExplicitClaim,
                 AbandonedSessionCloseOutcome::LeaseHeld,
             ))
+    }
+
+    /// The abandonment window's early look (span `session_close_early_look`):
+    /// running work that keeps the session whatever the changed-file probe,
+    /// the work class, the early-close safety rule and the open-file
+    /// observation would show. It reads only the database, the gate run
+    /// directory and a process table this pass already took for this binding
+    /// (none is taken here). It only keeps: every check is asked again where
+    /// it was, under the operation claim, before any close, and anything
+    /// unreadable here falls through to that path. Each check is asked only
+    /// for a holder whose state lets the later path reach it, and each keep
+    /// is one the landed lane would make on the same evidence, so a session
+    /// kept here and not offered to that lane loses no close. A session kept
+    /// here is not classified in this pass: its remembered work class and
+    /// due time stay as last recorded. Artifact producers are not asked: the
+    /// only check takes their reclaim lock.
+    fn abandonment_keep_before_probe(
+        &self,
+        candidate: &crate::Session,
+        metadata_ms: i64,
+        decision_now_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+    ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
+        let _span = crate::phase_telemetry::span("session_close_early_look");
+        let mut unreadable = false;
+        let kept = self.abandonment_keep_before_probe_checks(
+            candidate,
+            metadata_ms,
+            decision_now_ms,
+            process_table,
+            &mut unreadable,
+        );
+        if unreadable {
+            crate::phase_telemetry::add(
+                "session_close_early_look_unreadable",
+                std::time::Duration::ZERO,
+            );
+        }
+        if let Some((reason, _)) = kept {
+            crate::phase_telemetry::add("session_close_early_kept", std::time::Duration::ZERO);
+            crate::phase_telemetry::add_keyed(
+                "session_close_early_kept_by_reason",
+                reason.code(),
+                std::time::Duration::ZERO,
+            );
+        }
+        kept
+    }
+
+    fn abandonment_keep_before_probe_checks(
+        &self,
+        candidate: &crate::Session,
+        metadata_ms: i64,
+        decision_now_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        unreadable: &mut bool,
+    ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
+        use crate::session_holder::RecordedHolderLiveness as Liveness;
+        #[cfg(test)]
+        if EARLY_LOOK_UNREADABLE.with(std::cell::Cell::get) {
+            *unreadable = true;
+            return None;
+        }
+        let session_id = candidate.id;
+        let Ok(event) = self.store_ref().latest_session_holder_event(session_id) else {
+            *unreadable = true;
+            return None;
+        };
+        let holder = crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            session_id,
+            process_table,
+            false,
+        );
+        if event.as_ref().map(|event| event.id) != holder.binding_event_id {
+            return None;
+        }
+        // A live holder whose task lease is current and that was bound
+        // elsewhere after the index and `HEAD` times: the probe's time can
+        // only be later, so a holder not moved on by these has not moved on
+        // at all and is kept by the holder check, never reaching the checks
+        // below. An expired task lease can excuse the holder (the opt-in, or
+        // the landed lane), so it is not judged here.
+        let moved_on_alive = holder.liveness == Liveness::Alive
+            && event.as_ref().is_some_and(|event| {
+                crate::session_holder::task_lease_expired(
+                    event,
+                    candidate.last_activity_at,
+                    decision_now_ms,
+                ) != Some(true)
+                    && match self.holder_moved_on(
+                        session_id,
+                        event,
+                        metadata_ms.max(candidate.last_activity_at),
+                    ) {
+                        Ok(moved_on) => moved_on.is_some(),
+                        Err(_) => {
+                            *unreadable = true;
+                            false
+                        }
+                    }
+            });
+        let settled = holder.liveness == Liveness::Gone || moved_on_alive;
+        // Gates and operations are asked for a holder in the task-lease
+        // protocol, merge-queue entries for a moved-on holder only, as below.
+        let task_lease_binding = event
+            .as_ref()
+            .is_some_and(crate::session_holder::task_lease_binding_present);
+        if settled && task_lease_binding {
+            match crate::gates::checked_running_session_gates_until(
+                self.main_root(),
+                session_id,
+                || false,
+                256,
+            ) {
+                Some(gates) if !gates.is_empty() => {
+                    return Some((
+                        AbandonmentKeepReason::GateRunning,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
+                }
+                Some(_) => {}
+                None => *unreadable = true,
+            }
+            match self.session_operations_unresolved_since_boot(session_id) {
+                Ok(true) => {
+                    return Some((
+                        AbandonmentKeepReason::OperationUnresolved,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
+                }
+                Ok(false) => {}
+                Err(_) => *unreadable = true,
+            }
+        }
+        if moved_on_alive {
+            match self.store_ref().latest_merge_queue_for_session(session_id) {
+                Ok(Some(entry))
+                    if matches!(
+                        entry.status,
+                        crate::MergeStatus::Submitted
+                            | crate::MergeStatus::Simulating
+                            | crate::MergeStatus::Verified
+                    ) =>
+                {
+                    return Some((
+                        AbandonmentKeepReason::MergeQueueActive,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => *unreadable = true,
+            }
+        }
+        // No holder recorded, on a session created since holders are recorded
+        // (a legacy session's claims can stop holding by age). A shared agent
+        // service reads as unbound with a binding, and is left to the path
+        // that refreshes its process table.
+        let unbound = holder.liveness == Liveness::Unbound
+            && event.is_none()
+            && candidate.created_at >= HOLDER_RECORDING_SHIPPED_MS;
+        if !(settled || unbound) {
+            return None;
+        }
+        let leases = match self
+            .store_ref()
+            .unreleased_unexpired_leases_for_sessions_at(&[session_id], decision_now_ms)
+        {
+            Ok(leases) => leases,
+            Err(_) => {
+                *unreadable = true;
+                return None;
+            }
+        };
+        let explicit_leases = leases
+            .into_iter()
+            .filter(|lease| lease.kind == LeaseKind::Explicit)
+            .collect::<Vec<_>>();
+        if explicit_leases.is_empty() {
+            return None;
+        }
+        let table = holder
+            .binding_event_id
+            .and_then(|event_id| process_table.table_for(session_id, event_id));
+        let views = match crate::lease_liveness::assess_for_abandonment(
+            self.store_ref(),
+            &explicit_leases,
+            table,
+            decision_now_ms,
+            crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root()),
+        ) {
+            Ok(views) => views,
+            Err(_) => {
+                *unreadable = true;
+                return None;
+            }
+        };
+        // A gone holder never recorded gone reads as gone since now: the
+        // later check records that first sighting, which starts its grace, so
+        // only a grace already running (or anchored to the boot) keeps here.
+        let holds = views.iter().any(|view| {
+            let evidence = &view.liveness_evidence;
+            evidence.holds
+                && match evidence.basis {
+                    "holder_running" => moved_on_alive,
+                    "holder_gone" => {
+                        holder.liveness == Liveness::Gone
+                            && evidence
+                                .stale_since
+                                .is_some_and(|since| since < decision_now_ms)
+                    }
+                    "no_recorded_holder" => unbound,
+                    _ => false,
+                }
+        });
+        holds.then_some((
+            AbandonmentKeepReason::LeaseHeld,
+            AbandonedSessionCloseOutcome::LeaseHeld,
+        ))
     }
 
     /// The first look with its probe: the checkout's newest activity and the
