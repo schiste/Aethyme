@@ -4,6 +4,32 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.175] - 2026-11-25
+
+### Fixed
+
+- The checkout retirement lane no longer redoes, every slice, a plan or archive that did not fit its 5-minute slice. One cut after at least 4 minutes, or a plan that leaves under 90 s for its archive, is remembered as `out_of_time` with the existing back-off (1, 6, 24 h); a shorter cut gets one whole slice next (`cut_short`). After the back-off the lane gives that checkout 20 minutes from its plan, at most once per lane run. Before, another repository's lane spent 5,872 s in 5 runs and retired nothing, while the busiest repository's lane waited for the volume they share (#2014).
+- The deadline for installing an archive's prerequisite refs is taken at each install, not before the copy, so a long archive no longer fails on a 10-minute Git limit that began before it (#2014).
+- A volume turn lock that cannot be opened ends the lane with `error` instead of reading as held (#2014).
+
+### Changed
+
+- A judgement past its slice observes open files again before the move, for at most 30 s, under the lifecycle claim; an incomplete observation refuses the move (#2014).
+- The retirement lane's recorded time is set only by a run that ran a slice. An `out_of_time` checkout is tried by the worker only when no lane ran a slice for 2 hours, and is not withheld from the other cleanup lanes (#2014).
+
+### Added
+
+- Spans `checkout_retirement_volume_turn_wait`, `checkout_retirement_volume_turn_held` and `recovery_archive_apply_*`; counter `checkout_retirement_long_judgement`; keeps `out_of_time`, `cut_short`, `volume_turn_error` (#2014).
+
+### Upgrade notes
+
+- An older binary that rewrites the kept-checkout record drops the `out_of_time` flag, which only shortens the next attempt.
+
+### Known issues
+
+- One slow checkout can hold a volume's turn for about 25 minutes, once per lane run (5-minute slices before), and critical memory pressure is not read during it (#2014).
+- An incomplete archive whose checkout changed since still blocks that checkout's retirement (not new).
+
 ## [0.8.174] - 2026-11-25
 
 ### Fixed
