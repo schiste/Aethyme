@@ -1716,7 +1716,7 @@ pub(super) fn checked_worktree_metadata_ms(
 /// changed files' own modification times (and their parents') count too.
 /// A status call that times out or reaches its cap without evidence
 /// leaves the index and HEAD evidence alone (counted).
-pub(super) fn probed_worktree_activity(
+fn probed_worktree_activity(
     session: &Session,
     metadata_ms: i64,
 ) -> crate::worktree_status_activity::WorktreeActivity {

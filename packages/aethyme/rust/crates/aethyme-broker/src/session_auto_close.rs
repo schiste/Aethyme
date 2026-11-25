@@ -5046,14 +5046,15 @@ mod lane_tests {
 
     // ---- Cheap refusals come before the changed-file probe. ----
 
-    /// How often `judge` looked at the checkout as `look` (with the probe),
-    /// and which looks it avoided.
+    /// How `judge` ended, the looks it took at the checkout and the ones it
+    /// avoided. A judgement that ended at the first look `look` (or before
+    /// it) ran the probe exactly when it took that look.
     fn looks(
         look: &str,
         judge: impl FnOnce() -> crate::broker::AbandonedSessionCloseOutcome,
     ) -> (
         crate::broker::AbandonedSessionCloseOutcome,
-        u64,
+        Vec<String>,
         Vec<String>,
     ) {
         let recorder = crate::phase_telemetry::Recorder::default();
@@ -5062,19 +5063,22 @@ mod lane_tests {
             judge()
         };
         let attached = recorder.attachments();
-        let probed = attached
-            .get("worktree_activity_look")
-            .and_then(|looks| looks[look]["count"].as_u64())
-            .unwrap_or(0);
-        let avoided = attached
-            .get("worktree_activity_look_avoided")
-            .and_then(Value::as_object)
-            .map(|avoided| avoided.keys().cloned().collect())
-            .unwrap_or_default();
-        if probed == 0 {
-            assert_eq!(phase_count(&recorder, "worktree_status_activity"), 0);
+        let keys = |name: &str| -> Vec<String> {
+            attached
+                .get(name)
+                .and_then(Value::as_object)
+                .map(|keys| keys.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let taken = keys("worktree_activity_look");
+        if taken.iter().all(|taken| taken == look) {
+            assert_eq!(
+                phase_count(&recorder, "worktree_status_activity") > 0,
+                !taken.is_empty(),
+                "{look}"
+            );
         }
-        (outcome, probed, avoided)
+        (outcome, taken, keys("worktree_activity_look_avoided"))
     }
 
     fn close_landed_directly(
@@ -5097,8 +5101,8 @@ mod lane_tests {
     /// the probe; with an old index a new untracked file, which only the
     /// probe sees, still keeps it; and without that file the session closes
     /// after a probe. Mutations caught: the probe run first (first part), the
-    /// probe left out (second part: the landed lanes would then say the
-    /// checkout is unclean, and the other two would reach their next look).
+    /// probe left out or replaced by the index and `HEAD` (second part: no
+    /// probe is recorded, and the session is judged past its first look).
     #[test]
     fn every_close_lane_probes_only_when_the_index_does_not_decide() {
         use crate::broker::AbandonedSessionCloseOutcome as Outcome;
@@ -5134,7 +5138,11 @@ mod lane_tests {
             };
             assert_eq!(
                 judge(&mut broker),
-                (Outcome::NotDue, 0, vec![format!("{look}.recent_activity")]),
+                (
+                    Outcome::NotDue,
+                    Vec::new(),
+                    vec![format!("{look}.recent_activity")]
+                ),
                 "{lane}"
             );
 
@@ -5145,18 +5153,18 @@ mod lane_tests {
             std::fs::write(&deep, "more work\n").unwrap();
             assert_eq!(
                 judge(&mut broker),
-                (Outcome::NotDue, 1, Vec::new()),
+                (Outcome::NotDue, vec![look.clone()], Vec::new()),
                 "{lane}"
             );
             assert!(is_open(&broker, session.id), "{lane}");
 
             std::fs::remove_dir_all(deep.parent().unwrap()).unwrap();
             age(&mut broker, &session, hours);
-            assert_eq!(
-                judge(&mut broker),
-                (Outcome::Closed, 1, Vec::new()),
-                "{lane}"
-            );
+            let (outcome, taken, avoided) = judge(&mut broker);
+            assert_eq!(outcome, Outcome::Closed, "{lane}");
+            assert!(taken.contains(&look), "{lane}: {taken:?}");
+            assert!(taken.contains(&format!("{lane}_claimed")), "{lane}");
+            assert!(avoided.is_empty(), "{lane}: {avoided:?}");
             crate::host_boot::set_boot_time_ms_for_tests(None);
         }
     }
@@ -5191,13 +5199,13 @@ mod lane_tests {
             (unbound, Default::default(), "no_work_holder_unbound"),
             (alive, alive_table, "no_work_holder_alive"),
         ] {
-            let (outcome, probed, avoided) = looks("no_work_first", || {
+            let (outcome, taken, avoided) = looks("no_work_first", || {
                 close_no_work_directly(&mut broker, &session, &mut table)
             });
             assert_ne!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
             assert_eq!(
-                (probed, avoided),
-                (0, vec![format!("no_work_first.{code}")])
+                (taken, avoided),
+                (Vec::new(), vec![format!("no_work_first.{code}")])
             );
         }
     }
@@ -5225,73 +5233,112 @@ mod lane_tests {
                 )),
                 (
                     declined(reason),
-                    0,
+                    Vec::new(),
                     vec![format!("landed_first.{}", reason.code())]
                 )
             );
         }
     }
 
-    /// The merged-pull-request lane: a live holder of this session, and the
-    /// explicit lease of one that moved on, are known without the probe. A
-    /// session with a proof-timeout streak is proved before its lease is
-    /// asked, so the streak can end.
+    /// The landed lane: a checkout the cleanup policy pins, a policy that
+    /// turns removal off and one that cannot be read.
     #[test]
-    fn a_cheap_merged_refusal_runs_no_probe() {
-        use crate::broker::AbandonedSessionCloseOutcome as Outcome;
+    fn a_cleanup_policy_that_keeps_a_landed_session_runs_no_probe() {
         use crate::broker::LandedSessionDecline as Decline;
         let (_owner, _storage, mut broker) = fixture("");
+        let (landed, worktree) = session(&mut broker, "landed", true);
+        quiet(&mut broker, &landed, 30);
+        let pinned = format!(
+            "[cleanup]\nkeep = [\"{}\"]\n",
+            worktree.file_name().unwrap().to_string_lossy()
+        );
+        for (config, reason) in [
+            (pinned.as_str(), Decline::Pinned),
+            (
+                "[cleanup]\nauto_remove = false\n",
+                Decline::AutoRemoveDisabled,
+            ),
+            ("[cleanup]\nauto_remove = 3\n", Decline::PolicyUnavailable),
+        ] {
+            std::fs::write(
+                broker.main_root().join(".aethyme/config.toml"),
+                config.as_bytes(),
+            )
+            .unwrap();
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            assert_eq!(
+                looks("landed_first", || close_landed_directly(
+                    &mut broker,
+                    &landed,
+                    &mut table
+                )),
+                (
+                    declined(reason),
+                    Vec::new(),
+                    vec![format!("landed_first.{}", reason.code())]
+                )
+            );
+        }
+    }
+
+    /// Before the pass took a process table, the no-work lane lists no
+    /// process ahead of the probe: a live holder is learned after it.
+    #[test]
+    fn the_no_work_lane_lists_no_process_before_the_probe() {
+        let (_owner, _storage, mut broker) = fixture("");
         let holder = live_holder();
-        let (current, _) = merged_candidate(&mut broker, "the holder's session");
-        let mut table = held_by_live_holder(&mut broker, &current, &holder, 3);
+        let (alive, _) = no_work_session(&mut broker, "holder runs, no table yet");
+        bind_holder(&mut broker, &alive, &holder);
+        age(&mut broker, &alive, 5);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.queue_process_table_for_test(Some(crate::session_holder::ProcessTable::parse(
+            &format!("{} 1 {} {}\n", holder.pid, holder.started, holder.command),
+        )));
+        let judged = looks("no_work_first", || {
+            close_no_work_directly(&mut broker, &alive, &mut table)
+        });
         assert_eq!(
-            looks("merged_pull_request_first", || close_directly(
-                &mut broker,
-                &current,
-                &mut table
-            )),
+            judged,
             (
-                declined(Decline::HolderAlive),
-                0,
-                vec!["merged_pull_request_first.holder_alive_current".to_string()]
+                crate::broker::AbandonedSessionCloseOutcome::ActiveProcess,
+                vec!["no_work_first".to_string()],
+                Vec::new()
             )
         );
+        assert_eq!(table.snapshots_taken_for_test(), 1);
+    }
 
-        let (leased, _) = merged_candidate(&mut broker, "moved on, still leased");
-        broker
-            .store()
-            .claim_lease(leased.id, "base.txt", None)
-            .unwrap();
-        let mut table = held_by_live_holder(&mut broker, &leased, &holder, 3);
-        let (newer, _) = session(&mut broker, "the agent's next task", false);
-        bind_holder(&mut broker, &newer, &holder);
-        assert_eq!(
-            looks("merged_pull_request_first", || close_directly(
-                &mut broker,
-                &leased,
-                &mut table
-            )),
-            (
-                Outcome::LeaseHeld,
-                0,
-                vec!["merged_pull_request_first.lease_held".to_string()]
-            )
-        );
-
-        broker
-            .store_ref()
-            .meta_set(
-                crate::broker::LANDED_PROOF_TIMEOUTS_KEY,
-                &format!("{{\"{}\":[1,1]}}", leased.id),
-            )
-            .unwrap();
-        assert_eq!(
-            looks("merged_pull_request_first", || close_directly(
-                &mut broker,
-                &leased,
-                &mut table
-            )),
-            (Outcome::LeaseHeld, 1, Vec::new())
-        );
+    /// A missing checkout has nothing to probe: a look no cheap check refuses
+    /// is counted without one, and a refused one is not counted as avoided.
+    #[test]
+    fn a_missing_checkout_is_neither_probed_nor_counted_as_avoided() {
+        let (_owner, _storage, mut broker) = fixture("");
+        for claimed in [false, true] {
+            let (gone, worktree) = no_work_session(&mut broker, "checkout gone");
+            if claimed {
+                broker
+                    .store()
+                    .claim_lease(gone.id, "base.txt", None)
+                    .unwrap();
+            }
+            quiet(&mut broker, &gone, 5);
+            std::fs::remove_dir_all(&worktree).unwrap();
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                close_no_work_directly(&mut broker, &gone, &mut table);
+            }
+            assert!(is_open(&broker, gone.id));
+            let attached = recorder.attachments();
+            assert_eq!(
+                attached
+                    .get("worktree_activity_look")
+                    .is_some_and(|looks| looks["no_work_first"]["count"] == 1),
+                !claimed
+            );
+            assert!(attached.get("worktree_activity_look_avoided").is_none());
+            assert_eq!(phase_count(&recorder, "worktree_status_activity"), 0);
+        }
     }
 }
