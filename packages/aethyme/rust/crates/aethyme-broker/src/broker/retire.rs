@@ -9246,7 +9246,8 @@ mod tests {
         assert_eq!(lane.retired, 0, "{lane:#?}");
         let stored = broker.checkout_retirement_lane_record();
         assert_eq!(stored.last_end_reason, lane.end_reason);
-        assert!(stored.last_at_ms > 0);
+        // Only a run with a slice sets the time.
+        assert_eq!(stored.last_at_ms > 0, lane.slices > 0, "{lane:#?}");
     }
 
     /// Runs `hook` before each timed step of a judgement, until dropped.
