@@ -9,6 +9,8 @@
 //! The broker can answer this directly: it knows the session's baseline, the
 //! paths its commits touch, and which promoted entry introduced each path.
 
+use std::collections::HashSet;
+
 use crate::{Broker, BrokerOpError};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -38,6 +40,7 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<Vec<RenamedTarget>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("session_renamed_targets");
         let session = self.store().session(session_id)?;
         let Some(baseline) = session
             .adoption_base
@@ -64,18 +67,28 @@ impl Broker {
 
         // Bounded to what this session actually changed, not a whole-tree scan.
         let repo = self.repo_handle();
-        let mut touched: Vec<String> = Vec::new();
-        for commit in repo
+        let commits = repo
             .commits_between_oldest(&baseline, &head)
-            .unwrap_or_default()
-        {
-            for (_status, path) in repo.commit_changed_paths(&commit).unwrap_or_default() {
-                if !touched.contains(&path) {
-                    touched.push(path);
-                }
-            }
-        }
-        touched.retain(|path| repo.blob_at(&integration_tip, path).is_none());
+            .unwrap_or_default();
+        // One listing for all commits. If it fails, ask per commit, so one
+        // commit that cannot be read costs only its own paths.
+        let changed = repo.commits_changed_paths(&commits).unwrap_or_else(|_| {
+            commits
+                .iter()
+                .flat_map(|commit| repo.commit_changed_paths(commit).unwrap_or_default())
+                .collect()
+        });
+        let mut seen = HashSet::new();
+        let mut touched = changed
+            .into_iter()
+            .map(|(_status, path)| path)
+            .filter(|path| seen.insert(path.clone()))
+            .collect::<Vec<_>>();
+        // A listed path exists; nothing listed means every path is asked below.
+        let listed = repo
+            .paths_listed_at(&integration_tip, &touched)
+            .unwrap_or_default();
+        touched.retain(|path| !listed.contains(path));
         if touched.is_empty() {
             return Ok(Vec::new());
         }
@@ -90,6 +103,13 @@ impl Broker {
                 // operator's conflict to resolve, not ours to reinterpret.
                 continue;
             };
+            if self
+                .repo_handle()
+                .blob_at(&integration_tip, &path)
+                .is_some()
+            {
+                continue;
+            }
             let owner = self.promoted_entry_introducing(new_path);
             found.push(RenamedTarget {
                 from: path,

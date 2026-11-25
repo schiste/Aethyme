@@ -5599,3 +5599,53 @@ Whether the `archive_failed` keeps above follow from deadline cuts is not
 verified. Readers must accept the new keep reasons, fields, counters and spans.
 Covered by tests in `broker/retire.rs`, `cleanup_resolve.rs`, `auto_cleanup.rs`
 and `storage_ledger/tests.rs`.
+
+### Carried ownership on re-adoption (2026-11-25)
+
+Introduced 2026-11-25. `broker start --adopt` after a closed session no longer
+builds a submission plan against the local integration ref while it holds the
+repository lifecycle claim. In a repository that lands work only through pull
+requests that ref is stale, and the plan hashed every commit between it and the
+session's HEAD.
+
+- `carried_ownership.pending_owned_commits` is the submission plan's pending owned
+  count against the integration view, minus the commits reachable from the fetched
+  remote default branch. Only reachability counts there, never a patch match: a
+  patch cannot tell a landed commit from the same change applied again after a
+  revert. Squash- and rebase-landed commits stay carried, as before. When
+  reachability took commits out and nothing pending is left, the owned commits
+  that remain and that integration holds only by patch match (one or several) keep
+  the boundary and are what is counted, so the count is then not what submit
+  replays. When it took nothing out, the answer is exactly the plan's.
+- The default branch is `refs/remotes/origin/HEAD` only, never the main checkout's
+  `@{upstream}`; origin is trusted as the landing remote, as auto-cleanup does.
+  Without it, when it names the previous session's own branch, or when it cannot
+  be read, the answer is integration's alone.
+- A wrongly omitted commit loses its owner: `adoption_base`, `diff_base` and
+  `adopted_head` all become `HEAD`, submit replays nothing and the unsubmitted and
+  unpushed guards of `finish` no longer see the work. A patch match against
+  integration still omits a commit exactly as the plan does, reland included.
+- Where the plan failed on history it did not need (an unreadable inherited blob,
+  a timeout), ownership was dropped and is now carried, and `integration_drift`
+  can name commits that are safe to submit. Otherwise `integration_drift` is
+  unchanged, its base included.
+- Only adoption changed. Other commands that build a submission plan, `finish`
+  among them, still hash the history they did.
+- Span `adopt_carried_ownership` covers the ownership carry and span
+  `adopt_drift_report` the drift report, on every adoption path that runs them.
+- Span `adopt_ownership_candidates`, inside either, covers listing the base's
+  commits and the changed paths that decide which are hashed.
+- Metric attachment `adopt_ownership`: `carried_commits_hashed` and
+  `drift_commits_hashed`, the commits each one handed to patch hashing, counted
+  before the attempt so a timeout is not 0. A key is absent
+  when that step did not run. Counts only: no path, id or branch name.
+- Counter `adopt_carried_ownership_error`: the carry returned an error, which
+  leaves the baseline at `HEAD`. An ancestry test that fails reads as "not an
+  ancestor" and is not counted. Counter `adopt_carried_default_unreadable`: the
+  listing that excludes the default branch failed and was retried without it; an
+  `origin/HEAD` that is missing or does not resolve is not counted.
+- Span `session_renamed_targets` covers the renamed-path advisory, which now lists
+  the changed paths of all commits at once; its answer is unchanged.
+
+Readers must accept the new spans and attachment. Covered by tests in
+`submission_ownership.rs`.
