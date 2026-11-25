@@ -8,10 +8,15 @@
 //! branch cut from a default branch far ahead of a local integration ref that
 //! nothing moves carried all of that drift through one patch stream there.
 //!
-//! The answers here are the plan's, computed from fewer commits. What is left
-//! out cannot change them: an inherited commit is never owned, a commit the
-//! base reaches is integrated by ancestry whatever its patch, and two commits
-//! that change different path sets never share a patch identity.
+//! Against one base the pending commits are the plan's, computed from fewer
+//! commits. What is left out cannot change them: an inherited commit is never
+//! owned, a commit the base reaches is integrated by ancestry whatever its
+//! patch, and two commits that change different path sets never share a patch
+//! identity. Where the plan fails on history it did not need, these answer.
+//!
+//! [`Broker::carried_ownership`] starts from that answer for integration and
+//! additionally removes what the remote default branch proves delivered, by a
+//! stricter rule than the plan's: see [`Delivery`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -111,10 +116,103 @@ impl<'a> OwnedRange<'a> {
     }
 }
 
+/// How a commit its base does not reach compares with that base.
+enum Comparison {
+    /// A merge whose second parent the base reaches and whose tree is that
+    /// parent's: it adds nothing.
+    ExactSync,
+    /// The base's first-parent commits, beyond the recorded baseline, with the
+    /// same patch.
+    Patches(Vec<String>),
+}
+
+impl Comparison {
+    /// The state [`Broker::build_submission_plan`] gives the commit.
+    fn plan_state(&self) -> SubmissionIntegrationState {
+        match self {
+            Self::ExactSync => SubmissionIntegrationState::AlreadyIntegratedByAncestry,
+            Self::Patches(matches) => match matches.len() {
+                0 => SubmissionIntegrationState::Pending,
+                1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
+                _ => SubmissionIntegrationState::Ambiguous,
+            },
+        }
+    }
+}
+
+/// Whether the remote default branch proves a commit delivered, where a wrong
+/// yes drops the commit's owner for good.
+///
+/// A matching commit proves it only when it is not an ancestor of the owned
+/// commit itself. An ancestor landed before the owned commit was written, so
+/// it is an earlier landing of the same change -- one that was since reverted,
+/// and that the owned commit applies again -- never the owned commit's own.
+/// The question is asked of the owned commit and not of the session HEAD: a
+/// session that merges the default branch after its commit landed has the
+/// landing in its history, after that commit.
+///
+/// Ignoring ancestors is exactly comparing with the default branch's history
+/// since the owned commit's fork point. One match there is one landing after
+/// that point, the same evidence whatever happened before it; two or more stay
+/// ambiguous, and ambiguous is not delivered.
+struct Delivery {
+    /// For each matching commit in the session's history, the commits there
+    /// that descend from it.
+    descendants: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Delivery {
+    /// `history` is the session's commits beyond the baseline every match is
+    /// also beyond, parents before children.
+    fn new(compared: &[(String, Comparison)], history: &[(String, Vec<String>)]) -> Self {
+        let matched = compared
+            .iter()
+            .filter_map(|(_, comparison)| match comparison {
+                Comparison::Patches(matches) => Some(matches),
+                Comparison::ExactSync => None,
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let descendants = history
+            .iter()
+            .filter(|(commit, _)| matched.contains(commit))
+            .map(|(landing, _)| {
+                let mut reached = BTreeSet::from([landing.clone()]);
+                for (commit, parents) in history {
+                    if parents.iter().any(|parent| reached.contains(parent)) {
+                        reached.insert(commit.clone());
+                    }
+                }
+                (landing.clone(), reached)
+            })
+            .collect();
+        Self { descendants }
+    }
+
+    fn proven(&self, commit: &str, comparison: &Comparison) -> bool {
+        match comparison {
+            Comparison::ExactSync => true,
+            Comparison::Patches(matches) => {
+                matches
+                    .iter()
+                    .filter(|landing| {
+                        !self
+                            .descendants
+                            .get(*landing)
+                            .is_some_and(|reached| reached.contains(commit))
+                    })
+                    .count()
+                    == 1
+            }
+        }
+    }
+}
+
 /// Patch identities computed for one answer, shared by its comparisons.
 #[derive(Default)]
 struct PatchWork {
     cache: PatchIdCache,
+    /// Commits handed to hashing, counted before the attempt.
     hashed: usize,
 }
 
@@ -124,13 +222,18 @@ impl Broker {
     /// baseline at `head`.
     ///
     /// A commit is undelivered when the integration view holds it pending and
-    /// the fetched default branch, where pull requests land, does not prove it
-    /// delivered. So this is the integration answer minus proven deliveries:
-    /// work promoted into integration but not yet on the default branch stays
-    /// delivered, and only positive evidence on the default branch (ancestry,
-    /// an exact sync merge, or one patch-equivalent commit) can take a commit
-    /// out of the count. An ambiguous match there or a comparison that fails
-    /// proves nothing and leaves the commit owned.
+    /// the fetched remote default branch, where pull requests land, does not
+    /// prove it delivered. So this is the integration answer minus proven
+    /// deliveries: work promoted into integration but not yet on the default
+    /// branch stays delivered, and only positive evidence on the default
+    /// branch (ancestry, an exact sync merge, or one [`Delivery`] match) can
+    /// take a commit out of the count. Anything that cannot be read or
+    /// compared there leaves the commit owned.
+    ///
+    /// Only `refs/remotes/origin/HEAD` names that branch. The main checkout's
+    /// `@{upstream}` can be a session's own pushed branch or a local one, and
+    /// being contained there is not landing. Without it, the answer is
+    /// integration's alone.
     pub(crate) fn carried_ownership(
         &self,
         previous: &Session,
@@ -138,7 +241,8 @@ impl Broker {
     ) -> Option<AdoptCarriedOwnership> {
         let _span = crate::phase_telemetry::span("adopt_carried_ownership");
         let mut work = PatchWork::default();
-        let pending = self.undelivered_owned(previous, head, &mut work);
+        let upstream = self.remote_default_ref_and_tip().map(|(_, commit)| commit);
+        let pending = self.undelivered_owned(previous, head, upstream.as_deref(), &mut work);
         crate::phase_telemetry::attach(
             "adopt_ownership",
             serde_json::json!({ "carried_commits_hashed": work.hashed }),
@@ -155,43 +259,70 @@ impl Broker {
         &self,
         session: &Session,
         head: &str,
+        upstream: Option<&str>,
         work: &mut PatchWork,
     ) -> Result<Option<(String, usize)>, BrokerOpError> {
         let repo = self.repo_handle();
         let (_, integration) = self.integration_head_snapshot()?;
-        let upstream = self
-            .upstream_verification_head()
-            .map(|(_, commit)| commit)
-            .filter(|commit| *commit != integration);
+        let upstream = upstream.filter(|commit| *commit != integration);
         let checkpoint = OwnershipCheckpoint::select(repo, session, head);
         let Some(range) = OwnedRange::select(repo, &checkpoint, head, &integration) else {
             return Ok(None);
         };
         let baseline = range.baseline();
-        let mut bases = vec![integration.as_str()];
-        bases.extend(upstream.as_deref());
-        let outside = range.owned_outside(repo, head, &bases)?;
-        let mut pending = self
-            .states_outside(&outside, &integration, baseline, work)?
+        // A default branch that cannot be read proves nothing, and must not
+        // cost the answer integration gives without it.
+        let beyond_both = upstream.and_then(|upstream| {
+            range
+                .owned_outside(repo, head, &[&integration, upstream])
+                .ok()
+                .map(|outside| (outside, upstream))
+        });
+        let (outside, upstream) = match beyond_both {
+            Some((outside, upstream)) => (outside, Some(upstream)),
+            None => (range.owned_outside(repo, head, &[&integration])?, None),
+        };
+        let pending = self
+            .compare_outside(&outside, &integration, baseline, work)?
             .into_iter()
-            .filter(|(_, state)| *state == SubmissionIntegrationState::Pending)
+            .filter(|(_, comparison)| {
+                comparison.plan_state() == SubmissionIntegrationState::Pending
+            })
             .map(|(commit, _)| commit)
             .collect::<Vec<_>>();
-        if let Some(upstream) = &upstream
-            && let Ok(states) = self.states_outside(&pending, upstream, baseline, work)
-        {
-            pending = states
-                .into_iter()
-                .filter(|(_, state)| {
-                    matches!(
-                        state,
-                        SubmissionIntegrationState::Pending | SubmissionIntegrationState::Ambiguous
-                    )
-                })
-                .map(|(commit, _)| commit)
-                .collect();
-        }
-        Ok(Some((baseline.to_string(), pending.len())))
+        let delivered = upstream
+            .and_then(|upstream| {
+                self.proven_deliveries(&pending, head, upstream, baseline, work)
+                    .ok()
+            })
+            .unwrap_or(0);
+        Ok(Some((baseline.to_string(), pending.len() - delivered)))
+    }
+
+    /// How many of `commits` `upstream` proves delivered.
+    fn proven_deliveries(
+        &self,
+        commits: &[String],
+        head: &str,
+        upstream: &str,
+        baseline: &str,
+        work: &mut PatchWork,
+    ) -> Result<usize, BrokerOpError> {
+        let compared = self.compare_outside(commits, upstream, baseline, work)?;
+        let any_match = compared.iter().any(|(_, comparison)| {
+            matches!(comparison, Comparison::Patches(matches) if !matches.is_empty())
+        });
+        let history = if any_match {
+            self.repo_handle()
+                .parents_excluding_oldest(head, baseline)?
+        } else {
+            Vec::new()
+        };
+        let delivery = Delivery::new(&compared, &history);
+        Ok(compared
+            .iter()
+            .filter(|(commit, comparison)| delivery.proven(commit, comparison))
+            .count())
     }
 
     /// How many owned commits a submission against `base` would replay, when
@@ -237,14 +368,18 @@ impl Broker {
         } else {
             repo.commits_excluding_oldest(session_head, base)?
         };
-        let states = self.states_outside(&judged, base, range.baseline(), work)?;
+        let compared = self.compare_outside(&judged, base, range.baseline(), work)?;
+        let states = compared
+            .iter()
+            .map(|(commit, comparison)| (commit, comparison.plan_state()))
+            .collect::<Vec<_>>();
         if states
             .iter()
             .any(|(_, state)| *state == SubmissionIntegrationState::Ambiguous)
         {
             return Ok(0);
         }
-        let owned = owned.into_iter().collect::<BTreeSet<_>>();
+        let owned = owned.iter().collect::<BTreeSet<_>>();
         Ok(states
             .iter()
             .filter(|(commit, state)| {
@@ -253,15 +388,15 @@ impl Broker {
             .count())
     }
 
-    /// The integration state a plan against `base` gives each of `commits`,
-    /// in order. Every commit must be one `base` does not reach.
-    fn states_outside(
+    /// How each of `commits` compares with `base`, in order. Every commit
+    /// must be one `base` does not reach.
+    fn compare_outside(
         &self,
         commits: &[String],
         base: &str,
         baseline: &str,
         work: &mut PatchWork,
-    ) -> Result<Vec<(String, SubmissionIntegrationState)>, BrokerOpError> {
+    ) -> Result<Vec<(String, Comparison)>, BrokerOpError> {
         if commits.is_empty() {
             return Ok(Vec::new());
         }
@@ -293,36 +428,61 @@ impl Broker {
             .filter(|commit| !synced.contains(commit) && !shapes[*commit].parents.is_empty())
             .map(|commit| (commit.clone(), true))
             .collect::<Vec<_>>();
-        let matches = if compared.is_empty() {
-            BTreeMap::new()
-        } else {
-            let candidates = repo.first_parent_commits_excluding_oldest(base, baseline)?;
-            let candidate_shapes = repo.commit_shapes(&candidates)?;
-            let candidates = candidates
-                .into_iter()
-                .map(|commit| {
-                    let has_parent = !candidate_shapes[&commit].parents.is_empty();
-                    (commit, has_parent)
-                })
-                .collect::<Vec<_>>();
-            let (matches, hashed) =
-                repo.patch_equivalent_counts(&compared, &candidates, &mut work.cache)?;
-            work.hashed += hashed;
-            matches
-        };
+        let mut matches = self.patch_matches(&compared, base, baseline, work)?;
         Ok(commits
             .iter()
             .map(|commit| {
-                let state = if synced.contains(commit) {
-                    SubmissionIntegrationState::AlreadyIntegratedByAncestry
+                let comparison = if synced.contains(commit) {
+                    Comparison::ExactSync
                 } else {
-                    match matches.get(commit).copied().unwrap_or(0) {
-                        0 => SubmissionIntegrationState::Pending,
-                        1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
-                        _ => SubmissionIntegrationState::Ambiguous,
-                    }
+                    Comparison::Patches(matches.remove(commit).unwrap_or_default())
                 };
-                (commit.clone(), state)
+                (commit.clone(), comparison)
+            })
+            .collect())
+    }
+
+    /// `base`'s first-parent commits beyond `baseline` carrying the same patch
+    /// as each of `compared`; a commit without one is absent.
+    fn patch_matches(
+        &self,
+        compared: &[(String, bool)],
+        base: &str,
+        baseline: &str,
+        work: &mut PatchWork,
+    ) -> Result<BTreeMap<String, Vec<String>>, BrokerOpError> {
+        if compared.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let repo = self.repo_handle();
+        let (candidates, comparable) = {
+            let _span = crate::phase_telemetry::span("adopt_ownership_candidates");
+            let candidates = repo.first_parent_commits_excluding_oldest(base, baseline)?;
+            let shapes = repo.commit_shapes(&candidates)?;
+            let candidates = candidates
+                .into_iter()
+                .map(|commit| {
+                    let has_parent = !shapes[&commit].parents.is_empty();
+                    (commit, has_parent)
+                })
+                .collect::<Vec<_>>();
+            let comparable =
+                repo.commits_sharing_changed_paths(compared, &candidates, &mut work.cache)?;
+            (candidates, comparable)
+        };
+        work.hashed += repo.uncached_patch_id_count(&comparable, &work.cache);
+        let patch_ids = repo.cached_first_parent_patch_ids(&comparable, &mut work.cache)?;
+        let mut by_patch = BTreeMap::<&str, Vec<String>>::new();
+        for (candidate, _) in &candidates {
+            if let Some(patch) = patch_ids.get(candidate) {
+                by_patch.entry(patch).or_default().push(candidate.clone());
+            }
+        }
+        Ok(compared
+            .iter()
+            .filter_map(|(commit, _)| {
+                let matches = by_patch.get(patch_ids.get(commit)?.as_str())?;
+                Some((commit.clone(), matches.clone()))
             })
             .collect())
     }
@@ -448,7 +608,13 @@ mod tests {
             };
             assert_eq!(recorder.totals().1["adopt_carried_ownership"], 1);
             if let Some(carried) = &carried {
-                assert_eq!(Some(&carried.baseline), session.diff_base.as_ref());
+                let plan = self
+                    .broker
+                    .build_submission_plan(session, &self.head(), &self.base)
+                    .ok();
+                if let Some(plan) = plan {
+                    assert_eq!(Some(&carried.baseline), plan.recorded_baseline.as_ref());
+                }
                 assert_eq!(carried.from_session, session.id);
             }
             (
@@ -663,6 +829,198 @@ mod tests {
         );
         assert_eq!(fixture.carried(&session).0, None);
         commit(&fixture.work, "mine.txt", "mine\n");
+        assert_eq!(fixture.carried(&session).0, Some(1));
+    }
+
+    /// The review's reproduction: the session's change landed, was reverted on
+    /// the default branch, and the rebased session applies it again.
+    #[test]
+    fn a_reland_is_not_delivered_by_the_landing_it_descends_from() {
+        let mut fixture = Fixture::new();
+        fixture.set_integration(&fixture.base);
+        let session = fixture.adopt();
+        let first = commit(&fixture.work, "owned.txt", "owned\n");
+        fixture.land(&first);
+        git(&fixture.root, &["revert", "--no-edit", "HEAD"]);
+        let reverted = git(&fixture.root, &["rev-parse", "HEAD"]);
+        fixture.set_upstream(&reverted);
+        git(&fixture.work, &["reset", "-q", "--hard", &reverted]);
+        git(&fixture.work, &["revert", "--no-edit", "HEAD"]);
+        let reland = fixture.head();
+        assert_eq!(fixture.carried(&session).0, Some(1));
+
+        // Landed again: one landing is newer than the reland itself.
+        let landed = fixture.land(&reland);
+        fixture.set_upstream(&landed);
+        assert_eq!(fixture.carried(&session).0, None);
+
+        // Twice more is ambiguous again.
+        git(&fixture.root, &["revert", "--no-edit", "HEAD"]);
+        let again = fixture.land(&reland);
+        fixture.set_upstream(&again);
+        assert_eq!(fixture.carried(&session).0, Some(1));
+    }
+
+    /// The landing is in the session HEAD's history, but not in the owned
+    /// commit's; a reland on top of the merge is its own question.
+    #[test]
+    fn merging_the_default_branch_after_landing_keeps_a_commit_delivered() {
+        let mut fixture = Fixture::new();
+        fixture.set_integration(&fixture.base);
+        let session = fixture.adopt();
+        let owned = commit(&fixture.work, "owned.txt", "owned\n");
+        let landed = fixture.land(&owned);
+        fixture.set_upstream(&landed);
+        git(&fixture.work, &["merge", "-q", "--no-edit", "main"]);
+        assert_eq!(fixture.carried(&session).0, None);
+
+        git(&fixture.root, &["revert", "--no-edit", "HEAD"]);
+        fixture.set_upstream(&git(&fixture.root, &["rev-parse", "HEAD"]));
+        git(&fixture.work, &["merge", "-q", "--no-edit", "main"]);
+        git(&fixture.work, &["revert", "--no-edit", "main"]);
+        assert_eq!(fixture.carried(&session).0, Some(1), "the reland is owned");
+    }
+
+    /// The main checkout's `@{upstream}` is not where pull requests land.
+    #[test]
+    fn without_origin_head_the_main_checkouts_upstream_proves_nothing() {
+        for local in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.set_integration(&fixture.base);
+            let session = fixture.adopt();
+            let owned = commit(&fixture.work, "owned.txt", "owned\n");
+            let (remote, merge) = if local {
+                (".", "refs/heads/work")
+            } else {
+                git(
+                    &fixture.root,
+                    &["update-ref", "refs/remotes/origin/work", &owned],
+                );
+                git(&fixture.root, &["config", "remote.origin.url", "."]);
+                git(
+                    &fixture.root,
+                    &[
+                        "config",
+                        "remote.origin.fetch",
+                        "+refs/heads/*:refs/remotes/origin/*",
+                    ],
+                );
+                ("origin", "refs/heads/work")
+            };
+            git(&fixture.root, &["config", "branch.main.remote", remote]);
+            git(&fixture.root, &["config", "branch.main.merge", merge]);
+            assert_eq!(
+                git(&fixture.root, &["rev-parse", "@{upstream}"]),
+                owned,
+                "the misleading upstream resolves"
+            );
+            assert_eq!(fixture.carried(&session).0, Some(1), "local: {local}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_default_branch_leaves_the_integration_answer() {
+        let mut fixture = Fixture::new();
+        fixture.set_integration(&fixture.base);
+        let session = fixture.adopt();
+        commit(&fixture.work, "owned.txt", "owned\n");
+        let upstream = commit(&fixture.root, "other.txt", "other\n");
+        fixture.set_upstream(&upstream);
+        git(
+            &fixture.root,
+            &["update-ref", "refs/heads/main", &fixture.tip],
+        );
+        std::fs::remove_file(
+            fixture
+                .root
+                .join(".git/objects")
+                .join(&upstream[..2])
+                .join(&upstream[2..]),
+        )
+        .unwrap();
+        assert_eq!(fixture.carried(&session).0, Some(1), "the tip is gone");
+
+        // A tip that resolved but cannot be walked fails the listing itself.
+        let head = fixture.head();
+        assert!(
+            fixture
+                .broker
+                .repo_handle()
+                .commits_excluding_all_oldest(&head, &[&fixture.base, &upstream])
+                .is_err()
+        );
+        let (_, pending) = fixture
+            .broker
+            .undelivered_owned(&session, &head, Some(&upstream), &mut PatchWork::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn accepted_and_repaired_checkpoints_start_ownership_where_the_plan_does() {
+        let mut fixture = Fixture::new();
+        fixture.set_integration(&fixture.base);
+        let adopted = fixture.adopt();
+        let accepted = commit(&fixture.work, "accepted.txt", "accepted\n");
+        commit(&fixture.work, "later.txt", "later\n");
+        fixture.set_upstream(&fixture.tip);
+
+        let mut session = adopted.clone();
+        session.accepted_session_head = Some(accepted.clone());
+        assert_eq!(fixture.planned(&session, &fixture.base), 1);
+        assert_eq!(fixture.carried(&session).0, Some(1));
+
+        // The accepted checkpoint was rewritten and the broker recorded a
+        // repair baseline; without one, ownership is ambiguous.
+        git(
+            &fixture.root,
+            &["checkout", "-q", "--detach", &fixture.base],
+        );
+        let rewritten = commit(&fixture.root, "gone.txt", "gone\n");
+        git(&fixture.root, &["checkout", "-q", "main"]);
+        session.accepted_session_head = Some(rewritten);
+        assert_eq!(fixture.planned(&session, &fixture.base), 0);
+        assert_eq!(fixture.carried(&session).0, None);
+        session.diff_base = Some(accepted);
+        assert_eq!(fixture.planned(&session, &fixture.base), 1);
+        assert_eq!(fixture.carried(&session).0, Some(1));
+    }
+
+    #[test]
+    fn mode_only_merge_and_empty_commits_answer_as_the_plan_does() {
+        let mut fixture = Fixture::new();
+        let session = fixture.adopt();
+        git(&fixture.work, &["update-index", "--chmod=+x", "base.txt"]);
+        git(&fixture.work, &["commit", "-qm", "mode"]);
+        git(&fixture.work, &["checkout", "-q", "--", "base.txt"]);
+        let mode = fixture.head();
+        git(
+            &fixture.work,
+            &["commit", "-q", "--allow-empty", "-m", "empty"],
+        );
+        git(&fixture.work, &["checkout", "-q", "-b", "side"]);
+        commit(&fixture.work, "side.txt", "side\n");
+        git(&fixture.work, &["checkout", "-q", "work"]);
+        git(
+            &fixture.work,
+            &["merge", "-q", "--no-ff", "-m", "merge", "side"],
+        );
+        let merge = fixture.head();
+
+        fixture.set_integration(&fixture.base);
+        assert_eq!(fixture.planned(&session, &fixture.base), 4);
+        assert_eq!(fixture.carried(&session).0, Some(4));
+
+        fixture.land(&mode);
+        git(&fixture.root, &["cherry-pick", "-x", "-m", "1", &merge]);
+        let landed = git(&fixture.root, &["rev-parse", "HEAD"]);
+        // The side commit has the merge's patch, so only the empty commit is
+        // left, whichever branch holds the landings.
+        fixture.set_upstream(&landed);
+        assert_eq!(fixture.planned(&session, &landed), 1);
+        assert_eq!(fixture.carried(&session).0, Some(1));
+        fixture.set_integration(&landed);
         assert_eq!(fixture.carried(&session).0, Some(1));
     }
 

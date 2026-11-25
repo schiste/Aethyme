@@ -7253,42 +7253,45 @@ impl GitRepo {
         })
     }
 
-    /// How many of `candidates` carry the same patch as each of `listed`
-    /// (commits without a match are absent), and how many commits were hashed
-    /// to tell. Each side is `(commit, has a parent)`; the sides are disjoint.
-    ///
-    /// Commits with the same patch id change the same paths, so every match is
-    /// among the commits [`Self::commits_sharing_changed_paths`] keeps.
-    pub(crate) fn patch_equivalent_counts(
+    /// How many of `commits` [`Self::cached_first_parent_patch_ids`] would hash.
+    pub(crate) fn uncached_patch_id_count(
         &self,
-        listed: &[(String, bool)],
-        candidates: &[(String, bool)],
-        cache: &mut PatchIdCache,
-    ) -> Result<(BTreeMap<String, usize>, usize), GitError> {
-        let comparable = self.commits_sharing_changed_paths(listed, candidates, cache)?;
-        let hashed = comparable
+        commits: &[String],
+        cache: &PatchIdCache,
+    ) -> usize {
+        commits
             .iter()
             .filter(|commit| {
                 !cache
                     .entries
                     .contains_key(&(self.root.clone(), (*commit).clone()))
             })
-            .count();
-        let patch_ids = self.cached_first_parent_patch_ids(&comparable, cache)?;
-        let mut by_patch = BTreeMap::<&str, usize>::new();
-        for (candidate, _) in candidates {
-            if let Some(patch) = patch_ids.get(candidate) {
-                *by_patch.entry(patch).or_default() += 1;
-            }
-        }
-        let counts = listed
-            .iter()
-            .filter_map(|(commit, _)| {
-                let count = by_patch.get(patch_ids.get(commit)?.as_str())?;
-                Some((commit.clone(), *count))
+            .count()
+    }
+
+    /// Every commit `head` has and `excluded` lacks with its parents, parents
+    /// before children.
+    pub(crate) fn parents_excluding_oldest(
+        &self,
+        head: &str,
+        excluded: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, GitError> {
+        let args = [
+            "rev-list",
+            "--topo-order",
+            "--reverse",
+            "--parents",
+            head,
+            "--not",
+            excluded,
+        ];
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace().map(str::to_string);
+                Some((fields.next()?, fields.collect()))
             })
-            .collect();
-        Ok((counts, hashed))
+            .collect())
     }
 
     /// The commits of two sides whose patch ids can decide patch equivalence
@@ -7306,7 +7309,7 @@ impl GitRepo {
     ///
     /// Narrowing can only withhold an equivalence, never invent one, and a
     /// listing that is unavailable falls back to every commit.
-    fn commits_sharing_changed_paths(
+    pub(crate) fn commits_sharing_changed_paths(
         &self,
         left: &[(String, bool)],
         right: &[(String, bool)],
@@ -7418,7 +7421,7 @@ impl GitRepo {
 
     /// Reuse only successful, complete batches; missing IDs represent empty
     /// diffs, never errors. Callers still perform their exact tree checks.
-    fn cached_first_parent_patch_ids(
+    pub(crate) fn cached_first_parent_patch_ids(
         &self,
         commits: &[String],
         cache: &mut PatchIdCache,

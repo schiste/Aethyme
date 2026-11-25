@@ -5609,16 +5609,30 @@ requests that ref is stale, and the plan hashed every commit between it and the
 session's HEAD.
 
 - `carried_ownership.pending_owned_commits` counts owned commits that the
-  integration view holds pending and the fetched default branch does not prove
-  delivered (ancestry, an exact sync merge, or one patch-equivalent commit). It
-  can be lower than before, never higher; `carried_ownership` is omitted when
-  nothing is left. An ambiguous match on the default branch, or a comparison with
-  it that fails, leaves the commit owned.
-- `integration_drift` values are unchanged.
+  integration view holds pending and the fetched remote default branch
+  (`refs/remotes/origin/HEAD` only, never the main checkout's `@{upstream}`) does
+  not prove delivered: by ancestry, by an exact sync merge, or by exactly one
+  patch-equivalent commit that is not an ancestor of the owned commit. An earlier
+  landing the owned commit descends from (a reland after a revert) proves nothing.
+  An ambiguous match, or a default branch that cannot be read or compared, leaves
+  the commit owned; without `origin/HEAD` the answer is integration's alone.
+- A commit that landed and was then reverted on the default branch reads as
+  delivered while the session has not been rebased onto, or applied it again on
+  top of, the revert.
+- Where the full plan answered, the count is lower or the same, and
+  `carried_ownership` is omitted when nothing is left. Where the plan failed on
+  history it did not need (an unreadable inherited blob, a timeout), ownership was
+  dropped and is now carried, and `integration_drift` can name commits that are
+  safe to submit. Otherwise `integration_drift` is unchanged, its base included.
+- Only adoption changed. Other commands that build a submission plan, `finish`
+  among them, still hash the history they did.
 - Span `adopt_carried_ownership` covers the ownership carry and span
   `adopt_drift_report` the drift report, on every adoption path that runs them.
+- Span `adopt_ownership_candidates`, inside either, covers listing the base's
+  commits and the changed paths that decide which are hashed.
 - Metric attachment `adopt_ownership`: `carried_commits_hashed` and
-  `drift_commits_hashed`, the commits whose patch each one hashed. A key is absent
+  `drift_commits_hashed`, the commits each one handed to patch hashing, counted
+  before the attempt so a timeout is not 0. A key is absent
   when that step did not run. Counts only: no path, id or branch name.
 
 Readers must accept the new spans and attachment. Covered by tests in
