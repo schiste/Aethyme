@@ -64,6 +64,15 @@ pub(crate) fn note_look(look: &str, elapsed: Duration, timed_out: bool) {
     }
 }
 
+/// Record a first look whose probe did not run because `reason`, a cheaper
+/// check, already kept the session.
+pub(crate) fn note_look_avoided(look: &str, reason: &str) {
+    count_look(
+        "worktree_activity_look_avoided",
+        &format!("{look}.{reason}"),
+    );
+}
+
 fn count_look(name: &'static str, look: &str) {
     crate::phase_telemetry::add_keyed(name, look, Duration::ZERO);
 }

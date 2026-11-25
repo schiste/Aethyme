@@ -1012,6 +1012,9 @@ pub(crate) fn is_broker_state_file(
 
 #[cfg(test)]
 thread_local! {
+    /// Test seam between the keeps asked before the activity probe and it.
+    pub(crate) static BEFORE_ACTIVITY_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
     /// Test seams around the abandoned-session close: after its second look,
     /// before it takes the lifecycle claim; and under the claim, just before
     /// the compare-and-set.
@@ -1956,7 +1959,15 @@ impl Broker {
             let reason = process_table
                 .keep_reason()
                 .unwrap_or(AbandonmentKeepReason::Unrecorded);
-            crate::phase_telemetry::add(reason.no_work_telemetry_name(), std::time::Duration::ZERO);
+            let name = reason.no_work_telemetry_name();
+            crate::phase_telemetry::add(name, std::time::Duration::ZERO);
+            if name == "session_no_work_kept_other" {
+                crate::phase_telemetry::add_keyed(
+                    "session_no_work_kept_other_by_reason",
+                    reason.code(),
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         Ok(outcome)
     }
@@ -2885,6 +2896,132 @@ impl Broker {
         activity
     }
 
+    /// Why `lane` keeps `candidate` whatever the changed-file probe would
+    /// show, from checks that only read the database, the process table this
+    /// pass already holds, small configuration and ref files, and no Git
+    /// call; `None` when none of them decides, or one cannot be read. Each
+    /// is asked again after the probe, where it was before, and each keeps
+    /// a session the later checks would keep as well. `metadata_ms` is the
+    /// index and `HEAD` time: it can only understate the activity, so a
+    /// holder that has not moved on by it has not by the probe either.
+    fn refusal_before_probe(
+        &self,
+        candidate: &crate::Session,
+        metadata_ms: i64,
+        decision_now_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        lane: SessionCloseLane,
+    ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
+        use crate::session_holder::RecordedHolderLiveness as Liveness;
+        match lane {
+            // The work class comes next there: it runs Git, and its record
+            // and due time must not be lost to a cheaper keep.
+            SessionCloseLane::Abandonment => return None,
+            // Its holder and leases are judged after the probe.
+            SessionCloseLane::MergedPullRequest => return None,
+            // Only declines that, like recent activity, still let the
+            // abandonment and no-work windows judge the session.
+            SessionCloseLane::Landed => {
+                let declined = match self.landed_session_preconditions(candidate) {
+                    Err(reason) => reason,
+                    Ok(()) if self.has_no_session_commits_by_files(candidate) => {
+                        LandedSessionDecline::NoSessionCommits
+                    }
+                    Ok(()) => return None,
+                };
+                return Some((
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(declined),
+                ));
+            }
+            SessionCloseLane::NoWork => {}
+        }
+        // No process listing is taken here: only one this pass already took
+        // for this binding answers. Nothing later in this lane depends on
+        // which of these kept the session, and all of them come before the
+        // holder's gone event is recorded.
+        let event = self
+            .store_ref()
+            .latest_session_holder_event(candidate.id)
+            .ok()?;
+        let holder = crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            candidate.id,
+            process_table,
+            false,
+        );
+        if event.as_ref().map(|event| event.id) != holder.binding_event_id {
+            return None;
+        }
+        match holder.liveness {
+            Liveness::Unbound => {
+                return Some((
+                    AbandonmentKeepReason::NoWorkHolderUnbound,
+                    AbandonedSessionCloseOutcome::NotDue,
+                ));
+            }
+            Liveness::Alive
+                if event.as_ref().is_some_and(|event| {
+                    let activity_at = metadata_ms.max(candidate.last_activity_at);
+                    matches!(
+                        self.holder_moved_on(candidate.id, event, activity_at),
+                        Ok(None)
+                    )
+                }) =>
+            {
+                return Some((
+                    AbandonmentKeepReason::NoWorkHolderAlive,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
+            }
+            _ => {}
+        }
+        if matches!(
+            self.session_operations_unresolved_since_boot(candidate.id),
+            Ok(true)
+        ) {
+            return Some((
+                AbandonmentKeepReason::OperationUnresolved,
+                AbandonedSessionCloseOutcome::OperationActive,
+            ));
+        }
+        self.store_ref()
+            .unreleased_unexpired_leases_for_sessions_at(&[candidate.id], decision_now_ms)
+            .is_ok_and(|leases| leases.iter().any(|lease| lease.kind == LeaseKind::Explicit))
+            .then_some((
+                AbandonmentKeepReason::NoWorkExplicitClaim,
+                AbandonedSessionCloseOutcome::LeaseHeld,
+            ))
+    }
+
+    /// Whether the landed proof would answer `no_session_commits`, with HEAD
+    /// read from the checkout's files: HEAD is the diff base, no pull request
+    /// merged, and HEAD is not recorded as landed. False when anything is
+    /// unreadable or unusual.
+    fn has_no_session_commits_by_files(&self, session: &crate::Session) -> bool {
+        let Some(base) = session.diff_base.as_deref() else {
+            return false;
+        };
+        let Ok(Some((git_dir, common_dir))) =
+            checkout_git_dirs(std::path::Path::new(&session.worktree_path))
+        else {
+            return false;
+        };
+        let Ok(Some(head)) = read_head_commit(&git_dir, &common_dir) else {
+            return false;
+        };
+        head == base
+            && matches!(
+                self.store_ref()
+                    .session_has_merged_pull_request_link(session.id),
+                Ok(false)
+            )
+            && matches!(
+                self.store_ref().session_representation(session.id, &head),
+                Ok(None)
+            )
+    }
+
     /// [`Self::judge_session_close`], recording how a judgement whose first
     /// activity look timed out ended.
     #[allow(clippy::too_many_arguments)]
@@ -3099,9 +3236,15 @@ impl Broker {
         };
         let merged_at = merged_evidence.as_ref().map_or(0, |(_, at)| *at);
         let first_look = format!("{}_first", lane.look_name());
-        let first_activity = match self.look_at_activity(&candidate, &first_look) {
-            Ok(activity) => activity.unwrap_or_default(),
+        let look_started = std::time::Instant::now();
+        let first_metadata = match checked_worktree_metadata_ms(self.main_root(), &candidate) {
+            Ok(metadata_ms) => metadata_ms,
             Err(_) => {
+                crate::worktree_status_activity::note_look(
+                    &first_look,
+                    look_started.elapsed(),
+                    false,
+                );
                 return Ok(keep_with(
                     process_table,
                     AbandonmentKeepReason::WorktreeActivityUnavailable,
@@ -3109,15 +3252,9 @@ impl Broker {
                 ));
             }
         };
-        process_table.note_first_look_timed_out(first_activity.status.timed_out);
-        let fs_activity = first_activity.newest_ms();
         // An agent that only reads (tool calls, no writes, no broker
         // command) still signals through its PreToolUse hook.
         let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), session_id);
-        let database_activity = fs_activity
-            .max(candidate.last_activity_at)
-            .max(merged_at)
-            .max(hook_activity);
         let recent = |last_activity_at: i64, created_at: i64| {
             !matches!(
                 crate::decide_abandonment(
@@ -3134,6 +3271,90 @@ impl Broker {
                 crate::AbandonmentVerdict::Abandoned { .. }
             )
         };
+        // Cheaper keeps first: a probe that times out costs two seconds of
+        // the lane's budget. The probe's time can only raise the activity, so
+        // what is recent without it is recent with it. Every check asked here
+        // is asked again after the probe.
+        let refusal = {
+            let _span = crate::phase_telemetry::span("session_close_before_probe");
+            let activity = crate::worktree_status_activity::WorktreeActivity {
+                metadata_ms: first_metadata.unwrap_or_default(),
+                ..Default::default()
+            };
+            let known_activity = activity
+                .metadata_ms
+                .max(candidate.last_activity_at)
+                .max(merged_at)
+                .max(hook_activity);
+            if recent(known_activity, candidate.created_at) {
+                crate::worktree_status_activity::note_recent_verdict(
+                    &first_look,
+                    &activity,
+                    candidate.last_activity_at,
+                    candidate.last_activity_at.max(merged_at).max(hook_activity),
+                    |at| recent(at, candidate.created_at),
+                );
+                process_table.note_not_due_before(
+                    known_activity
+                        .max(candidate.created_at)
+                        .saturating_add(abandon_after_ms),
+                );
+                Some((
+                    AbandonmentKeepReason::RecentActivity,
+                    AbandonedSessionCloseOutcome::NotDue,
+                ))
+            } else {
+                self.refusal_before_probe(
+                    &candidate,
+                    activity.metadata_ms,
+                    decision_now_ms,
+                    process_table,
+                    lane,
+                )
+            }
+        };
+        if let Some((reason, outcome)) = refusal {
+            // A missing checkout has nothing to probe.
+            if first_metadata.is_some() {
+                crate::worktree_status_activity::note_look_avoided(
+                    &first_look,
+                    match outcome {
+                        AbandonedSessionCloseOutcome::LandedDeclined(declined) => declined.code(),
+                        _ => reason.code(),
+                    },
+                );
+            }
+            return Ok(keep_with(process_table, reason, outcome));
+        }
+        #[cfg(test)]
+        BEFORE_ACTIVITY_PROBE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        // The whole look again, index and HEAD included, and the hook after
+        // it: the verdict rests on nothing read before the cheap keeps but
+        // the session row and the merge evidence, as it always has.
+        let first_activity = match self.look_at_activity(&candidate, &first_look) {
+            Ok(activity) => activity.unwrap_or_default(),
+            Err(_) => {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::WorktreeActivityUnavailable,
+                    AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
+                ));
+            }
+        };
+        process_table.note_first_look_timed_out(first_activity.status.timed_out);
+        let hook_activity = hook_activity.max(crate::agent_hook::hook_activity_ms(
+            self.main_root(),
+            session_id,
+        ));
+        let fs_activity = first_activity.newest_ms();
+        let database_activity = fs_activity
+            .max(candidate.last_activity_at)
+            .max(merged_at)
+            .max(hook_activity);
         crate::worktree_status_activity::note_recent_verdict(
             &first_look,
             &first_activity,
@@ -8344,6 +8565,137 @@ mod generic_guarded_exec_tests {
                 .status
                 .is_closed()
         );
+    }
+
+    /// A tool call after the cheap keeps read the hook keeps the session: the
+    /// verdict after the probe reads it again. Mutation caught: the early
+    /// value reused (the look under the claim does not read the hook, so the
+    /// session would close).
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_touched_during_the_probe_keeps_the_session() {
+        let (repository, _storage, mut broker) = fixture();
+        let session = landed_by_pull_request(
+            &mut broker,
+            repository.path(),
+            "tool call during the probe",
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
+        age_worktree_for_task_retirement(&mut broker, &session);
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &task_lease_holder(i64::MAX),
+                    "fixture",
+                    None,
+                )),
+            )
+            .unwrap();
+        let root = broker.main_root().to_path_buf();
+        let session_id = session.id;
+        super::BEFORE_ACTIVITY_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                crate::agent_hook::record_hook_activity(&root, session_id);
+            }));
+        });
+        let mut close = || {
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            broker
+                .try_close_landed_session(
+                    session_id,
+                    crate::clock::epoch_ms(),
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None,
+                )
+                .unwrap()
+        };
+        let touched = close();
+        super::BEFORE_ACTIVITY_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(touched, AbandonedSessionCloseOutcome::NotDue);
+        // Without the tool call the same session closes.
+        std::fs::remove_file(
+            repository
+                .path()
+                .join(format!(".git/aethyme/hook-activity-{session_id}.json")),
+        )
+        .unwrap();
+        assert_eq!(close(), AbandonedSessionCloseOutcome::Closed);
+    }
+
+    /// What the file read of `no_session_commits` may answer: only a HEAD
+    /// that is the diff base, not recorded as landed, with no merged pull
+    /// request.
+    #[cfg(unix)]
+    #[test]
+    fn no_session_commits_is_read_from_files_only_when_certain() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("no commits", None).unwrap();
+        let checkout = PathBuf::from(&session.worktree_path);
+        let base = session.diff_base.clone().unwrap();
+        assert!(broker.has_no_session_commits_by_files(&session));
+        git(&checkout, &["pack-refs", "--all"]);
+        assert!(broker.has_no_session_commits_by_files(&session));
+        git(&checkout, &["checkout", "-q", "--detach"]);
+        assert!(broker.has_no_session_commits_by_files(&session));
+
+        git(
+            &checkout,
+            &["commit", "--allow-empty", "-qm", "detached work"],
+        );
+        assert!(!broker.has_no_session_commits_by_files(&session));
+        git(&checkout, &["checkout", "-q", "-B", &session.branch]);
+        git(&checkout, &["pack-refs", "--all"]);
+        assert!(!broker.has_no_session_commits_by_files(&session));
+        git(&checkout, &["reset", "-q", "--hard", &base]);
+        assert!(broker.has_no_session_commits_by_files(&session));
+
+        let head = crate::git::checked_worktree_git_dir(&checkout)
+            .unwrap()
+            .unwrap()
+            .join("HEAD");
+        let readable = std::fs::read(&head).unwrap();
+        std::fs::write(&head, "not a head\n").unwrap();
+        assert!(!broker.has_no_session_commits_by_files(&session));
+        std::fs::remove_file(&head).unwrap();
+        assert!(!broker.has_no_session_commits_by_files(&session));
+        std::fs::write(&head, readable).unwrap();
+        assert!(broker.has_no_session_commits_by_files(&session));
+
+        let connection = broker.store().connection();
+        connection.execute(
+            "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', 1, ?1, 1, 'watch')",
+            [session.id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO pull_request_milestones (repository, pr_number, merged_at, first_seen_at, updated_at) VALUES ('fixture', 1, 1, 1, 1)",
+            [],
+        ).unwrap();
+        assert!(!broker.has_no_session_commits_by_files(&session));
+        broker
+            .store()
+            .connection()
+            .execute("DELETE FROM pull_request_session_links", [])
+            .unwrap();
+        assert!(broker.has_no_session_commits_by_files(&session));
+        broker
+            .store()
+            .record_session_representation(&crate::types::NewSessionRepresentation {
+                session_id: session.id,
+                session_head: base.clone(),
+                representing_commit: Some(base),
+                representing_ref: "refs/remotes/origin/main".into(),
+                discovery: crate::types::RepresentationDiscovery::MergeTime,
+                pr_number: None,
+                paths_json: "[]".into(),
+                evidence: "fixture landed".into(),
+            })
+            .unwrap();
+        assert!(!broker.has_no_session_commits_by_files(&session));
     }
 
     /// The landed lane counts a live holder sitting in the worktree as use,
