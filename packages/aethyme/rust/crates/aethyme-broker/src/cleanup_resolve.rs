@@ -2321,18 +2321,11 @@ impl Broker {
                 actual: confirm.to_owned(),
             });
         }
-        let prerequisite_deadline = if plan.recovery_archive_schema_version
-            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        {
-            let git_deadline = recovery_bundle_deadline().map_err(|reason| {
-                BrokerOpError::CleanupResolveRefused {
-                    id: session_id,
-                    reason: format!("cannot establish prerequisite-ref deadline: {reason}"),
-                }
-            })?;
-            Some(operation_deadline.map_or(git_deadline, |deadline| deadline.min(git_deadline)))
-        } else {
-            None
+        // Taken anew at each use: a copy longer than one Git call's limit does
+        // not leave the ref installs after it a deadline already past.
+        let prerequisite_deadline = || -> Result<Instant, String> {
+            let git_deadline = recovery_bundle_deadline()?;
+            Ok(operation_deadline.map_or(git_deadline, |deadline| deadline.min(git_deadline)))
         };
         ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
         let session = self.store_ref().session(session_id)?;
@@ -2389,8 +2382,7 @@ impl Broker {
                             install_recovery_prerequisite_refs_in_archive(
                                 self.repo_handle(),
                                 &archive,
-                                prerequisite_deadline
-                                    .expect("schema v6 retirement has a Git deadline"),
+                                prerequisite_deadline()?,
                             )
                         })
                         .and_then(|()| {
@@ -2448,19 +2440,19 @@ impl Broker {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                install_recovery_prerequisite_refs_in_archive(
-                                    self.repo_handle(),
-                                    &partial_path,
-                                    prerequisite_deadline
-                                        .expect("schema v6 retirement has a Git deadline"),
-                                )
-                                .map_err(|reason| {
-                                    BrokerOpError::RecoveryArchiveUnverified {
+                                prerequisite_deadline()
+                                    .and_then(|deadline| {
+                                        install_recovery_prerequisite_refs_in_archive(
+                                            self.repo_handle(),
+                                            &partial_path,
+                                            deadline,
+                                        )
+                                    })
+                                    .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                         id: session_id,
                                         path: partial_path.to_string_lossy().into_owned(),
                                         reason,
-                                    }
-                                })?;
+                                    })?;
                             }
                             sync_archive_directories_bottom_up_until(
                                 &partial_path,
@@ -2514,11 +2506,14 @@ impl Broker {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                require_no_recovery_prerequisite_refs_for_partial(
-                                    self.repo_handle(),
-                                    &partial_path,
-                                    prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
-                                )
+                                prerequisite_deadline()
+                                .and_then(|deadline| {
+                                    require_no_recovery_prerequisite_refs_for_partial(
+                                        self.repo_handle(),
+                                        &partial_path,
+                                        deadline,
+                                    )
+                                })
                                 .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
                                     path: partial_path.to_string_lossy().into_owned(),
@@ -2578,19 +2573,19 @@ impl Broker {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                install_recovery_prerequisite_refs_in_archive(
-                                    self.repo_handle(),
-                                    &partial,
-                                    prerequisite_deadline
-                                        .expect("schema v6 retirement has a Git deadline"),
-                                )
-                                .map_err(|reason| {
-                                    BrokerOpError::RecoveryArchiveUnverified {
+                                prerequisite_deadline()
+                                    .and_then(|deadline| {
+                                        install_recovery_prerequisite_refs_in_archive(
+                                            self.repo_handle(),
+                                            &partial,
+                                            deadline,
+                                        )
+                                    })
+                                    .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                         id: session_id,
                                         path: partial.to_string_lossy().into_owned(),
                                         reason,
-                                    }
-                                })?;
+                                    })?;
                                 sync_archive_directories_bottom_up_until(
                                     &partial,
                                     &sync_directory,
@@ -2673,18 +2668,19 @@ impl Broker {
                     if plan.recovery_archive_schema_version
                         == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                     {
-                        install_recovery_prerequisite_refs_in_archive(
-                            self.repo_handle(),
-                            &partial,
-                            prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
-                        )
-                        .map_err(|reason| {
-                            BrokerOpError::RecoveryArchiveUnverified {
+                        prerequisite_deadline()
+                            .and_then(|deadline| {
+                                install_recovery_prerequisite_refs_in_archive(
+                                    self.repo_handle(),
+                                    &partial,
+                                    deadline,
+                                )
+                            })
+                            .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                 id: session_id,
                                 path: partial.to_string_lossy().into_owned(),
                                 reason,
-                            }
-                        })?;
+                            })?;
                         sync_archive_directories_bottom_up_until(
                             &partial,
                             &sync_directory,

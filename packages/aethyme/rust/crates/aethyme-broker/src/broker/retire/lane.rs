@@ -17,8 +17,7 @@
 //!   laps to let go.
 //! - One judgement at a time per volume, host-wide (a per-volume turn lock
 //!   held for each judgement), so a volume never runs two of the lane's Git
-//!   inspections at once. A turn that stays unavailable for
-//!   [`RETIRE_LANE_TURN_WAIT`] ends the run.
+//!   inspections at once.
 //! - At most one judgement per run is given longer than its slice (a
 //!   checkout an earlier attempt ran out of time on; see
 //!   [`long_judgement_budget`]).
@@ -46,22 +45,20 @@ const RETIRE_LANE_LISTING_PROBE_BUDGET: Duration = Duration::from_secs(10);
 /// process listing (epoch ms): retirement waits for an unsandboxed runner.
 pub(crate) const CHECKOUT_RETIREMENT_LISTING_REFUSED_KEY: &str =
     "checkout_retirement.listing_refused_at_ms";
-/// How long a judgement waits for its volume's turn before the lane run
-/// ends (the next worker starts another). It waits asleep, outside the
-/// slice's deadline; well under a slice, so the first judgement of a slice
-/// always keeps most of it.
-#[cfg(not(test))]
-pub(super) const RETIRE_LANE_TURN_WAIT: Duration = Duration::from_secs(2 * 60);
-#[cfg(test)]
-pub(super) const RETIRE_LANE_TURN_WAIT: Duration = Duration::from_secs(1);
 /// How often a judgement asks again for its volume's turn.
-const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
+pub(super) const RETIRE_LANE_TURN_POLL: Duration = Duration::from_millis(250);
 
 /// How long the judgement of a checkout may take after `attempts` attempts
 /// in a row ran out of time: 10 minutes after the first, then 20, twice and
 /// four times a slice and at most a third of [`RETIRE_LANE_MAX`].
 pub(super) fn long_judgement_budget(attempts: u32) -> Duration {
     Duration::from_secs(if attempts < 2 { 10 * 60 } else { 20 * 60 })
+}
+
+/// Whether the lane ends (`cap`): what is left until `cap` is too little for
+/// an inspection, so a slice would only defer.
+pub(super) fn lane_is_over(now: Instant, cap: Instant) -> bool {
+    now + RETIRE_INSPECTION_MIN_LEFT >= cap
 }
 
 /// What one lane process did, recorded as `checkout_retirement_lane` on
@@ -79,8 +76,8 @@ pub(crate) struct RetirementLaneReport {
     pub slices: usize,
     pub paced_slices: usize,
     /// `backlog_done`, `cap`, `pressure`, `process_use_unknown`,
-    /// `process_listing_refused`, `open_paths_unresolved`,
-    /// `volume_turn_unavailable`, `lane_present`, `no_pool` or `error`.
+    /// `process_listing_refused`, `open_paths_unresolved`, `lane_present`,
+    /// `no_pool` or `error`.
     pub end_reason: &'static str,
     pub elapsed_ms: u64,
 }
@@ -147,8 +144,7 @@ pub(crate) struct RetirementLaneRecord {
 }
 
 /// The record after a lane run: a run that retired one resets the count;
-/// one that ran no slice (another lane, no pool, refused listing), or that
-/// ended waiting for its volume's turn without inspecting anything, leaves it.
+/// one that ran no slice (another lane, no pool, refused listing) leaves it.
 pub(crate) fn next_lane_record(
     previous: &RetirementLaneRecord,
     lane: &RetirementLaneReport,
@@ -156,9 +152,7 @@ pub(crate) fn next_lane_record(
 ) -> RetirementLaneRecord {
     let runs_without_retirement = if lane.retired > 0 {
         0
-    } else if lane.slices > 0
-        && (lane.end_reason != "volume_turn_unavailable" || lane.inspections_started > 0)
-    {
+    } else if lane.slices > 0 {
         previous.runs_without_retirement.saturating_add(1)
     } else {
         previous.runs_without_retirement
@@ -177,7 +171,7 @@ pub(crate) fn next_lane_record(
 
 /// Take the host-wide turn lock at `path`, asking every
 /// [`RETIRE_LANE_TURN_POLL`] until `deadline`. `None` when it stayed held
-/// (or could not be opened) until then.
+/// until then; an error when it could not be opened or asked for.
 ///
 /// Turns are shared fairly between repositories' lanes: a waiter keeps a
 /// note beside the lock, and a process about to take the turn while
@@ -186,9 +180,9 @@ pub(crate) fn next_lane_record(
 pub(super) fn take_volume_turn(
     path: &Path,
     deadline: Instant,
-) -> Option<crate::file_lock::ExclusiveFileLock> {
+) -> std::io::Result<Option<crate::file_lock::ExclusiveFileLock>> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
+        std::fs::create_dir_all(parent)?;
     }
     let note = waiter_note_path(path);
     let own_pid = std::process::id();
@@ -214,22 +208,21 @@ pub(super) fn take_volume_turn(
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
-            .ok()?;
+            .open(path)?;
         match crate::file_lock::ExclusiveFileLock::try_acquire(file) {
             Ok(Some(lock)) => {
                 forget_note();
-                return Some(lock);
+                return Ok(Some(lock));
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(error) => {
                 forget_note();
-                return None;
+                return Err(error);
             }
         }
         if Instant::now() + RETIRE_LANE_TURN_POLL >= deadline {
             forget_note();
-            return None;
+            return Ok(None);
         }
         crate::warn_unrecorded(
             "note a volume turn waiter",
@@ -389,7 +382,6 @@ impl Broker {
                 "pressure" => "checkout_retirement_lane_end_pressure",
                 "process_use_unknown" => "checkout_retirement_lane_end_process_use_unknown",
                 "open_paths_unresolved" => "checkout_retirement_lane_end_open_paths_unresolved",
-                "volume_turn_unavailable" => "checkout_retirement_lane_end_volume_turn_unavailable",
                 "lane_present" => "checkout_retirement_lane_end_lane_present",
                 "no_pool" => "checkout_retirement_lane_end_no_pool",
                 "process_listing_refused" => "checkout_retirement_lane_end_process_listing_refused",
@@ -437,12 +429,11 @@ impl Broker {
             volume_key(&pool)
         ));
         let cap = Instant::now() + RETIRE_LANE_MAX;
-        // Until the run's one long judgement is taken.
-        let mut long_judgement_cap = Some(cap);
+        let mut long_slot = true;
+        let mut short_cuts = std::collections::BTreeSet::new();
         let mut succeeded_ms = Vec::new();
         loop {
-            // Too little left for an inspection: a slice would only defer.
-            if Instant::now() + RETIRE_INSPECTION_MIN_LEFT >= cap {
+            if lane_is_over(Instant::now(), cap) {
                 return "cap";
             }
             let pressure = {
@@ -472,7 +463,9 @@ impl Broker {
             };
             run.archive_deadline = slice_deadline;
             run.volume_turn = Some(volume_turn.clone());
-            run.long_judgement_cap = long_judgement_cap;
+            run.lane_end = Some(cap);
+            run.long_slot = long_slot;
+            run.short_cuts = std::mem::take(&mut short_cuts);
             let mut report = CheckoutRetirementReport::default();
             let closed_complete =
                 match self.retirement_lap(&mut run, &mut report, false, slice_deadline) {
@@ -485,7 +478,8 @@ impl Broker {
                     Ok(complete) => complete,
                     Err(_) => return "error",
                 };
-            long_judgement_cap = run.long_judgement_cap;
+            long_slot = run.long_slot;
+            short_cuts = std::mem::take(&mut run.short_cuts);
             lane.examined += report.examined;
             lane.retired +=
                 report.retired_clean + report.retired_archived + report.retired_operation_archived;
@@ -506,10 +500,9 @@ impl Broker {
             if report.process_use_unavailable {
                 return "process_use_unknown";
             }
-            // Another repository's lane kept the turn for the whole wait:
-            // the next worker's lane starts with the same checkout.
-            if report.kept.contains_key("volume_turn_unavailable") {
-                return "volume_turn_unavailable";
+            // The turn lock cannot be opened: no slice could judge anything.
+            if report.kept.contains_key("volume_turn_error") {
+                return "error";
             }
             if closed_complete && cleaned_complete {
                 return "backlog_done";
