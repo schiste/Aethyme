@@ -23,7 +23,10 @@
 //! and a clone is copy-on-write: a later write to the checkout's file never
 //! reaches the pool or another checkout. Hard links are never used for that
 //! reason. Files with more than one link are left alone (they are already
-//! shared, or the tool relies on the link). The pass only runs where the
+//! shared, or the tool relies on the link), and so is Python bytecode, which
+//! embeds its source's path and modification time: on the busiest repository
+//! 218 such files a preparation were hashed, cloned into the pool and hashed
+//! again, and none was ever reused. The pass only runs where the
 //! filesystem clones within the volume holding both the checkout and the pool;
 //! anywhere else it reports why it was skipped and changes nothing.
 //!
@@ -40,6 +43,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::package_store::{self, PackageImportMethod};
+
+#[path = "preparation_output_verified.rs"]
+mod verified;
+
+use verified::{EntryIdentity, KnownFrom, VerifiedEntries};
 
 /// The pool's directory inside the repository's package store
 /// (`<repository>/packages/<os>-<arch>/output-pool`), so it shares the
@@ -113,6 +121,28 @@ pub struct OutputShareReport {
     /// Candidates left alone: more than one link, or changed while hashed.
     pub files_left_alone: u64,
     pub files_failed: u64,
+    /// Python bytecode candidates, neither hashed nor pooled.
+    #[serde(default)]
+    pub files_skipped_bytecode: u64,
+    #[serde(default)]
+    pub bytes_skipped_bytecode: u64,
+    /// Pool entries read in full to check their content against their name.
+    #[serde(default)]
+    pub pool_entries_hashed: u64,
+    #[serde(default)]
+    pub pool_bytes_hashed: u64,
+    /// Pool entries not read again: their identity is the one an earlier
+    /// preparation hashed.
+    #[serde(default)]
+    pub pool_entries_verified_by_record: u64,
+    #[serde(default)]
+    pub pool_bytes_verified_by_record: u64,
+    /// The record of hashed entries was present but unusable.
+    #[serde(default)]
+    pub verification_record_ignored: bool,
+    /// The record of hashed entries could not be written.
+    #[serde(default)]
+    pub verification_record_write_failed: bool,
     /// Pool entries whose content did not match their name, removed; the
     /// files they would have replaced keep their own copy.
     #[serde(default)]
@@ -158,6 +188,14 @@ impl OutputShareReport {
             "bytes_added_to_pool": self.bytes_added_to_pool,
             "files_left_alone": self.files_left_alone,
             "files_failed": self.files_failed,
+            "files_skipped_bytecode": self.files_skipped_bytecode,
+            "bytes_skipped_bytecode": self.bytes_skipped_bytecode,
+            "pool_entries_hashed": self.pool_entries_hashed,
+            "pool_bytes_hashed": self.pool_bytes_hashed,
+            "pool_entries_verified_by_record": self.pool_entries_verified_by_record,
+            "pool_bytes_verified_by_record": self.pool_bytes_verified_by_record,
+            "verification_record_ignored": self.verification_record_ignored,
+            "verification_record_write_failed": self.verification_record_write_failed,
             "pool_entries_rejected": self.pool_entries_rejected,
             "stale_temporaries_removed": self.stale_temporaries_removed,
             "unique_bytes_before": self.unique_bytes_before,
@@ -255,6 +293,15 @@ pub(crate) fn share_outputs(
     request: &OutputShareRequest<'_>,
     tick: &mut dyn FnMut() -> bool,
 ) -> OutputShareReport {
+    share_outputs_settled(request, verified::SETTLE, tick)
+}
+
+/// [`share_outputs`] with the age an entry needs to be recorded as verified.
+fn share_outputs_settled(
+    request: &OutputShareRequest<'_>,
+    settle: Duration,
+    tick: &mut dyn FnMut() -> bool,
+) -> OutputShareReport {
     let started = Instant::now();
     if let Some(reason) = skip_reason(request.import_method, &request.roots) {
         let mut report = OutputShareReport::skipped(reason);
@@ -268,12 +315,17 @@ pub(crate) fn share_outputs(
         report.roots = request.roots.clone();
         return report;
     }
+    let mut spent = Spent::default();
+    let entries = timed(&mut spent.record, || {
+        VerifiedEntries::load(&pool, settle, super::now_ms())
+    });
     let mut pass = Pass {
         pool,
         deadline: started + request.budget,
         last_tick: started,
         report: OutputShareReport {
             roots: request.roots.clone(),
+            verification_record_ignored: entries.record_ignored,
             ..OutputShareReport::default()
         },
         unique_before: 0,
@@ -281,9 +333,12 @@ pub(crate) fn share_outputs(
         estimated: false,
         stop: None,
         temp_counter: 0,
-        verified_entries: std::collections::HashSet::new(),
+        entries,
+        spent,
     };
+    let sweeping = Instant::now();
     pass.sweep_pool_temporaries();
+    pass.spent.sweep += sweeping.elapsed();
     for root in &request.roots {
         if pass.stop.is_some() {
             break;
@@ -294,12 +349,17 @@ pub(crate) fn share_outputs(
         }
         pass.last_tick = Instant::now();
         let path = request.worktree.join(root);
-        if pass.already_shared(&path) {
+        let sampling = Instant::now();
+        let shared = pass.already_shared(&path);
+        pass.spent.sample += sampling.elapsed();
+        if shared {
             pass.report.roots_already_shared.push(root.clone());
             continue;
         }
         pass.walk(&path, tick);
     }
+    pass.save_record();
+    pass.spent.record();
     let Pass {
         mut report,
         unique_before,
@@ -337,8 +397,54 @@ struct Pass {
     /// Why the pass stopped early.
     stop: Option<String>,
     temp_counter: u64,
-    /// Pool entries whose content this pass has checked against their name.
-    verified_entries: std::collections::HashSet<PathBuf>,
+    /// Pool entries whose content was checked against their name.
+    entries: VerifiedEntries,
+    spent: Spent,
+}
+
+/// Where the pass's time went, added to the command's spans once at the end:
+/// one span per file would be recorded tens of thousands of times.
+#[derive(Default)]
+struct Spent {
+    sweep: Duration,
+    sample: Duration,
+    sizing: Duration,
+    hash: Duration,
+    verify: Duration,
+    add: Duration,
+    replace: Duration,
+    record: Duration,
+}
+
+impl Spent {
+    fn record(&self) {
+        for (name, elapsed) in [
+            ("prepare_output_share_sweep", self.sweep),
+            ("prepare_output_share_sample", self.sample),
+            ("prepare_output_share_sizing", self.sizing),
+            ("prepare_output_share_hash", self.hash),
+            ("prepare_output_share_verify", self.verify),
+            ("prepare_output_share_add", self.add),
+            ("prepare_output_share_replace", self.replace),
+            ("prepare_output_share_record", self.record),
+        ] {
+            crate::phase_telemetry::add(name, elapsed);
+        }
+    }
+}
+
+fn timed<T>(total: &mut Duration, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = work();
+    *total += started.elapsed();
+    result
+}
+
+/// Compiled Python embeds its source's absolute path and modification time,
+/// so a checkout's copy matches no other checkout's.
+fn is_python_bytecode(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "pyc" || extension == "pyo")
 }
 
 impl Pass {
@@ -369,7 +475,12 @@ impl Pass {
                 let Ok(metadata) = fs::symlink_metadata(&path) else {
                     continue;
                 };
-                if metadata.len() < MIN_SHARED_FILE_BYTES || link_count(&metadata) != 1 {
+                // Bytecode is never shared, so it says nothing about the
+                // tool's other files.
+                if metadata.len() < MIN_SHARED_FILE_BYTES
+                    || link_count(&metadata) != 1
+                    || is_python_bytecode(&path)
+                {
                     continue;
                 }
                 sampled += 1;
@@ -449,7 +560,7 @@ impl Pass {
     fn visit(&mut self, path: &Path, metadata: &fs::Metadata) {
         self.report.files_scanned += 1;
         self.report.bytes_scanned += metadata.len();
-        let unshared = match unshared_bytes(path) {
+        let unshared = match timed(&mut self.spent.sizing, || unshared_bytes(path)) {
             Some(bytes) => bytes,
             None => {
                 self.estimated = true;
@@ -467,6 +578,12 @@ impl Pass {
         }
         if link_count(metadata) != 1 {
             self.report.files_left_alone += 1;
+            self.unique_after = self.unique_after.saturating_add(unshared);
+            return;
+        }
+        if is_python_bytecode(path) {
+            self.report.files_skipped_bytecode += 1;
+            self.report.bytes_skipped_bytecode += metadata.len();
             self.unique_after = self.unique_after.saturating_add(unshared);
             return;
         }
@@ -494,7 +611,7 @@ impl Pass {
     }
 
     fn share_file(&mut self, path: &Path, metadata: &fs::Metadata) -> io::Result<Shared> {
-        let digest = sha256_file(path)?;
+        let digest = timed(&mut self.spent.hash, || sha256_file(path))?;
         // A file rewritten while it was hashed keeps its own copy.
         let after = fs::symlink_metadata(path)?;
         if !same_file_state(metadata, &after) {
@@ -509,18 +626,26 @@ impl Pass {
                     && !pooled.file_type().is_symlink()
                     && pooled.len() == metadata.len() =>
             {
-                if !self.entry_matches_its_name(&entry, &digest)? {
+                if !self.entry_matches_its_name(&entry, &digest, &pooled)? {
                     return Ok(Shared::LeftAlone);
                 }
                 let parent = path
                     .parent()
                     .ok_or_else(|| io::Error::other("an output file has no parent directory"))?;
                 let temporary = self.temporary_name(parent);
-                let replaced = replace_with_pooled(&entry, &temporary, path, metadata);
-                if replaced.is_err() {
+                let replaced = timed(&mut self.spent.replace, || {
+                    replace_with_pooled(&entry, &pooled, &temporary, path, metadata)
+                });
+                if !matches!(replaced, Ok(true)) {
                     remove_temporary(&temporary);
                 }
-                replaced.map(|()| Shared::FromPool)
+                replaced.map(|replaced| {
+                    if replaced {
+                        Shared::FromPool
+                    } else {
+                        Shared::LeftAlone
+                    }
+                })
             }
             Ok(_) => Err(io::Error::other(format!(
                 "{} is not a pooled file of the expected size",
@@ -528,13 +653,21 @@ impl Pass {
             ))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let temporary = self.temporary_name(&bucket);
-                let added = add_to_pool(path, &temporary, &entry, &digest);
+                let added = timed(&mut self.spent.add, || {
+                    add_to_pool(path, &temporary, &entry, &digest)
+                });
                 if !matches!(added, Ok(true)) {
                     remove_temporary(&temporary);
                 }
                 match added {
                     Ok(true) => {
-                        self.verified_entries.insert(entry);
+                        if let Some(identity) = fs::symlink_metadata(&entry)
+                            .ok()
+                            .as_ref()
+                            .and_then(EntryIdentity::of)
+                        {
+                            self.entries.published(&digest, identity);
+                        }
                         Ok(Shared::IntoPool)
                     }
                     // The file changed between hashing and cloning: nothing
@@ -547,17 +680,42 @@ impl Pass {
         }
     }
 
-    /// Whether the pool `entry` holds the bytes its name `digest` promises,
-    /// hashed once per pass. An entry that does not is removed and counted,
-    /// so no later preparation clones it either.
-    fn entry_matches_its_name(&mut self, entry: &Path, digest: &str) -> io::Result<bool> {
-        if self.verified_entries.contains(entry) {
+    /// Whether the pool `entry`, found as `pooled`, holds the bytes its name
+    /// `digest` promises. It is hashed unless this pass or the record of an
+    /// earlier one hashed exactly this file state. An entry that does not
+    /// match is removed and counted, so no later preparation clones it either.
+    fn entry_matches_its_name(
+        &mut self,
+        entry: &Path,
+        digest: &str,
+        pooled: &fs::Metadata,
+    ) -> io::Result<bool> {
+        let identity = EntryIdentity::of(pooled);
+        match identity.and_then(|identity| self.entries.known(digest, &identity)) {
+            Some(KnownFrom::ThisPass) => return Ok(true),
+            Some(KnownFrom::Record) => {
+                self.report.pool_entries_verified_by_record += 1;
+                self.report.pool_bytes_verified_by_record += pooled.len();
+                return Ok(true);
+            }
+            None => {}
+        }
+        let now_ms = super::now_ms();
+        self.report.pool_entries_hashed += 1;
+        self.report.pool_bytes_hashed += pooled.len();
+        if timed(&mut self.spent.verify, || sha256_file(entry))? == digest {
+            if let Some(identity) = identity
+                && fs::symlink_metadata(entry)
+                    .ok()
+                    .as_ref()
+                    .and_then(EntryIdentity::of)
+                    == Some(identity)
+            {
+                self.entries.verified(digest, identity, now_ms);
+            }
             return Ok(true);
         }
-        if sha256_file(entry)? == digest {
-            self.verified_entries.insert(entry.to_path_buf());
-            return Ok(true);
-        }
+        self.entries.rejected(digest);
         self.report.pool_entries_rejected += 1;
         if let Err(error) = fs::remove_file(entry)
             && error.kind() != io::ErrorKind::NotFound
@@ -570,14 +728,26 @@ impl Pass {
         Ok(false)
     }
 
-    /// Remove temporaries an interrupted earlier pass left in the pool's
-    /// buckets.
+    fn save_record(&mut self) {
+        let temporary = self.temporary_name(&self.pool.clone());
+        let saved = timed(&mut self.spent.record, || {
+            self.entries.save(&self.pool, &temporary, super::now_ms())
+        });
+        if saved.is_err() {
+            remove_temporary(&temporary);
+            self.report.verification_record_write_failed = true;
+        }
+    }
+
+    /// Remove temporaries an interrupted earlier pass left in the pool and
+    /// its buckets.
     fn sweep_pool_temporaries(&mut self) {
         let Ok(buckets) = fs::read_dir(&self.pool) else {
             return;
         };
         for bucket in buckets.flatten() {
             if !bucket.file_type().is_ok_and(|kind| kind.is_dir()) {
+                self.remove_if_stale_temporary(&bucket.path());
                 continue;
             }
             let Ok(entries) = fs::read_dir(bucket.path()) else {
@@ -661,7 +831,9 @@ fn process_alive(_pid: u32) -> bool {
 }
 
 /// Replace `path` with a clone of the pool `entry` (same bytes) carrying
-/// `path`'s own mode and timestamps, through `temporary` beside it.
+/// `path`'s own mode and timestamps, through `temporary` beside it. Returns
+/// `false`, replacing nothing, when the entry is no longer the file `pooled`
+/// that was verified.
 ///
 /// The file is not locked: a write to `path` between the caller's stat
 /// re-check and the rename below is lost, replaced by the pooled bytes the
@@ -674,16 +846,21 @@ fn process_alive(_pid: u32) -> bool {
 /// modification times are restored), and gets a new inode and birth time.
 fn replace_with_pooled(
     entry: &Path,
+    pooled: &fs::Metadata,
     temporary: &Path,
     path: &Path,
     original: &fs::Metadata,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     package_store::clone_file(entry, temporary)?;
+    if !same_file_state(pooled, &fs::symlink_metadata(entry)?) {
+        return Ok(false);
+    }
     restore_metadata(temporary, original)?;
     if fs::symlink_metadata(temporary)?.len() != original.len() {
         return Err(io::Error::other("the pooled clone has the wrong size"));
     }
-    fs::rename(temporary, path)
+    fs::rename(temporary, path)?;
+    Ok(true)
 }
 
 /// Clone `path` into the pool as `entry`, through `temporary` beside it,
@@ -1228,6 +1405,232 @@ mod tests {
         assert_eq!(report.files_left_alone, 1);
         assert!(!entry.exists(), "the forged entry is removed");
         assert_eq!(fs::read(checkout.join("env/lib.so")).unwrap(), original);
+    }
+
+    /// Python bytecode is counted and left alone: neither hashed nor pooled.
+    /// Needs no clone support.
+    #[test]
+    fn python_bytecode_is_neither_hashed_nor_pooled() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        fs::create_dir(&store).unwrap();
+        let checkout = root.path().join("checkout");
+        let bytecode = payload(17);
+        for name in ["env/__pycache__/a.cpython-313.pyc", "env/b.pyo"] {
+            write(&checkout.join(name), &bytecode);
+        }
+        let report = share_outputs(
+            &OutputShareRequest {
+                worktree: &checkout,
+                roots: vec!["env".into()],
+                store: &store,
+                import_method: PackageImportMethod::Clone,
+                budget: OUTPUT_SHARE_BUDGET,
+            },
+            &mut || true,
+        );
+        assert_eq!(report.state, Some(OutputShareState::Complete));
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.files_skipped_bytecode, 2);
+        assert_eq!(report.bytes_skipped_bytecode, 2 * bytecode.len() as u64);
+        assert_eq!(report.files_added_to_pool + report.files_failed, 0);
+        assert_eq!(report.unique_bytes_after, report.unique_bytes_before);
+        assert_eq!(
+            fs::read_dir(store.join(OUTPUT_POOL_DIR)).unwrap().count(),
+            0
+        );
+    }
+
+    /// A checkout file and the pool entry holding the same bytes, and a pass
+    /// over them. An entry is verified before any clone, so what these tests
+    /// assert does not need clone support.
+    #[cfg(unix)]
+    struct Pooled {
+        _root: tempfile::TempDir,
+        store: PathBuf,
+        checkout: PathBuf,
+        entry: PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    impl Pooled {
+        fn new(seed: u8) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let store = root.path().join("store");
+            let checkout = root.path().join("checkout");
+            let bytes = payload(seed);
+            let file = checkout.join("env/lib.so");
+            write(&file, &bytes);
+            let digest = sha256_file(&file).unwrap();
+            let entry = store.join(OUTPUT_POOL_DIR).join(&digest[..2]).join(&digest);
+            write(&entry, &bytes);
+            Self {
+                _root: root,
+                store,
+                checkout,
+                entry,
+                bytes,
+            }
+        }
+
+        fn run(&self, settle: Duration) -> OutputShareReport {
+            // A fresh copy each time: a pass that can clone replaces it.
+            fs::remove_file(self.checkout.join("env/lib.so")).unwrap();
+            write(&self.checkout.join("env/lib.so"), &self.bytes);
+            let report = share_outputs_settled(
+                &OutputShareRequest {
+                    worktree: &self.checkout,
+                    roots: vec!["env".into()],
+                    store: &self.store,
+                    import_method: PackageImportMethod::Clone,
+                    budget: OUTPUT_SHARE_BUDGET,
+                },
+                settle,
+                &mut || true,
+            );
+            assert_eq!(
+                fs::read(self.checkout.join("env/lib.so")).unwrap(),
+                self.bytes
+            );
+            assert!(!report.verification_record_write_failed);
+            report
+        }
+
+        fn record(&self) -> PathBuf {
+            self.store.join(OUTPUT_POOL_DIR).join(verified::RECORD_FILE)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_with_a_recorded_identity_is_not_read_again() {
+        let pooled = Pooled::new(19);
+        let first = pooled.run(Duration::ZERO);
+        assert_eq!(first.pool_entries_hashed, 1);
+        assert_eq!(first.pool_entries_verified_by_record, 0);
+        let second = pooled.run(Duration::ZERO);
+        assert_eq!(second.pool_entries_hashed, 0);
+        assert_eq!(second.pool_entries_verified_by_record, 1);
+        assert_eq!(
+            second.pool_bytes_verified_by_record,
+            pooled.bytes.len() as u64
+        );
+        fs::write(pooled.record(), b"{").unwrap();
+        let third = pooled.run(Duration::ZERO);
+        assert!(third.verification_record_ignored);
+        assert_eq!(third.pool_entries_hashed, 1);
+        assert_eq!(
+            pooled.run(Duration::ZERO).pool_entries_verified_by_record,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_just_written_entry_is_hashed_again_by_the_next_pass() {
+        let pooled = Pooled::new(23);
+        assert_eq!(pooled.run(verified::SETTLE).pool_entries_hashed, 1);
+        assert_eq!(pooled.run(verified::SETTLE).pool_entries_hashed, 1);
+        assert!(!pooled.record().exists());
+    }
+
+    /// Every change to a recorded entry is hashed again and rejected, even
+    /// one that keeps its size and restores its modification time.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_entry_is_hashed_again_and_rejected() {
+        let overwrite = |pooled: &Pooled| {
+            let modified = fs::metadata(&pooled.entry).unwrap().modified().unwrap();
+            // Past the coarsest timestamp tick a filesystem may use.
+            std::thread::sleep(Duration::from_millis(50));
+            let mut forged = pooled.bytes.clone();
+            forged[0] ^= 0xff;
+            fs::write(&pooled.entry, forged).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&pooled.entry)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        let replace = |pooled: &Pooled| {
+            let mut forged = pooled.bytes.clone();
+            forged[0] ^= 0xff;
+            let other = pooled.entry.with_extension("other");
+            fs::write(&other, forged).unwrap();
+            fs::rename(&other, &pooled.entry).unwrap();
+        };
+        for change in [&overwrite as &dyn Fn(&Pooled), &replace] {
+            let pooled = Pooled::new(29);
+            pooled.run(Duration::ZERO);
+            change(&pooled);
+            let report = pooled.run(Duration::ZERO);
+            assert_eq!(report.pool_entries_verified_by_record, 0);
+            assert_eq!(report.pool_entries_hashed, 1);
+            assert_eq!(report.pool_entries_rejected, 1);
+            assert_eq!(report.files_cloned_from_pool, 0);
+            assert!(!pooled.entry.exists());
+        }
+        // A truncated entry is refused on its size, record or not.
+        let pooled = Pooled::new(29);
+        pooled.run(Duration::ZERO);
+        fs::write(&pooled.entry, &pooled.bytes[..100]).unwrap();
+        let report = pooled.run(Duration::ZERO);
+        assert_eq!(report.files_failed, 1);
+        assert_eq!(report.pool_entries_verified_by_record, 0);
+        assert_eq!(report.files_cloned_from_pool, 0);
+    }
+
+    /// A record naming the right entry with another file's identity (stale,
+    /// forged, or a renumbered device) does not stop the entry's hash.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_for_another_identity_is_not_believed() {
+        for field in ["dev", "ino"] {
+            let pooled = Pooled::new(31);
+            pooled.run(Duration::ZERO);
+            let mut forged_entry = pooled.bytes.clone();
+            forged_entry[0] ^= 0xff;
+            fs::remove_file(&pooled.entry).unwrap();
+            write(&pooled.entry, &forged_entry);
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(pooled.record()).unwrap()).unwrap();
+            let name = pooled.entry.file_name().unwrap().to_str().unwrap();
+            let mut identity = serde_json::to_value(
+                EntryIdentity::of(&fs::symlink_metadata(&pooled.entry).unwrap()).unwrap(),
+            )
+            .unwrap();
+            identity[field] = (identity[field].as_u64().unwrap() + 1).into();
+            record["entries"][name]["identity"] = identity;
+            fs::write(pooled.record(), record.to_string()).unwrap();
+            let report = pooled.run(Duration::ZERO);
+            assert!(!report.verification_record_ignored);
+            assert_eq!(report.pool_entries_rejected, 1, "{field}");
+        }
+    }
+
+    /// An entry swapped between its verification and its clone is not used.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_replaced_after_its_verification_is_not_cloned_from() {
+        let root = tempfile::tempdir().unwrap();
+        if package_store::probe_import_method(root.path(), Some(true)) != PackageImportMethod::Clone
+        {
+            return;
+        }
+        let entry = root.path().join("entry");
+        let path = root.path().join("lib.so");
+        let temporary = root.path().join(".aethyme-share-1-1.tmp");
+        write(&entry, &payload(1));
+        write(&path, &payload(1));
+        let pooled = fs::symlink_metadata(&entry).unwrap();
+        let original = fs::symlink_metadata(&path).unwrap();
+        let swapped = root.path().join("swapped");
+        write(&swapped, &payload(2));
+        fs::rename(&swapped, &entry).unwrap();
+        assert!(!replace_with_pooled(&entry, &pooled, &temporary, &path, &original).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), payload(1));
     }
 
     /// A clone whose bytes no longer hash to the digest computed earlier
