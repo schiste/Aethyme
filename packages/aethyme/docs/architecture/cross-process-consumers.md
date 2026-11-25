@@ -5292,7 +5292,7 @@ is `{count, total_ms, max_ms}` (metric attachments):
 - `worktree_activity_look`: one look at a checkout's activity (the Git index,
   `HEAD` and the changed-file probe), by lane and look: `abandonment`,
   `landed`, `merged_pull_request` or `no_work`, followed by `_first` (before
-  any proof), `_claimed` (under the operation claim) or `_close` (the landed
+  any proof; for `merged_pull_request` after it), `_claimed` (under the operation claim) or `_close` (the landed
   lanes' last look), and `idle_strip`, whose only look is timed without the
   index and `HEAD` reads before it.
 - `worktree_activity_look_timed_out`: the looks whose `git status` ran out of
@@ -5359,6 +5359,20 @@ work class comes next, runs Git, and records the due time later passes wait
 for. The looks that do reach the probe read the index, `HEAD` and the hook
 again, the hook after the probe. `idle_strip` already asked its
 cheap refusals first.
+
+`merged_pull_request` puts its first probe off until just before the operation
+claim, after the holder check, the landing proof and its fresh search (added
+2026-11-25). Until then it judges by the index and `HEAD`. Then it takes the
+whole look, reads the hook and asks a moved-on holder again with the probe's
+time; a pass out of time is kept as `budget_exhausted` without a probe. A
+session kept before the probe is counted in `worktree_activity_look_avoided`
+under the landed code of the keep. A session only the probe would have kept as
+`recent_activity` is proved first and can end in any of the proof's answers,
+with what reads them: the proof-timeout streak, the landing memos (keyed by
+`HEAD` and tip) and, for `budget_exhausted`, the end of the likely-landed
+queue's pass. `landed_proof_worktree_clean_by_probe` reads `no_probe` for this
+lane: compare its time with `after_timed_out_probe` before, since the probe
+also warmed the file cache for that check.
 
 - `worktree_activity_look_avoided`: first looks whose probe did not run, by
   look, a dot and the code of the keep (`no_work_first.no_work_explicit_claim`);

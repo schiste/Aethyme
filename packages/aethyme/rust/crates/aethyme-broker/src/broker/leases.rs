@@ -2994,6 +2994,77 @@ impl Broker {
             ))
     }
 
+    /// The first look with its probe: the checkout's newest activity and the
+    /// newest of all evidence, or the keep when that is recent or the
+    /// checkout cannot be read. Everything but the session row and the merge
+    /// time is read here, the hook after the probe.
+    fn judge_first_look(
+        &self,
+        candidate: &crate::Session,
+        merged_at: i64,
+        decision_now_ms: i64,
+        abandon_after_ms: i64,
+        process_table: &crate::session_holder::RecordedHolderProcessTable,
+        lane: SessionCloseLane,
+    ) -> Result<(i64, i64), AbandonedSessionCloseOutcome> {
+        #[cfg(test)]
+        BEFORE_ACTIVITY_PROBE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        process_table.note_probe_put_off(false);
+        let look = format!("{}_first", lane.look_name());
+        let Ok(activity) = self.look_at_activity(candidate, &look) else {
+            return Err(keep_with(
+                process_table,
+                AbandonmentKeepReason::WorktreeActivityUnavailable,
+                AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
+            ));
+        };
+        let activity = activity.unwrap_or_default();
+        process_table.note_first_look_timed_out(activity.status.timed_out);
+        // An agent that only reads (tool calls, no writes, no broker
+        // command) still signals through its PreToolUse hook.
+        let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), candidate.id);
+        let recent = |last_activity_at: i64| {
+            !crate::decide_abandonment(
+                &SessionActivity {
+                    session_id: candidate.id,
+                    last_activity_at,
+                    created_at: candidate.created_at,
+                    agent_alive: None,
+                    closed: false,
+                },
+                decision_now_ms,
+                abandon_after_ms,
+            )
+            .is_abandoned()
+        };
+        let other_activity = candidate.last_activity_at.max(merged_at).max(hook_activity);
+        crate::worktree_status_activity::note_recent_verdict(
+            &look,
+            &activity,
+            candidate.last_activity_at,
+            other_activity,
+            recent,
+        );
+        let newest = activity.newest_ms().max(other_activity);
+        if recent(newest) {
+            process_table.note_not_due_before(
+                newest
+                    .max(candidate.created_at)
+                    .saturating_add(abandon_after_ms),
+            );
+            return Err(keep_with(
+                process_table,
+                AbandonmentKeepReason::RecentActivity,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
+        }
+        Ok((activity.newest_ms(), newest))
+    }
+
     /// Whether the landed proof would answer `no_session_commits`, with HEAD
     /// read from the checkout's files: HEAD is the diff base, no pull request
     /// merged, and HEAD is not recorded as landed. False when anything is
@@ -3036,6 +3107,7 @@ impl Broker {
         lane: SessionCloseLane,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
         process_table.note_first_look_timed_out(false);
+        process_table.note_probe_put_off(false);
         let outcome = self.judge_session_close(
             session_id,
             decision_now_ms,
@@ -3045,6 +3117,14 @@ impl Broker {
             deadline,
             lane,
         )?;
+        if process_table.probe_put_off()
+            && let Some(declined) = LandedSessionDecline::from_outcome(outcome)
+        {
+            crate::worktree_status_activity::note_look_avoided(
+                &format!("{}_first", lane.look_name()),
+                declined.code(),
+            );
+        }
         if process_table.first_look_timed_out() {
             let kept = process_table
                 .keep_reason()
@@ -3274,7 +3354,7 @@ impl Broker {
         // Cheaper keeps first: a probe that times out costs two seconds of
         // the lane's budget. The probe's time can only raise the activity, so
         // what is recent without it is recent with it. Every check asked here
-        // is asked again after the probe.
+        // is asked again later.
         let refusal = {
             let _span = crate::phase_telemetry::span("session_close_before_probe");
             let activity = crate::worktree_status_activity::WorktreeActivity {
@@ -3326,67 +3406,27 @@ impl Broker {
             }
             return Ok(keep_with(process_table, reason, outcome));
         }
-        #[cfg(test)]
-        BEFORE_ACTIVITY_PROBE.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        // The whole look again, index and HEAD included, and the hook after
-        // it: the verdict rests on nothing read before the cheap keeps but
-        // the session row and the merge evidence, as it always has.
-        let first_activity = match self.look_at_activity(&candidate, &first_look) {
-            Ok(activity) => activity.unwrap_or_default(),
-            Err(_) => {
-                return Ok(keep_with(
-                    process_table,
-                    AbandonmentKeepReason::WorktreeActivityUnavailable,
-                    AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
-                ));
-            }
-        };
-        process_table.note_first_look_timed_out(first_activity.status.timed_out);
-        let hook_activity = hook_activity.max(crate::agent_hook::hook_activity_ms(
-            self.main_root(),
-            session_id,
-        ));
-        let fs_activity = first_activity.newest_ms();
-        let database_activity = fs_activity
-            .max(candidate.last_activity_at)
-            .max(merged_at)
-            .max(hook_activity);
-        crate::worktree_status_activity::note_recent_verdict(
-            &first_look,
-            &first_activity,
-            candidate.last_activity_at,
-            candidate.last_activity_at.max(merged_at).max(hook_activity),
-            |at| recent(at, candidate.created_at),
-        );
-        if !matches!(
-            crate::decide_abandonment(
-                &SessionActivity {
-                    session_id,
-                    last_activity_at: database_activity,
-                    created_at: candidate.created_at,
-                    agent_alive: None,
-                    closed: false,
-                },
+        // The merged-pull-request lane puts its probe off until just before
+        // the operation claim: most of its sessions are kept by the proof.
+        // Until then it judges by the index and `HEAD`, which can only
+        // understate the activity; the holder is asked again with the probe.
+        let (fs_activity, database_activity) = if merged_lane {
+            process_table.note_probe_put_off(first_metadata.is_some());
+            let metadata_ms = first_metadata.unwrap_or_default();
+            (metadata_ms, metadata_ms)
+        } else {
+            match self.judge_first_look(
+                &candidate,
+                merged_at,
                 decision_now_ms,
                 abandon_after_ms,
-            ),
-            crate::AbandonmentVerdict::Abandoned { .. }
-        ) {
-            process_table.note_not_due_before(
-                database_activity
-                    .max(candidate.created_at)
-                    .saturating_add(abandon_after_ms),
-            );
-            return Ok(keep_with(
                 process_table,
-                AbandonmentKeepReason::RecentActivity,
-                AbandonedSessionCloseOutcome::NotDue,
-            ));
-        }
+                lane,
+            ) {
+                Ok(activity) => activity,
+                Err(kept) => return Ok(kept),
+            }
+        };
         // Past the abandonment window, what closing would put at risk sets
         // how much longer the session waits (landed, pushed but unmerged,
         // unpushed or uncommitted work). Asked before any holder or process
@@ -3732,6 +3772,47 @@ impl Broker {
                         AbandonedSessionCloseOutcome::LandedDeclined(reason),
                     ));
                 }
+            }
+        }
+        if merged_lane {
+            // Out of the pass's time: no probe, and no close without one.
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::BudgetExhausted,
+                    ),
+                ));
+            }
+            let (fs_activity, _) = match self.judge_first_look(
+                &candidate,
+                merged_at,
+                decision_now_ms,
+                abandon_after_ms,
+                process_table,
+                lane,
+            ) {
+                Ok(activity) => activity,
+                Err(kept) => return Ok(kept),
+            };
+            // A holder judged moved on by the index and `HEAD` may not have
+            // by a changed file.
+            if moved_on_to.is_some()
+                && let Some(event) = holder_event.as_ref()
+                && self
+                    .holder_moved_on(
+                        session_id,
+                        event,
+                        fs_activity.max(candidate.last_activity_at),
+                    )?
+                    .is_none()
+            {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::HolderAlive),
+                ));
             }
         }
         // Both claims (the operation claim below, the lifecycle claim at the
