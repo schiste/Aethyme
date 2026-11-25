@@ -1956,7 +1956,15 @@ impl Broker {
             let reason = process_table
                 .keep_reason()
                 .unwrap_or(AbandonmentKeepReason::Unrecorded);
-            crate::phase_telemetry::add(reason.no_work_telemetry_name(), std::time::Duration::ZERO);
+            let name = reason.no_work_telemetry_name();
+            crate::phase_telemetry::add(name, std::time::Duration::ZERO);
+            if name == "session_no_work_kept_other" {
+                crate::phase_telemetry::add_keyed(
+                    "session_no_work_kept_other_by_reason",
+                    reason.code(),
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         Ok(outcome)
     }
@@ -2885,6 +2893,170 @@ impl Broker {
         activity
     }
 
+    /// Why `lane` keeps `candidate` whatever the changed-file probe would
+    /// show, from checks that only read the database, the process table this
+    /// pass already holds, small configuration and ref files, and no Git
+    /// call; `None` when none of them decides, or one cannot be read. Each
+    /// is asked again after the probe, where it was before, and each keeps
+    /// a session the later checks would keep as well. `metadata_ms` is the
+    /// index and `HEAD` time: it can only understate the activity, so a
+    /// holder that has not moved on by it has not by the probe either.
+    fn refusal_before_probe(
+        &self,
+        candidate: &crate::Session,
+        metadata_ms: i64,
+        decision_now_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        lane: SessionCloseLane,
+    ) -> Option<(AbandonmentKeepReason, AbandonedSessionCloseOutcome)> {
+        use crate::session_holder::RecordedHolderLiveness as Liveness;
+        let landed = |reason| {
+            Some((
+                AbandonmentKeepReason::LandedDeclined,
+                AbandonedSessionCloseOutcome::LandedDeclined(reason),
+            ))
+        };
+        match lane {
+            // The work class comes next there: it runs Git, and its record
+            // and due time must not be lost to a cheaper keep.
+            SessionCloseLane::Abandonment => return None,
+            // Only declines that, like recent activity, still let the
+            // abandonment and no-work windows judge the session.
+            SessionCloseLane::Landed => {
+                if let Err(reason) = self.landed_session_preconditions(candidate) {
+                    return landed(reason);
+                }
+                return if self.has_no_session_commits_by_files(candidate) {
+                    landed(LandedSessionDecline::NoSessionCommits)
+                } else {
+                    None
+                };
+            }
+            SessionCloseLane::MergedPullRequest | SessionCloseLane::NoWork => {}
+        }
+        // No process listing is taken here: only one this pass already took
+        // for this binding answers.
+        let event = self
+            .store_ref()
+            .latest_session_holder_event(candidate.id)
+            .ok()?;
+        let holder = crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            candidate.id,
+            process_table,
+            false,
+        );
+        if event.as_ref().map(|event| event.id) != holder.binding_event_id {
+            return None;
+        }
+        // Read when the holder is alive: whether it may have moved on.
+        let moved_on = || {
+            let activity_at = metadata_ms.max(candidate.last_activity_at);
+            self.holder_moved_on(candidate.id, event.as_ref()?, activity_at)
+                .ok()
+                .map(|newer| newer.is_some())
+        };
+        let has_explicit_lease = || {
+            self.store_ref()
+                .unreleased_unexpired_leases_for_sessions_at(&[candidate.id], decision_now_ms)
+                .is_ok_and(|leases| leases.iter().any(|lease| lease.kind == LeaseKind::Explicit))
+        };
+        if lane == SessionCloseLane::NoWork {
+            // Nothing later in this lane depends on which of these kept the
+            // session, and all of them come before the holder's gone event
+            // is recorded.
+            match holder.liveness {
+                Liveness::Unbound => {
+                    return Some((
+                        AbandonmentKeepReason::NoWorkHolderUnbound,
+                        AbandonedSessionCloseOutcome::NotDue,
+                    ));
+                }
+                Liveness::Alive if moved_on() == Some(false) => {
+                    return Some((
+                        AbandonmentKeepReason::NoWorkHolderAlive,
+                        AbandonedSessionCloseOutcome::ActiveProcess,
+                    ));
+                }
+                _ => {}
+            }
+            if matches!(
+                self.session_operations_unresolved_since_boot(candidate.id),
+                Ok(true)
+            ) {
+                return Some((
+                    AbandonmentKeepReason::OperationUnresolved,
+                    AbandonedSessionCloseOutcome::OperationActive,
+                ));
+            }
+            return has_explicit_lease().then_some((
+                AbandonmentKeepReason::NoWorkExplicitClaim,
+                AbandonedSessionCloseOutcome::LeaseHeld,
+            ));
+        }
+        match holder.liveness {
+            Liveness::Unbound => landed(LandedSessionDecline::HolderUnbound),
+            // A live holder whose task lease expired may be excused.
+            Liveness::Alive
+                if event.as_ref().is_some_and(|event| {
+                    crate::session_holder::task_lease_expired(
+                        event,
+                        candidate.last_activity_at,
+                        decision_now_ms,
+                    ) != Some(true)
+                }) =>
+            {
+                match moved_on()? {
+                    false => landed(LandedSessionDecline::HolderAlive),
+                    // Explicit leases hold while their holder runs, moved on
+                    // or not. A session with a proof-timeout streak is proved
+                    // first, as before: only a conclusive proof ends it, and
+                    // the oldest streak is granted the long proof budget.
+                    true if has_explicit_lease()
+                        && !self
+                            .landed_proof_timeout_streaks()
+                            .contains_key(&candidate.id) =>
+                    {
+                        Some((
+                            AbandonmentKeepReason::LeaseHeld,
+                            AbandonedSessionCloseOutcome::LeaseHeld,
+                        ))
+                    }
+                    true => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the landed proof would answer `no_session_commits`, with HEAD
+    /// read from the checkout's files: HEAD is the diff base, no pull request
+    /// merged, and HEAD is not recorded as landed. False when anything is
+    /// unreadable or unusual.
+    fn has_no_session_commits_by_files(&self, session: &crate::Session) -> bool {
+        let Some(base) = session.diff_base.as_deref() else {
+            return false;
+        };
+        let Ok(Some((git_dir, common_dir))) =
+            checkout_git_dirs(std::path::Path::new(&session.worktree_path))
+        else {
+            return false;
+        };
+        let Ok(Some(head)) = read_head_commit(&git_dir, &common_dir) else {
+            return false;
+        };
+        head == base
+            && matches!(
+                self.store_ref()
+                    .session_has_merged_pull_request_link(session.id),
+                Ok(false)
+            )
+            && matches!(
+                self.store_ref().session_representation(session.id, &head),
+                Ok(None)
+            )
+    }
+
     /// [`Self::judge_session_close`], recording how a judgement whose first
     /// activity look timed out ended.
     #[allow(clippy::too_many_arguments)]
@@ -3099,9 +3271,15 @@ impl Broker {
         };
         let merged_at = merged_evidence.as_ref().map_or(0, |(_, at)| *at);
         let first_look = format!("{}_first", lane.look_name());
-        let first_activity = match self.look_at_activity(&candidate, &first_look) {
-            Ok(activity) => activity.unwrap_or_default(),
+        let look_started = std::time::Instant::now();
+        let first_metadata = match checked_worktree_metadata_ms(self.main_root(), &candidate) {
+            Ok(metadata_ms) => metadata_ms,
             Err(_) => {
+                crate::worktree_status_activity::note_look(
+                    &first_look,
+                    look_started.elapsed(),
+                    false,
+                );
                 return Ok(keep_with(
                     process_table,
                     AbandonmentKeepReason::WorktreeActivityUnavailable,
@@ -3109,15 +3287,10 @@ impl Broker {
                 ));
             }
         };
-        process_table.note_first_look_timed_out(first_activity.status.timed_out);
-        let fs_activity = first_activity.newest_ms();
+        let metadata_elapsed = look_started.elapsed();
         // An agent that only reads (tool calls, no writes, no broker
         // command) still signals through its PreToolUse hook.
         let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), session_id);
-        let database_activity = fs_activity
-            .max(candidate.last_activity_at)
-            .max(merged_at)
-            .max(hook_activity);
         let recent = |last_activity_at: i64, created_at: i64| {
             !matches!(
                 crate::decide_abandonment(
@@ -3134,6 +3307,76 @@ impl Broker {
                 crate::AbandonmentVerdict::Abandoned { .. }
             )
         };
+        // Cheaper keeps first: a probe that times out costs two seconds of
+        // the lane's budget. The probe's time can only raise the activity, so
+        // what is recent without it is recent with it. Every check asked here
+        // is asked again after the probe.
+        let refusal = {
+            let _span = crate::phase_telemetry::span("session_close_before_probe");
+            let activity = crate::worktree_status_activity::WorktreeActivity {
+                metadata_ms: first_metadata.unwrap_or_default(),
+                ..Default::default()
+            };
+            let known_activity = activity
+                .metadata_ms
+                .max(candidate.last_activity_at)
+                .max(merged_at)
+                .max(hook_activity);
+            if recent(known_activity, candidate.created_at) {
+                crate::worktree_status_activity::note_recent_verdict(
+                    &first_look,
+                    &activity,
+                    candidate.last_activity_at,
+                    candidate.last_activity_at.max(merged_at).max(hook_activity),
+                    |at| recent(at, candidate.created_at),
+                );
+                process_table.note_not_due_before(
+                    known_activity
+                        .max(candidate.created_at)
+                        .saturating_add(abandon_after_ms),
+                );
+                Some((
+                    AbandonmentKeepReason::RecentActivity,
+                    AbandonedSessionCloseOutcome::NotDue,
+                ))
+            } else {
+                self.refusal_before_probe(
+                    &candidate,
+                    activity.metadata_ms,
+                    decision_now_ms,
+                    process_table,
+                    lane,
+                )
+            }
+        };
+        if let Some((reason, outcome)) = refusal {
+            // A missing checkout has nothing to probe.
+            if first_metadata.is_some() {
+                crate::worktree_status_activity::note_look_avoided(
+                    &first_look,
+                    match outcome {
+                        AbandonedSessionCloseOutcome::LandedDeclined(declined) => declined.code(),
+                        _ => reason.code(),
+                    },
+                );
+            }
+            return Ok(keep_with(process_table, reason, outcome));
+        }
+        let probe_started = std::time::Instant::now();
+        let first_activity = first_metadata
+            .map(|metadata_ms| probed_worktree_activity(&candidate, metadata_ms))
+            .unwrap_or_default();
+        crate::worktree_status_activity::note_look(
+            &first_look,
+            metadata_elapsed.saturating_add(probe_started.elapsed()),
+            first_activity.status.timed_out,
+        );
+        process_table.note_first_look_timed_out(first_activity.status.timed_out);
+        let fs_activity = first_activity.newest_ms();
+        let database_activity = fs_activity
+            .max(candidate.last_activity_at)
+            .max(merged_at)
+            .max(hook_activity);
         crate::worktree_status_activity::note_recent_verdict(
             &first_look,
             &first_activity,

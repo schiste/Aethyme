@@ -1632,6 +1632,16 @@ pub(crate) fn checked_worktree_activity(
     main_root: &Path,
     session: &Session,
 ) -> Result<Option<crate::worktree_status_activity::WorktreeActivity>, std::io::Error> {
+    Ok(checked_worktree_metadata_ms(main_root, session)?
+        .map(|metadata_ms| probed_worktree_activity(session, metadata_ms)))
+}
+
+/// The Git index and `HEAD` half of [`checked_worktree_activity`]: file
+/// metadata only, no Git call.
+pub(super) fn checked_worktree_metadata_ms(
+    main_root: &Path,
+    session: &Session,
+) -> Result<Option<i64>, std::io::Error> {
     let worktree = Path::new(&session.worktree_path);
     match std::fs::symlink_metadata(worktree) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
@@ -1693,36 +1703,38 @@ pub(crate) fn checked_worktree_activity(
         let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
         newest = Some(newest.map_or(millis, |known| known.max(millis)));
     }
-    // Deep edits touch neither the index nor any directory above them: the
-    // changed files' own modification times (and their parents') count too.
-    // A status call that times out or reaches its cap without evidence
-    // leaves the index and HEAD evidence alone (counted).
-    let mut status = crate::worktree_status_activity::StatusActivity::default();
-    if newest.is_some() {
-        status = crate::worktree_status_activity::status_activity(
-            worktree,
-            crate::worktree_status_activity::STATUS_ACTIVITY_BUDGET,
-            crate::worktree_status_activity::STATUS_ACTIVITY_PATH_CAP,
-        );
-        if status.newest_ms.is_none() && !status.complete {
-            crate::phase_telemetry::add(
-                "worktree_activity_status_fallback",
-                std::time::Duration::ZERO,
-            );
-        }
-    }
-    let activity = newest.map(
-        |metadata_ms| crate::worktree_status_activity::WorktreeActivity {
-            metadata_ms,
-            status,
-        },
-    );
-    activity.map(Some).ok_or_else(|| {
+    newest.map(Some).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "existing worktree has no readable Git activity metadata",
         )
     })
+}
+
+/// The changed-file half of [`checked_worktree_activity`]: one `git status`.
+/// Deep edits touch neither the index nor any directory above them: the
+/// changed files' own modification times (and their parents') count too.
+/// A status call that times out or reaches its cap without evidence
+/// leaves the index and HEAD evidence alone (counted).
+pub(super) fn probed_worktree_activity(
+    session: &Session,
+    metadata_ms: i64,
+) -> crate::worktree_status_activity::WorktreeActivity {
+    let status = crate::worktree_status_activity::status_activity(
+        Path::new(&session.worktree_path),
+        crate::worktree_status_activity::STATUS_ACTIVITY_BUDGET,
+        crate::worktree_status_activity::STATUS_ACTIVITY_PATH_CAP,
+    );
+    if status.newest_ms.is_none() && !status.complete {
+        crate::phase_telemetry::add(
+            "worktree_activity_status_fallback",
+            std::time::Duration::ZERO,
+        );
+    }
+    crate::worktree_status_activity::WorktreeActivity {
+        metadata_ms,
+        status,
+    }
 }
 
 fn checked_git_common_dir(git_dir: &Path) -> Result<PathBuf, std::io::Error> {

@@ -5309,7 +5309,9 @@ is `{count, total_ms, max_ms}` (metric attachments):
   `idle_strip` with the strip's idle cutoff.
 - `worktree_activity_index_head_decides`: looks the index or `HEAD` alone
   already decided. A session its own age keeps is not counted. `idle_strip`
-  runs no probe then; the close lanes do.
+  and the close lanes' first look run no probe then (a `_first` one is counted
+  here and in `worktree_activity_look_avoided`, not in
+  `worktree_activity_look`); the `_claimed` and `_close` looks do.
 - `worktree_activity_probe_changed_verdict`: looks where the probe examined
   every changed path and only its newest file, not the index, `HEAD` or the
   other activity, kept the session. `worktree_activity_capped_probe_changed_verdict`
@@ -5337,6 +5339,47 @@ is `{count, total_ms, max_ms}` (metric attachments):
   checkout within 30 s: `after_probe`, `after_timed_out_probe` or `no_probe`.
   It includes proofs made outside a close judgement, and a remembered timeout
   reads as `no_probe` once the fresh one is older than that.
+
+A close lane's first look asks cheaper keeps before its probe (added
+2026-11-25). They read the database, file times, small configuration and ref
+files and the process table the pass already holds; none runs Git, lists
+processes or calls a provider. Every check is asked again where it was asked
+before, and the `_claimed` and `_close` looks are unchanged:
+
+- every lane: recent by the session's own activity, its last merge, the hook,
+  the index or `HEAD`;
+- `landed`: an unmerged linked pull request, the cleanup policy
+  (`policy_unavailable`, `auto_remove_disabled`, `pinned`), and
+  `no_session_commits` with `HEAD` read from its files;
+- `merged_pull_request`: no recorded holder, a live holder that has not moved
+  on, and an explicit lease of a live holder that has (not for a session with
+  a proof-timeout streak, which only a conclusive proof ends);
+- `no_work`: no recorded holder, a live holder that has not moved on, an
+  unresolved operation, an explicit claim.
+
+`abandonment` asks only the first: its work class comes next, runs Git, and
+records the due time later passes wait for. `idle_strip` already asked its
+cheap refusals first.
+
+- `worktree_activity_look_avoided`: first looks whose probe did not run, by
+  look, a dot and the code of the keep (`no_work_first.no_work_explicit_claim`);
+  times are zero. A missing checkout is not counted: it has nothing to probe.
+  These are not in `worktree_activity_look`, whose `_first` entries now count
+  only the looks that came to the probe (and checkouts that could not be read).
+- `session_no_work_kept_other_by_reason`: the keeps behind the counter
+  `session_no_work_kept_other`, by code.
+- New phase span `session_close_before_probe`: those checks.
+
+Keep counts shift: a session the probe alone would have kept as
+`recent_activity` can now be counted under one of the codes above, and a
+merged-pull-request session with a held lease under `lease_held` instead of a
+proof's answer. What reads the codes: the abandonment window's not-due memo
+(a recent session may be judged again earlier, never later), the landed
+decline memo (`no_session_commits` and `holder_unbound` are remembered, under
+a key that names what they depend on), and the proof-timeout streaks (above).
+The landed codes allow the abandonment and no-work windows just as
+`recent_activity` does; no new code stops a lane, holds its cursor or backs a
+session off.
 
 The looks run on the thread that judges the session, which is the thread that
 records; none is handed to a worker thread. Covered by
