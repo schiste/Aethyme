@@ -5599,3 +5599,27 @@ Whether the `archive_failed` keeps above follow from deadline cuts is not
 verified. Readers must accept the new keep reasons, fields, counters and spans.
 Covered by tests in `broker/retire.rs`, `cleanup_resolve.rs`, `auto_cleanup.rs`
 and `storage_ledger/tests.rs`.
+
+### Carried ownership on re-adoption (2026-11-25)
+
+Introduced 2026-11-25. `broker start --adopt` after a closed session no longer
+builds a submission plan against the local integration ref while it holds the
+repository lifecycle claim. In a repository that lands work only through pull
+requests that ref is stale, and the plan hashed every commit between it and the
+session's HEAD.
+
+- `carried_ownership.pending_owned_commits` counts owned commits that the
+  integration view holds pending and the fetched default branch does not prove
+  delivered (ancestry, an exact sync merge, or one patch-equivalent commit). It
+  can be lower than before, never higher; `carried_ownership` is omitted when
+  nothing is left. An ambiguous match on the default branch, or a comparison with
+  it that fails, leaves the commit owned.
+- `integration_drift` values are unchanged.
+- Span `adopt_carried_ownership` covers the ownership carry and span
+  `adopt_drift_report` the drift report, on every adoption path that runs them.
+- Metric attachment `adopt_ownership`: `carried_commits_hashed` and
+  `drift_commits_hashed`, the commits whose patch each one hashed. A key is absent
+  when that step did not run. Counts only: no path, id or branch name.
+
+Readers must accept the new spans and attachment. Covered by tests in
+`submission_ownership.rs`.

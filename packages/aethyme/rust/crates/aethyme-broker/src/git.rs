@@ -6724,13 +6724,22 @@ impl GitRepo {
         head: &str,
         excluded: &str,
     ) -> Result<Vec<String>, GitError> {
-        Ok(run_git(
-            &self.root,
-            &["rev-list", "--reverse", head, "--not", excluded],
-        )?
-        .lines()
-        .map(str::to_string)
-        .collect())
+        self.commits_excluding_all_oldest(head, &[excluded])
+    }
+
+    /// [`Self::commits_excluding_oldest`] for commits none of `excluded`
+    /// reaches.
+    pub(crate) fn commits_excluding_all_oldest(
+        &self,
+        head: &str,
+        excluded: &[&str],
+    ) -> Result<Vec<String>, GitError> {
+        let mut args = vec!["rev-list", "--reverse", head, "--not"];
+        args.extend_from_slice(excluded);
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 
     /// Earliest committer time among `commits`, Unix epoch milliseconds, in
@@ -7242,6 +7251,44 @@ impl GitRepo {
             left_only: left,
             right_only: right,
         })
+    }
+
+    /// How many of `candidates` carry the same patch as each of `listed`
+    /// (commits without a match are absent), and how many commits were hashed
+    /// to tell. Each side is `(commit, has a parent)`; the sides are disjoint.
+    ///
+    /// Commits with the same patch id change the same paths, so every match is
+    /// among the commits [`Self::commits_sharing_changed_paths`] keeps.
+    pub(crate) fn patch_equivalent_counts(
+        &self,
+        listed: &[(String, bool)],
+        candidates: &[(String, bool)],
+        cache: &mut PatchIdCache,
+    ) -> Result<(BTreeMap<String, usize>, usize), GitError> {
+        let comparable = self.commits_sharing_changed_paths(listed, candidates, cache)?;
+        let hashed = comparable
+            .iter()
+            .filter(|commit| {
+                !cache
+                    .entries
+                    .contains_key(&(self.root.clone(), (*commit).clone()))
+            })
+            .count();
+        let patch_ids = self.cached_first_parent_patch_ids(&comparable, cache)?;
+        let mut by_patch = BTreeMap::<&str, usize>::new();
+        for (candidate, _) in candidates {
+            if let Some(patch) = patch_ids.get(candidate) {
+                *by_patch.entry(patch).or_default() += 1;
+            }
+        }
+        let counts = listed
+            .iter()
+            .filter_map(|(commit, _)| {
+                let count = by_patch.get(patch_ids.get(commit)?.as_str())?;
+                Some((commit.clone(), *count))
+            })
+            .collect();
+        Ok((counts, hashed))
     }
 
     /// The commits of two sides whose patch ids can decide patch equivalence
