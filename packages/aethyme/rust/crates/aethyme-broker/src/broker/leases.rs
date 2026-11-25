@@ -1015,6 +1015,9 @@ thread_local! {
     /// Test seam between the keeps asked before the activity probe and it.
     pub(crate) static BEFORE_ACTIVITY_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
+    /// Test seam: the pass deadline the late probe is asked under.
+    pub(crate) static DEADLINE_AT_LATE_PROBE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
     /// Test seams around the abandoned-session close: after its second look,
     /// before it takes the lifecycle claim; and under the claim, just before
     /// the compare-and-set.
@@ -2900,8 +2903,8 @@ impl Broker {
     /// show, from checks that only read the database, the process table this
     /// pass already holds, small configuration and ref files, and no Git
     /// call; `None` when none of them decides, or one cannot be read. Each
-    /// is asked again after the probe, where it was before, and each keeps
-    /// a session the later checks would keep as well. `metadata_ms` is the
+    /// is still asked later, where it was before, and each keeps a session
+    /// the later checks would keep as well. `metadata_ms` is the
     /// index and `HEAD` time: it can only understate the activity, so a
     /// holder that has not moved on by it has not by the probe either.
     fn refusal_before_probe(
@@ -2917,7 +2920,7 @@ impl Broker {
             // The work class comes next there: it runs Git, and its record
             // and due time must not be lost to a cheaper keep.
             SessionCloseLane::Abandonment => return None,
-            // Its holder and leases are judged after the probe.
+            // Its probe is put off until after the holder and the proof.
             SessionCloseLane::MergedPullRequest => return None,
             // Only declines that, like recent activity, still let the
             // abandonment and no-work windows judge the session.
@@ -2997,11 +3000,14 @@ impl Broker {
     /// The first look with its probe: the checkout's newest activity and the
     /// newest of all evidence, or the keep when that is recent or the
     /// checkout cannot be read. Everything but the session row and the merge
-    /// time is read here, the hook after the probe.
+    /// time is read here, the hook again after the probe (`hook_activity` is
+    /// its earlier time).
+    #[allow(clippy::too_many_arguments)]
     fn judge_first_look(
         &self,
         candidate: &crate::Session,
         merged_at: i64,
+        hook_activity: i64,
         decision_now_ms: i64,
         abandon_after_ms: i64,
         process_table: &crate::session_holder::RecordedHolderProcessTable,
@@ -3026,7 +3032,10 @@ impl Broker {
         process_table.note_first_look_timed_out(activity.status.timed_out);
         // An agent that only reads (tool calls, no writes, no broker
         // command) still signals through its PreToolUse hook.
-        let hook_activity = crate::agent_hook::hook_activity_ms(self.main_root(), candidate.id);
+        let hook_activity = hook_activity.max(crate::agent_hook::hook_activity_ms(
+            self.main_root(),
+            candidate.id,
+        ));
         let recent = |last_activity_at: i64| {
             !crate::decide_abandonment(
                 &SessionActivity {
@@ -3418,6 +3427,7 @@ impl Broker {
             match self.judge_first_look(
                 &candidate,
                 merged_at,
+                hook_activity,
                 decision_now_ms,
                 abandon_after_ms,
                 process_table,
@@ -3775,7 +3785,15 @@ impl Broker {
             }
         }
         if merged_lane {
-            // Out of the pass's time: no probe, and no close without one.
+            // Out of the pass's time: no probe, and no close without one. The
+            // session's own budget is not asked here: spent, it ends in what
+            // the checks under the claim find first (busy, a held lease, an
+            // unknown operation that falls back to the landed lane), and a
+            // `proof_timed_out` here would lengthen the streak instead.
+            #[cfg(test)]
+            let deadline = DEADLINE_AT_LATE_PROBE
+                .with(std::cell::Cell::get)
+                .or(deadline);
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Ok(keep_with(
                     process_table,
@@ -3788,6 +3806,7 @@ impl Broker {
             let (fs_activity, _) = match self.judge_first_look(
                 &candidate,
                 merged_at,
+                hook_activity,
                 decision_now_ms,
                 abandon_after_ms,
                 process_table,

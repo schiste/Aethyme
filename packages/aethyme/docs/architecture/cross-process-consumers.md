@@ -5343,7 +5343,7 @@ is `{count, total_ms, max_ms}` (metric attachments):
 A close lane's first look asks cheaper keeps before its probe (added
 2026-11-25). They read the database, file times, small configuration and ref
 files and the process table the pass already holds; none runs Git, lists
-processes or calls a provider. Every check is asked again where it was asked
+processes or calls a provider. Every check is still asked where it was asked
 before, and the `_claimed` and `_close` looks are unchanged:
 
 - every lane: recent by the session's own activity, its last merge, the hook,
@@ -5366,20 +5366,29 @@ claim, after the holder check, the landing proof and its fresh search (added
 whole look, reads the hook and asks a moved-on holder again with the probe's
 time; a pass out of time is kept as `budget_exhausted` without a probe. A
 session kept before the probe is counted in `worktree_activity_look_avoided`
-under the landed code of the keep. A session only the probe would have kept as
+under the landed code of the keep.
+`worktree_activity_after_first_look_timed_out` for this lane has only endings
+at or after that look. A session only the probe would have kept as
 `recent_activity` is proved first and can end in any of the proof's answers,
-with what reads them: the proof-timeout streak, the landing memos (keyed by
-`HEAD` and tip) and, for `budget_exhausted`, the end of the likely-landed
-queue's pass. `landed_proof_worktree_clean_by_probe` reads `no_probe` for this
-lane: compare its time with `after_timed_out_probe` before, since the probe
-also warmed the file cache for that check.
+with what they write or decide: the proof-timeout streak and the unprovable
+mark, the landing memos (keyed by `HEAD` and tip), the landed decline memo
+and, for `budget_exhausted`, the end of the likely-landed queue's pass.
+The probe also warmed the file cache for the proof's clean check, and a
+timeout it remembered made the `_claimed` look free.
+`landed_proof_worktree_clean_by_probe` mostly reads `no_probe` for this lane
+now; that key is per thread and checkout within 30 s and shared with the
+landed lane, so it does not tell the lanes apart. Judge the order per gc run
+by `worktree_status_activity` plus `landed_proof_worktree_clean` plus
+`session_close_checkout_activity`, with sessions judged and closed; `_first`
+time alone proves nothing.
 
 - `worktree_activity_look_avoided`: first looks whose probe did not run, by
   look, a dot and the code of the keep (`no_work_first.no_work_explicit_claim`);
   times are zero. A missing checkout is not counted: it has nothing to probe.
   These are not in `worktree_activity_look`, whose `_first` entries now count
   the looks that came to the probe, the missing checkouts no cheap check
-  refused (they have nothing to probe) and the checkouts that could not be
+  refused (they have nothing to probe; a missing `merged_pull_request` one is
+  kept by the proof before its look and is counted nowhere) and the checkouts that could not be
   read. The denominators of `worktree_activity_probe_newest`,
   `worktree_activity_look_timed_out`, the verdict counts and
   `worktree_activity_after_first_look_timed_out` leave avoided looks out too,
