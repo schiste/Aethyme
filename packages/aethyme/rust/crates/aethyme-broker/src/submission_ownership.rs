@@ -92,7 +92,7 @@ impl<'a> OwnedRange<'a> {
 
     fn baseline(&self) -> &'a str {
         match self {
-            Self::AfterBaseline(baseline) | Self::BeyondBase(baseline) => *baseline,
+            Self::AfterBaseline(baseline) | Self::BeyondBase(baseline) => baseline,
         }
     }
 
@@ -105,7 +105,7 @@ impl<'a> OwnedRange<'a> {
     ) -> Result<Vec<String>, BrokerOpError> {
         let mut excluded = bases.to_vec();
         if let Self::AfterBaseline(baseline) = self {
-            excluded.push(*baseline);
+            excluded.push(baseline);
         }
         Ok(repo.commits_excluding_all_oldest(session_head, &excluded)?)
     }
