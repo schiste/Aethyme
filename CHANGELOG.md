@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.171] - 2026-11-25
+
+### Fixed
+
+- `start --reuse` no longer recreates a retired checkout from its branch when its recovery archive may exist but cannot be reached (an unmounted volume, an unreadable directory, record or manifest, an incomplete pool binding). Before, the tombstone was removed first and unreadable places were skipped, so the checkout came back without its uncommitted work and without the pointer to the archive. The archive is now looked up before the tombstone is touched; when it cannot be told, the command refuses, leaves the tombstone, and gives a next step for that cause. An archive proven gone still falls back to the branch. Later failures put the tombstone back. An empty directory left by a killed restore is handled as retired (#2005).
+- An unreadable record of archived sessions is no longer overwritten. The next archived retirement keeps its text and restarts the record with the entries that can be read (#2005).
+- The merged-branch lane keeps a branch when an archive root or record cannot be resolved or checked. Before, such a root read as holding no archive (#2003).
+
+### Changed
+
+- The merged-branch lane lists the recovery archives once per slice instead of once per session; the re-check under the lifecycle claim before each delete still reads them afresh. `merged_branches_restorable_state` took 5.4 to 20.3 s in 13 of 14 recorded 0.8.169 passes on the busiest repository; which part of it was slow is inferred, and the new spans measure it (#2003).
+
+### Added
+
+- Spans and counts `merged_branches_archive_record`, `_tombstone`, `_archive_listing`, `_archive_listing_fresh`, `_archive_roots`, `_archive_entries`, `_archive_roots_unknown` (#2003); span `checkout_restore_archive_lookup` and counts `checkout_restore_refused_archive_unknown`, `checkout_restore_tombstone_lost`, `checkout_retirement_tombstone_kept_archive_unknown`, `checkout_retirement_archive_record_restarted`, `checkout_retirement_archive_record_preserve_refused` (#2005).
+- Attachments that split the changed-files activity probe by lane and look: `worktree_activity_look`, `worktree_activity_look_timed_out`, `worktree_activity_probe_newest`, `worktree_activity_index_head_decides`, `worktree_activity_probe_changed_verdict`, `worktree_activity_capped_probe_changed_verdict`, `worktree_activity_probe_answer_differs`, `worktree_activity_after_first_look_timed_out`, `landed_proof_worktree_clean_by_probe` (#2006).
+
+### Upgrade notes
+
+- `start --reuse` can now refuse where it used to recreate a checkout; the message says what to do (#2005).
+
+### Known issues
+
+- After a damaged record of archived sessions, a session closed before the restart can stay refused when no tombstone names its archive and the damaged text cannot answer for it; its archive is then restored by hand (#2005).
+
 ## [0.8.170] - 2026-11-24
 
 ### Fixed
