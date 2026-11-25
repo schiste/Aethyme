@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.179] - 2026-11-25
+
+### Changed
+
+- The step of `submit prepare` that shares dependency files between checkouts no longer hashes or pools Python bytecode. Bytecode usually carries its checkout's path and its source's time, so it rarely matches another checkout; each examined prepare added about 25 MB of it to the pool. In a sample of the pool, 988 of 1,036 entries were bytecode (#2024).
+- A pool entry verified in the last day is not read again while its device, inode, size, modification time and change time are unchanged. Together these should remove about 367 of 685 MB read per pass (estimated from bytes; not timed). The step took 1,293 s over 40 prepares on 0.8.177 on the busiest repository (median 20.8 s, p90 82 s) (#2024).
+
+### Added
+
+- Spans `prepare_output_share_sweep`, `_sample`, `_sizing`, `_hash`, `_verify`, `_add`, `_replace` and `_record`, and counters for skipped bytecode and for pool entries hashed or recognised (#2024).
+
+### Upgrade notes
+
+- `unique_bytes_after` now includes bytecode that is no longer pooled (about 25 MB per checkout there). Bytecode already in the pool stays until the store rotates.
+
+### Known issues
+
+- The first prepare after the upgrade, and one about once a day, still hashes every reused pool entry.
+- Damage on disk that changes no metadata of a pool entry is found within a day instead of by the next prepare.
+
 ## [0.8.178] - 2026-11-25
 
 ### Fixed
