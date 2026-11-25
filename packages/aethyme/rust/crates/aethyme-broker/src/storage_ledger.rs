@@ -965,6 +965,11 @@ pub struct RecoveryArchiveUsage {
     pub evicted_bytes_total: u64,
     /// The measurement stopped at its deadline (a lower bound).
     pub partial: bool,
+    /// Every archive found is in the total, measured by this pass or counted
+    /// with the size an earlier pass measured (so it can be true of a
+    /// `partial` pass). A record from before this field reads as not known.
+    #[serde(default)]
+    pub total_known: bool,
     pub observed_at_ms: i64,
 }
 
@@ -1016,6 +1021,20 @@ pub struct MeasuredArchiveSize {
     pub bytes: u64,
 }
 
+/// An archive the broker cannot vouch for, in [`ArchiveBoundState`]: its
+/// content may change, so it is walked again whenever a pass reaches it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnownedArchiveSize {
+    /// What the last completed walk found, if any: only ever counted in the
+    /// total of a pass that could not walk it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// When a walk was last tried: the one tried longest ago goes first, so
+    /// one that is always too large cannot hold back the others.
+    #[serde(default)]
+    pub tried_at_ms: i64,
+}
+
 fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
     use sha2::Digest as _;
     // Beside the usage record, with an extension the usage reader skips.
@@ -1036,6 +1055,9 @@ pub struct ArchiveBoundState {
     /// owns are kept; a failed walk is never recorded.
     #[serde(default)]
     pub sizes: BTreeMap<String, MeasuredArchiveSize>,
+    /// Archives the broker could not vouch for when last listed.
+    #[serde(default)]
+    pub unowned_sizes: BTreeMap<String, UnownedArchiveSize>,
     /// Archives whose size walk ran out of budget, with when: measured
     /// after the others next run, with what budget is left.
     #[serde(default)]

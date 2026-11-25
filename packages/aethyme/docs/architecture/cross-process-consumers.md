@@ -4257,7 +4257,7 @@ Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
 - Changed 2026-11-20 (retirement run reaches its closed lap). On 0.8.141 on the busiest repository (closed backlog 335, 683 open sessions), two of three runs never started the closed lap: resolving the open sessions' paths took 80 s and 63 s against a fixed third of the 180 s window (60 s), and a resolution that runs out keeps nothing. The recovery-archive bound then took 105 s and 339 s to list 2,390 archives with nothing listed (one `lstat` per archive root entry, then one per earlier recorded size), which was the 300 s no checkout-retirement span covered. Now:
   - Resolving open paths may use the window less the closed lap's floor, never less than a third (135 s of 180 s at the 45 s backlog floor).
   - While 50 or more closed checkouts wait, the closed lap runs right after the scratch pass, with the rest of the sweep window (at least its floor), and the strip and idle strip passes follow with their floors (counter `checkout_retirement_closed_lap_first`). Below 50 the order is unchanged.
-  - The recovery-archive bound runs at most every 30 minutes while its last recorded pass measured every archive and found them within the bound, and the run's laps (which run before it) wrote no recovery archive. It runs on every run whose last record is over the bound or `partial` (it may undercount), and on every run that archived a checkout or an abandoned operation (from the storage ledger's `observed_at_ms`, `over_bound` and `partial`; counter `checkout_retirement_archive_bound_not_due` when skipped; span `checkout_retirement_archive_bound` around it). The archive listing takes entry types from the directory listing instead of one `lstat` per entry, and carrying earlier sizes forward checks only sizes the pass does not already hold. New spans `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`, and `checkout_retirement_setup` (the trash backlog and progress reads before the open paths).
+  - The recovery-archive bound runs at most every 30 minutes while its last recorded pass measured every archive and found them within the bound, and the run's laps (which run before it) wrote no recovery archive. It runs on every run whose last record is over the bound or `partial` (it may undercount; since 2026-11-25, whose total is not known, see below), and on every run that archived a checkout or an abandoned operation (from the storage ledger's `observed_at_ms`, `over_bound` and `partial`; counter `checkout_retirement_archive_bound_not_due` when skipped; span `checkout_retirement_archive_bound` around it). The archive listing takes entry types from the directory listing instead of one `lstat` per entry, and carrying earlier sizes forward checks only sizes the pass does not already hold. New spans `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`, and `checkout_retirement_setup` (the trash backlog and progress reads before the open paths).
   - The `checkout_retirement` attachment adds `closed_lap_first`, `open_sessions` and `open_paths_ms`, and `closed_stop` is `not_reached_open_paths` when the open paths could not be resolved in time (it was empty).
   - Unchanged and why. The plan's `git status` already runs with `GIT_OPTIONAL_LOCKS=0`, `core.fsmonitor=false` and `core.untrackedCache=false`; `git worktree list` takes no index or lock and reads each of about 1,000 registrations, already once per run. No cheaper listing gives the same answer, so both are left as they are.
 Covered by `broker/retire.rs` tests.
@@ -5414,3 +5414,32 @@ holds its cursor or backs a session off.
 The looks run on the thread that judges the session, which is the thread that
 records; none is handed to a worker thread. Covered by
 `worktree_status_activity.rs` and `broker/leases.rs` tests.
+
+Changed 2026-11-25 (a partial archive bound pass that knows its total waits).
+On the busiest repository (0.8.173) 22 of 26 recovery-archive bound passes used
+their whole 20 s and ended `partial`, so each was due again at the next run
+although the archives were at a third of the bound. The storage ledger's
+`RecoveryArchiveUsage` adds `total_known`: every archive found is in the total,
+measured by the pass or counted with the size an earlier pass measured. The
+bound pass is due when it is over the bound, its total is not known (instead of
+`partial`), its record is 30 minutes old, the clock went back, or the run
+archived something. A record without the field reads as not known. `partial`
+keeps its meaning. The bound state (`<sha256>.archive-sizes`) adds
+`unowned_sizes` (path to `bytes` and `tried_at_ms`): the last size of an archive
+the broker cannot vouch for, only counted while its walk cannot run; the one
+tried longest ago is walked first. The listing may use three quarters of the
+20 s, leaving the rest to size walks. A pass that listed nothing while archives
+wait, or could not read an archive directory, does not know its total.
+
+Attachment `recovery_archive_bound_pass` adds `walk_fell_back` (archives listed
+but counted with an earlier size because their walk did not complete),
+`size_unknown` (archives with no size from this pass or an earlier one, which
+makes the pass due again), `root_failures` (archive directories that could not
+be listed), `total_known` and `total_from_earlier_sizes` (known only with the
+help of earlier sizes); `recovery_archive_bound` adds `total_known`. New
+counters: `recovery_archive_bound_total_from_earlier_sizes` and
+`recovery_archive_bound_total_unknown` (one per such pass), and
+`checkout_retirement_archive_bound_not_due_partial` (runs that skipped the bound
+after a partial pass with a known total, also counted in
+`checkout_retirement_archive_bound_not_due`). Covered by `broker/retire.rs` and
+`broker/archive_bound.rs` tests.

@@ -30,6 +30,18 @@
 //! passes rotate past until their retry is due. Only the archive about to
 //! be removed is fully proven, under the lifecycle claim.
 //!
+//! A pass that did not list or walk everything (`partial`) still knows the
+//! total (`total_known`) when every archive is either measured by it or
+//! counted with the size an earlier pass measured; within the bound, it is
+//! then not due again before the normal interval. That total cannot hide an
+//! overrun for long: every pass reads the names in both archive directories
+//! whole, so an archive removed elsewhere is never counted and a new one,
+//! having no size, makes the total unknown; content the broker vouches for
+//! does not change; and an archive it does not vouch for, which may grow, is
+//! walked again each time the listing reaches it. The listing keeps its
+//! cursor and leaves part of the budget to the walks, so successive passes
+//! reach every archive however slow the volume.
+//!
 //! What it measured is recorded per repository in the storage ledger
 //! (`storage-ledger-recovery-archives/<sha256 of the repository root>.json`),
 //! with bytes and counts by location, and shown by `aethyme storage status`.
@@ -42,6 +54,10 @@ use crate::storage_ledger::{ArchiveBoundState, MeasuredArchiveSize};
 
 /// The longest listing and sizing may take in one pass.
 const ARCHIVE_BOUND_BUDGET: Duration = Duration::from_secs(20);
+/// The listing's share of that budget, as `(numerator, denominator)`; the
+/// rest is for size walks. A listing that used the whole budget left none,
+/// so nothing it reached was ever walked until some listing completed.
+const ARCHIVE_LISTING_SHARE: (u32, u32) = (3, 4);
 /// The longest landing checks, removal proofs and removals may take in one
 /// pass, on top of listing and sizing: a pass whose sizing used its whole
 /// budget still removes what it can.
@@ -59,14 +75,16 @@ const UNIQUE_SESSIONS_NAMED: usize = 20;
 #[cfg(test)]
 thread_local! {
     /// Test hooks: a clock offset for the pass, a bound replacing the
-    /// configured one, and how many of the next removal proofs start
-    /// already out of budget.
+    /// configured one, how many of the next removal proofs start already
+    /// out of budget, and whether every size walk runs out of budget.
     pub(super) static CLOCK_SKEW_MS_FOR_TEST: std::cell::Cell<i64> =
         const { std::cell::Cell::new(0) };
     pub(super) static BOUND_BYTES_FOR_TEST: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     pub(super) static EXPIRED_PROOFS_FOR_TEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    pub(super) static EXPIRED_WALKS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn pass_now_ms() -> i64 {
@@ -93,6 +111,18 @@ struct PassStats {
     skipped_by_budget: usize,
     /// Archives not listed this pass but counted from an earlier size.
     counted_from_earlier_size: usize,
+    /// Archives listed this pass that could not be walked, counted from an
+    /// earlier size (only ones the broker cannot vouch for).
+    walk_fell_back: usize,
+    /// Archives with neither a size from this pass nor an earlier one: the
+    /// total is not known, so the next run measures again.
+    size_unknown: usize,
+    /// Archive directories whose listing failed.
+    root_failures: usize,
+    /// Every archive is in the total, and whether some only from an
+    /// earlier size.
+    total_known: bool,
+    total_from_earlier_sizes: bool,
     /// Sizes taken from earlier passes, walked now, stopped by the budget
     /// (retried next run), or failed (never recorded).
     size_cached: usize,
@@ -121,12 +151,26 @@ impl PassStats {
         if self.budget_stops > 0 {
             crate::phase_telemetry::add("recovery_archive_bound_budget_stop", Duration::ZERO);
         }
+        if self.total_from_earlier_sizes {
+            crate::phase_telemetry::add(
+                "recovery_archive_bound_total_from_earlier_sizes",
+                Duration::ZERO,
+            );
+        }
+        if !self.total_known {
+            crate::phase_telemetry::add("recovery_archive_bound_total_unknown", Duration::ZERO);
+        }
         crate::phase_telemetry::attach(
             "recovery_archive_bound_pass",
             serde_json::json!({
                 "listed": self.listed,
                 "listing_skipped_by_budget": self.skipped_by_budget,
                 "counted_from_earlier_size": self.counted_from_earlier_size,
+                "walk_fell_back": self.walk_fell_back,
+                "size_unknown": self.size_unknown,
+                "root_failures": self.root_failures,
+                "total_known": self.total_known,
+                "total_from_earlier_sizes": self.total_from_earlier_sizes,
                 "size_cached": self.size_cached,
                 "size_measured": self.size_measured,
                 "size_skipped_by_budget": self.size_skipped_by_budget,
@@ -166,6 +210,10 @@ enum SizeWalk {
 }
 
 fn walk_size(path: &Path, deadline: Instant) -> SizeWalk {
+    #[cfg(test)]
+    if EXPIRED_WALKS_FOR_TEST.with(std::cell::Cell::get) {
+        return SizeWalk::OutOfBudget;
+    }
     if Instant::now() >= deadline {
         return SizeWalk::OutOfBudget;
     }
@@ -182,7 +230,11 @@ impl Broker {
     /// documentation). Never removes an archive holding unique work.
     pub(crate) fn enforce_recovery_archive_bound(&self, deadline: Instant) -> ArchiveBoundUsage {
         let _span = crate::phase_telemetry::span("recovery_archive_bound_pass");
-        let scan_deadline = deadline.min(Instant::now() + ARCHIVE_BOUND_BUDGET);
+        let started = Instant::now();
+        let scan_deadline = deadline.min(started + ARCHIVE_BOUND_BUDGET);
+        let listing_deadline = started
+            + scan_deadline.saturating_duration_since(started) * ARCHIVE_LISTING_SHARE.0
+                / ARCHIVE_LISTING_SHARE.1;
         let bound_bytes = crate::auto_cleanup::recovery_archive_bound_bytes(self.main_root());
         #[cfg(test)]
         let bound_bytes = BOUND_BYTES_FOR_TEST
@@ -202,7 +254,7 @@ impl Broker {
             .or_else(|| crate::host_state::resolve_host_state_dir().map(|(path, _)| path));
         let repository = self.main_root().to_string_lossy().into_owned();
         let state_span = crate::phase_telemetry::span("recovery_archive_bound_state_read");
-        let previous = host_state
+        let mut previous = host_state
             .as_deref()
             .map(|host| crate::storage_ledger::archive_bound_state(host, &repository))
             .unwrap_or_default();
@@ -213,7 +265,7 @@ impl Broker {
         // lifecycle claim, in `evict_landed_archive`.
         let listing_span = crate::phase_telemetry::span("recovery_archive_bound_listing");
         let scan = match self.recovery_archive_listing(
-            scan_deadline,
+            listing_deadline,
             previous.listing_cursor.as_deref().map(Path::new),
         ) {
             Ok(scan) => scan,
@@ -227,6 +279,7 @@ impl Broker {
         let mut stats = PassStats {
             listed: scan.owned.len() + scan.unowned.len(),
             skipped_by_budget: scan.skipped_by_budget,
+            root_failures: scan.root_failures,
             ..PassStats::default()
         };
         let mut state = ArchiveBoundState {
@@ -283,6 +336,9 @@ impl Broker {
                 sized.push((archive, known.bytes));
                 continue;
             }
+            // A size recorded for another archive at this path is not this
+            // one's: a later pass must not count it from there.
+            previous.sizes.remove(&path_key);
             match walk_size(&archive.path, scan_deadline) {
                 SizeWalk::Measured(bytes) => {
                     stats.size_measured += 1;
@@ -297,55 +353,114 @@ impl Broker {
                 }
                 SizeWalk::OutOfBudget => {
                     stats.size_skipped_by_budget += 1;
+                    stats.size_unknown += 1;
                     usage.partial = true;
                     state.size_deferred_at_ms.insert(path_key, pass_now_ms());
                 }
                 SizeWalk::Failed => {
                     stats.size_failed += 1;
+                    stats.size_unknown += 1;
                     usage.partial = true;
                 }
             }
         }
         // Archives the broker cannot vouch for count, are never removed,
-        // and are walked afresh each pass (their content may change).
-        for (path, _) in &scan.unowned {
-            match walk_size(path, scan_deadline) {
+        // and are walked afresh when reached (their content may change), the
+        // one tried longest ago first. One whose walk does not complete
+        // counts with its last measured size, if any; that size is used for
+        // nothing else. An archive directory that could not be listed is in
+        // `unowned` too: what is in it is unknown, so no size of it is kept
+        // and the total is not known.
+        let mut unowned = scan
+            .unowned
+            .iter()
+            .enumerate()
+            .map(|(index, (path, _))| {
+                let earlier = previous
+                    .unowned_sizes
+                    .get(&key(path))
+                    .copied()
+                    .unwrap_or_default();
+                (path, index < scan.root_failures, earlier)
+            })
+            .collect::<Vec<_>>();
+        unowned.sort_by_key(|(_, _, earlier)| earlier.tried_at_ms);
+        for (path, root_failure, earlier) in unowned {
+            let path_key = key(path);
+            let mut record = earlier;
+            if Instant::now() < scan_deadline {
+                record.tried_at_ms = pass_now_ms();
+            }
+            let counted = match walk_size(path, scan_deadline) {
                 SizeWalk::Measured(bytes) => {
                     stats.size_measured += 1;
-                    let location = if in_pool(path) {
-                        &mut usage.pool
+                    record.bytes = Some(bytes);
+                    Some(bytes)
+                }
+                incomplete => {
+                    if matches!(incomplete, SizeWalk::OutOfBudget) {
+                        stats.size_skipped_by_budget += 1;
                     } else {
-                        &mut usage.host_state
-                    };
-                    location.archives += 1;
-                    location.bytes = location.bytes.saturating_add(bytes);
-                }
-                SizeWalk::OutOfBudget => {
-                    stats.size_skipped_by_budget += 1;
+                        stats.size_failed += 1;
+                    }
                     usage.partial = true;
+                    if earlier.bytes.is_some() {
+                        stats.walk_fell_back += 1;
+                    } else if !root_failure {
+                        stats.size_unknown += 1;
+                    }
+                    earlier.bytes
                 }
-                SizeWalk::Failed => {
-                    stats.size_failed += 1;
-                    usage.partial = true;
-                }
-            }
-        }
-        // Archives this listing did not reach count with the size an
-        // earlier pass measured, so a long listing does not hide them from
-        // the total; they are not candidates this pass.
-        for path in &scan.not_listed {
-            if let Some(known) = previous.sizes.get(&key(path)) {
-                stats.counted_from_earlier_size += 1;
-                state.sizes.insert(key(path), *known);
+            };
+            if let Some(bytes) = counted {
                 let location = if in_pool(path) {
                     &mut usage.pool
                 } else {
                     &mut usage.host_state
                 };
                 location.archives += 1;
-                location.bytes = location.bytes.saturating_add(known.bytes);
+                location.bytes = location.bytes.saturating_add(bytes);
+            }
+            if !root_failure {
+                state.unowned_sizes.insert(path_key, record);
             }
         }
+        // Archives this listing did not reach count with the size an
+        // earlier pass measured, so a long listing does not hide them from
+        // the total; they are not candidates this pass. The size walked when
+        // the broker could last not vouch for it is the more recent one: it
+        // is forgotten once the archive is listed as the broker's.
+        for path in &scan.not_listed {
+            let path_key = key(path);
+            let mut earlier = None;
+            if let Some(known) = previous.sizes.get(&path_key) {
+                state.sizes.insert(path_key.clone(), *known);
+                earlier = Some(known.bytes);
+            }
+            if let Some(unowned) = previous.unowned_sizes.get(&path_key) {
+                state.unowned_sizes.insert(path_key, *unowned);
+                earlier = unowned.bytes;
+            }
+            let Some(bytes) = earlier else {
+                stats.size_unknown += 1;
+                continue;
+            };
+            stats.counted_from_earlier_size += 1;
+            let location = if in_pool(path) {
+                &mut usage.pool
+            } else {
+                &mut usage.host_state
+            };
+            location.archives += 1;
+            location.bytes = location.bytes.saturating_add(bytes);
+        }
+        // A pass that listed nothing while archives wait made no progress:
+        // it stays due, so waiting an interval always moves the cursor.
+        let stalled = scan.last_listed.is_none() && !scan.not_listed.is_empty();
+        usage.total_known = stats.size_unknown == 0 && scan.root_failures == 0 && !stalled;
+        stats.total_known = usage.total_known;
+        stats.total_from_earlier_sizes =
+            usage.total_known && stats.counted_from_earlier_size + stats.walk_fell_back > 0;
         if stats.size_skipped_by_budget > 0 {
             stats.budget_stops += 1;
         }
@@ -609,6 +724,7 @@ impl Broker {
                 "over_bound": usage.over_bound,
                 "unique_kept_over_bound": usage.unique_kept_over_bound,
                 "partial": usage.partial,
+                "total_known": usage.total_known,
             }),
         );
         usage
@@ -701,6 +817,7 @@ impl Broker {
                 observed_at_ms: usage.observed_at_ms,
                 over_bound: usage.over_bound,
                 partial: usage.partial,
+                total_known: usage.total_known,
             })
     }
 }
@@ -713,9 +830,12 @@ pub(crate) struct LastArchiveBound {
     pub(crate) observed_at_ms: i64,
     /// The archives were over the bound.
     pub(crate) over_bound: bool,
-    /// The pass did not measure every archive (a budget stop or a failed
-    /// listing), so its total may undercount.
+    /// The pass did not list and walk every archive (a budget stop or a
+    /// failed listing).
     pub(crate) partial: bool,
+    /// Every archive is in its total all the same, some from a size an
+    /// earlier pass measured; otherwise it may undercount.
+    pub(crate) total_known: bool,
 }
 
 /// Whether an archive can never be shown landed, whatever Git holds: it
@@ -781,6 +901,26 @@ mod tests {
             eviction_order(&[(true, Some((false, 1)))]),
             Vec::<usize>::new()
         );
+    }
+
+    /// Records from before `total_known` and the sizes of unowned archives
+    /// read as a total not known and no such size.
+    #[test]
+    fn records_from_before_known_totals_still_read() {
+        let mut usage = serde_json::to_value(ArchiveBoundUsage {
+            total_known: true,
+            ..ArchiveBoundUsage::default()
+        })
+        .unwrap();
+        usage.as_object_mut().unwrap().remove("total_known");
+        let usage: ArchiveBoundUsage = serde_json::from_value(usage).unwrap();
+        assert!(!usage.total_known);
+        let state: ArchiveBoundState = serde_json::from_value(serde_json::json!({
+            "sizes": {"/a/1-x": {"created_at_ms": 5, "bytes": 7}},
+        }))
+        .unwrap();
+        assert_eq!(state.sizes["/a/1-x"].bytes, 7);
+        assert!(state.unowned_sizes.is_empty());
     }
 
     /// Usage serialises with both locations, so `storage status` can show

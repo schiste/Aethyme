@@ -2868,6 +2868,9 @@ pub(crate) struct RecoveryArchiveScan {
     pub owned: Vec<OwnedRecoveryArchive>,
     /// Everything else, with why the broker cannot vouch for it.
     pub unowned: Vec<(PathBuf, String)>,
+    /// How many of the first `unowned` entries are archive directories whose
+    /// own listing failed: what is in them is in no other field.
+    pub root_failures: usize,
     /// Entries not classified because the scan reached its deadline.
     pub skipped_by_budget: usize,
     /// Those entries, in the order a resumed listing would reach them.
@@ -2886,6 +2889,24 @@ pub(crate) enum ArchiveProof {
     /// The whole tree, its integrity records, bundle and refs, before the
     /// archive's content is relied on or destroyed.
     Full { deadline: Option<Instant> },
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: a scan with a deadline stops, as if it had passed, once it
+    /// classified this many entries.
+    pub(crate) static LISTING_STOPS_AFTER_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn listing_stopped_for_test(listed: usize) -> bool {
+    LISTING_STOPS_AFTER_FOR_TEST.with(|stop| stop.get().is_some_and(|stop| listed >= stop))
+}
+
+#[cfg(not(test))]
+fn listing_stopped_for_test(_listed: usize) -> bool {
+    false
 }
 
 thread_local! {
@@ -4873,6 +4894,7 @@ impl Broker {
         if let Some(pool) = self.pool_recovery_archive_root(false) {
             paths.extend(archive_entries_under(&pool, &mut unowned));
         }
+        let root_failures = unowned.len();
         drop(entries_span);
         let start = resume_after.map_or(0, |cursor| listing_resume_index(&paths, cursor));
         paths.rotate_left(start);
@@ -4881,7 +4903,10 @@ impl Broker {
         let mut not_listed = Vec::new();
         let mut paths = paths.into_iter();
         for path in paths.by_ref() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if deadline.is_some_and(|deadline| {
+                Instant::now() >= deadline
+                    || listing_stopped_for_test(owned.len() + unowned.len() - root_failures)
+            }) {
                 crate::phase_telemetry::add("recovery_archive_listing_budget_stop", Duration::ZERO);
                 not_listed.push(path);
                 break;
@@ -4898,6 +4923,7 @@ impl Broker {
             root: host_root,
             owned,
             unowned,
+            root_failures,
             skipped_by_budget: not_listed.len(),
             not_listed,
             last_listed,
