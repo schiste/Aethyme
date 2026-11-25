@@ -5551,7 +5551,15 @@ Recovery archive file lists and earlier retirement staging:
   attempt ends and the alternate is not opened; counter
   `recovery_archive_stale_partial_undecided`. Staging of another checkout, or
   with another unreadable record, is refused as before. The staging place an
-  apply does not use is settled the same way for up to 10 s, whatever comes of it.
+  apply does not use is settled the same way for up to 10 s, whatever comes of it,
+  never into the 10 s an apply reserves and not with under 1 s left. The three
+  counters and the span cover both the staging an apply needs and the one it does
+  not use.
+- With both places kept, an owner reads the two directories under the archive
+  root (`storage archives` lists them once the bound pass has), copies back what
+  only they hold and removes them, or archives the checkout without them with
+  `broker finish cleanup resolve <session> --archive` (add
+  `--archive-ignored-directories` if it refuses an ignored directory).
 - No lane expires kept staging. It is listed as `unfinished_staging` by
   `storage archives` (path, bytes) and counted under
   `recovery_archives_by_location` by `storage status`, from the sizes the archive

@@ -5615,6 +5615,11 @@ fn run_recovery_git_output_with_input_limited(
     Ok(output)
 }
 
+/// [`list_recovery_prerequisite_refs`]'s refusal of what it read, unlike a
+/// failure to read it.
+const MALFORMED_PREREQUISITE_NAMESPACE: &str =
+    "recovery prerequisite namespace contains a malformed or symbolic ref";
+
 fn list_recovery_prerequisite_refs(
     repository: &GitRepo,
     expected: &[RecoveryArchivePrerequisiteRef],
@@ -5661,9 +5666,7 @@ fn list_recovery_prerequisite_refs(
             || !symbolic_target.is_empty()
             || refs.insert(name.to_owned(), object_id.to_owned()).is_some()
         {
-            return Err(
-                "recovery prerequisite namespace contains a malformed or symbolic ref".into(),
-            );
+            return Err(MALFORMED_PREREQUISITE_NAMESPACE.into());
         }
     }
     Ok(refs)
@@ -7808,6 +7811,10 @@ mod tests {
 
         assert!(error.contains("both staging places"), "{error}");
         assert!(error.contains("ignored/lost.log"), "{error}");
+        assert!(
+            error.contains("finish cleanup resolve") && error.contains("--archive"),
+            "{error}"
+        );
         assert!(worktree.is_dir());
         let mut held = std::fs::read_dir(&plan.archive_root)
             .unwrap()
@@ -7825,7 +7832,7 @@ mod tests {
     #[test]
     fn stale_staging_that_cannot_be_proven_is_never_removed() {
         type Fill = fn(&Path, &Path);
-        let cases: [(&str, Fill); 8] = [
+        let cases: [(&str, Fill); 9] = [
             ("differs", |partial, _| {
                 std::fs::write(partial.join("untracked/preserve.txt"), "another text").unwrap();
             }),
@@ -7849,6 +7856,11 @@ mod tests {
             }),
             ("cannot be compared", |partial, _| {
                 std::fs::write(partial.join("stray"), "stray").unwrap();
+            }),
+            ("does not archive", |partial, _| {
+                // The name decides before the content that sorts before it.
+                std::fs::write(partial.join("untracked/preserve.txt"), "another").unwrap();
+                std::fs::write(partial.join("untracked/unplanned"), "x").unwrap();
             }),
             ("not the checkout's current one", |partial, _| {
                 std::fs::write(partial.join(STAGED_PATCH_FILE), "a patch").unwrap();
@@ -8019,6 +8031,21 @@ mod tests {
 
         assert_eq!(name, names[1]);
         assert!(partial.join("untracked/preserve.txt").is_file());
+
+        // A symbolic ref in that namespace is as much a fact.
+        git(
+            &repository,
+            &["symbolic-ref", &pin.ref_name, "refs/heads/main"],
+        );
+        let name = stale_partial::settle_retirement_staging(
+            broker.repo_handle(),
+            &plan.archive_root,
+            &plan,
+            None,
+        )
+        .unwrap();
+        assert_eq!(name, names[1]);
+        assert!(partial.join("untracked/preserve.txt").is_file());
     }
 
     /// Copies of an ignored file and of a link, and an empty copy, are proven
@@ -8166,6 +8193,115 @@ mod tests {
 
             assert_eq!(used, names[0]);
             assert_eq!(partial.exists(), left, "{name}");
+        }
+    }
+
+    /// A finished archive whose checkout stayed is reused: spare staging is
+    /// settled, even with a record that still matches, and a spare nobody can
+    /// judge does not stop the apply. The archive and its refs are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn reusing_an_archive_settles_spare_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        for unreadable in [false, true] {
+            let (
+                _owner,
+                repository,
+                _storage,
+                mut broker,
+                session,
+                worktree,
+                _base,
+                _head,
+                _branch,
+            ) = closed_unique_commit_fixture("archive reuse spare staging");
+            let names = stale_names(session.id);
+            let preserve = worktree.join("preserve.txt");
+            let original = std::fs::read(&preserve).unwrap();
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+            let changed = preserve.clone();
+            let kept = broker
+                .cleanup_resolve_apply_with_bundle_writer_mode(
+                    session.id,
+                    &plan.digest,
+                    move || std::fs::write(&changed, "changed under the archive\n").unwrap(),
+                    sync_archive_directory,
+                    |_, _| {
+                        Some(crate::disk_headroom::DiskHeadroom {
+                            bytes: u64::MAX,
+                            inodes: None,
+                        })
+                    },
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    RecoveryBundleWriter {
+                        max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                        write_to: write_recovery_bundle_to_file,
+                    },
+                )
+                .unwrap();
+            assert!(!kept.worktree_removed, "{kept:?}");
+            let manifest = std::fs::read(kept.archive.join(MANIFEST_FILE)).unwrap();
+            std::fs::write(&preserve, &original).unwrap();
+            // The staging's own refs are those of the new delivery targets,
+            // not the archive's installed ones.
+            git(&repository, &["merge", "-q", "--ff-only", &session.branch]);
+            let partial = stale_staging(&mut broker, session.id, &worktree, &names[1], |_| {});
+            std::fs::write(&preserve, &original).unwrap();
+            let copy = partial.join("untracked/preserve.txt");
+            if unreadable {
+                std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+                if std::fs::File::open(&copy).is_ok() {
+                    // Run with the right to read anything: nothing to observe.
+                    return;
+                }
+            }
+            let plan = broker
+                .cleanup_resolve_retirement_plan(session.id, false)
+                .unwrap();
+            verify_retirement_archive_record_for_content_identity(&partial, &plan).unwrap();
+
+            let outcome = broker
+                .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+                .unwrap();
+
+            assert!(outcome.worktree_removed, "{outcome:?}");
+            assert_eq!(outcome.archive, kept.archive, "the archive is reused");
+            assert_eq!(partial.exists(), unreadable);
+            assert_eq!(
+                std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap(),
+                manifest
+            );
+            let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+            assert!(!owned.prerequisite_refs.is_empty());
+            for pin in &owned.prerequisite_refs {
+                assert_eq!(
+                    git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+                    pin.object_id
+                );
+            }
+        }
+    }
+
+    /// Settling spare staging never uses the time the apply reserves.
+    #[test]
+    fn spare_staging_leaves_the_apply_its_reserve() {
+        let now = Instant::now();
+        let after = |seconds| now + Duration::from_secs(seconds);
+        for (operation, expected) in [
+            (None, Some(after(10))),
+            (Some(after(60)), Some(after(10))),
+            (Some(after(15)), Some(after(5))),
+            (Some(after(11)), Some(after(1))),
+            (Some(after(10)), None),
+            (Some(now), None),
+        ] {
+            assert_eq!(stale_partial::spare_deadline(now, operation), expected);
         }
     }
 

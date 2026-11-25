@@ -1042,7 +1042,12 @@ fn archives(json_output: bool) -> u8 {
         return crate::exit_status::SUCCESS;
     }
     let rows = value["archives"].as_array().cloned().unwrap_or_default();
-    println!("{} recovery archive(s)", rows.len());
+    let staging = value["unfinished_staging"].as_array();
+    if rows.is_empty() && staging.is_some_and(|staging| !staging.is_empty()) {
+        println!("no finished recovery archive");
+    } else {
+        println!("{} recovery archive(s)", rows.len());
+    }
     for row in rows {
         println!(
             "  {}  {}  {}  created {}  expires {}{}",
@@ -1062,7 +1067,6 @@ fn archives(json_output: bool) -> u8 {
             if row["kept"] == true { "  kept" } else { "" }
         );
     }
-    let staging = value["unfinished_staging"].as_array();
     for entry in staging.into_iter().flatten() {
         println!(
             "  unfinished staging  {}  {}  (copies of an attempt that did not finish; never expired)",

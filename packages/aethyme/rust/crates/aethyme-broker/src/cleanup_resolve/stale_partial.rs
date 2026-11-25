@@ -57,6 +57,8 @@ pub(super) struct StagingTree {
 
 /// How long settling staging this apply does not use may take.
 const SPARE_STAGING_BUDGET: Duration = Duration::from_secs(10);
+/// It is not started with less time than this.
+const SPARE_STAGING_MINIMUM: Duration = Duration::from_secs(1);
 
 /// The staging name this apply uses, after removing earlier staging of the
 /// same checkout that holds nothing the checkout does not. The caller holds
@@ -85,8 +87,9 @@ pub(super) fn settle_retirement_staging(
         }
     }
     Err(format!(
-        "staging of earlier states of this checkout was retained in both staging places: {}",
-        kept.join("; ")
+        "staging of earlier states of this checkout was retained in both staging places: {}. Both are plain copies under the archive root: copy back what only they hold from untracked/ and ignored/ and remove the directory, or archive the checkout without them with `aethyme broker finish cleanup resolve {} --archive`",
+        kept.join("; "),
+        plan.session_id
     ))
 }
 
@@ -99,8 +102,10 @@ pub(super) fn settle_spare_staging(
     deadline: Option<Instant>,
     names: &[String],
 ) {
-    let budget = Instant::now() + SPARE_STAGING_BUDGET;
-    let deadline = deadline.map_or(budget, |deadline| deadline.min(budget));
+    let Some(deadline) = spare_deadline(Instant::now(), effective_archive_deadline(deadline))
+    else {
+        return;
+    };
     for name in names {
         let _ = settle_one(
             repository,
@@ -110,6 +115,19 @@ pub(super) fn settle_spare_staging(
             true,
         );
     }
+}
+
+/// When settling spare staging has to stop, if it may start: the apply's own
+/// reserve is never spent on it.
+pub(super) fn spare_deadline(now: Instant, operation: Option<Instant>) -> Option<Instant> {
+    let budget = now + SPARE_STAGING_BUDGET;
+    let deadline = match operation {
+        Some(operation) => operation
+            .checked_sub(AUTO_COMPACTION_STAGING_RESERVE)?
+            .min(budget),
+        None => budget,
+    };
+    (deadline.saturating_duration_since(now) >= SPARE_STAGING_MINIMUM).then_some(deadline)
 }
 
 fn settle_one(
@@ -154,7 +172,13 @@ fn settle_one(
             let git_deadline = proof_git_deadline(deadline)?;
             let refs = record.prerequisite_refs.as_deref().unwrap_or_default();
             if !list_recovery_prerequisite_refs(repository, refs, git_deadline)
-                .map_err(Unproven::Operational)?
+                .map_err(|reason| {
+                    if reason == MALFORMED_PREREQUISITE_NAMESPACE {
+                        Unproven::Fact(reason)
+                    } else {
+                        Unproven::Operational(reason)
+                    }
+                })?
                 .is_empty()
             {
                 return Err(Unproven::Fact(
@@ -263,6 +287,7 @@ pub(super) fn prove_recorded_tips_held(
                 "its record names a commit this repository no longer has".into(),
             ));
         }
+        let _git_deadline = crate::git::limit_git_until(proof_git_deadline(deadline)?);
         let mut held = false;
         for root in planned.into_iter().flatten() {
             held = held
@@ -333,15 +358,39 @@ pub(super) fn prove_partial_held_by_checkout(
     let ignored = by_path(&plan.ignored_files);
     let worktree = Path::new(&plan.worktree_path);
     let tree = staging_tree(partial, deadline)?;
+    // Every name first, so one that decides is not found after reading all
+    // the content before it.
+    let mut copies = Vec::new();
     for relative in &tree.files {
-        check_time(deadline)?;
         let text = relative
             .to_str()
             .ok_or_else(|| Unproven::Fact("it holds a non-UTF-8 name".into()))?;
-        let copy = partial.join(relative);
-        match text {
-            RETIREMENT_ARCHIVE_RECORD_FILE => continue,
-            STAGED_PATCH_FILE | UNSTAGED_PATCH_FILE => {
+        let planned = match text.split_once('/') {
+            None if text == RETIREMENT_ARCHIVE_RECORD_FILE => continue,
+            None if text == STAGED_PATCH_FILE || text == UNSTAGED_PATCH_FILE => {
+                copies.push((text, None));
+                continue;
+            }
+            Some((UNTRACKED_DIRECTORY, path)) => (path, untracked.get(path)),
+            Some((IGNORED_DIRECTORY, path)) => (path, ignored.get(path)),
+            _ => {
+                return Err(Unproven::Fact(format!(
+                    "it holds {text}, which cannot be compared with the checkout"
+                )));
+            }
+        };
+        let (path, Some(symlink)) = planned else {
+            return Err(Unproven::Fact(format!(
+                "it holds {text}, which the current plan does not archive"
+            )));
+        };
+        copies.push((text, Some((path, *symlink))));
+    }
+    for (text, planned) in copies {
+        check_time(deadline)?;
+        let copy = partial.join(text);
+        match planned {
+            None => {
                 let (bytes, sha256) = if text == STAGED_PATCH_FILE {
                     (plan.staged_patch_bytes, &plan.staged_patch_sha256)
                 } else {
@@ -356,25 +405,11 @@ pub(super) fn prove_partial_held_by_checkout(
                         "its {text} is not the checkout's current one"
                     )));
                 }
-                continue;
             }
-            _ => {}
+            Some((path, symlink)) => {
+                prove_copy_held(&copy, text, worktree, path, symlink, deadline)?;
+            }
         }
-        let (path, planned) = match text.split_once('/') {
-            Some((UNTRACKED_DIRECTORY, path)) => (path, untracked.get(path)),
-            Some((IGNORED_DIRECTORY, path)) => (path, ignored.get(path)),
-            _ => {
-                return Err(Unproven::Fact(format!(
-                    "it holds {text}, which cannot be compared with the checkout"
-                )));
-            }
-        };
-        let Some(symlink) = planned else {
-            return Err(Unproven::Fact(format!(
-                "it holds {text}, which the current plan does not archive"
-            )));
-        };
-        prove_copy_held(&copy, text, worktree, path, *symlink, deadline)?;
     }
     Ok(tree)
 }
@@ -422,7 +457,7 @@ fn prove_copy_held(
         .file_type();
     if copy_type.is_symlink() != symlink
         || source_type.is_symlink() != symlink
-        || (!symlink && !(copy_type.is_file() && source_type.is_file()))
+        || !(symlink || copy_type.is_file() && source_type.is_file())
     {
         return Err(fact("is another kind of file than the checkout's"));
     }
@@ -503,6 +538,9 @@ pub(super) fn remove_proven_partial(
     if left != 1 {
         return Err(gained());
     }
+    // The record must not be lost before the removals it vouches for last.
+    sync_archive_directory(partial)
+        .map_err(operational("cannot sync the emptied staging".into()))?;
     std::fs::remove_file(partial.join(record))
         .map_err(operational("cannot remove the staging record".into()))?;
     remove_directory(partial)
