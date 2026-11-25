@@ -5412,9 +5412,10 @@ before, and the `_claimed` and `_close` looks are unchanged:
 - `no_work`: no recorded holder, a live holder that has not moved on, an
   unresolved operation, an explicit claim.
 
-`abandonment` and `merged_pull_request` ask only the first. The abandonment
-work class comes next, runs Git, and records the due time later passes wait
-for. The looks that do reach the probe read the index, `HEAD` and the hook
+`abandonment` and `merged_pull_request` ask only the first; `abandonment`
+also asks its early look (see "Early look in the abandonment window"). The
+abandonment work class comes next, runs Git, and records the due time later
+passes wait for. The looks that do reach the probe read the index, `HEAD` and the hook
 again, the hook after the probe. `idle_strip` already asked its
 cheap refusals first.
 
@@ -5680,3 +5681,61 @@ session's HEAD.
 
 Readers must accept the new spans and attachment. Covered by tests in
 `submission_ownership.rs`.
+
+### Early look in the abandonment window (2026-11-25)
+
+The abandonment window now asks a few cheap keeps before its first activity
+probe, the work class, the early-close safety rule (with its remote lookup),
+the operation claim and the open-file observation. They read only the
+database, the lease policy (`[leases]` in the repository's `broker.toml`, as the
+claim check reads it),
+the gate run directory, probing each recorded gate's process group (and its
+leader) with signal 0 and stopping at the pass deadline, and a process table
+the pass already took for the session's binding; none is taken there. Each is asked only for a
+holder whose state lets the later path reach the same check:
+
+- a running gate and an unresolved operation, for a task-lease holder that is
+  gone or has moved on;
+- an active merge-queue entry, for a live holder whose task lease is current
+  and that was bound elsewhere after the index and `HEAD` times;
+- an explicit claim that holds: a moved-on live holder's, a gone holder's
+  whose stale grace already runs (a holder never recorded gone is left to the
+  later check, which records the first sighting), and that of a session with
+  no holder recorded created since holders are recorded.
+
+Artifact producers are not asked early: their only check takes the reclaim
+lock. The early look only keeps. Every check still runs where it did, under
+the operation claim, before any close; an error in the early look falls
+through to that path.
+
+- Span `session_close_early_look`: one per look (abandonment lane only).
+- Counter `session_close_early_kept`: looks that kept the session.
+- Counter `session_close_early_look_unreadable`: looks where a read failed
+  and was not taken as a keep.
+- Attachment `session_close_early_kept_by_reason`: early keeps by keep code
+  (`lease_held`, `merge_queue_active`, `gate_running`,
+  `operation_unresolved`), `{count, total_ms, max_ms}` with zero times.
+- An early keep is counted under `session_abandonment_kept_<code>` and in
+  `worktree_activity_look_avoided` (`abandonment_first.<code>`) like any keep
+  before the probe, and no longer in `worktree_activity_look`.
+
+What changes for readers: a session with several reasons can be reported
+under the early one (the keep record behind `sessions.abandonment-held`, the
+retirement summary's kept counts). A session kept early records no not-due
+time, so the next pass judges it again (cheaply) rather than waiting; once
+the reason goes, the full judgement runs and records it as before. It is not
+classified in that pass either: `sessions.stale-backlog` and
+`sessions.closing-soon` read its last recorded class and due time, or leave
+it out until a full judgement classifies it. An early keep is one the landed
+lane would also make on the same evidence; where the full judgement would
+have ended with a not-due or live-process answer first (a probe showing
+recent activity, a holder the probe shows not moved on), the session is now
+reported under the early code and is not offered to the landed lane in that
+pass, which would have kept it too. An early keep counts as deferred in the
+retirement summary, as the same keep did later in the full judgement: a held
+claim under the deferred reason `LeaseLivenessUnavailable`, running work
+under `OperationActive`. Where the full judgement could have ended first as not
+due (`recent_activity`, `work_class_not_due`), which is not deferred, the
+pass now reports deferred work: the retirement request stays armed, the
+retirement issue reads as actionable, and the checkout-cleanup generation is
+not completed as having no deferred work. Covered by `session_auto_close.rs` tests.
