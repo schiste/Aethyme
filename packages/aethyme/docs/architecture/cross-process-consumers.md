@@ -2481,6 +2481,37 @@ worktree-volume root otherwise. `auto` serializes as `host`, so no
 preparation digest or trusted policy changes. Older binaries refuse
 `root = "auto"` written explicitly; omit it to stay readable by them.
 
+Changed 2026-11-25 (cheaper output sharing). The pass no longer hashes or
+pools Python bytecode (`.pyc`, `.pyo`): it embeds its source's path and
+modification time, and on the busiest repository 218 such files were added by
+every preparation and none was reused. They keep their own copy, are counted,
+and stay in `unique_bytes_after`, which no longer calls them shared; bytecode
+pooled earlier leaves with the store's rotation. A pool entry is still hashed
+against its name before its first use, but the result is remembered in
+`output-pool/.aethyme-verified-entries.json` (format version 1, at most 2 MiB
+and 4096 entries, replaced atomically, read only as a regular file with one
+link, owned by the user and not writable by others). It is bound to the
+entry's device, inode, size, and modification and change times in
+nanoseconds; any difference means another hash, so a device renumbered by a
+remount costs one. A result is recorded only for an entry unchanged for 60
+seconds when hashed, and stands for 24 hours. An unusable or differently
+versioned record counts as empty. An entry's file state is checked again
+after the clone and before the checkout's file is replaced. Mixed versions:
+older binaries ignore the record and hash every entry they use; concurrent
+writers lose at most each other's results. Without Unix file identities
+nothing is remembered. Output contract (additive): `output_share` and the
+`prepare_dependency_sharing` metric gain `files_skipped_bytecode`,
+`bytes_skipped_bytecode`, `pool_entries_hashed`, `pool_bytes_hashed`,
+`pool_entries_verified_by_record`, `pool_bytes_verified_by_record`,
+`verification_record_ignored` (present but unusable) and
+`verification_record_write_failed`. New spans, each a total added once per
+pass and nested in `prepare_output_share` (the remainder is walking):
+`prepare_output_share_sweep` (stale temporaries in the pool), `_sample`
+(whether a root already shares its blocks), `_sizing` (unshared bytes of
+every file), `_hash` (checkout files), `_verify` (pool entries read), `_add`
+(clone into the pool, hash, publish), `_replace` (clone over a checkout file)
+and `_record` (reading and writing the record).
+
 The preparation schema remains version 1. An empty list is omitted from the
 serialized configuration to preserve existing preparation digests; a
 nonempty selection changes the digest and trusted prepare policy, and requires

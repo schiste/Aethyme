@@ -1096,7 +1096,11 @@ why. `package_store.output_share` reports the output-sharing pass: its
 (`files_scanned`, `files_already_shared`, `files_cloned_from_pool`,
 `bytes_cloned_from_pool`, `files_added_to_pool`, `bytes_added_to_pool`,
 `files_left_alone`, `files_failed`, `pool_entries_rejected` for entries
-whose bytes did not match their name, `stale_temporaries_removed`),
+whose bytes did not match their name, `stale_temporaries_removed`,
+`files_skipped_bytecode` and `bytes_skipped_bytecode` for Python bytecode,
+`pool_entries_hashed`, `pool_bytes_hashed`, `pool_entries_verified_by_record`
+and `pool_bytes_verified_by_record` for entries read or recognized as already
+hashed, `verification_record_ignored`, `verification_record_write_failed`),
 `unique_bytes_before` and
 `unique_bytes_after` (bytes the walked outputs own alone, from APFS private
 sizes or Linux FIEMAP shared-extent flags; `unique_bytes_method` is
