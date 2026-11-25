@@ -5337,7 +5337,7 @@ mod lane_tests {
                     .is_some_and(|looks| looks["no_work_first"]["count"] == 1),
                 !claimed
             );
-            assert!(attached.get("worktree_activity_look_avoided").is_none());
+            assert!(!attached.contains_key("worktree_activity_look_avoided"));
             assert_eq!(phase_count(&recorder, "worktree_status_activity"), 0);
         }
     }
