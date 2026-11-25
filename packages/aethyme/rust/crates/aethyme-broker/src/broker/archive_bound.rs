@@ -32,15 +32,22 @@
 //!
 //! A pass that did not list or walk everything (`partial`) still knows the
 //! total (`total_known`) when every archive is either measured by it or
-//! counted with the size an earlier pass measured; within the bound, it is
-//! then not due again before the normal interval. That total cannot hide an
-//! overrun for long: every pass reads the names in both archive directories
-//! whole, so an archive removed elsewhere is never counted and a new one,
-//! having no size, makes the total unknown; content the broker vouches for
-//! does not change; and an archive it does not vouch for, which may grow, is
-//! walked again each time the listing reaches it. The listing keeps its
-//! cursor and leaves part of the budget to the walks, so successive passes
-//! reach every archive however slow the volume.
+//! counted with a size an earlier pass measured; within the bound, it is
+//! then not due again before the normal interval. What that rests on:
+//!
+//! - every pass reads the names in both archive directories whole, so an
+//!   archive removed elsewhere is never counted, and a new one, having no
+//!   size, makes the total unknown (it is listed and walked first). A
+//!   directory that cannot be listed, or a pool that was there before and is
+//!   not now, makes it unknown too, and its sizes are kept;
+//! - content the broker vouches for does not change;
+//! - an archive it does not vouch for may grow: its earlier size makes the
+//!   total known for a day at most, and not after a failed walk. Within that
+//!   day the total may be too low by what it grew.
+//!
+//! The listing keeps its cursor and leaves part of the budget to the walks,
+//! so successive passes reach every archive; a pass that could not move the
+//! cursor does not know the total, so it stays due.
 //!
 //! What it measured is recorded per repository in the storage ledger
 //! (`storage-ledger-recovery-archives/<sha256 of the repository root>.json`),
@@ -54,10 +61,6 @@ use crate::storage_ledger::{ArchiveBoundState, MeasuredArchiveSize};
 
 /// The longest listing and sizing may take in one pass.
 const ARCHIVE_BOUND_BUDGET: Duration = Duration::from_secs(20);
-/// The listing's share of that budget, as `(numerator, denominator)`; the
-/// rest is for size walks. A listing that used the whole budget left none,
-/// so nothing it reached was ever walked until some listing completed.
-const ARCHIVE_LISTING_SHARE: (u32, u32) = (3, 4);
 /// The longest landing checks, removal proofs and removals may take in one
 /// pass, on top of listing and sizing: a pass whose sizing used its whole
 /// budget still removes what it can.
@@ -76,14 +79,20 @@ const UNIQUE_SESSIONS_NAMED: usize = 20;
 thread_local! {
     /// Test hooks: a clock offset for the pass, a bound replacing the
     /// configured one, how many of the next removal proofs start already
-    /// out of budget, and whether every size walk runs out of budget.
+    /// out of budget, how many more size walks start (the rest find the
+    /// budget used), whether size walks fail, and whether removals find
+    /// their budget used.
     pub(super) static CLOCK_SKEW_MS_FOR_TEST: std::cell::Cell<i64> =
         const { std::cell::Cell::new(0) };
     pub(super) static BOUND_BYTES_FOR_TEST: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     pub(super) static EXPIRED_PROOFS_FOR_TEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    pub(super) static EXPIRED_WALKS_FOR_TEST: std::cell::Cell<bool> =
+    pub(super) static WALKS_LEFT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    pub(super) static FAILED_WALKS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(super) static EXPIRED_EVICTION_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -114,6 +123,13 @@ struct PassStats {
     /// Archives listed this pass that could not be walked, counted from an
     /// earlier size (only ones the broker cannot vouch for).
     walk_fell_back: usize,
+    /// Those and unlisted ones whose earlier size is too old, or whose walk
+    /// failed since: counted, but the total is not known.
+    size_stale: usize,
+    /// Archives with no usable earlier size, listed ahead of the rotation.
+    listed_first: usize,
+    /// The pool seen before is absent.
+    pool_absent: bool,
     /// Archives with neither a size from this pass nor an earlier one: the
     /// total is not known, so the next run measures again.
     size_unknown: usize,
@@ -167,6 +183,9 @@ impl PassStats {
                 "listing_skipped_by_budget": self.skipped_by_budget,
                 "counted_from_earlier_size": self.counted_from_earlier_size,
                 "walk_fell_back": self.walk_fell_back,
+                "size_stale": self.size_stale,
+                "listed_first": self.listed_first,
+                "pool_absent": self.pool_absent,
                 "size_unknown": self.size_unknown,
                 "root_failures": self.root_failures,
                 "total_known": self.total_known,
@@ -205,17 +224,66 @@ struct Measured {
 /// How a size walk ended.
 enum SizeWalk {
     Measured(u64),
+    /// The budget was used before it began.
+    NotStarted,
     OutOfBudget,
     Failed,
 }
 
+/// One archive to size.
+enum Walk {
+    Owned(crate::cleanup_resolve::OwnedRecoveryArchive),
+    Unowned {
+        path: PathBuf,
+        /// An archive directory that could not be listed.
+        root_failure: bool,
+        earlier: crate::storage_ledger::UnownedArchiveSize,
+    },
+}
+
+/// What [`walk_order`] needs of one archive.
+enum WalkKind {
+    Owned { deferred: Option<i64> },
+    Unowned { tried: i64 },
+    Root,
+}
+
+/// The order archives are sized in: the broker's own, unless an earlier walk
+/// ran out of budget; then the ones it cannot vouch for, longest untried
+/// first; then its own whose walk ran out, longest ago first, so one that
+/// never fits cannot use the budget ahead of the others; then directories
+/// that could not be listed.
+fn walk_order(kind: WalkKind) -> (u8, i64) {
+    match kind {
+        WalkKind::Owned { deferred: None } => (0, 0),
+        WalkKind::Unowned { tried } => (1, tried),
+        WalkKind::Owned { deferred: Some(at) } => (2, at),
+        WalkKind::Root => (3, 0),
+    }
+}
+
+/// Whether nothing is at `path`; any other error leaves it unknown.
+fn plainly_missing(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 fn walk_size(path: &Path, deadline: Instant) -> SizeWalk {
     #[cfg(test)]
-    if EXPIRED_WALKS_FOR_TEST.with(std::cell::Cell::get) {
-        return SizeWalk::OutOfBudget;
+    {
+        let left = WALKS_LEFT_FOR_TEST.with(std::cell::Cell::get);
+        if left == Some(0) {
+            return SizeWalk::NotStarted;
+        }
+        WALKS_LEFT_FOR_TEST.with(|cell| cell.set(left.map(|left| left - 1)));
+        if FAILED_WALKS_FOR_TEST.with(std::cell::Cell::get) {
+            return SizeWalk::Failed;
+        }
     }
     if Instant::now() >= deadline {
-        return SizeWalk::OutOfBudget;
+        return SizeWalk::NotStarted;
     }
     match crate::disk_headroom::directory_usage_bounded(path, deadline) {
         Some(usage) => SizeWalk::Measured(usage.bytes),
@@ -230,11 +298,7 @@ impl Broker {
     /// documentation). Never removes an archive holding unique work.
     pub(crate) fn enforce_recovery_archive_bound(&self, deadline: Instant) -> ArchiveBoundUsage {
         let _span = crate::phase_telemetry::span("recovery_archive_bound_pass");
-        let started = Instant::now();
-        let scan_deadline = deadline.min(started + ARCHIVE_BOUND_BUDGET);
-        let listing_deadline = started
-            + scan_deadline.saturating_duration_since(started) * ARCHIVE_LISTING_SHARE.0
-                / ARCHIVE_LISTING_SHARE.1;
+        let scan_deadline = deadline.min(Instant::now() + ARCHIVE_BOUND_BUDGET);
         let bound_bytes = crate::auto_cleanup::recovery_archive_bound_bytes(self.main_root());
         #[cfg(test)]
         let bound_bytes = BOUND_BYTES_FOR_TEST
@@ -265,8 +329,17 @@ impl Broker {
         // lifecycle claim, in `evict_landed_archive`.
         let listing_span = crate::phase_telemetry::span("recovery_archive_bound_listing");
         let scan = match self.recovery_archive_listing(
-            listing_deadline,
+            scan_deadline,
             previous.listing_cursor.as_deref().map(Path::new),
+            // Archives with no size to count, and those whose size is too
+            // old to rely on, are reached first.
+            &|path: &Path| {
+                let path = path.to_string_lossy();
+                previous.unowned_sizes.get(&*path).map_or_else(
+                    || previous.sizes.contains_key(&*path),
+                    |unowned| unowned.fresh(pass_now_ms()),
+                )
+            },
         ) {
             Ok(scan) => scan,
             Err(error) => {
@@ -280,6 +353,7 @@ impl Broker {
             listed: scan.owned.len() + scan.unowned.len(),
             skipped_by_budget: scan.skipped_by_budget,
             root_failures: scan.root_failures,
+            listed_first: scan.listed_first,
             ..PassStats::default()
         };
         let mut state = ArchiveBoundState {
@@ -297,7 +371,24 @@ impl Broker {
             usage.partial = true;
             stats.budget_stops += 1;
         }
-        let pool_root = self.pool_recovery_archive_root(false);
+        let pool_root = scan.pool_root.clone();
+        // A pool seen before and absent now (unmounted, or its marker does
+        // not match) may hold archives: nothing under it was listed.
+        state.pool_root = pool_root
+            .as_ref()
+            .map(|root| {
+                std::fs::canonicalize(root)
+                    .unwrap_or_else(|_| root.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .or_else(|| previous.pool_root.clone());
+        let absent_pool = previous
+            .pool_root
+            .as_ref()
+            .filter(|_| pool_root.is_none())
+            .map(PathBuf::from);
+        stats.pool_absent = absent_pool.is_some();
         usage.pool.root = pool_root
             .as_ref()
             .map(|root| root.to_string_lossy().into_owned());
@@ -314,122 +405,168 @@ impl Broker {
         // not walked before are walked in listing order, the ones whose
         // walk ran out of budget last time after the others; a walk stopped
         // by the budget is retried next run, a failed one is not recorded.
+        //
+        // Archives the broker cannot vouch for are walked afresh whenever
+        // reached (their content may change), the one tried longest ago
+        // first, and are never removed. One whose walk does not complete
+        // counts in the total with its last measured size, if any. An
+        // archive directory that could not be listed is among them: what is
+        // in it is unknown, and it keeps no size of its own.
         let sizing_span = crate::phase_telemetry::span("recovery_archive_bound_sizing");
-        let mut owned = scan.owned;
-        owned.sort_by_key(|archive| {
-            previous
-                .size_deferred_at_ms
-                .get(&key(&archive.path))
-                .copied()
-                .unwrap_or(i64::MIN)
-        });
-        let mut sized = Vec::new();
-        for archive in owned {
-            let path_key = key(&archive.path);
-            if let Some(known) = previous
-                .sizes
-                .get(&path_key)
-                .filter(|known| known.created_at_ms == archive.created_at_ms)
-            {
-                stats.size_cached += 1;
-                state.sizes.insert(path_key, *known);
-                sized.push((archive, known.bytes));
-                continue;
-            }
-            // A size recorded for another archive at this path is not this
-            // one's: a later pass must not count it from there.
-            previous.sizes.remove(&path_key);
-            match walk_size(&archive.path, scan_deadline) {
-                SizeWalk::Measured(bytes) => {
-                    stats.size_measured += 1;
-                    state.sizes.insert(
-                        path_key,
-                        MeasuredArchiveSize {
-                            created_at_ms: archive.created_at_ms,
-                            bytes,
-                        },
-                    );
-                    sized.push((archive, bytes));
-                }
-                SizeWalk::OutOfBudget => {
-                    stats.size_skipped_by_budget += 1;
-                    stats.size_unknown += 1;
-                    usage.partial = true;
-                    state.size_deferred_at_ms.insert(path_key, pass_now_ms());
-                }
-                SizeWalk::Failed => {
-                    stats.size_failed += 1;
-                    stats.size_unknown += 1;
-                    usage.partial = true;
-                }
-            }
-        }
-        // Archives the broker cannot vouch for count, are never removed,
-        // and are walked afresh when reached (their content may change), the
-        // one tried longest ago first. One whose walk does not complete
-        // counts with its last measured size, if any; that size is used for
-        // nothing else. An archive directory that could not be listed is in
-        // `unowned` too: what is in it is unknown, so no size of it is kept
-        // and the total is not known.
-        let mut unowned = scan
-            .unowned
-            .iter()
-            .enumerate()
-            .map(|(index, (path, _))| {
-                let earlier = previous
-                    .unowned_sizes
-                    .get(&key(path))
-                    .copied()
-                    .unwrap_or_default();
-                (path, index < scan.root_failures, earlier)
+        let size_now = pass_now_ms();
+        let mut walks = scan
+            .owned
+            .into_iter()
+            .map(|archive| {
+                let deferred = previous
+                    .size_deferred_at_ms
+                    .get(&key(&archive.path))
+                    .copied();
+                (
+                    walk_order(WalkKind::Owned { deferred }),
+                    Walk::Owned(archive),
+                )
             })
+            .chain(
+                scan.unowned
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (path, _))| {
+                        let root_failure = index < scan.root_failures;
+                        let earlier = previous
+                            .unowned_sizes
+                            .get(&key(&path))
+                            .copied()
+                            .unwrap_or_default();
+                        let kind = if root_failure {
+                            WalkKind::Root
+                        } else {
+                            WalkKind::Unowned {
+                                tried: earlier.tried_at_ms,
+                            }
+                        };
+                        (
+                            walk_order(kind),
+                            Walk::Unowned {
+                                path,
+                                root_failure,
+                                earlier,
+                            },
+                        )
+                    }),
+            )
             .collect::<Vec<_>>();
-        unowned.sort_by_key(|(_, _, earlier)| earlier.tried_at_ms);
-        for (path, root_failure, earlier) in unowned {
-            let path_key = key(path);
-            let mut record = earlier;
-            if Instant::now() < scan_deadline {
-                record.tried_at_ms = pass_now_ms();
-            }
-            let counted = match walk_size(path, scan_deadline) {
-                SizeWalk::Measured(bytes) => {
-                    stats.size_measured += 1;
-                    record.bytes = Some(bytes);
-                    Some(bytes)
-                }
-                incomplete => {
-                    if matches!(incomplete, SizeWalk::OutOfBudget) {
-                        stats.size_skipped_by_budget += 1;
-                    } else {
-                        stats.size_failed += 1;
+        walks.sort_by_key(|(order, _)| *order);
+        // Bytes of archives the broker cannot vouch for that this pass did
+        // not walk. They count in the total and against the bound, but never
+        // towards removing an archive: that size may be out of date.
+        let mut unwalked_unowned_bytes = 0_u64;
+        let mut sized = Vec::new();
+        for (_, walk) in walks {
+            match walk {
+                Walk::Owned(archive) => {
+                    let path_key = key(&archive.path);
+                    previous.unowned_sizes.remove(&path_key);
+                    if let Some(known) = previous
+                        .sizes
+                        .get(&path_key)
+                        .filter(|known| known.created_at_ms == archive.created_at_ms)
+                    {
+                        stats.size_cached += 1;
+                        state.sizes.insert(path_key, *known);
+                        sized.push((archive, known.bytes));
+                        continue;
                     }
+                    // A size recorded for another archive at this path is
+                    // not this one's: a later pass must not count it.
+                    previous.sizes.remove(&path_key);
+                    match walk_size(&archive.path, scan_deadline) {
+                        SizeWalk::Measured(bytes) => {
+                            stats.size_measured += 1;
+                            state.sizes.insert(
+                                path_key,
+                                MeasuredArchiveSize {
+                                    created_at_ms: archive.created_at_ms,
+                                    bytes,
+                                },
+                            );
+                            sized.push((archive, bytes));
+                            continue;
+                        }
+                        SizeWalk::NotStarted => stats.size_skipped_by_budget += 1,
+                        SizeWalk::OutOfBudget => {
+                            // Only one that was tried: the others go first
+                            // next time.
+                            stats.size_skipped_by_budget += 1;
+                            state.size_deferred_at_ms.insert(path_key, size_now);
+                        }
+                        SizeWalk::Failed => stats.size_failed += 1,
+                    }
+                    stats.size_unknown += 1;
                     usage.partial = true;
-                    if earlier.bytes.is_some() {
-                        stats.walk_fell_back += 1;
+                }
+                Walk::Unowned {
+                    path,
+                    root_failure,
+                    earlier,
+                } => {
+                    let mut record = earlier;
+                    let walked = walk_size(&path, scan_deadline);
+                    if !matches!(walked, SizeWalk::NotStarted) {
+                        record.tried_at_ms = size_now;
+                    }
+                    let complete = matches!(walked, SizeWalk::Measured(_));
+                    match walked {
+                        SizeWalk::Measured(bytes) => {
+                            stats.size_measured += 1;
+                            record.bytes = Some(bytes);
+                            record.measured_at_ms = size_now;
+                        }
+                        SizeWalk::NotStarted | SizeWalk::OutOfBudget => {
+                            stats.size_skipped_by_budget += 1;
+                            usage.partial = true;
+                        }
+                        SizeWalk::Failed => {
+                            stats.size_failed += 1;
+                            usage.partial = true;
+                            if !root_failure && plainly_missing(&path) {
+                                // Removed since it was listed.
+                                previous.unowned_sizes.remove(&key(&path));
+                                previous.sizes.remove(&key(&path));
+                                continue;
+                            }
+                            record.measured_at_ms = 0;
+                        }
+                    }
+                    if let Some(bytes) = record.bytes {
+                        let location = if in_pool(&path) {
+                            &mut usage.pool
+                        } else {
+                            &mut usage.host_state
+                        };
+                        location.archives += 1;
+                        location.bytes = location.bytes.saturating_add(bytes);
+                        if !complete {
+                            stats.walk_fell_back += 1;
+                            unwalked_unowned_bytes = unwalked_unowned_bytes.saturating_add(bytes);
+                            if !record.fresh(size_now) {
+                                stats.size_stale += 1;
+                            }
+                        }
                     } else if !root_failure {
                         stats.size_unknown += 1;
                     }
-                    earlier.bytes
+                    if !root_failure {
+                        state.unowned_sizes.insert(key(&path), record);
+                    }
                 }
-            };
-            if let Some(bytes) = counted {
-                let location = if in_pool(path) {
-                    &mut usage.pool
-                } else {
-                    &mut usage.host_state
-                };
-                location.archives += 1;
-                location.bytes = location.bytes.saturating_add(bytes);
-            }
-            if !root_failure {
-                state.unowned_sizes.insert(path_key, record);
             }
         }
         // Archives this listing did not reach count with the size an
         // earlier pass measured, so a long listing does not hide them from
-        // the total; they are not candidates this pass. The size walked when
-        // the broker could last not vouch for it is the more recent one: it
-        // is forgotten once the archive is listed as the broker's.
+        // the total; they are not candidates this pass. A size walked while
+        // the broker could not vouch for the archive is the more recent one
+        // (it is forgotten once the archive is listed as the broker's).
         for path in &scan.not_listed {
             let path_key = key(path);
             let mut earlier = None;
@@ -440,6 +577,12 @@ impl Broker {
             if let Some(unowned) = previous.unowned_sizes.get(&path_key) {
                 state.unowned_sizes.insert(path_key, *unowned);
                 earlier = unowned.bytes;
+                if let Some(bytes) = unowned.bytes {
+                    unwalked_unowned_bytes = unwalked_unowned_bytes.saturating_add(bytes);
+                    if !unowned.fresh(size_now) {
+                        stats.size_stale += 1;
+                    }
+                }
             }
             let Some(bytes) = earlier else {
                 stats.size_unknown += 1;
@@ -454,10 +597,15 @@ impl Broker {
             location.archives += 1;
             location.bytes = location.bytes.saturating_add(bytes);
         }
-        // A pass that listed nothing while archives wait made no progress:
-        // it stays due, so waiting an interval always moves the cursor.
+        // A pass whose rotation listed nothing while archives wait made no
+        // progress: it stays due, so waiting an interval always moves the
+        // cursor.
         let stalled = scan.last_listed.is_none() && !scan.not_listed.is_empty();
-        usage.total_known = stats.size_unknown == 0 && scan.root_failures == 0 && !stalled;
+        usage.total_known = stats.size_unknown == 0
+            && stats.size_stale == 0
+            && scan.root_failures == 0
+            && !stats.pool_absent
+            && !stalled;
         stats.total_known = usage.total_known;
         stats.total_from_earlier_sizes =
             usage.total_known && stats.counted_from_earlier_size + stats.walk_fell_back > 0;
@@ -516,6 +664,12 @@ impl Broker {
         // retry is due, then tried first with the whole budget.
         let evict_span = crate::phase_telemetry::span("recovery_archive_bound_eviction");
         let evict_deadline = deadline.min(Instant::now() + ARCHIVE_EVICTION_BUDGET);
+        #[cfg(test)]
+        let evict_deadline = if EXPIRED_EVICTION_FOR_TEST.with(std::cell::Cell::get) {
+            Instant::now()
+        } else {
+            evict_deadline
+        };
         measured.sort_by_key(|entry| (entry.archive.created_at_ms, entry.archive.session_id));
         let order = eviction_order(
             &measured
@@ -550,13 +704,17 @@ impl Broker {
             })
             .count();
         let mut removed = vec![false; measured.len()];
-        for index in order {
+        for (position, &index) in order.iter().enumerate() {
             if Instant::now() >= evict_deadline {
                 stats.budget_stops += 1;
+                usage.eviction_unfinished = order[position..]
+                    .iter()
+                    .any(|&left| measured[left].aged_out && measured[left].landed != Some(false));
                 break;
             }
-            let needed =
-                measured[index].aged_out || (usage.bound_bytes > 0 && total > usage.bound_bytes);
+            let needed = measured[index].aged_out
+                || (usage.bound_bytes > 0
+                    && total.saturating_sub(unwalked_unowned_bytes) > usage.bound_bytes);
             if !needed {
                 continue;
             }
@@ -686,9 +844,21 @@ impl Broker {
         // keeping it changes nothing, and asking for each of 2,373 archives
         // took about 70 s of one pass on the busiest repository.
         let carry_span = crate::phase_telemetry::span("recovery_archive_bound_state_carry");
+        // Only a path plainly missing is dropped, and none of an absent pool.
+        let still_there = |path: &str| {
+            absent_pool
+                .as_ref()
+                .is_some_and(|root| Path::new(path).starts_with(root))
+                || !plainly_missing(Path::new(path))
+        };
         for (path, known) in previous.sizes {
-            if !state.sizes.contains_key(&path) && std::fs::symlink_metadata(&path).is_ok() {
+            if !state.sizes.contains_key(&path) && still_there(&path) {
                 state.sizes.insert(path, known);
+            }
+        }
+        for (path, known) in previous.unowned_sizes {
+            if !state.unowned_sizes.contains_key(&path) && still_there(&path) {
+                state.unowned_sizes.insert(path, known);
             }
         }
         for (path, at) in previous.size_deferred_at_ms {
@@ -725,6 +895,7 @@ impl Broker {
                 "unique_kept_over_bound": usage.unique_kept_over_bound,
                 "partial": usage.partial,
                 "total_known": usage.total_known,
+                "eviction_unfinished": usage.eviction_unfinished,
             }),
         );
         usage
@@ -818,6 +989,7 @@ impl Broker {
                 over_bound: usage.over_bound,
                 partial: usage.partial,
                 total_known: usage.total_known,
+                eviction_unfinished: usage.eviction_unfinished,
             })
     }
 }
@@ -836,6 +1008,8 @@ pub(crate) struct LastArchiveBound {
     /// Every archive is in its total all the same, some from a size an
     /// earlier pass measured; otherwise it may undercount.
     pub(crate) total_known: bool,
+    /// Removals stopped on their budget with aged-out archives left.
+    pub(crate) eviction_unfinished: bool,
 }
 
 /// Whether an archive can never be shown landed, whatever Git holds: it
@@ -901,6 +1075,21 @@ mod tests {
             eviction_order(&[(true, Some((false, 1)))]),
             Vec::<usize>::new()
         );
+    }
+
+    /// Own archives never deferred, then unowned ones longest untried first,
+    /// then own ones deferred longest ago, then unlistable directories.
+    #[test]
+    fn walks_are_ordered_so_one_large_archive_cannot_starve_the_rest() {
+        let order = [
+            walk_order(WalkKind::Owned { deferred: None }),
+            walk_order(WalkKind::Unowned { tried: 0 }),
+            walk_order(WalkKind::Unowned { tried: 9 }),
+            walk_order(WalkKind::Owned { deferred: Some(1) }),
+            walk_order(WalkKind::Owned { deferred: Some(2) }),
+            walk_order(WalkKind::Root),
+        ];
+        assert!(order.is_sorted(), "{order:?}");
     }
 
     /// Records from before `total_known` and the sizes of unowned archives

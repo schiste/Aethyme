@@ -5422,21 +5422,32 @@ although the archives were at a third of the bound. The storage ledger's
 `RecoveryArchiveUsage` adds `total_known`: every archive found is in the total,
 measured by the pass or counted with the size an earlier pass measured. The
 bound pass is due when it is over the bound, its total is not known (instead of
-`partial`), its record is 30 minutes old, the clock went back, or the run
-archived something. A record without the field reads as not known. `partial`
+`partial`), its removals stopped on their budget with aged-out archives left
+(`eviction_unfinished`), its record is 30 minutes old, the clock went back, or
+the run archived something. A record without the field reads as not known. `partial`
 keeps its meaning. The bound state (`<sha256>.archive-sizes`) adds
-`unowned_sizes` (path to `bytes` and `tried_at_ms`): the last size of an archive
-the broker cannot vouch for, only counted while its walk cannot run; the one
-tried longest ago is walked first. The listing may use three quarters of the
-20 s, leaving the rest to size walks. A pass that listed nothing while archives
-wait, or could not read an archive directory, does not know its total.
+`unowned_sizes` (path to `bytes`, `measured_at_ms` and `tried_at_ms`): the last
+size of an archive the broker cannot vouch for. While its walk cannot run it
+counts in the total and against the bound, but never towards removing an
+archive; after 24 hours, or a failed walk, it still counts but the total is not
+known. The state also adds `pool_root`: while a pool seen before is absent, its
+sizes are kept and the total is not known. Three quarters of what the 20 s leave
+once the directories are read are for the listing (a third of that at most for
+archives with no usable size, which are listed first and do not move the
+cursor), the rest for size walks: own archives first, then unowned ones longest
+untried first, then own ones whose walk ran out of budget before. A pass whose
+rotation listed nothing while archives wait, or that could not read an archive
+directory, does not know its total.
 
 Attachment `recovery_archive_bound_pass` adds `walk_fell_back` (archives listed
 but counted with an earlier size because their walk did not complete),
+`size_stale` (counted with an earlier size too old or failed since),
+`listed_first` (archives listed ahead of the rotation), `pool_absent`,
 `size_unknown` (archives with no size from this pass or an earlier one, which
 makes the pass due again), `root_failures` (archive directories that could not
 be listed), `total_known` and `total_from_earlier_sizes` (known only with the
-help of earlier sizes); `recovery_archive_bound` adds `total_known`. New
+help of earlier sizes); `recovery_archive_bound` adds `total_known`
+and `eviction_unfinished`. New
 counters: `recovery_archive_bound_total_from_earlier_sizes` and
 `recovery_archive_bound_total_unknown` (one per such pass), and
 `checkout_retirement_archive_bound_not_due_partial` (runs that skipped the bound

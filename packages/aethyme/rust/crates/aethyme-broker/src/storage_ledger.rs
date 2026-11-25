@@ -970,6 +970,10 @@ pub struct RecoveryArchiveUsage {
     /// `partial` pass). A record from before this field reads as not known.
     #[serde(default)]
     pub total_known: bool,
+    /// Removals stopped on their budget with archives past their retention
+    /// age left to try.
+    #[serde(default)]
+    pub eviction_unfinished: bool,
     pub observed_at_ms: i64,
 }
 
@@ -1025,14 +1029,32 @@ pub struct MeasuredArchiveSize {
 /// content may change, so it is walked again whenever a pass reaches it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnownedArchiveSize {
-    /// What the last completed walk found, if any: only ever counted in the
-    /// total of a pass that could not walk it.
+    /// What the last completed walk found, if any: counted in the total of
+    /// a pass that could not walk it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// When that walk completed; `0` once a later walk failed. Past
+    /// [`UNOWNED_SIZE_FRESH_MS`] the bytes still count, but the total is
+    /// not known.
+    #[serde(default)]
+    pub measured_at_ms: i64,
     /// When a walk was last tried: the one tried longest ago goes first, so
     /// one that is always too large cannot hold back the others.
     #[serde(default)]
     pub tried_at_ms: i64,
+}
+
+/// How long the size of an archive the broker cannot vouch for stands in for
+/// a new walk: it may have grown since.
+pub const UNOWNED_SIZE_FRESH_MS: i64 = 24 * 60 * 60 * 1_000;
+
+impl UnownedArchiveSize {
+    /// Whether the size is recent enough for a known total.
+    pub fn fresh(&self, now_ms: i64) -> bool {
+        self.bytes.is_some()
+            && now_ms >= self.measured_at_ms
+            && now_ms - self.measured_at_ms < UNOWNED_SIZE_FRESH_MS
+    }
 }
 
 fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
@@ -1071,6 +1093,10 @@ pub struct ArchiveBoundState {
     /// resumes after it. `None` once a listing reaches every archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_cursor: Option<String>,
+    /// The pool-side archive directory last seen: while it is absent (an
+    /// unmounted volume), its sizes are kept and the total is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_root: Option<String>,
 }
 
 /// `repository`'s [`ArchiveBoundState`] (empty when none was recorded or
