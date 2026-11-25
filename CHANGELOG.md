@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.174] - 2026-11-25
+
+### Fixed
+
+- The recovery-archive size check honours its 30-minute interval when it cannot list every archive within its budget but every archive's size is known and the total is within the bound. Before, such a check was due again at the next run: on the busiest repository 22 of 26 recorded checks used their whole 20 s listing budget, with archives at about a third of the bound (#2012).
+
+### Changed
+
+- Listing gets at most three quarters of the check's budget and size walks the rest; archives with no usable size are listed first, and the listing share is taken after the directory entries are read (#2012).
+- Archives the broker does not vouch for keep their last measured size for at most 24 h. A carried size counts in the total and the bound, and never towards removing an archive (#2012).
+- An archive directory that cannot be listed, or a pool that is absent while archives are recorded in it, makes the total unknown, and recorded sizes there are kept. An absent pool alone waits for the interval (#2012).
+- A check that removed an expired archive and ran out of budget with more left is due again at once (#2012).
+
+### Added
+
+- Recorded usage fields `total_known`, `only_pool_absent`, `eviction_unfinished`; pass fields `walk_fell_back`, `size_unknown`, `size_stale`, `listed_first`, `root_failures`, `pool_absent`, `total_known`, `total_from_earlier_sizes`, `eviction_unfinished`; counters `recovery_archive_bound_total_from_earlier_sizes`, `recovery_archive_bound_total_unknown`, `checkout_retirement_archive_bound_not_due_partial` (#2012).
+
+### Upgrade notes
+
+- Each repository runs at least one extra check after the upgrade.
+
+### Known issues
+
+- A check that does not list every archive judges only the listed ones for age expiry, so expiry can take several intervals to cover all of them (#2012).
+
 ## [0.8.173] - 2026-11-25
 
 ### Changed
