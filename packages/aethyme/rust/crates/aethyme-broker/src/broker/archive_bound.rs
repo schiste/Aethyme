@@ -39,7 +39,8 @@
 //!   archive removed elsewhere is never counted, and a new one, having no
 //!   size, makes the total unknown (it is listed and walked first). A
 //!   directory that cannot be listed, or a pool that was there before and is
-//!   not now, makes it unknown too, and its sizes are kept;
+//!   not now while sizes of archives in it are recorded, makes it unknown
+//!   too, and its sizes are kept (an absent pool alone waits the interval);
 //! - content the broker vouches for does not change;
 //! - an archive it does not vouch for may grow: its earlier size makes the
 //!   total known for a day at most, and not after a failed walk. Within that
@@ -80,8 +81,8 @@ thread_local! {
     /// Test hooks: a clock offset for the pass, a bound replacing the
     /// configured one, how many of the next removal proofs start already
     /// out of budget, how many more size walks start (the rest find the
-    /// budget used), whether size walks fail, and whether removals find
-    /// their budget used.
+    /// budget used), whether size walks fail, and after how many
+    /// removals the rest find their budget used.
     pub(super) static CLOCK_SKEW_MS_FOR_TEST: std::cell::Cell<i64> =
         const { std::cell::Cell::new(0) };
     pub(super) static BOUND_BYTES_FOR_TEST: std::cell::Cell<Option<u64>> =
@@ -92,8 +93,18 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     pub(super) static FAILED_WALKS_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    pub(super) static EXPIRED_EVICTION_FOR_TEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    pub(super) static REMOVALS_LEFT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn eviction_stopped_for_test(evicted: usize) -> bool {
+    REMOVALS_LEFT_FOR_TEST.with(|stop| stop.get().is_some_and(|stop| evicted >= stop))
+}
+
+#[cfg(not(test))]
+fn eviction_stopped_for_test(_evicted: usize) -> bool {
+    false
 }
 
 fn pass_now_ms() -> i64 {
@@ -373,21 +384,25 @@ impl Broker {
         }
         let pool_root = scan.pool_root.clone();
         // A pool seen before and absent now (unmounted, or its marker does
-        // not match) may hold archives: nothing under it was listed.
-        state.pool_root = pool_root
-            .as_ref()
-            .map(|root| {
-                std::fs::canonicalize(root)
-                    .unwrap_or_else(|_| root.clone())
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .or_else(|| previous.pool_root.clone());
+        // not match) may hold archives: nothing under it was listed. One in
+        // which nothing is recorded is forgotten.
         let absent_pool = previous
             .pool_root
             .as_ref()
             .filter(|_| pool_root.is_none())
+            .filter(|root| {
+                previous
+                    .sizes
+                    .keys()
+                    .chain(previous.unowned_sizes.keys())
+                    .any(|path| Path::new(path).starts_with(root))
+            })
             .map(PathBuf::from);
+        state.pool_root = pool_root
+            .as_ref()
+            .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+            .or_else(|| absent_pool.clone())
+            .map(|root| root.to_string_lossy().into_owned());
         stats.pool_absent = absent_pool.is_some();
         usage.pool.root = pool_root
             .as_ref()
@@ -601,11 +616,12 @@ impl Broker {
         // progress: it stays due, so waiting an interval always moves the
         // cursor.
         let stalled = scan.last_listed.is_none() && !scan.not_listed.is_empty();
-        usage.total_known = stats.size_unknown == 0
-            && stats.size_stale == 0
-            && scan.root_failures == 0
-            && !stats.pool_absent
-            && !stalled;
+        let reachable_known =
+            stats.size_unknown == 0 && stats.size_stale == 0 && scan.root_failures == 0 && !stalled;
+        usage.total_known = reachable_known && !stats.pool_absent;
+        // Measuring again at once cannot bring an absent pool back: alone,
+        // it waits for the interval.
+        usage.only_pool_absent = reachable_known && stats.pool_absent;
         stats.total_known = usage.total_known;
         stats.total_from_earlier_sizes =
             usage.total_known && stats.counted_from_earlier_size + stats.walk_fell_back > 0;
@@ -664,12 +680,6 @@ impl Broker {
         // retry is due, then tried first with the whole budget.
         let evict_span = crate::phase_telemetry::span("recovery_archive_bound_eviction");
         let evict_deadline = deadline.min(Instant::now() + ARCHIVE_EVICTION_BUDGET);
-        #[cfg(test)]
-        let evict_deadline = if EXPIRED_EVICTION_FOR_TEST.with(std::cell::Cell::get) {
-            Instant::now()
-        } else {
-            evict_deadline
-        };
         measured.sort_by_key(|entry| (entry.archive.created_at_ms, entry.archive.session_id));
         let order = eviction_order(
             &measured
@@ -705,11 +715,14 @@ impl Broker {
             .count();
         let mut removed = vec![false; measured.len()];
         for (position, &index) in order.iter().enumerate() {
-            if Instant::now() >= evict_deadline {
+            if Instant::now() >= evict_deadline || eviction_stopped_for_test(usage.evicted) {
                 stats.budget_stops += 1;
-                usage.eviction_unfinished = order[position..]
-                    .iter()
-                    .any(|&left| measured[left].aged_out && measured[left].landed != Some(false));
+                // Only a pass that removed something: aged archives that
+                // never land would otherwise keep it due for ever.
+                usage.eviction_unfinished = usage.evicted > 0
+                    && order[position..].iter().any(|&left| {
+                        measured[left].aged_out && measured[left].landed != Some(false)
+                    });
                 break;
             }
             let needed = measured[index].aged_out
@@ -895,6 +908,7 @@ impl Broker {
                 "unique_kept_over_bound": usage.unique_kept_over_bound,
                 "partial": usage.partial,
                 "total_known": usage.total_known,
+                "only_pool_absent": usage.only_pool_absent,
                 "eviction_unfinished": usage.eviction_unfinished,
             }),
         );
@@ -989,6 +1003,7 @@ impl Broker {
                 over_bound: usage.over_bound,
                 partial: usage.partial,
                 total_known: usage.total_known,
+                only_pool_absent: usage.only_pool_absent,
                 eviction_unfinished: usage.eviction_unfinished,
             })
     }
@@ -1008,7 +1023,10 @@ pub(crate) struct LastArchiveBound {
     /// Every archive is in its total all the same, some from a size an
     /// earlier pass measured; otherwise it may undercount.
     pub(crate) total_known: bool,
-    /// Removals stopped on their budget with aged-out archives left.
+    /// The total is not known for an absent pool alone.
+    pub(crate) only_pool_absent: bool,
+    /// Removals made some and stopped on their budget with aged-out
+    /// archives left.
     pub(crate) eviction_unfinished: bool,
 }
 

@@ -2914,6 +2914,9 @@ fn listing_stopped_for_test(_listed: usize) -> bool {
     false
 }
 
+/// Whether an archive, by path, already has a usable size.
+type HasSize<'a> = &'a dyn Fn(&Path) -> bool;
+
 /// The listing's share of what its deadline leaves once the directory
 /// entries are read, as `(numerator, denominator)`; the rest is for the
 /// caller's size walks. A listing that used it all left none, so nothing it
@@ -4892,7 +4895,7 @@ impl Broker {
         &self,
         deadline: Instant,
         resume_after: Option<&Path>,
-        has_size: &dyn Fn(&Path) -> bool,
+        has_size: HasSize<'_>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         self.recovery_archive_scan(
             ArchiveProof::Metadata,
@@ -4904,7 +4907,7 @@ impl Broker {
     fn recovery_archive_scan(
         &self,
         proof: ArchiveProof,
-        bounded: Option<(Instant, &dyn Fn(&Path) -> bool)>,
+        bounded: Option<(Instant, HasSize<'_>)>,
         resume_after: Option<&Path>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let roots = self.inspected_recovery_archive_roots();
@@ -4952,10 +4955,9 @@ impl Broker {
         }
         paths.retain(|path| !listed_first.contains(path));
         let mut last_listed = None;
-        let mut rotated = 0;
         let mut not_listed = Vec::new();
         let mut paths = paths.into_iter();
-        for path in paths.by_ref() {
+        for (rotated, path) in paths.by_ref().enumerate() {
             if deadline.is_some_and(|deadline| {
                 Instant::now() >= deadline || listing_stopped_for_test(rotated)
             }) {
@@ -4964,7 +4966,6 @@ impl Broker {
                 break;
             }
             classify(&path);
-            rotated += 1;
             last_listed = Some(path);
         }
         not_listed.extend(paths);

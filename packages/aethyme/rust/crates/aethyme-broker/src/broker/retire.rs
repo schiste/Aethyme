@@ -146,8 +146,8 @@ const RETIRE_ARCHIVE_BOUND_INTERVAL_MS: i64 = 30 * 60 * 1_000;
 /// Whether the recovery-archive bound is due this run: this run wrote a
 /// recovery archive, none is recorded, or the last pass found the archives
 /// over the bound, does not know their total (an archive it neither measured
-/// nor had a usable earlier size of, or a failed listing), left aged-out
-/// archives to remove when its budget ended, is at least
+/// nor had a usable earlier size of, or a failed listing; an absent pool
+/// alone waits), removed some and left aged-out archives to remove when its budget ended, is at least
 /// [`RETIRE_ARCHIVE_BOUND_INTERVAL_MS`] old, or the clock went back. A
 /// `partial` pass that knows the total waits like a complete one: its
 /// listing's cursor resumes at the interval.
@@ -159,7 +159,7 @@ fn archive_bound_due(
     archived_this_run
         || last.is_none_or(|last| {
             last.over_bound
-                || !last.total_known
+                || !(last.total_known || last.only_pool_absent)
                 || last.eviction_unfinished
                 || now_ms < last.observed_at_ms
                 || now_ms - last.observed_at_ms >= RETIRE_ARCHIVE_BOUND_INTERVAL_MS
@@ -9341,6 +9341,7 @@ mod tests {
             over_bound: false,
             partial: false,
             total_known: true,
+            only_pool_absent: false,
             eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(None, false, now));
@@ -9379,6 +9380,7 @@ mod tests {
             over_bound: false,
             partial: true,
             total_known: false,
+            only_pool_absent: false,
             eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(Some(partial), false, now));
@@ -9404,10 +9406,35 @@ mod tests {
             over_bound: false,
             partial: true,
             total_known: true,
+            only_pool_absent: false,
             eviction_unfinished: false,
         };
         assert!(!super::archive_bound_due(Some(known), false, now));
         assert!(super::archive_bound_due(Some(known), true, now));
+        // Not known for an absent pool alone waits too; over the bound and
+        // at the interval it does not.
+        let absent = super::super::archive_bound::LastArchiveBound {
+            total_known: false,
+            only_pool_absent: true,
+            ..known
+        };
+        assert!(!super::archive_bound_due(Some(absent), false, now));
+        for due in [
+            super::super::archive_bound::LastArchiveBound {
+                over_bound: true,
+                ..absent
+            },
+            super::super::archive_bound::LastArchiveBound {
+                observed_at_ms: now - super::RETIRE_ARCHIVE_BOUND_INTERVAL_MS,
+                ..absent
+            },
+            super::super::archive_bound::LastArchiveBound {
+                only_pool_absent: false,
+                ..absent
+            },
+        ] {
+            assert!(super::archive_bound_due(Some(due), false, now), "{due:?}");
+        }
         for due in [
             super::super::archive_bound::LastArchiveBound {
                 over_bound: true,
@@ -9440,6 +9467,7 @@ mod tests {
             over_bound: false,
             partial: false,
             total_known: true,
+            only_pool_absent: false,
             eviction_unfinished: false,
         };
         assert!(super::archive_bound_due(Some(recent), true, now));
@@ -11086,14 +11114,28 @@ mod tests {
         std::fs::rename(&parent, &away).unwrap();
         for _ in 0..2 {
             let (absent, pass) = interrupted_pass(&broker, None, None);
-            assert!(!absent.total_known, "{pass}");
+            assert!(!absent.total_known && absent.only_pool_absent, "{pass}");
             assert_eq!(pass["pool_absent"], true, "{pass}");
             assert_eq!(read_archive_bound_state(&broker).sizes, before.sizes);
         }
+        // With something else unknown too, it is not the only reason.
+        let (stale, pass) = {
+            change_archive_bound_state(&broker, |state| state.unowned_sizes.clear());
+            interrupted_pass(&broker, None, Some(0))
+        };
+        assert!(!stale.total_known && !stale.only_pool_absent, "{pass}");
         std::fs::rename(&away, &parent).unwrap();
         let (back, pass) = interrupted_pass(&broker, None, None);
         assert!(back.total_known, "{pass}");
         assert_eq!(pass["size_cached"], 1, "{pass}");
+
+        // Gone, with nothing recorded in it: forgotten, the total is known.
+        std::fs::rename(&parent, &away).unwrap();
+        change_archive_bound_state(&broker, |state| state.sizes.clear());
+        let (gone, pass) = interrupted_pass(&broker, None, None);
+        assert!(gone.total_known && !gone.only_pool_absent, "{pass}");
+        assert_eq!(read_archive_bound_state(&broker).pool_root, None);
+        std::fs::rename(&away, &parent).unwrap();
     }
 
     /// A size carried for an unowned archive puts the total over the bound
@@ -11124,27 +11166,34 @@ mod tests {
         assert!(!archive.exists());
     }
 
-    /// Removals that stop on their budget with an aged-out archive left say
-    /// so, which keeps the next pass due.
+    /// Removals that made some and stop on their budget with an aged-out
+    /// archive left say so, which keeps the next pass due; a pass that
+    /// removed nothing does not (those left may never land).
     #[test]
     fn an_unfinished_expiry_is_recorded() {
         let (_owner, _storage, mut broker) = fixture();
-        let archive = retired_then_landed(&mut broker, "aged out");
-        let pass = |expired| {
-            super::super::archive_bound::EXPIRED_EVICTION_FOR_TEST.with(|cell| cell.set(expired));
+        let first = retired_then_landed(&mut broker, "aged out first");
+        let second = retired_then_landed(&mut broker, "aged out second");
+        let pass = |removals| {
+            super::super::archive_bound::REMOVALS_LEFT_FOR_TEST.with(|cell| cell.set(removals));
             super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST
                 .with(|skew| skew.set(100 * 86_400_000));
             let result = interrupted_pass(&broker, None, None);
             super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(0));
-            super::super::archive_bound::EXPIRED_EVICTION_FOR_TEST.with(|cell| cell.set(false));
+            super::super::archive_bound::REMOVALS_LEFT_FOR_TEST.with(|cell| cell.set(None));
             result.0
         };
-        let stopped = pass(true);
+        let none = pass(Some(0));
+        assert_eq!(none.evicted, 0, "{none:?}");
+        assert!(!none.eviction_unfinished, "{none:?}");
+        assert!(first.exists() && second.exists());
+        let stopped = pass(Some(1));
+        assert_eq!(stopped.evicted, 1, "{stopped:?}");
         assert!(stopped.eviction_unfinished, "{stopped:?}");
-        assert!(archive.exists());
-        let finished = pass(false);
+        assert!(!first.exists() && second.exists());
+        let finished = pass(None);
         assert!(!finished.eviction_unfinished, "{finished:?}");
-        assert!(!archive.exists());
+        assert!(!second.exists());
     }
 
     /// Over the bound by earlier sizes alone is over the bound, and due.
@@ -11166,6 +11215,7 @@ mod tests {
                 over_bound: usage.over_bound,
                 partial: usage.partial,
                 total_known: usage.total_known,
+                only_pool_absent: usage.only_pool_absent,
                 eviction_unfinished: usage.eviction_unfinished,
             }),
             false,

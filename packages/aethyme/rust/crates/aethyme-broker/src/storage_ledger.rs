@@ -970,8 +970,12 @@ pub struct RecoveryArchiveUsage {
     /// `partial` pass). A record from before this field reads as not known.
     #[serde(default)]
     pub total_known: bool,
-    /// Removals stopped on their budget with archives past their retention
-    /// age left to try.
+    /// `total_known` is false for one reason alone: a pool seen before is
+    /// absent.
+    #[serde(default)]
+    pub only_pool_absent: bool,
+    /// Removals made some and stopped on their budget with archives past
+    /// their retention age left to try.
     #[serde(default)]
     pub eviction_unfinished: bool,
     pub observed_at_ms: i64,
@@ -1094,7 +1098,8 @@ pub struct ArchiveBoundState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_cursor: Option<String>,
     /// The pool-side archive directory last seen: while it is absent (an
-    /// unmounted volume), its sizes are kept and the total is not known.
+    /// unmounted volume) and sizes under it are recorded, they are kept and
+    /// the total is not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_root: Option<String>,
 }
