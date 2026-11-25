@@ -116,14 +116,6 @@ impl<'a> OwnedRange<'a> {
     }
 }
 
-/// Patch identities computed for one answer, shared by its comparisons.
-#[derive(Default)]
-struct PatchWork {
-    cache: PatchIdCache,
-    /// Commits handed to hashing, counted before the attempt.
-    hashed: usize,
-}
-
 impl Broker {
     /// The previous session's ownership boundary, when it still owns commits
     /// at `head` that were not delivered. `None` leaves the new session's
@@ -134,6 +126,14 @@ impl Broker {
     /// requests land. Only reachability counts there: a patch match cannot say
     /// whether a commit is the one that landed or the same change applied
     /// again after a revert, so squash- and rebase-landed work stays carried.
+    ///
+    /// The plan drops the boundary when nothing is pending, so a commit it
+    /// matches by patch on integration keeps its owner only while another one
+    /// is pending. Reachability takes such siblings out of the count, and a
+    /// patch match is no proof, so when it did and nothing else is pending,
+    /// every owned commit left that integration does not hold by ancestry or
+    /// an exact sync merge keeps the boundary and is what is counted. When it
+    /// took nothing out, the answer is exactly the plan's.
     ///
     /// Leaving out an undelivered commit is not a display error. The new
     /// session's `diff_base`, `adoption_base` and `adopted_head` all become
@@ -151,16 +151,16 @@ impl Broker {
         head: &str,
     ) -> Option<AdoptCarriedOwnership> {
         let _span = crate::phase_telemetry::span("adopt_carried_ownership");
-        let mut work = PatchWork::default();
+        let mut hashed = 0;
         let own_branch = format!("refs/remotes/origin/{}", previous.branch);
         let default_tip = self
             .remote_default_ref_and_tip()
             .filter(|(reference, _)| *reference != own_branch)
             .map(|(_, commit)| commit);
-        let pending = self.undelivered_owned(previous, head, default_tip.as_deref(), &mut work);
+        let pending = self.undelivered_owned(previous, head, default_tip.as_deref(), &mut hashed);
         crate::phase_telemetry::attach(
             "adopt_ownership",
-            serde_json::json!({ "carried_commits_hashed": work.hashed }),
+            serde_json::json!({ "carried_commits_hashed": hashed }),
         );
         if pending.is_err() {
             crate::phase_telemetry::add("adopt_carried_ownership_error", Duration::ZERO);
@@ -178,7 +178,7 @@ impl Broker {
         session: &Session,
         head: &str,
         default_tip: Option<&str>,
-        work: &mut PatchWork,
+        hashed: &mut usize,
     ) -> Result<Option<(String, usize)>, BrokerOpError> {
         let repo = self.repo_handle();
         let (_, integration) = self.integration_head_snapshot()?;
@@ -195,16 +195,30 @@ impl Broker {
             }
             outside
         });
+        let read_default = beyond_both.is_some();
         let outside = match beyond_both {
             Some(outside) => outside,
             None => range.owned_outside(repo, head, &[&integration])?,
         };
-        let pending = self
-            .states_outside(&outside, &integration, range.baseline(), work)?
-            .into_iter()
-            .filter(|(_, state)| *state == SubmissionIntegrationState::Pending)
-            .count();
-        Ok(Some((range.baseline().to_string(), pending)))
+        let states = self.states_outside(&outside, &integration, range.baseline(), hashed)?;
+        let count = |keep: fn(&SubmissionIntegrationState) -> bool| {
+            states.iter().filter(|(_, state)| keep(state)).count()
+        };
+        let mut kept = count(|state| *state == SubmissionIntegrationState::Pending);
+        if kept == 0 && read_default {
+            let unproven =
+                count(|state| *state != SubmissionIntegrationState::AlreadyIntegratedByAncestry);
+            // A listing that fails cannot say nothing was taken out.
+            let subtracted = || {
+                range
+                    .owned_outside(repo, head, &[&integration])
+                    .map_or(true, |all| all.len() > outside.len())
+            };
+            if unproven > 0 && subtracted() {
+                kept = unproven;
+            }
+        }
+        Ok(Some((range.baseline().to_string(), kept)))
     }
 
     /// How many owned commits a submission against `base` would replay, when
@@ -216,13 +230,13 @@ impl Broker {
         session_head: &str,
         base: &str,
     ) -> usize {
-        let mut work = PatchWork::default();
+        let mut hashed = 0;
         let count = self
-            .submittable_owned(session, session_head, base, &mut work)
+            .submittable_owned(session, session_head, base, &mut hashed)
             .unwrap_or(0);
         crate::phase_telemetry::attach(
             "adopt_ownership",
-            serde_json::json!({ "drift_commits_hashed": work.hashed }),
+            serde_json::json!({ "drift_commits_hashed": hashed }),
         );
         count
     }
@@ -232,7 +246,7 @@ impl Broker {
         session: &Session,
         session_head: &str,
         base: &str,
-        work: &mut PatchWork,
+        hashed: &mut usize,
     ) -> Result<usize, BrokerOpError> {
         let repo = self.repo_handle();
         let checkpoint = OwnershipCheckpoint::select(repo, session, session_head);
@@ -250,7 +264,7 @@ impl Broker {
         } else {
             repo.commits_excluding_oldest(session_head, base)?
         };
-        let states = self.states_outside(&judged, base, range.baseline(), work)?;
+        let states = self.states_outside(&judged, base, range.baseline(), hashed)?;
         if states
             .iter()
             .any(|(_, state)| *state == SubmissionIntegrationState::Ambiguous)
@@ -273,7 +287,7 @@ impl Broker {
         commits: &[String],
         base: &str,
         baseline: &str,
-        work: &mut PatchWork,
+        hashed: &mut usize,
     ) -> Result<Vec<(String, SubmissionIntegrationState)>, BrokerOpError> {
         if commits.is_empty() {
             return Ok(Vec::new());
@@ -306,7 +320,7 @@ impl Broker {
             .filter(|commit| !synced.contains(commit) && !shapes[*commit].parents.is_empty())
             .map(|commit| (commit.clone(), true))
             .collect::<Vec<_>>();
-        let matches = self.patch_match_counts(&compared, base, baseline, work)?;
+        let matches = self.patch_match_counts(&compared, base, baseline, hashed)?;
         Ok(commits
             .iter()
             .map(|commit| {
@@ -331,7 +345,7 @@ impl Broker {
         compared: &[(String, bool)],
         base: &str,
         baseline: &str,
-        work: &mut PatchWork,
+        hashed: &mut usize,
     ) -> Result<BTreeMap<String, usize>, BrokerOpError> {
         if compared.is_empty() {
             return Ok(BTreeMap::new());
@@ -348,12 +362,15 @@ impl Broker {
                     (commit, has_parent)
                 })
                 .collect::<Vec<_>>();
-            let comparable =
-                repo.commits_sharing_changed_paths(compared, &candidates, &mut work.cache)?;
+            let comparable = repo.commits_sharing_changed_paths(
+                compared,
+                &candidates,
+                &mut PatchIdCache::default(),
+            )?;
             (candidates, comparable)
         };
-        work.hashed += repo.uncached_patch_id_count(&comparable, &work.cache);
-        let patch_ids = repo.cached_first_parent_patch_ids(&comparable, &mut work.cache)?;
+        *hashed += comparable.len();
+        let patch_ids = repo.first_parent_patch_ids(&comparable)?;
         let mut by_patch = BTreeMap::<&str, usize>::new();
         for (candidate, _) in &candidates {
             if let Some(patch) = patch_ids.get(candidate) {
@@ -870,12 +887,17 @@ mod tests {
                 .commits_excluding_all_oldest(&head, &[&fixture.base, &upstream])
                 .is_err()
         );
-        let (_, pending) = fixture
-            .broker
-            .undelivered_owned(&session, &head, Some(&upstream), &mut PatchWork::default())
-            .unwrap()
-            .unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let (_, pending) = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            fixture
+                .broker
+                .undelivered_owned(&session, &head, Some(&upstream), &mut 0)
+                .unwrap()
+                .unwrap()
+        };
         assert_eq!(pending, 1);
+        assert_eq!(recorder.totals().1["adopt_carried_default_unreadable"], 1);
     }
 
     #[test]
@@ -946,15 +968,82 @@ mod tests {
         assert_eq!(fixture.carried(&session).0, Some(1));
     }
 
+    /// The reachable sibling was what kept the boundary; taking it out must
+    /// not drop a commit integration only matches by patch.
+    #[test]
+    fn a_reachable_sibling_does_not_take_a_patch_matched_commits_owner_with_it() {
+        for twice in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.set_upstream(&fixture.tip);
+            let session = fixture.adopt();
+            let matched = commit(&fixture.work, "matched.txt", "matched\n");
+            let integration = if twice {
+                fixture.land_twice(&matched)
+            } else {
+                fixture.land(&matched)
+            };
+            fixture.set_integration(&integration);
+            // Nothing taken out: the plan's answer.
+            assert_eq!(fixture.carried(&session), (None, if twice { 4 } else { 2 }));
+
+            git(&fixture.work, &["reset", "-q", "--hard", &fixture.tip]);
+            let sibling = commit(&fixture.work, "sibling.txt", "sibling\n");
+            git(&fixture.work, &["cherry-pick", &matched]);
+            assert_eq!(fixture.planned(&session, &integration), 1);
+            fixture.set_upstream(&sibling);
+            assert_eq!(fixture.carried(&session).0, Some(1), "twice: {twice}");
+
+            // Once it is reachable too, nothing is left to own.
+            fixture.set_upstream(&fixture.head());
+            assert_eq!(fixture.carried(&session).0, None, "twice: {twice}");
+        }
+    }
+
+    /// An exact sync merge on integration is integrated, also as the only
+    /// commit left once its sibling is reachable from the default branch.
+    #[test]
+    fn an_exact_sync_merge_is_integrated() {
+        let mut fixture = Fixture::new();
+        let session = fixture.adopt();
+        let integration = commit(&fixture.root, "moved.txt", "moved\n");
+        fixture.set_integration(&integration);
+        git(
+            &fixture.work,
+            &["merge", "-q", "--no-ff", "-m", "sync", "main"],
+        );
+        assert_eq!(fixture.planned(&session, &integration), 0);
+        assert_eq!(fixture.carried(&session), (None, 0));
+        commit(&fixture.work, "mine.txt", "mine\n");
+        assert_eq!(fixture.planned(&session, &integration), 1);
+        // The candidate changes another path, so nothing is hashed.
+        assert_eq!(fixture.carried(&session), (Some(1), 0));
+
+        // A merge with its own tree is not a sync, only a patch match.
+        git(&fixture.work, &["reset", "-q", "--hard", &fixture.tip]);
+        let sibling = commit(&fixture.work, "sibling.txt", "sibling\n");
+        git(
+            &fixture.work,
+            &["merge", "-q", "--no-ff", "-m", "other", "main"],
+        );
+        fixture.set_upstream(&sibling);
+        assert_eq!(fixture.planned(&session, &integration), 1);
+        assert_eq!(fixture.carried(&session).0, Some(1));
+    }
+
     #[test]
     fn the_drift_report_counts_what_the_plan_would_submit() {
-        for (case, expected) in [("owned", 1), ("inherited", 0), ("reapplied", 0)] {
+        for (case, expected) in [
+            ("owned", 1),
+            ("inherited", 0),
+            ("reapplied", 0),
+            ("inherited ambiguous", 0),
+        ] {
             let mut fixture = Fixture::new();
             fixture.set_upstream(&fixture.tip);
             if case == "inherited" {
                 commit(&fixture.work, "inherited.txt", "inherited\n");
             }
-            let session = fixture.adopt();
+            let mut session = fixture.adopt();
             match case {
                 "owned" => {
                     commit(&fixture.work, "owned.txt", "owned\n");
@@ -971,6 +1060,15 @@ mod tests {
                     git(&fixture.work, &["reset", "-q", "--hard", &reverted]);
                     git(&fixture.work, &["cherry-pick", "-x", &owned]);
                     commit(&fixture.work, "more.txt", "more\n");
+                }
+                // The ambiguous commit predates the baseline, and still makes
+                // the plan unsafe for the owned ones.
+                "inherited ambiguous" => {
+                    let inherited = commit(&fixture.work, "owned.txt", "owned\n");
+                    fixture.set_upstream(&fixture.land_twice(&inherited));
+                    git(&fixture.work, &["merge", "-q", "--no-edit", "main"]);
+                    commit(&fixture.work, "more.txt", "more\n");
+                    session.diff_base = Some(inherited);
                 }
                 _ => {}
             }

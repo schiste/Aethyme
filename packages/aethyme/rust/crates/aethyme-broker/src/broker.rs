@@ -908,7 +908,9 @@ pub struct AdoptCarriedOwnership {
     pub from_session: i64,
     /// The ownership boundary the new session starts from.
     pub baseline: String,
-    /// Commits after `baseline` that submit will replay.
+    /// Commits after `baseline` that stay session-owned: those integration
+    /// holds pending, or, when reachability from the default branch took every
+    /// one of those out, the ones integration only matches by patch.
     pub pending_owned_commits: usize,
 }
 

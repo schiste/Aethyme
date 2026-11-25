@@ -350,6 +350,18 @@ fn changed_path_log_args() -> Vec<&'static str> {
     ]
 }
 
+/// `(status, path)` per `--name-status` line.
+fn parse_name_status(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let status = parts.next()?.trim().to_string();
+            let path = parts.next()?.trim().to_string();
+            (!status.is_empty() && !path.is_empty()).then_some((status, path))
+        })
+        .collect()
+}
+
 /// Both side-specific patch-equivalence results for one symmetric range.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PairedCherryMarks {
@@ -6876,15 +6888,73 @@ impl GitRepo {
                 commit,
             ],
         )?;
-        Ok(out
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split('\t');
-                let status = parts.next()?.trim().to_string();
-                let path = parts.next()?.trim().to_string();
-                (!status.is_empty() && !path.is_empty()).then_some((status, path))
-            })
-            .collect())
+        Ok(parse_name_status(&out))
+    }
+
+    /// [`Self::commit_changed_paths`] of every commit, concatenated in order,
+    /// from one `diff-tree` however many commits are named.
+    pub(crate) fn commits_changed_paths(
+        &self,
+        commits: &[String],
+    ) -> Result<Vec<(String, String)>, GitError> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stdout = self.run_git_with_stdin(
+            &[
+                "diff-tree",
+                "--stdin",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-m",
+                "--first-parent",
+            ],
+            commits,
+        )?;
+        Ok(parse_name_status(&String::from_utf8_lossy(&stdout)))
+    }
+
+    /// Those of `paths` a tree listing of `rev` names. Reads trees only, in
+    /// batches of paths. A named path exists; one that is not named may still
+    /// (Git lists a directory's entries in its place when a path below it is
+    /// asked for too), so ask [`Self::blob_at`] before reading absence.
+    pub(crate) fn paths_listed_at(
+        &self,
+        rev: &str,
+        paths: &[String],
+    ) -> Result<std::collections::HashSet<String>, GitError> {
+        let mut listed = std::collections::HashSet::new();
+        let mut remaining = paths;
+        while !remaining.is_empty() {
+            let mut bytes = 0_usize;
+            let count = remaining
+                .iter()
+                .take(MAX_LITERAL_PATHSPEC_BATCH_COUNT)
+                .take_while(|path| {
+                    bytes = bytes.saturating_add(path.len());
+                    bytes <= MAX_LITERAL_PATHSPEC_BATCH_BYTES
+                })
+                .count()
+                .max(1);
+            let (batch, rest) = remaining.split_at(count);
+            remaining = rest;
+            let literal = batch
+                .iter()
+                .map(|path| format!(":(literal){path}"))
+                .collect::<Vec<_>>();
+            let mut args = vec!["ls-tree", "-z", "--full-tree", "--name-only", rev, "--"];
+            args.extend(literal.iter().map(String::as_str));
+            let output = self.run_git_output_limited(&args, MAX_GIT_BATCH_OUTPUT_BYTES)?;
+            listed.extend(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| String::from_utf8_lossy(path).into_owned()),
+            );
+        }
+        Ok(listed)
     }
 
     /// Renames git detects between two commits, as `old -> new`.
@@ -7253,22 +7323,6 @@ impl GitRepo {
         })
     }
 
-    /// How many of `commits` [`Self::cached_first_parent_patch_ids`] would hash.
-    pub(crate) fn uncached_patch_id_count(
-        &self,
-        commits: &[String],
-        cache: &PatchIdCache,
-    ) -> usize {
-        commits
-            .iter()
-            .filter(|commit| {
-                !cache
-                    .entries
-                    .contains_key(&(self.root.clone(), (*commit).clone()))
-            })
-            .count()
-    }
-
     /// The commits of two sides whose patch ids can decide patch equivalence
     /// between them: those with a parent whose changed-path set also occurs
     /// on the opposite side.
@@ -7396,7 +7450,7 @@ impl GitRepo {
 
     /// Reuse only successful, complete batches; missing IDs represent empty
     /// diffs, never errors. Callers still perform their exact tree checks.
-    pub(crate) fn cached_first_parent_patch_ids(
+    fn cached_first_parent_patch_ids(
         &self,
         commits: &[String],
         cache: &mut PatchIdCache,
@@ -13767,6 +13821,64 @@ mod batched_commit_tests {
             repo.cherry_marked("main", "unrelated", CherrySide::Right)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn batched_changed_paths_and_listings_match_the_per_item_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        for path in ["a.txt", "dir/b.txt", "[x].txt", "caf\u{e9}.txt"] {
+            std::fs::write(root.join(path), "one\n").unwrap();
+        }
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "root"]);
+        run(root, &["mv", "a.txt", "dir/a.txt"]);
+        run(root, &["commit", "-qm", "rename"]);
+        run(root, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        run(root, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+        std::fs::write(root.join("side.txt"), "side\n").unwrap();
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "side"]);
+        run(root, &["checkout", "-q", "main"]);
+        run(root, &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+
+        let repo = GitRepo::discover(root).unwrap();
+        let commits = run(root, &["rev-list", "--reverse", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(commits.len(), 5);
+        assert_eq!(
+            repo.commits_changed_paths(&commits).unwrap(),
+            commits
+                .iter()
+                .flat_map(|commit| repo.commit_changed_paths(commit).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert!(repo.commits_changed_paths(&[]).unwrap().is_empty());
+
+        let mut paths = [
+            "a.txt",
+            "dir/b.txt",
+            "[x].txt",
+            "x.txt",
+            "dir",
+            "caf\u{e9}.txt",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        paths.extend((0..300).map(|index| format!("absent-{index}")));
+        paths.push("side.txt".into());
+        let listed = repo.paths_listed_at("HEAD", &paths).unwrap();
+        for path in &listed {
+            assert!(repo.blob_at("HEAD", path).is_some(), "{path}");
+        }
+        for path in ["dir/b.txt", "[x].txt", "caf\u{e9}.txt", "side.txt"] {
+            assert!(listed.contains(path), "{path}");
+        }
+        assert!(!listed.contains("a.txt") && !listed.contains("x.txt"));
     }
 
     #[test]

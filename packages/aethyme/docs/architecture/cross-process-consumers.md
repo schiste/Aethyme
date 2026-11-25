@@ -5612,7 +5612,11 @@ session's HEAD.
   count against the integration view, minus the commits reachable from the fetched
   remote default branch. Only reachability counts there, never a patch match: a
   patch cannot tell a landed commit from the same change applied again after a
-  revert. Squash- and rebase-landed commits stay carried, as before.
+  revert. Squash- and rebase-landed commits stay carried, as before. When
+  reachability took commits out and nothing pending is left, the owned commits
+  that remain and that integration holds only by patch match (one or several) keep
+  the boundary and are what is counted, so the count is then not what submit
+  replays. When it took nothing out, the answer is exactly the plan's.
 - The default branch is `refs/remotes/origin/HEAD` only, never the main checkout's
   `@{upstream}`; origin is trusted as the landing remote, as auto-cleanup does.
   Without it, when it names the previous session's own branch, or when it cannot
@@ -5635,10 +5639,13 @@ session's HEAD.
   `drift_commits_hashed`, the commits each one handed to patch hashing, counted
   before the attempt so a timeout is not 0. A key is absent
   when that step did not run. Counts only: no path, id or branch name.
-- Counter `adopt_carried_ownership_error`: the carry ended in an error, which
-  leaves the baseline at `HEAD`, as opposed to nothing pending. Counter
-  `adopt_carried_default_unreadable`: the listing with the default branch failed
-  and was retried without it.
+- Counter `adopt_carried_ownership_error`: the carry returned an error, which
+  leaves the baseline at `HEAD`. An ancestry test that fails reads as "not an
+  ancestor" and is not counted. Counter `adopt_carried_default_unreadable`: the
+  listing that excludes the default branch failed and was retried without it; an
+  `origin/HEAD` that is missing or does not resolve is not counted.
+- Span `session_renamed_targets` covers the renamed-path advisory, which now lists
+  the changed paths of all commits at once; its answer is unchanged.
 
 Readers must accept the new spans and attachment. Covered by tests in
 `submission_ownership.rs`.
