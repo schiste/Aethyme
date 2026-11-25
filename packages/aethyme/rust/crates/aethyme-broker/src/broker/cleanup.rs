@@ -5451,6 +5451,8 @@ impl Broker {
                 let archived_plan = archive_guard.plan();
                 let archive_path = archive_guard.archive_path();
                 let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
+                let replan_span =
+                    crate::phase_telemetry::span("recovery_archive_apply_replan_under_claim");
                 let current = if archive_guard.is_retirement() {
                     self.cleanup_resolve_retirement_revalidation_plan(
                         session_id,
@@ -5461,6 +5463,7 @@ impl Broker {
                 } else {
                     self.cleanup_resolve_revalidation_plan(session_id)?
                 };
+                drop(replan_span);
                 if current.digest != archived_plan.digest
                     || current.target_origin != session.origin
                     || archived_plan.target_origin != session.origin
@@ -5504,6 +5507,8 @@ impl Broker {
                         }
                     }
                 }
+                let _verify_span =
+                    crate::phase_telemetry::span("recovery_archive_apply_verify_under_claim");
                 crate::cleanup_resolve::verify_recovery_archive_for_plan(
                     self.repo_handle(),
                     archive_path,

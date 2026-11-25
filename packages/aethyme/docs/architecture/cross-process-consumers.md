@@ -4538,7 +4538,7 @@ Introduced 2026-11-17. Changes consumers may see:
 - When the observation cannot be taken completely, the lap stops at the checkout that needed it (the cursor stays there), nothing is remembered, the report and progress field `process_use_unavailable` say so, and the next run is due within a minute. `cleanup.retirement-stalled` names it after 3 such runs.
 - The rename into the trash reuses the run's observation (`checkout_trash_run_process_use_reused`) instead of taking a second one. A process that enters the checkout after the observation keeps its working directory, which now lies in the trash (on Unix a rename does not fail for a busy directory). The deleter therefore takes one open-file observation per drain before its first deletion and leaves alone any entry a process has its working directory or an open file under (`checkout_trash_entry_in_use`, report field `entries_in_use`, progress field `trash_entries_in_use`); an incomplete observation deletes nothing that run (`checkout_trash_process_use_unknown`, report field `process_use_unknown`). Callers outside the lane still take a fresh observation before the rename.
 - Inside the lane, every live-checkout check (the run's open paths, the plan context, and each check of the archive path) reads the live session list fresh but canonicalizes only sessions the run has not resolved yet, by session id and recorded path (`checkout_retirement_live_paths_reused`). A new session, or one whose recorded path changed, is always resolved again.
-- An archive is started only with at least 90 s of the lane's 180 s budget left and may use that whole budget rather than the sweep's two thirds; otherwise the checkout is kept as `archive_deferred` (not remembered) and the lap stops there unless it was the run's first judgement. An archive cut off by the deadline is kept as `deadline` (not remembered; the verified archive is reused next time) instead of `archive_cleanup_failed` for an hour.
+- An archive is started only with at least 90 s of the lane's 180 s budget left and may use that whole budget rather than the sweep's two thirds; otherwise the checkout is kept as `archive_deferred` (not remembered) and the lap stops there unless it was the run's first judgement. An archive cut off by the deadline is kept as `deadline` (not remembered; only a complete archive is reused next time, once it is verified again, and an incomplete one is removed and written from the start; since 2026-11-25 the lane remembers a cut after a full slice as `out_of_time`, see the end of this document) instead of `archive_cleanup_failed` for an hour.
 - New `[cleanup] abandoned_operation_after_hours` (integer, 1 to 8760, default 24). A merge, rebase, cherry-pick, revert or bisect left in progress (or unmerged index entries) in a closed session's checkout is abandoned only when the newest modification among its operation markers (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_LOG`, `rebase-merge/`, `rebase-apply/`, `sequencer/`), its index, its `logs/HEAD` and every changed, unmerged or untracked working file is older than that, the session's last broker activity and close are older than that, no open session uses the path, and no live holder is bound to the session (`checkout_retirement_kept_holder_alive`, `_holder_unknown`). It is then archived under the lifecycle claim into `<recovery archive root>/<session>-operation-<head12>-<nonce>/`: `git-state/` (the operation files and directories, the raw `index`, `HEAD`, `logs/HEAD`), `worktree/` (every path `git status --no-renames --untracked-files=all` reports, as on disk; missing ones listed as `deleted`), `ignored/` (the protected ignored files), `objects/` (a pack, its index and `ids.txt`: every object the raw index needs at any stage, and the `AUTO_MERGE` tree's objects, that the HEAD tree does not hold; every id is checked present before packing, the pack must pass `git verify-pack` and list every id, otherwise the checkout is kept), `README.md` (restore steps: copy the pack into the repository, recreate the worktree, restore files, index and state; expiry and how to keep it) and, written last, `manifest.json` (schema `aethyme-operation-archive-v1`, `created_at_ms`, `session_id`, each file's size, SHA-256 and original mode, the packed ids and pack hashes). Copies are 0600 and directories 0700; the archive root is made 0700, and refused if it cannot be. HEAD and every commit the state names, the rebase and sequencer todo and done lists included, are pinned as `refs/aethyme/retired/<session>/<commit>`. Immediately before the move every archived source is re-checked (size, modification time, inode; the index by SHA-256), `git status` must report the same paths and the missing ones must still be missing; any difference keeps the checkout as `changed` and forgets its remembered keep. Then the checkout is moved into the trash and the session recorded as cleaned. Over 512 MiB or 50,000 files keeps it as `archive_too_large`; any other failure keeps it as `operation_archive_failed` (remembered). New outcome counter `checkout_retirement_retired_operation_archived`, report field `retired_operation_archived`, progress field `abandoned_operations_archived` (cumulative) and advice `cleanup.retire-abandoned-operations-archived`. These archives expire by age through the storage ledger like every recovery archive (attributed to their pool and session by the manifest; default 30 days, after 7 days named in `broker status`); keep one with `aethyme storage keep-archive <pool>/<archive>`. A partial archive is named `.partial-operation-<session>-<created ms>-<pid>-<process start ms>-<nonce>` and holds no `manifest.json` until it is complete; the storage ledger never lists or expires a `.partial-*` or `*.partial` entry, and each retirement run removes partial operation archives older than a day whose creating process is gone (`checkout_retirement_operation_partial_swept`).
 - Retirement plans (the lane only) no longer refuse a checkout for an ignored directory nothing catalogues as regenerable (`ignored path <dir>/ is neither a regular file nor a symbolic link`): every regular file and link under it is archived as a protected ignored file, at most 20,000 files and 512 MiB per checkout; a special file or a non-UTF-8 name under it still refuses. `finish cleanup resolve` keeps refusing unless given the new flag `--archive-ignored-directories` (on both the plan and its `--confirm`, since the digest covers the archived files).
 - Remembered keeps carry the refusing step's own words (meta key `checkout_retirement.keeps`, field `detail`, at most 400 bytes), and `broker gc plan --json` lists them as `checkout_retirement_keeps` (`session_id`, `reason`, `detail`, `kept_at_ms`, `attempts`; reporting only, outside the digest, omitted when empty).
@@ -5455,3 +5455,72 @@ counters: `recovery_archive_bound_total_from_earlier_sizes` and
 after a partial pass with a known total, also counted in
 `checkout_retirement_archive_bound_not_due`). Covered by `broker/retire.rs` and
 `broker/archive_bound.rs` tests.
+
+Changed 2026-11-25 (retirement work that runs out of time is not redone every
+slice). Two repositories' lanes share one volume. In five runs of one lane
+(0.8.173 and 0.8.174) 5,872 s retired nothing: 17 keeps were `deadline`, 14
+`archive_failed`, and 4,227 s went to `checkout_retirement_phase_archive`. An
+archive cut by the slice's deadline was not remembered, so every slice planned
+it, planned it again and archived it from nothing. The other lane meanwhile
+waited for the volume's turn for whole slices (7 in one run of 2,511 s), in no
+span. Now:
+
+- In the lane process, a plan or archive (an abandoned operation's too) cut by
+  its deadline in a judgement granted at least 4 minutes of its 5-minute slice is
+  kept as `out_of_time` (counter `checkout_retirement_kept_out_of_time`),
+  remembered with the keep back-off (1 h, 6 h, 24 h) and its key (HEAD and
+  index): a checkout whose HEAD or index changed is judged again at once.
+- A plan that leaves less than 90 s for its archive is such a cut in the lane
+  (elsewhere it stays `archive_deferred`).
+- A shorter cut in the lane is `cut_short` (counter
+  `checkout_retirement_kept_cut_short`, not remembered) and stops the lap with
+  its cursor before the checkout (`closed_stop` `cut_short`). The next slice
+  gives that checkout 5 minutes from its plan, once per lane run; a second short
+  cut (the lane ending) is `deadline`, as is every cut in the worker or at close.
+- The remembered keep adds `out_of_time`: one of its attempts ran out of time
+  (absent: false). Attempts of one key go on through `out_of_time`,
+  `archive_failed` and `archive_cleanup_failed`, so neither back-off nor budget
+  starts again when they alternate.
+- A keep whose reason is `out_of_time` does not take the checkout from the other
+  cleanup lanes.
+- Once the back-off is over, the lane gives such a checkout 20 minutes from its
+  plan, only with that much left before its own end and once per lane run; lane
+  runs can follow each other, and the back-off bounds each checkout. A judgement
+  that ends within 5 minutes with a keep that is not remembered leaves it to the
+  next checkout; one that spends it counts `checkout_retirement_long_judgement`.
+  An abandoned operation's archive stays within its slice (it is written under
+  the lifecycle claim). Otherwise the lane keeps the checkout as
+  `deferred_to_lane`. The worker does too while a lane run had a slice in the
+  last 2 hours (`last_at_ms` of the lane record, now set only by such a run);
+  without one it tries the checkout.
+- A judgement past its slice takes a fresh open-file observation before the move,
+  under the claim, between the re-plan and the rename, for up to 30 s (added to
+  the 60 s of proofs there) instead of reusing the run's. The archive's
+  verification and read-back, the re-plan under the claim and its 60 s, the
+  deletion rules and the archive format are unchanged. The lease, gate and
+  unresolved-operation checks are made only at the judgement's start, as before,
+  so they can now be about 20 minutes old at the move. Memory pressure is read
+  between slices, so a long judgement is not stopped by critical memory pressure.
+- A turn held elsewhere is waited for as before. A turn
+  lock that cannot be opened is `volume_turn_error` (counter
+  `checkout_retirement_kept_volume_turn_error`) and ends the lane `error`. A lane
+  with too little left for an inspection before its 60 minutes ends `cap`.
+- The deadline of an archive's prerequisite-ref installs is taken at each
+  install, not before the copy, still bounded by the operation's own deadline.
+- Spans: `checkout_retirement_volume_turn_wait` and
+  `checkout_retirement_volume_turn_held`, both inside
+  `checkout_retirement_judge`. Inside `checkout_retirement_phase_archive` (and in
+  any command's recovery-archive apply): `recovery_archive_apply_plan` (the
+  second plan), `recovery_archive_apply_verify_existing` (a complete archive or a
+  partial found in place; for a complete one it contains the ref install),
+  `recovery_archive_apply_restart_plan` (before an incomplete partial is
+  restarted), `recovery_archive_apply_copy` (patches, bundle and files, each file
+  read back as it is written), `recovery_archive_apply_read_back` (the whole
+  archive), `recovery_archive_apply_sync` (directory syncs),
+  `recovery_archive_apply_replan_under_claim` and
+  `recovery_archive_apply_verify_under_claim`. The other ref installs and the
+  wait for the claim (`lifecycle_lock_wait`) are in none of these.
+
+Whether the `archive_failed` keeps above follow from deadline cuts is not
+verified. Readers must accept the new keep reasons, field, counters and spans.
+Covered by `broker/retire.rs` tests.

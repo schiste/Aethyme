@@ -2288,6 +2288,7 @@ impl Broker {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
+        let plan_span = crate::phase_telemetry::span("recovery_archive_apply_plan");
         let retirement_context = if retirement_mode {
             Some(self.cleanup_resolve_retirement_context_until(operation_deadline)?)
         } else {
@@ -2313,24 +2314,18 @@ impl Broker {
         } else {
             self.cleanup_resolve_revalidation_plan(session_id)?
         };
+        drop(plan_span);
         if plan.digest != confirm {
             return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                 id: session_id,
                 actual: confirm.to_owned(),
             });
         }
-        let prerequisite_deadline = if plan.recovery_archive_schema_version
-            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        {
-            let git_deadline = recovery_bundle_deadline().map_err(|reason| {
-                BrokerOpError::CleanupResolveRefused {
-                    id: session_id,
-                    reason: format!("cannot establish prerequisite-ref deadline: {reason}"),
-                }
-            })?;
-            Some(operation_deadline.map_or(git_deadline, |deadline| deadline.min(git_deadline)))
-        } else {
-            None
+        // Taken anew at each use: a copy longer than one Git call's limit does
+        // not leave the ref installs after it a deadline already past.
+        let prerequisite_deadline = || -> Result<Instant, String> {
+            let git_deadline = recovery_bundle_deadline()?;
+            Ok(operation_deadline.map_or(git_deadline, |deadline| deadline.min(git_deadline)))
         };
         ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
         let session = self.store_ref().session(session_id)?;
@@ -2378,6 +2373,7 @@ impl Broker {
             Ok(metadata)
                 if retirement_mode && metadata.is_dir() && !metadata.file_type().is_symlink() =>
             {
+                let _span = crate::phase_telemetry::span("recovery_archive_apply_verify_existing");
                 if plan.recovery_archive_schema_version
                     == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 {
@@ -2386,8 +2382,7 @@ impl Broker {
                             install_recovery_prerequisite_refs_in_archive(
                                 self.repo_handle(),
                                 &archive,
-                                prerequisite_deadline
-                                    .expect("schema v6 retirement has a Git deadline"),
+                                prerequisite_deadline()?,
                             )
                         })
                         .and_then(|()| {
@@ -2431,28 +2426,33 @@ impl Broker {
                         && metadata.is_dir()
                         && !metadata.file_type().is_symlink() =>
                 {
-                    match verify_recovery_archive_payload_for_plan(
-                        self.repo_handle(),
-                        &partial_path,
-                        &plan,
-                    ) {
+                    let verified = {
+                        let _span =
+                            crate::phase_telemetry::span("recovery_archive_apply_verify_existing");
+                        verify_recovery_archive_payload_for_plan(
+                            self.repo_handle(),
+                            &partial_path,
+                            &plan,
+                        )
+                    };
+                    match verified {
                         Ok(()) => {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                install_recovery_prerequisite_refs_in_archive(
-                                    self.repo_handle(),
-                                    &partial_path,
-                                    prerequisite_deadline
-                                        .expect("schema v6 retirement has a Git deadline"),
-                                )
-                                .map_err(|reason| {
-                                    BrokerOpError::RecoveryArchiveUnverified {
+                                prerequisite_deadline()
+                                    .and_then(|deadline| {
+                                        install_recovery_prerequisite_refs_in_archive(
+                                            self.repo_handle(),
+                                            &partial_path,
+                                            deadline,
+                                        )
+                                    })
+                                    .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                         id: session_id,
                                         path: partial_path.to_string_lossy().into_owned(),
                                         reason,
-                                    }
-                                })?;
+                                    })?;
                             }
                             sync_archive_directories_bottom_up_until(
                                 &partial_path,
@@ -2478,6 +2478,8 @@ impl Broker {
                                         "incomplete retirement staging is not proven to belong to the current source identity; it was retained: {verification_error}; {marker_error}"
                                     ),
                                 })?;
+                            let restart_span =
+                                crate::phase_telemetry::span("recovery_archive_apply_restart_plan");
                             let revalidation_context =
                                 self.cleanup_resolve_retirement_context_until(operation_deadline)?;
                             let current_plan =
@@ -2494,6 +2496,7 @@ impl Broker {
                                         &revalidation_context,
                                     )?
                                 };
+                            drop(restart_span);
                             if current_plan.digest != plan.digest {
                                 return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                                     id: session_id,
@@ -2503,11 +2506,14 @@ impl Broker {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                require_no_recovery_prerequisite_refs_for_partial(
-                                    self.repo_handle(),
-                                    &partial_path,
-                                    prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
-                                )
+                                prerequisite_deadline()
+                                .and_then(|deadline| {
+                                    require_no_recovery_prerequisite_refs_for_partial(
+                                        self.repo_handle(),
+                                        &partial_path,
+                                        deadline,
+                                    )
+                                })
                                 .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
                                     path: partial_path.to_string_lossy().into_owned(),
@@ -2567,19 +2573,19 @@ impl Broker {
                             if plan.recovery_archive_schema_version
                                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                             {
-                                install_recovery_prerequisite_refs_in_archive(
-                                    self.repo_handle(),
-                                    &partial,
-                                    prerequisite_deadline
-                                        .expect("schema v6 retirement has a Git deadline"),
-                                )
-                                .map_err(|reason| {
-                                    BrokerOpError::RecoveryArchiveUnverified {
+                                prerequisite_deadline()
+                                    .and_then(|deadline| {
+                                        install_recovery_prerequisite_refs_in_archive(
+                                            self.repo_handle(),
+                                            &partial,
+                                            deadline,
+                                        )
+                                    })
+                                    .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                         id: session_id,
                                         path: partial.to_string_lossy().into_owned(),
                                         reason,
-                                    }
-                                })?;
+                                    })?;
                                 sync_archive_directories_bottom_up_until(
                                     &partial,
                                     &sync_directory,
@@ -2662,18 +2668,19 @@ impl Broker {
                     if plan.recovery_archive_schema_version
                         == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                     {
-                        install_recovery_prerequisite_refs_in_archive(
-                            self.repo_handle(),
-                            &partial,
-                            prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
-                        )
-                        .map_err(|reason| {
-                            BrokerOpError::RecoveryArchiveUnverified {
+                        prerequisite_deadline()
+                            .and_then(|deadline| {
+                                install_recovery_prerequisite_refs_in_archive(
+                                    self.repo_handle(),
+                                    &partial,
+                                    deadline,
+                                )
+                            })
+                            .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                                 id: session_id,
                                 path: partial.to_string_lossy().into_owned(),
                                 reason,
-                            }
-                        })?;
+                            })?;
                         sync_archive_directories_bottom_up_until(
                             &partial,
                             &sync_directory,
@@ -2709,6 +2716,7 @@ impl Broker {
                     path: archive_parent.to_string_lossy().into_owned(),
                     reason: "archive root has no storage anchor to sync".into(),
                 })?;
+        let roots_span = crate::phase_telemetry::span("recovery_archive_apply_sync");
         for (label, path) in [
             ("archive root", archive_root.as_path()),
             ("archive parent", archive_parent),
@@ -2720,6 +2728,7 @@ impl Broker {
                 reason: format!("cannot sync {label} before worktree removal: {error}"),
             })?;
         }
+        drop(roots_span);
         if operation_deadline.is_some_and(|deadline| {
             deadline.saturating_duration_since(Instant::now()) < AUTO_COMPACTION_STAGING_RESERVE
         }) {
@@ -6128,6 +6137,7 @@ fn sync_archive_directories_bottom_up_until<S>(
 where
     S: Fn(&Path) -> std::io::Result<()>,
 {
+    let _span = crate::phase_telemetry::span("recovery_archive_apply_sync");
     let deadline = effective_archive_deadline(deadline);
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut directories = Vec::new();
@@ -6260,6 +6270,7 @@ where
     B: Fn(&GitRepo, &[String], &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
 {
     check_archive_deadline(deadline, "recovery archive write")?;
+    let copy_span = crate::phase_telemetry::span("recovery_archive_apply_copy");
     require_real_directory(dir)?;
     let dir = dir
         .canonicalize()
@@ -6508,7 +6519,11 @@ where
         ));
     }
     create_new_archive_file(&dir, README_FILE, readme.as_bytes())?;
-    verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    drop(copy_span);
+    {
+        let _span = crate::phase_telemetry::span("recovery_archive_apply_read_back");
+        verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    }
     check_archive_deadline(deadline, "recovery archive durability sync")?;
     sync_archive_directories_bottom_up_until(&dir, sync_directory, deadline)?;
     Ok(())
