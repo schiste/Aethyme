@@ -2279,6 +2279,7 @@ impl Broker {
             // The measured store is gone: its result must not outlive it on
             // an inode identity some filesystems reuse.
             self.forget_shared_cache_measurement();
+            self.end_shared_cache_deadline_wait();
         }
         if shared
             && cache_mode == SharedCacheMode::Exclusive
@@ -2416,6 +2417,7 @@ impl Broker {
                 // as on the normal path after a rotation.
                 self.forget_shared_cache_measurement();
                 if recovered.is_some() {
+                    self.end_shared_cache_deadline_wait();
                     rotation = recovered;
                 }
             }
