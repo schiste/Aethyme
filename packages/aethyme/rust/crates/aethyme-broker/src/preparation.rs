@@ -2257,6 +2257,13 @@ impl Broker {
         if let Some(resource_db_path) = &resource_db_path {
             storage_paths.push(resource_db_path.clone());
         }
+        // What a running step's heartbeat watches, by what it holds: the
+        // install's own volumes need room to finish the install, the
+        // broker's state only room to record it.
+        let mut install_paths = vec![root.clone()];
+        install_paths.extend(cache_dir.iter().cloned());
+        let mut bookkeeping_paths = vec![self.main_root().join(".aethyme")];
+        bookkeeping_paths.extend(resource_db_path.iter().cloned());
         let main_root = self.main_root().to_path_buf();
         self.require_storage_or_reclaim(
             cache_root_binding.as_ref(),
@@ -2925,11 +2932,12 @@ impl Broker {
                             Instant::now(),
                             || {
                                 // The build reserve was checked before the
-                                // step was dispatched; a running step only
-                                // needs room to record its outcome.
-                                require_preparation_bookkeeping_storage(
+                                // step was dispatched; a running step needs
+                                // room to finish and to record its outcome.
+                                require_running_step_storage(
                                     &main_root,
-                                    &storage_paths,
+                                    &install_paths,
+                                    &bookkeeping_paths,
                                     cache_root_binding.as_ref(),
                                 )
                             },
@@ -7321,15 +7329,26 @@ fn route_preparation_command_failure(
     } = context;
     if matches!(
         error,
-        BrokerOpError::Preparation(
-            PreparationError::CommandOutcomeUnknown { .. }
-                | PreparationError::CleanupUnknown { .. }
-        )
+        BrokerOpError::Preparation(PreparationError::CleanupUnknown { .. })
     ) {
-        // The command may have changed the worktree even when its process is
-        // gone. Keep the durable in-progress record and host lease until an
-        // operator inspects the effects and chooses how to reconcile them.
+        // A process of the step may still run. Keep the durable in-progress
+        // record and quarantine the host lease until an operator inspects
+        // the effects and chooses how to reconcile them.
         quarantine_grant_best_effort(coordinator, grant);
+        return false;
+    }
+    if matches!(
+        error,
+        BrokerOpError::Preparation(PreparationError::CommandOutcomeUnknown { .. })
+    ) {
+        // Cleanup was verified: no process of the step remains, but its
+        // effects are unknown. Keep the in-progress record (which records
+        // only the steps that finished) and release the lease, so the run
+        // reads `interrupted` once this process exits and the next prepare
+        // verifies its finished steps and reruns the rest, as the refusal's
+        // `retry_prepare` action promises. A quarantined lease would hold the
+        // record in progress and refuse that retry.
+        release_grant_best_effort(coordinator, grant);
         return false;
     }
 
@@ -7449,24 +7468,51 @@ fn preparation_storage_with(
     )
 }
 
-/// What a running step's heartbeat requires of every watched path: room for
-/// the step's bookkeeping ([`outcome_recovery::BOOKKEEPING_RESERVE_BYTES`]),
-/// not the build reserve, which is checked before each step is dispatched.
-/// Under the build reserve a heartbeat stopped installs that had run for 20
-/// minutes because the host state disk dipped to 8 GiB.
-fn require_preparation_bookkeeping_storage(
+/// What a running step's heartbeat requires, never the build reserve (which
+/// is checked before each step is dispatched): the install's own volumes
+/// (`install`: the worktree and the shared cache directory) keep
+/// [`outcome_recovery::INSTALL_RESERVE_BYTES`], so an install cannot drive
+/// them to zero; the broker's state (`bookkeeping`: `.aethyme` and the host
+/// resource database) keeps [`outcome_recovery::BOOKKEEPING_RESERVE_BYTES`],
+/// room to record the outcome. Under the build reserve a heartbeat stopped
+/// installs that had run for 20 minutes because the host state disk dipped
+/// to 8 GiB.
+fn require_running_step_storage(
     main_root: &Path,
-    paths: &[PathBuf],
+    install: &[PathBuf],
+    bookkeeping: &[PathBuf],
     binding: Option<&crate::broker::PreparationCacheRootBinding>,
 ) -> Result<(), PreparationError> {
-    preparation_storage_within(
-        paths,
+    running_step_storage_with(
+        install,
+        bookkeeping,
         crate::verification::removable_volume_unavailable_reason,
         |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
-        outcome_recovery::BOOKKEEPING_RESERVE_BYTES,
-        outcome_recovery::BOOKKEEPING_RESERVE_INODES,
     )?;
     ensure_preparation_cache_root_binding(binding)
+}
+
+/// [`require_running_step_storage`]'s floors, with the probes injected.
+fn running_step_storage_with(
+    install: &[PathBuf],
+    bookkeeping: &[PathBuf],
+    mut unavailable: impl FnMut(&Path) -> Option<String>,
+    mut headroom: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> Result<(), PreparationError> {
+    preparation_storage_within(
+        install,
+        &mut unavailable,
+        &mut headroom,
+        outcome_recovery::INSTALL_RESERVE_BYTES,
+        outcome_recovery::INSTALL_RESERVE_INODES,
+    )?;
+    preparation_storage_within(
+        bookkeeping,
+        unavailable,
+        headroom,
+        outcome_recovery::BOOKKEEPING_RESERVE_BYTES,
+        outcome_recovery::BOOKKEEPING_RESERVE_INODES,
+    )
 }
 
 fn preparation_storage_within(
@@ -8619,14 +8665,13 @@ mod tests {
         assert_eq!(record.steps[1].outcome, "cancelled");
     }
 
+    /// Only unverified cleanup (a step process may still run) keeps the
+    /// lease quarantined and the retry refused; an unconfirmed outcome with
+    /// verified cleanup is covered by
+    /// `an_unconfirmed_outcome_is_retried_as_its_action_advertises`.
     #[test]
-    fn unknown_command_outcomes_keep_preparation_unresolved_and_retry_blocked() {
+    fn unverified_cleanup_keeps_preparation_unresolved_and_retry_blocked() {
         let errors: Vec<BrokerOpError> = vec![
-            PreparationError::CommandOutcomeUnknown {
-                session_id: 41,
-                reason: "injected lost result".into(),
-            }
-            .into(),
             PreparationError::CleanupUnknown {
                 session_id: 41,
                 reason: "injected unconfirmed cleanup".into(),
@@ -8692,6 +8737,87 @@ mod tests {
                 Err(crate::HostResourceError::Conflict { .. })
             ));
         }
+    }
+
+    /// An unconfirmed outcome (cleanup verified) advertises a retry with
+    /// `retry_after_seconds: 0`. The retry must not be refused: the lease is
+    /// released, the record still in progress reads `interrupted` once its
+    /// preparer is gone, the retry gate admits it, the cache can be taken
+    /// again, and the steps the run recorded as finished are accepted.
+    #[test]
+    fn an_unconfirmed_outcome_is_retried_as_its_action_advertises() {
+        let owner = tempfile::tempdir().unwrap();
+        let db = owner.path().join("host-resources.db");
+        let mut coordinator = Some(HostResourceCoordinator::open(&db).unwrap());
+        // The preparer is a process that has already exited.
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = exited.id();
+        exited.wait().unwrap();
+        let mut request = preparation_failure_test_request("unconfirmed");
+        request.holder_pid = Some(dead_pid);
+        let mut grant = Some(coordinator.as_mut().unwrap().acquire(&request).unwrap());
+        let session_id = 43;
+        let mut record = in_progress_test_record(session_id, grant.as_ref().unwrap());
+        record.steps = vec![PreparationStepTiming {
+            index: 0,
+            name: "dependencies".into(),
+            outcome: "ok".into(),
+            ..PreparationStepTiming::default()
+        }];
+        let state_path = record_path(owner.path(), session_id);
+        write_record(&state_path, &record).unwrap();
+        let (lease_id, generation) = (
+            record.host_lease_id.clone().unwrap(),
+            record.host_lease_generation.unwrap(),
+        );
+        let error: BrokerOpError = PreparationError::CommandOutcomeUnknown {
+            session_id,
+            reason: "injected lost result".into(),
+        }
+        .into();
+
+        let restart_storage_worker = route_preparation_command_failure(
+            &error,
+            PreparationCommandFailureContext {
+                step: "build",
+                state_path: &state_path,
+                record: &mut record,
+                coordinator: &mut coordinator,
+                grant: &mut grant,
+                exit_code: None,
+                write_exit_code: false,
+            },
+            |_| panic!("unknown outcomes must not trigger storage recovery"),
+        );
+
+        assert!(!restart_storage_worker);
+        assert!(grant.is_none());
+        let persisted = read_record(&state_path).unwrap().unwrap();
+        assert_eq!(persisted.state, PreparationState::InProgress);
+        assert!(
+            lease_released_in(&db, &lease_id, generation),
+            "the lease is released, so the run reads interrupted"
+        );
+        ensure_preparation_retry_allowed(session_id, PreparationState::Interrupted)
+            .expect("the advertised retry is admitted");
+        assert_eq!(
+            outcome_recovery::uncertain_outcome_verdict(
+                PreparationState::Interrupted,
+                Some(&persisted),
+                &persisted.source_digest,
+                &[],
+                false,
+                &["dependencies"],
+            ),
+            outcome_recovery::UncertainVerdict::AcceptComplete
+        );
+        let mut retry = preparation_failure_test_request("unconfirmed-retry");
+        retry.run_id = "unconfirmed-retry-run".into();
+        coordinator
+            .as_mut()
+            .unwrap()
+            .acquire(&retry)
+            .expect("the cache is free for the retry");
     }
 
     #[test]

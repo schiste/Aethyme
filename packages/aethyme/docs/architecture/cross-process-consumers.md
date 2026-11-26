@@ -6135,9 +6135,11 @@ the deleter, raised to `IOPOL_IMPORTANT` so a busy disk cannot starve it,
 starved the install instead.
 
 Each preparation step and each gate command leaves a marker in `<host state>/run/foreground-io/`
-naming its volume (device number) and process, removed when it ends; a
-marker whose process is gone counts for nothing and is removed by the next
-reader. Before each slice, the checkout trash catch-up reads the markers
+naming its volume (device number), its process and that process's start
+time, removed when it ends. A marker whose process is gone, whose pid now
+names another process (a different start time), or that is older than four
+hours (`MAX_MARKER_AGE`) counts for nothing; every reader judges each entry
+it reads (at most 4,096) and removes such markers before answering. Before each slice, the checkout trash catch-up reads the markers
 for the volumes of its trash entries. While one is live, a deleter that
 raised itself to `IOPOL_IMPORTANT` drops to `IOPOL_THROTTLE` (macOS) and
 waits 5 s instead of 1 s between slices; it returns to `important` when
@@ -6159,9 +6161,12 @@ uncertain outcome installed again from the start. The changes:
 
 - **Space is checked before dispatch, bookkeeping after.** The build reserve
   (8 GiB) is checked before each step is dispatched, as before. While a step
-  runs, its heartbeat now requires only the bookkeeping reserve
-  (`BOOKKEEPING_RESERVE_BYTES`, 256 MiB, and 1,000 inodes) on the watched
-  paths, the host resource database included.
+  runs, its heartbeat requires 2 GiB and 10,000 inodes
+  (`INSTALL_RESERVE_BYTES`) on the volumes the install writes (the worktree
+  and the shared cache directory), so an install cannot drive them to zero,
+  and only the bookkeeping reserve (`BOOKKEEPING_RESERVE_BYTES`, 256 MiB and
+  1,000 inodes) on the broker's state (`.aethyme`, the host resource
+  database).
   - Counter `prepare_storage_refused_before_dispatch`: a step not started
     because a watched path was below the build reserve.
 - **A quarantined lease no longer stops a running step.** A renewal that
@@ -6191,8 +6196,12 @@ uncertain outcome installed again from the start. The changes:
     running a step.
   - Counter `prepare_resumed_after_uncertain` (one per preparation) and
     `prepare_step_resumed_after_uncertain` (one per skipped step).
-  - A step whose outcome could not be confirmed leaves the `--json` error a
-    structured `error.action`: `kind: retry_prepare`, `reason:
+  - A step whose outcome could not be confirmed but whose cleanup was
+    verified now releases its lease (it used to be quarantined, which held
+    the record in progress and refused every retry); unverified cleanup
+    still quarantines it. The run then reads `interrupted` once its
+    preparer exits, and the `--json` error carries a structured
+    `error.action`: `kind: retry_prepare`, `reason:
     outcome_unconfirmed`, `retry_after_seconds: 0`, `command`.
 - **A busy shared cache is waited for, not failed.** When `--wait` runs out
   and the holder is another session whose live activity record shows progress

@@ -25,14 +25,23 @@ use std::time::Duration;
 use super::cache_activity::{PreparationCacheActivity, STALE_AFTER_MS};
 use super::{PreparationRecord, PreparationState};
 
-/// Free bytes a running step's heartbeat requires on every path it watches:
-/// enough to write the step's outcome (a record of a few KB, a SQLite page
-/// or two), never the 8 GiB build reserve. That reserve keeps protecting
-/// builds: it is checked before each step is dispatched, never after.
+/// Free bytes a running step's heartbeat requires on the broker's state
+/// (`.aethyme`, the host resource database): enough to write the step's
+/// outcome (a record of a few KB, a SQLite page or two), never the 8 GiB
+/// build reserve. That reserve keeps protecting builds: it is checked before
+/// each step is dispatched, never after.
 pub(super) const BOOKKEEPING_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Free inodes a running step's heartbeat requires on every watched path.
+/// Free inodes a running step's heartbeat requires on the broker's state.
 pub(super) const BOOKKEEPING_RESERVE_INODES: u64 = 1_000;
+
+/// Free bytes a running step's heartbeat requires on the volumes the install
+/// writes (the worktree, the shared cache directory): the step is stopped
+/// before it drives its own volume to zero.
+pub(super) const INSTALL_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Free inodes a running step's heartbeat requires on the install's volumes.
+pub(super) const INSTALL_RESERVE_INODES: u64 = 10_000;
 
 /// The fallback journal's name in the session's scratch directory, on the
 /// worktree's volume: where a finished preparation's record goes when the
@@ -355,6 +364,72 @@ mod tests {
             )
             .is_err(),
             "a disk too full to record anything still stops the step"
+        );
+    }
+
+    /// A running step keeps 2 GiB on the volumes it installs into and only
+    /// 256 MiB on the broker's state.
+    #[test]
+    fn a_running_step_keeps_an_install_floor_and_a_bookkeeping_floor() {
+        let worktree = PathBuf::from("worktree");
+        let host_db = PathBuf::from("host-state/host-resources.db");
+        let free = |worktree_bytes: u64, db_bytes: u64| {
+            move |path: &Path| {
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: if path == Path::new("worktree") {
+                        worktree_bytes
+                    } else {
+                        db_bytes
+                    },
+                    inodes: Some(1_000_000),
+                })
+            }
+        };
+        let check = |worktree_bytes, db_bytes| {
+            super::super::running_step_storage_with(
+                std::slice::from_ref(&worktree),
+                std::slice::from_ref(&host_db),
+                |_| None,
+                free(worktree_bytes, db_bytes),
+            )
+        };
+        let gib = 1024 * 1024 * 1024;
+        assert!(check(3 * gib, BOOKKEEPING_RESERVE_BYTES).is_ok());
+        assert!(
+            check(INSTALL_RESERVE_BYTES - 1, 3 * gib).is_err(),
+            "an install may not drive its own volume below 2 GiB"
+        );
+        assert!(
+            check(3 * gib, gib).is_ok(),
+            "1 GiB on the host state disk is plenty for bookkeeping"
+        );
+        assert!(
+            check(3 * gib, BOOKKEEPING_RESERVE_BYTES - 1).is_err(),
+            "a host state disk too full to record anything stops the step"
+        );
+        let few_inodes = |_: &Path| {
+            Some(crate::disk_headroom::DiskHeadroom {
+                bytes: 3 * gib,
+                inodes: Some(INSTALL_RESERVE_INODES - 1),
+            })
+        };
+        assert!(
+            super::super::running_step_storage_with(
+                std::slice::from_ref(&worktree),
+                &[],
+                |_| None,
+                few_inodes,
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::running_step_storage_with(
+                &[],
+                std::slice::from_ref(&host_db),
+                |_| None,
+                few_inodes,
+            )
+            .is_ok()
         );
     }
 
