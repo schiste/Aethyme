@@ -9,11 +9,13 @@
 //! 2026-11-26 one held 108 generations of one workspace crate's artefacts.
 //! Evicting the whole entry instead makes the next gate rebuild everything.
 //!
-//! So while a repository's gate caches are over its budget (or a root is
-//! under pressure), each of its entries, largest first, is pruned with
+//! So every pass while the artifact max age is on (otherwise only while a
+//! repository's gate caches are over its budget, or a root is under
+//! pressure), each entry, largest first, is pruned with
 //! [`crate::cargo_target_prune`] limited to local packages: superseded
-//! generations of workspace (path) packages that nothing read since their
-//! successor was built, never a registry or git dependency's. The prune
+//! generations of workspace (path) packages not used for the max age (a day
+//! when it is off; [`crate::cargo_target_prune::worker_prunable`]), never a
+//! registry or git dependency's. The prune
 //! runs only while this worker holds the entry's exclusive gate cache lease
 //! (a gate holding it keeps the entry untouched), only renames units into a
 //! staging directory beside the cache (`.aethyme-storage-evicting-*`), and
@@ -46,6 +48,14 @@ pub struct GatePruneReport {
     pub candidates: u64,
     /// Superseded units kept because their package is not local.
     pub not_local: u64,
+    /// Superseded local units kept because they were used within the max
+    /// age (a day when it is off).
+    #[serde(default)]
+    pub in_use: u64,
+    /// Entries judged because the max age prunes every pass, not because
+    /// their repository was over budget.
+    #[serde(default)]
+    pub for_pile_up: u64,
     /// Entries left alone because a gate held their lease.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leased: Vec<String>,
@@ -55,15 +65,18 @@ pub struct GatePruneReport {
     pub stop: String,
 }
 
-/// The gate cache entries to prune, in order: those of each repository over
-/// its budget (every repository's under pressure on their root), largest
-/// first, as `(item index, child name)`.
+/// The gate cache entries to prune, in order: every entry while the artifact
+/// max age is on (no pile-up of superseded generations, whatever the
+/// budget), else those of each repository over its budget (every
+/// repository's under pressure on their root); largest first, as `(item
+/// index, child name)`.
 pub fn entries_to_prune(
     ledger: &Ledger,
     budgets: &Budgets,
     aggressive: &BTreeSet<RootKind>,
 ) -> Vec<(usize, String)> {
     let totals = evict::gate_cache_by_repository(ledger);
+    let now = super::now_ms();
     let mut entries: Vec<(u64, usize, String)> = Vec::new();
     for (index, item) in ledger.items.iter().enumerate() {
         if item.class != Class::GateCache || !item.measured {
@@ -74,9 +87,14 @@ pub fn entries_to_prune(
             let Some((repository, _)) = child.name.split_once('/') else {
                 continue;
             };
+            // An entry unused for the max age goes whole this pass; pruning
+            // it would only make it look used.
+            if evict::gate_entry_expired(child, budgets, now) {
+                continue;
+            }
             let over =
                 totals.get(repository).copied().unwrap_or(0) > budgets.gate_budget(repository);
-            if over || pressing {
+            if over || pressing || budgets.artifact_max_age().is_some() {
                 entries.push((child.bytes, index, child.name.clone()));
             }
         }
@@ -117,6 +135,14 @@ pub fn prune_pass(
         stop: "done".into(),
         ..GatePruneReport::default()
     };
+    let totals = evict::gate_cache_by_repository(ledger);
+    let rule = crate::cargo_target_prune::WorkerRule {
+        now: std::time::SystemTime::now(),
+        unused_for: inputs
+            .budgets
+            .artifact_max_age()
+            .unwrap_or(crate::cargo_target_prune::ACCESS_TIME_WINDOW),
+    };
     for (index, name) in entries {
         let Some(item) = ledger.items.get(index) else {
             continue;
@@ -126,6 +152,9 @@ pub fn prune_pass(
             continue;
         };
         let (repository, key) = (repository.to_string(), key.to_string());
+        let over_budget = pressing
+            || totals.get(&repository).copied().unwrap_or(0)
+                > inputs.budgets.gate_budget(&repository);
         if Instant::now() >= inputs.deadline {
             report.stop = "deadline".into();
             break;
@@ -165,7 +194,7 @@ pub fn prune_pass(
                     &staging,
                     u64::MAX,
                     inputs.deadline,
-                    crate::cargo_target_prune::UnitScope::LocalPackages,
+                    crate::cargo_target_prune::UnitScope::Worker(rule),
                 );
                 if outcome.units > 0 {
                     // The next gate counts the units cargo rebuilt with a
@@ -185,6 +214,13 @@ pub fn prune_pass(
             }
         };
         report.entries += 1;
+        if !over_budget {
+            report.for_pile_up += 1;
+        }
+        report.in_use += outcome.in_use;
+        for _ in 0..outcome.in_use {
+            crate::phase_telemetry::add("storage_gate_cache_prune_in_use", Duration::ZERO);
+        }
         report.units += outcome.units;
         report.bytes = report.bytes.saturating_add(outcome.bytes);
         report.candidates += outcome.candidates;
@@ -236,6 +272,8 @@ pub fn prune_pass(
             "bytes": report.bytes,
             "candidates": report.candidates,
             "not_local": report.not_local,
+            "in_use": report.in_use,
+            "for_pile_up": report.for_pile_up,
             "leased": report.leased.len(),
             "stop": report.stop,
         }),
@@ -244,7 +282,8 @@ pub fn prune_pass(
 }
 
 /// Add `staged` to the entry's pruned-units record (one unit per line),
-/// which the next gate reads to count rebuilt units and then removes.
+/// which the next gate reads after its build to count rebuilt units and
+/// then removes.
 fn record_pruned_units(target: &Path, staged: &[String]) {
     let marker = target.join(crate::gates::PRUNED_UNITS_MARKER);
     let mut lines: Vec<String> = std::fs::read_to_string(&marker)

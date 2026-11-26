@@ -45,7 +45,7 @@ use crate::checkout_trash::{
 /// The container directory inside a worktree pool.
 pub(crate) const SCRATCH_CONTAINER: &str = ".aethyme-session-scratch";
 /// Marker file proving the container is the broker's.
-const SCRATCH_MARKER: &str = ".aethyme-scratch-marker";
+pub(crate) const SCRATCH_MARKER: &str = ".aethyme-scratch-marker";
 const SCRATCH_MARKER_CONTENT: &str = "aethyme session scratch v1\n";
 /// Prefix of a finished-run signal, `<container>/.aethyme-finished.<entry>`:
 /// an empty file written after a finished-run marker of the scratch

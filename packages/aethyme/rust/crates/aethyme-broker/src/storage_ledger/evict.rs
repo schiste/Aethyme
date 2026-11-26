@@ -263,7 +263,17 @@ pub fn plan(
                     );
                 }
             }
-            Policy::GateCache => over.extend(plan_gate_cache(item, budgets, pressing, now)),
+            Policy::GateCache => {
+                // Entries unused for the artifact max age go whatever the
+                // budget; the rest are judged for budget.
+                expired.extend(
+                    item.children
+                        .iter()
+                        .filter(|child| gate_entry_expired(child, budgets, now))
+                        .map(|child| child_candidate(item, child, Reason::Expired)),
+                );
+                over.extend(plan_gate_cache(item, budgets, pressing, now));
+            }
             Policy::RecoveryArchives => {
                 // Pressure does not empty this budget: below a volume's
                 // floor, the archive floor removes the oldest removable
@@ -308,6 +318,16 @@ pub fn plan(
     expired
 }
 
+/// Whether a gate cache entry (`<repository>/<key>`) was unused for the
+/// artifact max age: its newest change (every gate rebuilds the workspace
+/// members it tests into it, #391) is that old. Unknown recency, or the
+/// max age off, is not expired.
+pub fn gate_entry_expired(child: &Child, budgets: &Budgets, now: u64) -> bool {
+    budgets.artifact_max_age().is_some_and(|max_age| {
+        last_used(child).is_some_and(|used| now.saturating_sub(used) >= duration_ms(max_age))
+    })
+}
+
 /// How long the most recently used entry of a gate kind must be unused
 /// before it goes for budget (outside pressure): its next gate rebuilds from
 /// nothing, so an entry in daily use is kept.
@@ -322,6 +342,9 @@ pub const GATE_CACHE_LAST_ENTRY_IDLE: Duration = Duration::from_secs(24 * 60 * 6
 fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool, now: u64) -> Vec<Candidate> {
     let mut by_repository: BTreeMap<&str, Vec<&Child>> = BTreeMap::new();
     for child in &item.children {
+        if gate_entry_expired(child, budgets, now) {
+            continue;
+        }
         if let Some((repository, _)) = child.name.split_once('/') {
             by_repository.entry(repository).or_default().push(child);
         }
@@ -589,6 +612,11 @@ pub fn refuse(
                 }
                 Some(_) => {}
             }
+            // Expired by the artifact max age: a gate that wrote into it
+            // since it was measured used it.
+            if candidate.reason == Reason::Expired && recent_change(&path) > candidate.newest_ms {
+                return Some("used since it was measured".into());
+            }
         }
         Policy::RecoveryArchives if candidate.reason == Reason::Expired => {
             // Re-read just before removal: the keep marker, and the age from
@@ -758,6 +786,16 @@ pub fn delete_tree(
     beat: &mut dyn FnMut(),
     deadline: Option<Instant>,
 ) -> std::io::Result<bool> {
+    delete_tree_measured(path, beat, deadline).map(|(done, _)| done)
+}
+
+/// [`delete_tree`], also returning the allocated bytes of what it removed.
+pub fn delete_tree_measured(
+    path: &Path,
+    beat: &mut dyn FnMut(),
+    deadline: Option<Instant>,
+) -> std::io::Result<(bool, u64)> {
+    let mut removed_bytes = 0_u64;
     let mut last_beat = Instant::now();
     let mut stack = vec![(path.to_path_buf(), false)];
     while let Some((next, visited)) = stack.pop() {
@@ -769,6 +807,7 @@ pub fn delete_tree(
         if metadata.is_dir() {
             if visited {
                 fs::remove_dir(&next)?;
+                removed_bytes = removed_bytes.saturating_add(super::allocated(&metadata));
             } else {
                 stack.push((next.clone(), true));
                 for entry in fs::read_dir(&next)?.flatten() {
@@ -778,16 +817,17 @@ pub fn delete_tree(
         } else {
             // A file or a link: the link itself goes, never its target.
             fs::remove_file(&next)?;
+            removed_bytes = removed_bytes.saturating_add(super::allocated(&metadata));
         }
         if last_beat.elapsed() >= super::BEAT_EVERY {
             beat();
             last_beat = Instant::now();
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) && !stack.is_empty() {
-            return Ok(false);
+            return Ok((false, removed_bytes));
         }
     }
-    Ok(true)
+    Ok((true, removed_bytes))
 }
 
 /// Leftovers of removals interrupted after the rename.

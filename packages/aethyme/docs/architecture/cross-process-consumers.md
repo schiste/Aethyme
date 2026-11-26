@@ -343,6 +343,56 @@ class to `entries` and `bytes` removed this pass; `stop`: `done` or
 `last_prune` (the last pass's `gate_cache_prune`), and the gate cache's
 over-budget clock now runs while any repository is over its budget.
 
+Changed 2026-11-26 (artifact max age). `storage.toml` `[budget]
+artifact_max_age_hours` (default 24, `0` off; an older binary rejects the key
+and runs on default budgets). Gate caches: an entry unused for the max age is
+planned as `expired` whatever the budget and refused at removal when a gate
+wrote into it since it was measured; while the max age is on, every other
+entry is pruned each pass (not only over budget), and the prune's in-use
+signal is the unit's last recorded access or modification older than the max
+age (a day when it is off), local packages only (`relatime` may leave a read
+unrecorded for up to a day, so "not read since its successor was built" was
+not a safe signal). `storage_gate_cache_prune` attachment and
+`gate_cache_prune` report add `in_use` (superseded local units kept as used)
+and `for_pile_up` (entries judged only because the max age is on); counter
+`storage_gate_cache_prune_in_use` per kept unit. Under pressure from a volume
+below its free floor, the eviction loop re-reads the volume's free space after
+each budget removal and stops removing for pressure once it is back above the
+floor (counter `storage_eviction_pressure_relieved`).
+`storage_node_compile_cache_day_evicted` now counts `d<days>` directories only.
+New pass step `artifact_age` (phase `artifact_age`, 60 s budget, paced):
+Cargo targets in session scratch directories and in the main checkouts of
+registered repositories, and empty leftover worktree roots (see the CLI
+reference). Spans `storage_artifact_age` (the step),
+`storage_artifact_age_discover` (finding targets in one root or checkout),
+`storage_artifact_age_target` (judging one target),
+`storage_artifact_age_remove` (renaming one aside and deleting it),
+`storage_artifact_age_prune` (pruning one target in use) and
+`storage_artifact_age_leftover_roots`; counters
+`storage_artifact_age_<class>_removed`, `..._pruned_unit`,
+`..._kept_in_use` and `..._kept_unproven` for `session_scratch_build` and
+`main_checkout_target`, `storage_artifact_age_leftover_worktree_root_removed`
+and `..._kept_unproven`, and one of `storage_artifact_age_stop_done`,
+`storage_artifact_age_stop_deadline` or `storage_artifact_age_stop_lock_lost`
+per step; attachment `storage_artifact_age` (`max_age_hours`, `stop`,
+`classes`: per class `found`, `removed_for_age`, `removed_for_age_bytes`,
+`pruned_for_pile_up`, `pruned_for_pile_up_bytes`, `kept_in_use`,
+`kept_unproven`, `oldest_kept_age_ms`), also in the pass report as
+`artifact_age`. `storage status --json` adds `oldest_age_ms` to every class and
+`artifact_max_age` (see the CLI reference). Gates count the units a prune
+removed that cargo rebuilt (`managed_cache_prune_rebuilt_unit`, attachment
+`managed_cache_prune.rebuilt_after_previous_prune`) after their build instead
+of before it, so a prune the worker made between gates is counted too; a
+gate's own prune adds to the `.aethyme-pruned-units` record instead of
+replacing it. The idle strip removes the Cargo targets of sessions idle for
+the max age (counters `checkout_idle_strip_covered_cargo_target_max_age`,
+`checkout_idle_strip_max_age_targets_only`; attachment `checkout_idle_strip`
+adds `artifact_max_age_hours`; meta key `checkout_strip.idle_max_age_done`).
+An expired metrics-trim resume record's temporary is removed only once it was
+not modified for 120 s (counter
+`command_metrics_trim_resume_expired_recently_modified` when it is left for the
+stale-temporary sweep).
+
 Host temp folders (2026-11-22): after each pass the worker reads the per-user
 temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
 `/tmp`, at most every 10 minutes, into
@@ -707,6 +757,24 @@ and `cat-file blob` of the selected file
   `path_through_non_tree`, `not_a_regular_file`, `malformed_tree`,
   `not_a_blob`, `too_large`, `unexpected_target`. Each answered query is one
   `subprocess_git` fewer (`file_at_revision` two: `cat-file -e` and `show`).
+
+## Submit's conflict report reads integration history in one bounded log (2026-11-26)
+
+When a replayed session commit conflicts, `broker submit` lists, per
+conflicting path, the integration-side commits that touched it
+(`integration_side_commits` in the conflict details). It used to start two
+Git processes per first-parent commit per path between the merge base and
+the integration head; on a merge-heavy history with an old merge base this
+ran for over an hour with no deadline and the submission never reached its
+gates. It now reads one `git log --first-parent --diff-merges=first-parent
+--no-renames --name-only -z` over the newest 2,000 first-parent commits,
+keeps at most 20 commits per path (oldest first, as before) and stops after
+20 s; on any Git error or timeout the list is empty. A change a merge brought
+in from its side branch is attributed to the merge. Span
+`submission_conflict_history` times the read; count
+`submission_conflict_history_unavailable` records an empty list caused by an
+error or the budget. The list is a hint: an empty or shorter list never
+changes the submission verdict.
 
 ## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
 
