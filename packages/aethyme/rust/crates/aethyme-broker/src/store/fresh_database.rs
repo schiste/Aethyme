@@ -18,6 +18,7 @@ use super::*;
 
 #[cfg(unix)]
 const FRESH_DATABASE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(unix)]
 const FRESH_DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
 const FRESH_DATABASE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -136,7 +137,7 @@ pub(super) fn open_in_repo(
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    connection.busy_timeout(FRESH_DATABASE_BUSY_TIMEOUT)?;
+    crate::db_busy::install_handler(&connection)?;
     let version = schema::current_version(&connection)?;
     if version > crate::SCHEMA_VERSION {
         return Err(BrokerError::SchemaTooNew {
@@ -1417,7 +1418,7 @@ mod unix {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.busy_timeout(FRESH_DATABASE_BUSY_TIMEOUT)?;
+        crate::db_busy::install_handler(&connection)?;
         connection.pragma_update(None, "query_only", true)?;
         let version = strict_schema_version(&connection)?;
         if version != crate::SCHEMA_VERSION {
@@ -1653,7 +1654,7 @@ mod unix {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.busy_timeout(FRESH_DATABASE_BUSY_TIMEOUT)?;
+        crate::db_busy::install_handler(&connection)?;
         connection.pragma_update(None, "query_only", true)?;
         let version = read_version_if_present(&connection)?;
         if version != crate::SCHEMA_VERSION {
@@ -1916,13 +1917,13 @@ mod unix {
         identity: &VerifiedRepositoryIdentity,
         binding_scope: &super::repository_identity::RepositoryBindingScope,
     ) -> Result<BrokerStore, BrokerError> {
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.busy_timeout(FRESH_DATABASE_BUSY_TIMEOUT)?;
+        crate::db_busy::configure_writer(&mut connection, logical_path)?;
         connection.pragma_update(None, "journal_mode", "wal")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;

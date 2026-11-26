@@ -1471,7 +1471,10 @@ impl BrokerStore {
         namespace: &str,
         cap: usize,
     ) -> Result<Option<CleanupCohortPendingDelta>, BrokerError> {
-        let tx = self.conn.unchecked_transaction()?;
+        // Deferred on purpose: writable broker connections begin
+        // `transaction()` immediately, and this read-only snapshot must not
+        // take the write lock.
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         let Some((high_water, after, stored_complete)) = tx
             .query_row(
                 "SELECT high_water_session_id, after_session_id, complete

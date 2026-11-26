@@ -5,7 +5,8 @@
 //!
 //! One `BrokerStore` wraps one connection and is intended per-process
 //! (CLI invocations are short-lived). Cross-process safety comes from
-//! SQLite WAL + a 5s busy timeout; nothing here assumes in-process locks.
+//! SQLite WAL + the bounded busy handler of `crate::db_busy`; nothing here
+//! assumes in-process locks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -65,9 +66,6 @@ pub(crate) struct SessionReplacementOptions<'a> {
     pub(crate) base_observation: Option<&'a crate::broker::SessionBaseObservation>,
 }
 use crate::types::{NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation};
-
-/// Milliseconds a writer waits on a locked database before erroring.
-const BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// Retries for the fresh-database open race (see [`BrokerStore::open`]).
 /// Backoff is 25ms × attempt, so 10 retries bound the wait at ~1.4s —

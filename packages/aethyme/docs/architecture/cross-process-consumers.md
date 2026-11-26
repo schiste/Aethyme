@@ -6419,3 +6419,48 @@ uncertain outcome installed again from the start. The changes:
     opened and the step's streams were inherited as before.
   - Counter `preparation_step_output_drain_timed_out`: a stream stayed open
     2 s after the step (a descendant kept it); the tail so far was kept.
+
+### Broker database lock waits are bounded, retried and attributed (2026-11-26)
+
+On the busiest repository 63 broker commands failed with `broker db:
+database is locked` in six hours, and their metric lines could not say how
+long they waited or who held the lock. Two causes: every broker-database
+connection waited at most 5 s for another writer, and a writable connection's
+plain `transaction()` began deferred, so a transaction that read before it
+wrote (session status updates, automation notes, queue updates) failed at
+once with `SQLITE_BUSY_SNAPSHOT` when another writer committed in between;
+SQLite never retries that. An audit found no broker-database transaction held
+across a child process, a sleep or a network call.
+
+- **One wait policy** (`db_busy`). Every broker-database connection,
+  read-only ones included, gets a busy handler that retries with jittered
+  exponential backoff (2 ms doubling to 250 ms, each delay scaled by 0.5 to
+  1.5) for up to 30 s, replacing the 5 s `busy_timeout`. Deliberate
+  try-lock sites that set a zero timeout restore the handler afterwards.
+- **Writes begin immediately.** Writable broker connections start every
+  `transaction()` and `unchecked_transaction()` with `BEGIN IMMEDIATE`, so
+  the write lock is waited for (and retried) at the start instead of failing
+  mid-transaction. A read-only snapshot transaction on a writable connection
+  asks for `DEFERRED` explicitly.
+- **Holder record.** When a transaction on a writable broker connection
+  first changes a row, it writes `<database>.writer` beside the database
+  (mode 0600; JSON `pid`, `command`, `since_ms`) and removes it when the
+  transaction commits or rolls back, or the connection closes. `command` is
+  the command's metric surface (`gc.__trash-catchup`), never a path, id or
+  task text. A record naming a dead process is ignored. The window between
+  `BEGIN IMMEDIATE` and the first changed row is not recorded.
+- **Named errors.** A wait that runs out of budget fails as before
+  (`database is locked`), with `after waiting <n> s; database write lock held
+  by pid <pid> (`aethyme broker <command>`) for <n> s` appended, or a note
+  that the holder was not recorded.
+- **`broker status`** (compact form) adds `database_write_lock` (`pid`,
+  `command`, `held_ms`, `message`) in `--json`, and the `message` line in
+  text, when a live recorded holder has held the lock for at least 5 s. The
+  field is outside the status revision.
+- Span `broker_db_busy_wait`: time slept waiting for a database lock, one
+  occurrence per retry; counted as wait time in the command's attribution.
+- Counters `broker_db_busy_retry` (one per retry) and
+  `broker_db_busy_failure` (one per wait that ran out of budget).
+- Attachment `broker_db_busy_wait_by_holder`: `{<holder command>: {count,
+  total_ms, max_ms}}` of time waited, keyed by the recorded holder's command
+  surface read when the wait began (`unrecorded` when there was none).

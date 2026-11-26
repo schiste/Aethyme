@@ -1031,8 +1031,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        self.conn
-            .busy_timeout(std::time::Duration::from_millis(super::BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&self.conn)?;
         result
     }
 
@@ -1058,8 +1057,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        self.conn
-            .busy_timeout(std::time::Duration::from_millis(super::BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&self.conn)?;
         result
     }
 

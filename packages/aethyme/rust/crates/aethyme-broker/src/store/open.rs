@@ -286,7 +286,7 @@ impl BrokerStore {
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&conn)?;
         let found = schema::current_version(&conn)?;
         if found > crate::SCHEMA_VERSION && schema::newer_schema_is_compatible(&conn, found)? {
             conn.pragma_update(None, "query_only", true)?;
@@ -331,7 +331,7 @@ impl BrokerStore {
         conn.execute("VACUUM INTO ?1", [snapshot_path.to_string_lossy().as_ref()])?;
         drop(conn);
         let snapshot = Connection::open(&snapshot_path)?;
-        snapshot.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&snapshot)?;
         schema::migrate(&snapshot)?;
         snapshot.pragma_update(None, "query_only", true)?;
         Ok(Self {
@@ -393,7 +393,7 @@ impl BrokerStore {
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&conn)?;
         let found = schema::current_version(&conn)?;
         if found != crate::SCHEMA_VERSION {
             return Err(BrokerError::SnapshotSchemaMismatch {
@@ -451,11 +451,11 @@ impl BrokerStore {
         enroll_repository_graph_fence(&repository_root)?;
         // No `SQLITE_OPEN_CREATE`: an absent database stays absent even if it
         // is deleted between the check above and this open.
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::configure_writer(&mut conn, &path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         if schema::current_version(&conn)? != crate::SCHEMA_VERSION {
             return Ok(None);
@@ -499,8 +499,8 @@ impl BrokerStore {
     }
 
     pub(super) fn open_once(db_path: &Path) -> Result<Self, BrokerError> {
-        let conn = Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let mut conn = Connection::open(db_path)?;
+        crate::db_busy::configure_writer(&mut conn, db_path)?;
         // WAL: readers never block the writer and vice versa. NORMAL sync
         // is durable-enough for operational state (a crash may lose the
         // last transaction, never corrupt).
@@ -1780,8 +1780,7 @@ impl BrokerStore {
             }
             transition => transition,
         };
-        self.conn
-            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&self.conn)?;
         transition
     }
 
@@ -3295,12 +3294,17 @@ mod abandoned_close_cas_tests {
             started.elapsed() < std::time::Duration::from_millis(250),
             "a held database writer must defer instead of blocking the maintenance pass"
         );
-        let restored_timeout_ms: i64 = store
-            .conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(restored_timeout_ms, BUSY_TIMEOUT_MS as i64);
         assert_unclosed_without_abandoned_event(&store, observed.id);
+        // The connection waits for writers again afterwards: a write queued
+        // behind a writer that commits shortly succeeds instead of failing.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.execute_batch("COMMIT;").unwrap();
+        });
+        store
+            .append_event("test.after_deferral", Some(observed.id), Some("{}"))
+            .unwrap();
+        release.join().unwrap();
     }
 }
 
