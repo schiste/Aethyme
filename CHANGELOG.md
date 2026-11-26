@@ -4,6 +4,33 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.186] - 2026-11-26
+
+### Changed
+
+- Build artifacts and caches no older than a host-wide max age, default 24 hours (`[budget] artifact_max_age_hours` in `storage.toml`, 0 turns it off): idle gate cache entries expire; superseded generations of local packages are pruned from every cargo target the worker manages on every pass, not only over budget; Cargo targets (CACHEDIR.TAG) in session scratch directories and in registered repositories' main checkouts (proven untracked and ignored, with Git routing variables dropped) unused for the max age are removed while the worker holds every profile's `.cargo-lock`; sessions idle for the max age lose their Cargo target; empty leftover worktree roots are removed. Rebuilds after a worker prune are now counted, a generation is pruned only when superseded and older than the max age, and pressure eviction stops once free space is back above the floor (#2044).
+- Dependency preparation no longer discards finished installs or makes agents loop. A running step's heartbeat used to apply the 8 GiB build reserve to the host-state database every second and kill the install when the internal disk touched it; running steps now keep 2 GiB on the install's own volumes and 256 MiB on bookkeeping paths. A finished step is recorded at once, with a fallback record in the session scratch directory. An unconfirmed outcome releases its lease after verified cleanup, and the next prepare skips steps recorded as finished. A session waiting for another session's shared-cache fill keeps waiting while the holder is alive (up to 2 hours) instead of failing after 60 s, and every refusal carries `retry_after_seconds`. Each step's output tail is kept in a capped log. The trash catch-up drops to throttled I/O while an install or gate runs on its volume. On the website repository these failures cost an agent over an hour of a 2-hour task (#2046).
+- `broker submit` no longer stalls in its conflict report: the integration-side history per conflicting path comes from one bounded `git log` (newest 2,000 first-parent commits, 20 per path, 20 s) instead of two Git processes per commit per path, which ran over an hour on a merge-heavy history (#2047).
+- `broker submit` replays a session branch that merged the default branch ("sync merges") as GitHub would merge it: the newest covering sync merge is replayed once from the integration commit it merged. Before, its first-parent delta was replayed, which reported spurious conflicts when the default branch changed the synced lines again and silently restored content the default branch had reverted. A conflict it finds is recovered by merging the default branch, not rebasing (#2048).
+- A command interrupted by SIGINT, SIGTERM or SIGHUP writes its command-metrics row before it dies of the signal, naming the span it was in; long commands write a heartbeat under `.aethyme/run/commands/` (#2049).
+- Recovery archive migration to a storage root is fast and continuous: each file is copied and hashed in one read (up to 4 threads per archive), read back once, and the device is flushed once per archive (also on the reconcile path) before the source is removed; while no install or gate runs and neither volume is under pressure, migration runs at ordinary I/O priority for up to 20 minutes per pass instead of 60 s throttled. On 0.8.185 it moved about 16 archives per 10-minute pass, about 20 hours for 2,000 (#2050).
+- The content gate compares portable-verdict final newlines with the source (#1995, via #2052).
+
+### Added
+
+- Telemetry and fields for each change above, documented in `cross-process-consumers.md`: `artifact_age` and `artifact_max_age` (#2044); `prepare_*`, `shared_cache_waited_for_fill`, `foreground_io_marked`, `checkout_trash_catchup_yielded_to_foreground` (#2046); `submission_conflict_history` (#2047); `submission_replay_sync_merge_three_way` (#2048); the `interrupted` field and `AETHYME_COMMAND_HEARTBEAT_MS` (#2049).
+
+### Build and release
+
+- Release macOS tests run as a job of the release workflow after the release builds instead of on every tag push, so they no longer hold the macOS runners the release builds need. On v0.8.185 the x86_64 macOS build waited 27 minutes for a runner behind them, in a 45-minute release. The macOS verdict is the `macOS tests` job of the release run and does not gate publication (#2051).
+
+### Upgrade notes
+
+- `artifact_max_age_hours` defaults to 24: a repository idle for a day builds its first gate or Cargo target cold (#2044).
+- Binaries before 0.8.186 reject a `storage.toml` that sets `artifact_max_age_hours` and fall back to default budgets (#2044).
+- A waiting `prepare` can now block for up to 2 hours while another live session fills the shared cache; `--wait 0s` still fails at once (#2046).
+- An interrupted command's row has `exit` = 128 + signal and `outcome` = `interrupted`; heartbeat readers must check the pid and `updated_at_ms` (#2049).
+
 ## [0.8.185] - 2026-11-26
 
 ### Added
