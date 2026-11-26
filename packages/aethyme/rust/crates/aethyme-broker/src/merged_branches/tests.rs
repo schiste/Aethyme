@@ -1074,3 +1074,37 @@ fn new_archives_follow_the_placement_and_fall_back_to_host_state() {
     );
     crate::storage_ledger::placement::set_local_for_test(None);
 }
+
+/// The operation archive lane takes its root from `retirement_archive_root`
+/// and writes there without the resolve path's recording: resolving a
+/// storage root records it, so an archive written there and then made
+/// unreachable (an unmounted volume) defers absence and keeps the branch.
+#[test]
+fn an_operation_archive_on_an_unmounted_storage_root_keeps_the_branch() {
+    let mut fixture = fixture();
+    let session = merged_branch(&mut fixture);
+    let (storage, archive_dir) = adopt_storage_root(&fixture);
+    std::fs::write(
+        fixture._storage.host_state_dir().join("storage.toml"),
+        "[placement]\nrecovery_archives = \"storage\"\n",
+    )
+    .unwrap();
+    crate::storage_ledger::placement::set_local_for_test(Some(true));
+    // No pool is bound: the lane's root is the placed one.
+    let lane_root = fixture.broker.retirement_archive_root().unwrap();
+    assert_eq!(lane_root, archive_dir);
+    std::fs::create_dir_all(lane_root.join(format!("{session}-operation-archive"))).unwrap();
+    let away = storage.with_file_name("storage-away");
+    std::fs::rename(&storage, &away).unwrap();
+
+    assert!(fixture.broker.checked_recovery_archive_roots().is_none());
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert!(
+        counts.contains_key("merged_branches_archive_roots_unknown"),
+        "{counts:?}"
+    );
+    assert!(branch_exists(&fixture.root, "agent/merged"));
+    crate::storage_ledger::placement::set_local_for_test(None);
+}

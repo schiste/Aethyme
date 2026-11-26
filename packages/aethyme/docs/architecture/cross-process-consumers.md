@@ -445,8 +445,10 @@ storage root, in host state's layout (`<root>/recovery-archives/<key>/<id>`,
 `<root>/gates/<key>/<cache key>`); the ledger classifies those two names in a
 storage root as `recovery_archives` and `gate_cache`. New host state files,
 classified `coordination`: `storage-archive-roots.json` (storage roots that
-received archives, written before the first archive lands; read by every
-archive reader) and `storage-placement.json` (the migration's `cursor`,
+received archives, written durably under the exclusive lock
+`storage-archive-roots.lock` whenever an archive writer resolves a storage
+path and before each migration pass, so before any archive lands; read by
+every archive reader) and `storage-placement.json` (the migration's `cursor`,
 `archives_migrated_total`, `bytes_migrated_total`, `archives_failed_total`).
 `storage status --json` adds `placement` (`recovery_archives` and
 `gate_caches`, each `configured`, `placed`, `fallback`; `storage_root`,
@@ -462,7 +464,10 @@ the phase `placement`. Command metrics: spans `storage_placement` (the whole
 step), `storage_placement_migrate`, `storage_placement_migrate_list`,
 `storage_placement_migrate_rename`, `storage_placement_migrate_copy`,
 `storage_placement_migrate_verify`, `storage_placement_migrate_reconcile`
-and `storage_placement_host_gate_cache_evict`; counters
+and `storage_placement_host_gate_cache_evict` and `storage_placement_record_root`
+(recording a new root); counters `storage_placement_root_recorded`,
+`storage_placement_fallback_unrecorded` (the root could not be recorded, so
+the archive stays in host state),
 `storage_placement_archive_migrated`, `_archive_skipped` (partial, no
 manifest, lifecycle lock busy or unavailable), `_archive_failed`,
 `_archive_out_of_time`, `_archive_reconciled` (a crash left two identical

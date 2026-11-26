@@ -68,6 +68,8 @@ pub const GATE_CACHE_DIRECTORY: &str = "gates";
 /// (`<host state>/storage-archive-roots.json`): while one is unreachable, a
 /// decision that deletes when it finds no archive cannot be made.
 pub const ARCHIVE_STORAGE_ROOTS_FILE: &str = "storage-archive-roots.json";
+/// The lock serializing writers of [`ARCHIVE_STORAGE_ROOTS_FILE`].
+pub const ARCHIVE_STORAGE_ROOTS_LOCK_FILE: &str = "storage-archive-roots.lock";
 /// The migration's cursor and counters (`<host state>/storage-placement.json`).
 pub const MIGRATION_STATE_FILE: &str = "storage-placement.json";
 /// The longest one pass spends moving archives.
@@ -368,17 +370,42 @@ fn recorded_archive_storage_roots(host_state: &Path) -> Vec<PathBuf> {
 
 /// Record that `root` holds (or is about to hold) recovery archives, before
 /// the first one is written or moved there (a no-op when known).
+///
+/// Durable before it returns: written aside, synced, renamed in and the
+/// directory synced. Recorders in several processes are serialized by an
+/// exclusive lock on `<host state>/storage-archive-roots.lock`, and each
+/// re-reads the file under it, so none drops a root another just added.
 pub fn record_archive_storage_root(host_state: &Path, root: &Path) -> io::Result<()> {
+    if recorded_archive_storage_roots(host_state)
+        .iter()
+        .any(|known| known == root)
+    {
+        return Ok(());
+    }
+    let _span = crate::phase_telemetry::span("storage_placement_record_root");
+    fs::create_dir_all(host_state)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(host_state.join(ARCHIVE_STORAGE_ROOTS_LOCK_FILE))?;
+    lock.lock()?;
     let mut known = recorded_archive_storage_roots(host_state);
     if known.iter().any(|known| known == root) {
         return Ok(());
     }
     known.push(root.to_path_buf());
-    fs::create_dir_all(host_state)?;
-    write_atomically(
-        &host_state.join(ARCHIVE_STORAGE_ROOTS_FILE),
+    let path = host_state.join(ARCHIVE_STORAGE_ROOTS_FILE);
+    let mut temporary = tempfile::NamedTempFile::new_in(host_state)?;
+    io::Write::write_all(
+        &mut temporary,
         &serde_json::to_vec(&known).map_err(io::Error::other)?,
-    )
+    )?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| error.error)?;
+    sync_directory(host_state)?;
+    crate::phase_telemetry::add("storage_placement_root_recorded", Duration::ZERO);
+    Ok(())
 }
 
 /// If `archive_root` is `<storage root>/recovery-archives/<key>` on an
@@ -595,7 +622,12 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
         ))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::create_dir(path)?;
-            crate::host_state::protect_host_state_path(path, true)
+            crate::host_state::protect_host_state_path(path, true)?;
+            // The new entry is durable before anything is placed in it.
+            match path.parent() {
+                Some(parent) => sync_directory(parent),
+                None => Ok(()),
+            }
         }
         Err(error) => Err(error),
     }
@@ -929,10 +961,10 @@ fn migrate_one(
         }
         bytes
     };
-    crate::warn_unrecorded(
-        "sync the archive destination",
-        sync_directory(&destination_dir),
-    );
+    // The host copy goes only once the placed one is durable.
+    if let Err(error) = sync_directory(&destination_dir) {
+        return Moved::Failed(format!("sync the destination: {error}"));
+    }
     if crashed_for_test("after_place") {
         return Moved::Failed("stopped after placing the copy (test)".into());
     }
@@ -945,6 +977,11 @@ fn migrate_one(
         && let Err(error) = remove_source(host_state, id, beat)
     {
         return Moved::Failed(format!("remove the host copy: {error}"));
+    }
+    // And once more after it: the markers sit beside the archive, so one
+    // written while the source was removed is still there to copy.
+    if let Err(error) = copy_markers(&source, &destination) {
+        return Moved::Failed(format!("markers: {error}"));
     }
     if let Err(error) = remove_source_markers(&source) {
         return Moved::Failed(format!("remove the host markers: {error}"));
@@ -968,17 +1005,22 @@ pub fn migrate_archives(
 ) {
     let _span = crate::phase_telemetry::span("storage_placement_migrate");
     let source_root = host_state.join(RECOVERY_ARCHIVE_DIRECTORY);
+    let destination_root = storage_root.join(RECOVERY_ARCHIVE_DIRECTORY);
+    // Readers learn of the root before anything is moved or written there,
+    // whether or not host state holds archives to move.
+    if let Err(error) = record_archive_storage_root(host_state, storage_root) {
+        crate::phase_telemetry::add("storage_placement_migrate_failed", Duration::ZERO);
+        report.archives_failed += 1;
+        report.reason(RECOVERY_ARCHIVE_DIRECTORY, &error.to_string());
+        return;
+    }
     if !fs::symlink_metadata(&source_root)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
     {
         report.migration_stop = Some("done".into());
         return;
     }
-    let destination_root = storage_root.join(RECOVERY_ARCHIVE_DIRECTORY);
-    // Readers learn of the root before anything is moved there.
-    if let Err(error) = record_archive_storage_root(host_state, storage_root)
-        .and_then(|()| ensure_private_directory(&destination_root))
-    {
+    if let Err(error) = ensure_private_directory(&destination_root) {
         crate::phase_telemetry::add("storage_placement_migrate_failed", Duration::ZERO);
         report.archives_failed += 1;
         report.reason(RECOVERY_ARCHIVE_DIRECTORY, &error.to_string());

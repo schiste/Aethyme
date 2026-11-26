@@ -1360,7 +1360,23 @@ impl Broker {
                 placement::resolve(host_state, placement::Data::RecoveryArchives).storage_root
         {
             let key = self.worktree_root_plan()?.repository_key;
-            return Ok(root.join(RECOVERY_ARCHIVE_DIRECTORY).join(key));
+            // Every writer that gets this path (the operation archive lane
+            // included) may write there next: readers must know of the root
+            // first, or an unmounted root would read as holding nothing.
+            // Unrecordable, the archive stays in host state.
+            match placement::record_archive_storage_root(host_state, &root) {
+                Ok(()) => return Ok(root.join(RECOVERY_ARCHIVE_DIRECTORY).join(key)),
+                Err(error) => {
+                    crate::phase_telemetry::add(
+                        "storage_placement_fallback_unrecorded",
+                        Duration::ZERO,
+                    );
+                    crate::warn_unrecorded::<(), _>(
+                        "record the archive storage root (archives stay in host state)",
+                        Err(error),
+                    );
+                }
+            }
         }
         self.recovery_archive_root()
     }

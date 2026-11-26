@@ -566,3 +566,22 @@ fn gate_caches_on_a_storage_root_are_selected_for_pruning() {
     assert_eq!(ledger.items[*index].root, fixture.storage);
     assert_eq!(name, "example-0123/rust-workspace-v1");
 }
+
+/// With nothing in host state to move, the pass still records the root
+/// new archives are about to be written to.
+#[test]
+fn the_root_is_recorded_even_with_no_host_archives() {
+    let fixture = Fixture::new();
+    assert!(!fixture.host_state.join(RECOVERY_ARCHIVE_DIRECTORY).exists());
+
+    let report = fixture.migrate();
+
+    assert_eq!(report.migration_stop.as_deref(), Some("done"));
+    assert_eq!(
+        recorded_archive_storage_roots(&fixture.host_state),
+        std::slice::from_ref(&fixture.storage)
+    );
+    // Recording again changes nothing.
+    record_archive_storage_root(&fixture.host_state, &fixture.storage).unwrap();
+    assert_eq!(recorded_archive_storage_roots(&fixture.host_state).len(), 1);
+}

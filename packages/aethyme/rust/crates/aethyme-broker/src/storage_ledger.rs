@@ -240,6 +240,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE
                 | placement::ARCHIVE_STORAGE_ROOTS_FILE
+                | placement::ARCHIVE_STORAGE_ROOTS_LOCK_FILE
                 | placement::MIGRATION_STATE_FILE => Class::Coordination,
                 _ => Class::Unclassified,
             }
