@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.182] - 2026-11-26
+
+### Added
+
+- `broker status` now says where its `retention` phase goes: spans `cleanup_retention_policy`, `_inventory`, `_closed_sessions`, `_inode_summary`, `_closed_worktrees`, `_oldest_closed`, `_gate_headroom`, `_reconciliation` and `_artifact_sweep`. On the busiest repository that phase took about 2.8 s per full status view on 0.8.181 with nothing attributed under it (#2031).
+- `blockers_action_required` (about 1 s per full status view there) is split into `blockers_action_required_sessions` and, per live session, `_notice_probe`, `_strip_marker` and `_notice_clear` (#2031).
+
+### Fixed
+
+- The architecture notes said the `gc_plan_*` spans added in 0.8.181 time the `retention` phase of `status`; they time that of `doctor` (#2031).
+
 ## [0.8.181] - 2026-11-26
 
 ### Changed
