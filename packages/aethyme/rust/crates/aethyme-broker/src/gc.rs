@@ -6003,6 +6003,7 @@ impl Broker {
             // one): any entry defers the whole archive set to `--full-scan`.
             let mut roots = vec![self.recovery_archive_root()?];
             roots.extend(self.pool_recovery_archive_root(false));
+            roots.extend(self.storage_recovery_archive_dirs());
             for root in roots {
                 if std::time::Instant::now() >= deadline {
                     return Ok((Vec::new(), None, false));

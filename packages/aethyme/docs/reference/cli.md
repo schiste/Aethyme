@@ -400,6 +400,54 @@ A `storage.toml` the worker cannot read leaves it on default budgets and is
 advised as `storage.budget-config-invalid` in `broker status`. `gc plan` reads a gate cache entry's size from the
 ledger when the worker measured it within the hour instead of walking it.
 
+Placement: recovery archives and managed gate caches can live on an adopted
+storage root on another volume instead of host state and the host cache.
+`<host state>/storage.toml`:
+
+```toml
+[placement]
+recovery_archives = "storage"   # "host" (default) or "storage"
+gate_caches = "storage"         # "host" (default) or "storage"
+storage_root = "/path/to/root"  # optional; needed when several roots are adopted
+```
+
+Only an adopted root qualifies (`aethyme storage adopt <dir>`): a real
+directory, not a symbolic link, carrying the adoption marker, both owned by
+this user, on a mounted, local file system. When it does not (unmounted,
+unadopted, ambiguous, a link, another owner, a network file system, or an
+unreadable `[placement]`), archives and gate caches go to host state and the
+host cache as before; the reason shows in `storage status` (`placement`) and
+is counted, and no cleanup fails for it. On the root, the layout mirrors host
+state: `<root>/recovery-archives/<repository key>/<archive>` and
+`<root>/gates/<repository key>/<cache key>`, so the worker inventories,
+expires, floors and lists them as before and archive ids do not change. The
+retirement lane still prefers the pool's own archive directory; a reviewed
+`cleanup resolve` and a repository with no pool write to the placed root.
+Every reader (restore, `storage archives`, `keep-archive`, landing proofs,
+expiry, the archive floor and bound, `gc plan`, merged-branch cleanup) finds
+archives in host state, the pool and every storage root that received archives
+or was adopted; while a root that received archives is unreachable, decisions
+that delete when no archive is found are deferred.
+
+While `recovery_archives = "storage"` resolves to a root, each worker pass
+moves host state archives there (at most 60 s and 500 archives per pass,
+resuming from a recorded cursor): never one being written (partial names),
+without a manifest, or while its repository's lifecycle lock is held or
+awaited (a restore, retirement or bound pass). Same volume: one rename.
+Another volume: copied to a `.partial` staging directory, every file and
+directory synced, both trees compared (type, size and SHA-256 of every file),
+renamed into place, then the host copy is removed; keep and dismissal markers
+move with it. A crash leaves the host copy intact or two identical copies,
+which the next pass reconciles. While `gate_caches = "storage"` resolves to
+a root, gates build there and the worker evicts the host cache's gate caches
+(never moved), each under its exclusive lease, so a running gate keeps its
+cache. `storage status --json` adds `placement` (configured and placed
+location per kind, `fallback`, `storage_root`, `archive_storage_roots`,
+`migration` totals and cursor) and `recovery_archives_by_location.storage`;
+the pass report adds `placement`. An older binary rejects a `storage.toml`
+with a `[placement]` table and runs on default budgets, so add it only once
+every binary on the host is at least this version.
+
 Host temp folders (the per-user temp folder on macOS and `/tmp`) are not
 Aethyme's roots: they are read, never deleted. After its pass, at most every
 10 minutes, the worker counts their top-level entries (at most 100,000) and

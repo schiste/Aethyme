@@ -243,6 +243,7 @@ pub fn status_value(host_state: &Path) -> Value {
             json!({
                 "pool": sum(|usage| &usage.pool),
                 "host_state": sum(|usage| &usage.host_state),
+                "storage": sum(|usage| &usage.storage),
                 "over_bound": archive_usage.values().filter(|usage| usage.over_bound).count(),
                 "unique_kept_over_bound": archive_usage.values().map(|usage| usage.unique_kept_over_bound).sum::<usize>(),
                 "evicted_total": archive_usage.values().map(|usage| usage.evicted_total).sum::<usize>(),
@@ -316,6 +317,8 @@ pub fn status_value(host_state: &Path) -> Value {
         "host_temp": super::host_temp::Reading::load(host_state),
         "budgets": budgets,
         "budget_error": budget_error,
+        // `storage.toml` `[placement]`: where archives and gate caches go.
+        "placement": super::placement::status(host_state),
         "last_pass": ledger.last_pass,
         "phases_ms": {"read": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)},
     })
@@ -336,6 +339,21 @@ fn status(json_output: bool) -> u8 {
     }
     if let Some(error) = value["budget_error"].as_str() {
         println!("Warning: {error}; default storage budgets in use");
+    }
+    for data in ["recovery_archives", "gate_caches"] {
+        let placement = &value["placement"][data];
+        if placement["configured"] == "storage" || !placement["fallback"].is_null() {
+            println!(
+                "placement: {data} configured {}, placed {}{}",
+                placement["configured"].as_str().unwrap_or("?"),
+                placement["placed"].as_str().unwrap_or("?"),
+                placement["fallback"]
+                    .as_str()
+                    .map_or_else(String::new, |why| format!(
+                        " (Warning: fell back to the host: {why})"
+                    )),
+            );
+        }
     }
     // Roots and one total first.
     let total: u64 = value["classes"]
@@ -914,8 +932,29 @@ pub(super) fn command_temp_backlog_advice(
 
 /// The directory of archive `id` (`<pool>/<archive>`, optionally prefixed
 /// with `recovery-archives/`), checked to be a plain path inside the host
-/// state's archive root.
+/// state's archive root or, for an archive placed or moved there, an
+/// adopted storage root's (`storage.toml` `[placement]`).
 pub fn archive_path(host_state: &Path, id: &str) -> Result<std::path::PathBuf, String> {
+    let mut bases = vec![host_state.to_path_buf()];
+    bases.extend(
+        super::placement::archive_storage_roots(host_state)
+            .into_iter()
+            .map(|(root, _)| root),
+    );
+    let mut first_error = None;
+    for base in &bases {
+        match archive_path_in(base, id) {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| format!("no archive {id}")))
+}
+
+/// [`archive_path`] in one base directory (host state or a storage root).
+fn archive_path_in(host_state: &Path, id: &str) -> Result<std::path::PathBuf, String> {
     let id = id.strip_prefix("recovery-archives/").unwrap_or(id);
     let parts: Vec<&str> = id.split('/').collect();
     let plain = |part: &str| {

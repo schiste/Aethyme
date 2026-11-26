@@ -1087,6 +1087,36 @@ impl GateStorageLocations {
             Self::Captured { host_cache_dir, .. } => host_cache_dir.clone(),
         }
     }
+
+    /// The directory managed gate caches go under (`<dir>/gates/<repository
+    /// key>/<cache key>`): the host cache, or the adopted storage root
+    /// `<host state>/storage.toml` `[placement] gate_caches = "storage"`
+    /// names, while it qualifies. A missing or unqualified root falls back to
+    /// the host cache (counted by reason). A cache left in the other location
+    /// is never reused: it is only a cache, and the storage worker evicts the
+    /// host one once it is unleased.
+    pub(crate) fn gate_cache_dir(&self) -> Option<PathBuf> {
+        let host_cache = self.cache_dir()?;
+        let host_state = match self {
+            Self::Defaults => crate::host_state::default_host_state_dir(),
+            Self::Captured {
+                host_resource_db_path,
+                ..
+            } => host_resource_db_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        if let Some(host_state) = host_state {
+            use crate::storage_ledger::placement;
+            if let Some(root) =
+                placement::resolve(&host_state, placement::Data::GateCaches).storage_root
+            {
+                return Some(root);
+            }
+        }
+        Some(host_cache)
+    }
 }
 
 /// Per-run host sampling and progress dependencies. Tests inject deterministic
@@ -3227,7 +3257,7 @@ fn prepare_managed_gate_cache(
     if policy.is_none() {
         return Ok(None);
     }
-    let root = storage.cache_dir().ok_or_else(|| {
+    let root = storage.gate_cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
     // Pruned units are handed to the storage worker, which removes the
@@ -3334,7 +3364,18 @@ fn prepare_managed_gate_cache_in(
         return Ok(None);
     };
     std::fs::create_dir_all(root)?;
-    crate::host_state::protect_host_state_path(root, true)?;
+    // The host cache is private; an adopted storage root is the owner's
+    // directory (it holds other data), so only its `gates` is made private.
+    if root
+        .join(crate::storage_ledger::STORAGE_ROOT_MARKER)
+        .is_file()
+    {
+        let gates = root.join("gates");
+        std::fs::create_dir_all(&gates)?;
+        crate::host_state::protect_host_state_path(&gates, true)?;
+    } else {
+        crate::host_state::protect_host_state_path(root, true)?;
+    }
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);
@@ -3519,7 +3560,8 @@ fn gate_storage_probes(
             path: checkout.root().to_path_buf(),
         },
     ];
-    if let (Some(cache_key), Some(cache_root)) = (gate.managed_cache.as_ref(), storage.cache_dir())
+    if let (Some(cache_key), Some(cache_root)) =
+        (gate.managed_cache.as_ref(), storage.gate_cache_dir())
     {
         let repository = git_origin_fingerprint(checkout);
         probes.push(GateStorageProbe {
@@ -3599,7 +3641,7 @@ fn gate_storage_admission_refusal(
     gate: &Gate,
     storage: GateStorageLocations,
 ) -> Option<String> {
-    if gate.managed_cache.is_some() && storage.cache_dir().is_none() {
+    if gate.managed_cache.is_some() && storage.gate_cache_dir().is_none() {
         return Some(
             "the broker's captured host cache directory is unavailable for this managed cache"
                 .into(),

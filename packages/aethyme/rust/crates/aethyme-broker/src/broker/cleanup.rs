@@ -4045,7 +4045,7 @@ impl Broker {
             })
             .unwrap_or_default();
         let gate_storage = self.storage_context().gate_storage_locations();
-        if uses_managed_cache && let Some(cache) = gate_storage.cache_dir() {
+        if uses_managed_cache && let Some(cache) = gate_storage.gate_cache_dir() {
             probes.insert(cache);
         }
         if uses_host_resource_db && let Ok(database) = gate_storage.resource_db_path() {

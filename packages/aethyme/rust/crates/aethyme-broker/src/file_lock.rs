@@ -456,6 +456,42 @@ pub(crate) fn try_acquire_repository_lifecycle_lock(
     Ok(Some(lock))
 }
 
+/// A host-wide storage maintenance claim of one repository's lifecycle
+/// lock (the storage worker moving that repository's recovery archives):
+/// try once, never queue and never promote, and step aside while anyone
+/// waits for the lock. `None` means busy. Unlike
+/// [`try_acquire_repository_lifecycle_lock`] it keeps no yield streak: the
+/// storage worker simply tries the archive again on a later pass.
+#[track_caller]
+pub(crate) fn try_acquire_repository_lifecycle_lock_for_storage(
+    main_root: &Path,
+) -> io::Result<Option<ExclusiveFileLock>> {
+    if nonblocking_claims_declined() {
+        return Ok(None);
+    }
+    let path = repository_lifecycle_lock_path(main_root)?;
+    if let Some(directory) = existing_lifecycle_waiters_directory(main_root)
+        && scan_lifecycle_queue(&directory, None, None).live > 0
+    {
+        return Ok(None);
+    }
+    let file = open_lock_file_nofollow(&path)?;
+    let Some(mut lock) = ExclusiveFileLock::try_acquire(file)? else {
+        return Ok(None);
+    };
+    if repository_lifecycle_lock_path(main_root)? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker lifecycle lock path changed while it was acquired",
+        ));
+    }
+    verify_named_lock_file(&path, &lock.file)?;
+    record_lifecycle_holder(&lock, LifecycleClaimKind::Nonblocking);
+    lock.lifecycle_held_since = Some((Instant::now(), LifecycleClaimKind::Nonblocking));
+    lock.lifecycle_holder = Some(("storage_placement", std::panic::Location::caller()));
+    Ok(Some(lock))
+}
+
 /// A background lane's run of consecutive yields, as persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundYields {
