@@ -5688,3 +5688,356 @@ mod session_baseline_tests {
         assert_eq!(resolved.integration, None);
     }
 }
+
+#[cfg(test)]
+mod sync_merge_replay_tests {
+    //! Session branches that merge the default branch into themselves ("sync
+    //! merges") must replay to the tree a merge of the pull request would
+    //! produce, and report a conflict only when that merge conflicts.
+    use super::*;
+    use std::path::PathBuf;
+
+    const NINE_LINES: &str = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+
+    fn command(root: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", root.join("missing-system-gitconfig"))
+            .env("GIT_CONFIG_GLOBAL", root.join("missing-global-gitconfig"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_AUTHOR_NAME", "Replay Test")
+            .env("GIT_AUTHOR_EMAIL", "replay@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Replay Test")
+            .env("GIT_COMMITTER_EMAIL", "replay@example.invalid")
+            .output()
+            .unwrap()
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = command(root, args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        broker: Broker,
+        root: PathBuf,
+        work: PathBuf,
+        session: crate::types::Session,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_path_buf();
+            git(&root, &["init", "-q", "-b", "main"]);
+            std::fs::write(root.join("f.txt"), NINE_LINES).unwrap();
+            std::fs::write(root.join("g.txt"), "g\n").unwrap();
+            std::fs::write(root.join("h.txt"), "h\n").unwrap();
+            git(&root, &["add", "f.txt", "g.txt", "h.txt"]);
+            git(&root, &["commit", "-qm", "base"]);
+            let mut broker = Broker::open(&root).unwrap();
+            let work = root.join(".aethyme/worktrees/work");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "agent/work",
+                    work.to_str().unwrap(),
+                ],
+            );
+            let session = broker.adopt(&work, None).unwrap();
+            Self {
+                _tmp: tmp,
+                broker,
+                root,
+                work,
+                session,
+            }
+        }
+
+        /// Commit `content` as `file` on the default branch.
+        fn integrate(&self, file: &str, content: &str) {
+            commit_file(&self.root, file, content);
+        }
+
+        /// Commit `content` as `file` on the session branch.
+        fn session_commit(&self, file: &str, content: &str) {
+            commit_file(&self.work, file, content);
+        }
+
+        /// Merge the default branch into the session branch.
+        fn sync(&self) {
+            git(&self.work, &["merge", "-q", "--no-ff", "--no-edit", "main"]);
+        }
+
+        /// Merge the default branch into the session branch, resolving its
+        /// conflict in `file` to `resolution`.
+        fn sync_resolving(&self, file: &str, resolution: &str) {
+            let output = command(&self.work, &["merge", "-q", "--no-ff", "--no-edit", "main"]);
+            assert!(!output.status.success(), "the sync merge did not conflict");
+            std::fs::write(self.work.join(file), resolution).unwrap();
+            git(&self.work, &["add", file]);
+            git(&self.work, &["commit", "-q", "--no-edit"]);
+        }
+
+        fn integration_head(&self) -> String {
+            git(&self.root, &["rev-parse", "main"])
+        }
+
+        fn session_head(&self) -> String {
+            git(&self.work, &["rev-parse", "HEAD"])
+        }
+
+        fn plan(&self) -> SubmissionPlan {
+            let plan = self
+                .broker
+                .build_submission_plan(
+                    &self.session,
+                    &self.session_head(),
+                    &self.integration_head(),
+                )
+                .unwrap();
+            assert!(plan.safe, "{:?}", plan.warnings);
+            assert!(
+                !self.broker.can_preserve_owned_merge_history(&plan).unwrap(),
+                "the fixture must exercise the replay, not history preservation"
+            );
+            plan
+        }
+
+        /// The tree a merge of the pull request (the session head into the
+        /// integration head) produces, or `None` when that merge conflicts.
+        fn pull_request_merge_tree(&self) -> Option<String> {
+            let output = command(
+                &self.root,
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    &self.integration_head(),
+                    &self.session_head(),
+                ],
+            );
+            match output.status.code() {
+                Some(0) => Some(
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                ),
+                Some(1) => None,
+                _ => panic!(
+                    "git merge-tree failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            }
+        }
+
+        fn file_in(&self, tree: &str, file: &str) -> String {
+            git(&self.root, &["show", &format!("{tree}:{file}")])
+        }
+
+        /// Replay the plan, assert it is clean and lands exactly what a merge
+        /// of the pull request would, and return the replayed tree.
+        fn assert_replays_like_the_pull_request_merge(&self) -> String {
+            let expected = self
+                .pull_request_merge_tree()
+                .expect("the fixture's pull request merge must be clean");
+            let replay = self.broker.replay_submission_plan(&self.plan()).unwrap();
+            assert_eq!(
+                replay.conflicts,
+                Vec::<String>::new(),
+                "a branch that merges cleanly reported replay conflicts"
+            );
+            assert!(replay.conflict_details.is_empty());
+            assert_eq!(replay.history_parent, None);
+            assert_eq!(
+                replay.tree, expected,
+                "the verified tree differs from what merging the pull request lands"
+            );
+            replay.tree
+        }
+    }
+
+    fn commit_file(dir: &Path, file: &str, content: &str) {
+        std::fs::write(dir.join(file), content).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-qm", file]);
+    }
+
+    fn with_line(line: usize, text: &str) -> String {
+        replace_lines(&[(line, text)])
+    }
+
+    fn replace_lines(edits: &[(usize, &str)]) -> String {
+        NINE_LINES
+            .lines()
+            .enumerate()
+            .map(|(index, original)| {
+                edits
+                    .iter()
+                    .find(|(line, _)| *line == index + 1)
+                    .map_or(original, |(_, text)| *text)
+                    .to_string()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn integration_edits_after_a_sync_merge_do_not_conflict_with_its_replay() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-session\n");
+        // A sync usually brings several integration commits, so the merge's
+        // first-parent patch matches none of them.
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        // The default branch then edits the lines the sync brought in again.
+        fixture.integrate("f.txt", &with_line(2, "2-p2"));
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let tree = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            fixture.assert_replays_like_the_pull_request_merge()
+        };
+        assert_eq!(fixture.file_in(&tree, "f.txt"), with_line(2, "2-p2").trim());
+        assert_eq!(fixture.file_in(&tree, "g.txt"), "g-session");
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("submission_replay_sync_merge_three_way"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn integration_reverting_synced_content_is_not_reintroduced_by_the_replay() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-session\n");
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        // The default branch reverts the synced edit; the session never
+        // touched f.txt, so the reverted content must stay reverted.
+        fixture.integrate("f.txt", NINE_LINES);
+
+        let tree = fixture.assert_replays_like_the_pull_request_merge();
+        assert_eq!(fixture.file_in(&tree, "f.txt"), NINE_LINES.trim());
+    }
+
+    #[test]
+    fn a_sync_merge_resolution_is_kept_when_integration_moves_on() {
+        let fixture = Fixture::new();
+        fixture.session_commit("f.txt", &with_line(2, "2-session"));
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync_resolving("f.txt", &with_line(2, "2-resolved"));
+        fixture.integrate("f.txt", &replace_lines(&[(2, "2-p1"), (8, "8-p2")]));
+
+        let tree = fixture.assert_replays_like_the_pull_request_merge();
+        assert_eq!(
+            fixture.file_in(&tree, "f.txt"),
+            replace_lines(&[(2, "2-resolved"), (8, "8-p2")]).trim()
+        );
+    }
+
+    #[test]
+    fn consecutive_sync_merges_and_later_work_replay_like_the_pull_request_merge() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-session\n");
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        fixture.session_commit("new.txt", "new\n");
+        fixture.integrate("f.txt", &with_line(2, "2-p2"));
+        fixture.integrate("h.txt", "h-p2\n");
+        fixture.sync();
+        fixture.session_commit("g.txt", "g-session-again\n");
+        fixture.integrate("f.txt", &with_line(2, "2-p3"));
+
+        let tree = fixture.assert_replays_like_the_pull_request_merge();
+        assert_eq!(fixture.file_in(&tree, "f.txt"), with_line(2, "2-p3").trim());
+        assert_eq!(fixture.file_in(&tree, "g.txt"), "g-session-again");
+        assert_eq!(fixture.file_in(&tree, "new.txt"), "new");
+    }
+
+    #[test]
+    fn a_session_edit_the_integration_later_changes_is_still_a_conflict() {
+        let fixture = Fixture::new();
+        fixture.session_commit("f.txt", &with_line(8, "8-session"));
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        fixture.integrate("f.txt", &replace_lines(&[(2, "2-p1"), (8, "8-p2")]));
+
+        assert_eq!(fixture.pull_request_merge_tree(), None);
+        let replay = fixture
+            .broker
+            .replay_submission_plan(&fixture.plan())
+            .unwrap();
+        assert_eq!(replay.conflicts, vec!["f.txt".to_string()]);
+        assert_eq!(replay.conflict_details.len(), 1);
+        assert_eq!(replay.conflict_details[0].path, "f.txt");
+    }
+
+    #[test]
+    fn a_session_side_with_inherited_work_keeps_the_first_parent_replay() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-inherited\n");
+        fixture.session_commit("new.txt", "owned\n");
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        fixture.integrate("i.txt", "i\n");
+
+        let mut plan = fixture.plan();
+        let inherited = git(&fixture.work, &["rev-parse", "HEAD~2"]);
+        let entry = plan
+            .commits
+            .iter_mut()
+            .find(|commit| commit.commit == inherited)
+            .unwrap();
+        entry.ownership = SubmissionCommitOwnership::InheritedFromRecordedBaseline;
+
+        let replay = fixture.broker.replay_submission_plan(&plan).unwrap();
+        assert!(replay.conflicts.is_empty(), "{:?}", replay.conflicts);
+        assert_eq!(
+            fixture.file_in(&replay.tree, "g.txt"),
+            "g",
+            "work the session does not own was imported by the sync merge replay"
+        );
+        assert_eq!(fixture.file_in(&replay.tree, "new.txt"), "owned");
+        assert_eq!(fixture.file_in(&replay.tree, "h.txt"), "h-p1");
+        assert_eq!(fixture.file_in(&replay.tree, "i.txt"), "i");
+        assert_eq!(
+            fixture.file_in(&replay.tree, "f.txt"),
+            with_line(2, "2-p1").trim()
+        );
+    }
+}
