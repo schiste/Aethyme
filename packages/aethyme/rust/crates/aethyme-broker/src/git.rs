@@ -371,6 +371,26 @@ pub(crate) struct PairedCherryMarks {
     pub(crate) right_only: Vec<(String, bool)>,
 }
 
+/// A directory Git is certain to find no checkout in, and why
+/// (see [`GitRepo::checkout_discovery_certainly_fails`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckoutDiscoveryFailure {
+    /// No `.git` or `HEAD` in the directory or any ancestor.
+    NoGitEntry,
+    /// A `.git` file naming a Git directory that does not exist.
+    DanglingPointer,
+}
+
+impl CheckoutDiscoveryFailure {
+    /// The counter recorded each time this answer saves a Git probe.
+    pub(crate) fn counter(self) -> &'static str {
+        match self {
+            Self::NoGitEntry => "worktree_common_dir_no_git_entry",
+            Self::DanglingPointer => "worktree_common_dir_dangling_pointer",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("failed to run git {args}: {source}")]
@@ -4520,6 +4540,106 @@ impl GitRepo {
             .canonicalize()
             .ok()?;
         (common.join("HEAD").is_file() && common.join("objects").is_dir()).then_some(common)
+    }
+
+    /// Why `git rev-parse` run in `path` is certain to find no checkout,
+    /// decided from the filesystem alone; `None` leaves the question to Git.
+    ///
+    /// Git's discovery looks at `<dir>/.git` (a directory, or a file naming
+    /// one) and then at `<dir>` itself as a bare repository, which needs a
+    /// `<dir>/HEAD`, for `path` and then each parent in turn, and stops at
+    /// the first `.git` it can use. Two shapes cannot succeed:
+    ///
+    /// - [`CheckoutDiscoveryFailure::NoGitEntry`]: neither `.git` nor `HEAD`
+    ///   exists in `path` or in any ancestor, so every level is passed over.
+    ///   A directory inside a checkout always has its checkout's `.git` in an
+    ///   ancestor and is never answered here.
+    /// - [`CheckoutDiscoveryFailure::DanglingPointer`]: `path/.git` is a
+    ///   regular file of the exact `gitdir: <path>` form whose named directory
+    ///   does not exist. Git refuses an unusable `.git` file outright rather
+    ///   than walking on to the parent.
+    ///
+    /// Everything else goes to Git: any entry that exists or cannot be read,
+    /// a pointer in any other form, symlinked entries, an environment that
+    /// names a Git directory, an expired Git deadline (Git reports that as a
+    /// timeout, which callers must keep seeing) and non-Unix platforms.
+    pub(crate) fn checkout_discovery_certainly_fails(
+        path: &Path,
+    ) -> Option<CheckoutDiscoveryFailure> {
+        fn absent(path: &Path) -> bool {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+        if !cfg!(unix)
+            || !repository_identity_cache::environment_allows_memory()
+            || active_git_deadline().is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return None;
+        }
+        // Git runs with the physical directory as its working directory, so
+        // the ancestors it walks are the canonical path's.
+        let path = path.canonicalize().ok()?;
+        if !std::fs::metadata(&path).ok()?.is_dir() {
+            return None;
+        }
+        match std::fs::symlink_metadata(path.join(".git")) {
+            Ok(metadata) => {
+                return (metadata.is_file() && Self::git_file_names_missing_directory(&path))
+                    .then_some(CheckoutDiscoveryFailure::DanglingPointer);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        if !absent(&path.join("HEAD")) {
+            return None;
+        }
+        for ancestor in path.ancestors().skip(1) {
+            if !absent(&ancestor.join(".git")) || !absent(&ancestor.join("HEAD")) {
+                return None;
+            }
+        }
+        Some(CheckoutDiscoveryFailure::NoGitEntry)
+    }
+
+    /// Whether `<path>/.git` reads exactly as Git parses a `.git` file --
+    /// `gitdir: ` then one path, with only line endings after it -- and the
+    /// directory it names (relative to `path` when relative) does not exist.
+    /// Anything Git might read differently answers `false`.
+    fn git_file_names_missing_directory(path: &Path) -> bool {
+        const POINTER_LIMIT: u64 = 4096;
+        let Ok(file) = std::fs::File::open(path.join(".git")) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(POINTER_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > POINTER_LIMIT
+        {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let Some(target) = text.trim_end_matches(['\n', '\r']).strip_prefix("gitdir: ") else {
+            return false;
+        };
+        if target.is_empty() || target.trim() != target || target.contains(['\n', '\r', '\0']) {
+            return false;
+        }
+        let target = Path::new(target);
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            path.join(target)
+        };
+        matches!(
+            std::fs::symlink_metadata(&target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     fn absolute_common_dir(path: &Path, common: &str) -> PathBuf {
@@ -12721,6 +12841,156 @@ mod worktree_common_dir_tests {
             matches!(result, Err(GitError::TimedOut { ref args, .. })
                 if args == "rev-parse --is-inside-work-tree --git-common-dir"),
             "an unavailable ownership inspection must remain unavailable: {result:?}",
+        );
+    }
+
+    /// Every directory the filesystem answer claims is checked against Git
+    /// itself, and the shapes it must leave to Git are shown to be left.
+    #[cfg(unix)]
+    #[test]
+    fn a_certain_discovery_failure_is_one_git_also_reports() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        if GitRepo::discover(&root).is_ok() {
+            // The temporary directory sits inside some checkout, so nothing
+            // under it is outside every repository.
+            return;
+        }
+        let main = root.join("main");
+        let pool = root.join("pool");
+        let linked = pool.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&pool).unwrap();
+        run_git(&main, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = GitRepo::discover(&main).unwrap().git_common_dir().unwrap();
+
+        // A retired or stripped checkout: a pool directory with no `.git`.
+        let stripped = pool.join("stripped");
+        std::fs::create_dir(&stripped).unwrap();
+        std::fs::write(stripped.join("left-behind.txt"), "kept\n").unwrap();
+        // Pointers whose Git directory was removed, absolute and relative.
+        let dangling = pool.join("dangling");
+        std::fs::create_dir(&dangling).unwrap();
+        std::fs::write(
+            dangling.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                expected.join("worktrees/dangling").display()
+            ),
+        )
+        .unwrap();
+        let dangling_relative = pool.join("dangling-relative");
+        std::fs::create_dir(&dangling_relative).unwrap();
+        std::fs::write(
+            dangling_relative.join(".git"),
+            "gitdir: ../missing/.git/worktrees/dangling-relative\n",
+        )
+        .unwrap();
+
+        let certain = [
+            (&stripped, CheckoutDiscoveryFailure::NoGitEntry),
+            (&dangling, CheckoutDiscoveryFailure::DanglingPointer),
+            (
+                &dangling_relative,
+                CheckoutDiscoveryFailure::DanglingPointer,
+            ),
+        ];
+        for (path, failure) in certain {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                Some(failure),
+                "{}",
+                path.display()
+            );
+            assert!(
+                GitRepo::worktree_common_dir(path).is_err(),
+                "Git must agree that {} holds no checkout",
+                path.display()
+            );
+        }
+
+        // A checkout, and directories inside one, are Git's to answer: the
+        // nested ones have no `.git` of their own but are inside a checkout.
+        let main_nested = main.join("nested");
+        let linked_nested = linked.join("nested");
+        let legacy_pool_child = main.join(".aethyme/worktrees/stripped");
+        std::fs::create_dir_all(&main_nested).unwrap();
+        std::fs::create_dir_all(&linked_nested).unwrap();
+        std::fs::create_dir_all(&legacy_pool_child).unwrap();
+        for path in [
+            &main,
+            &main_nested,
+            &linked,
+            &linked_nested,
+            &legacy_pool_child,
+        ] {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                None,
+                "{}",
+                path.display()
+            );
+            assert_eq!(GitRepo::worktree_common_dir(path).unwrap(), expected);
+        }
+
+        // Shapes Git might read otherwise are left to it as well.
+        let bare = root.join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        run_git(&bare, &["init", "--bare", "-q"]).unwrap();
+        let padded = pool.join("padded");
+        std::fs::create_dir(&padded).unwrap();
+        std::fs::write(padded.join(".git"), "gitdir:  /missing/worktrees/padded\n").unwrap();
+        let unprefixed = pool.join("unprefixed");
+        std::fs::create_dir(&unprefixed).unwrap();
+        std::fs::write(unprefixed.join(".git"), "/missing/worktrees/unprefixed\n").unwrap();
+        let symlinked = pool.join("symlinked");
+        std::fs::create_dir(&symlinked).unwrap();
+        std::os::unix::fs::symlink(dangling.join(".git"), symlinked.join(".git")).unwrap();
+        for path in [&bare, &padded, &unprefixed, &symlinked] {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                None,
+                "{}",
+                path.display()
+            );
+        }
+
+        // An expired deadline must still reach Git and read as a timeout.
+        assert_eq!(
+            with_git_deadline(Duration::ZERO, || {
+                GitRepo::checkout_discovery_certainly_fails(&stripped)
+            }),
+            None
         );
     }
 }

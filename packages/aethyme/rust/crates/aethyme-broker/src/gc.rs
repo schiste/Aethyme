@@ -6394,14 +6394,21 @@ impl Broker {
         let evaluated_at = now_ms();
         let age_anchor_ms = utc_day_floor_ms(evaluated_at);
         let main_root = self.main_root().to_path_buf();
+        // Each step below has its own span: `broker status` spent most of its
+        // `retention` phase in this plan with only part of it attributed.
+        let step = crate::phase_telemetry::span("gc_plan_retention_policy");
         let retention_config = load_retention_policy_report(&main_root)?;
+        drop(step);
         let policy = retention_config.policy;
         let retention_config_warnings = retention_config.warnings;
         let exposure_cutoff = cutoff(age_anchor_ms, policy.publication_exposure_days);
+        let step = crate::phase_telemetry::span("gc_plan_cleanup_inventory");
         let (cleanup, cleanup_size_records_complete) = match deadline {
             Some(deadline) => self.cleanup_plan_scanned_until(scan, deadline)?,
             None => (self.cleanup_plan_scanned(scan)?, true),
         };
+        drop(step);
+        let step = crate::phase_telemetry::span("gc_plan_store_reads");
         let mut deferred_checks = Vec::new();
         if !cleanup_size_records_complete {
             deferred_checks.push("cleanup_size_records".into());
@@ -6465,6 +6472,7 @@ impl Broker {
         } else {
             self.store().gc_unresolved_operations()?
         };
+        drop(step);
         let publication_exposure_expiries = exposures
             .iter()
             .filter(|exposure| exposure.created_at < exposure_cutoff)
@@ -6535,6 +6543,7 @@ impl Broker {
             });
         }
 
+        let step = crate::phase_telemetry::span("gc_plan_gate_logs");
         let gate_root = main_root.join(".aethyme/logs/gates");
         let mut files = BTreeMap::<String, GcFileCandidate>::new();
         let mut retained_rows = Vec::with_capacity(rows.len());
@@ -6636,7 +6645,9 @@ impl Broker {
         if gate_log_inventory_deferred {
             deferred_checks.push("gate_log_inventory".into());
         }
+        drop(step);
 
+        let step = crate::phase_telemetry::span("gc_plan_command_metrics");
         match metrics_rewrite(
             &main_root,
             cutoff(age_anchor_ms, policy.command_metrics_days),
@@ -6649,7 +6660,9 @@ impl Broker {
             MetricsRewrite::Complete(None) => {}
             MetricsRewrite::Deferred => deferred_checks.push("command_metrics".into()),
         }
+        drop(step);
 
+        let step = crate::phase_telemetry::span("gc_plan_worktree_blockers");
         let worktree_cutoff = cutoff(age_anchor_ms, policy.closed_worktrees_days);
         let live_worktrees = live_sessions
             .iter()
@@ -6767,7 +6780,9 @@ impl Broker {
                 ),
             });
         }
+        drop(step);
 
+        let step = crate::phase_telemetry::span("gc_plan_artifact_candidates");
         let removed_sessions = worktrees
             .iter()
             .map(|worktree| worktree.session_id)
@@ -6805,6 +6820,8 @@ impl Broker {
         if artifact_worktrees_not_scanned > 0 {
             deferred_checks.push("artifact_scan".into());
         }
+        drop(step);
+        let step = crate::phase_telemetry::span("gc_plan_orphan_roots");
         let (mut orphans, orphans_complete) = if exclude_orphans {
             blockers.push(GcBlocker {
                 kind: "orphans_excluded".into(),
@@ -6819,11 +6836,15 @@ impl Broker {
         if !orphans_complete {
             deferred_checks.push("orphan_scan".into());
         }
+        drop(step);
+        let step = crate::phase_telemetry::span("gc_plan_recovery_archives");
         let (recovery_archives, recovery_archive_inventory, archives_complete) =
             self.recovery_archive_candidates(age_anchor_ms, &policy, scan, deadline)?;
         if !archives_complete {
             deferred_checks.push("recovery_archives".into());
         }
+        drop(step);
+        let step = crate::phase_telemetry::span("gc_plan_gate_cache");
         // Rooted at the per-user cache directory, not at any worktree: that
         // is why no total here ever counted it (#295).
         let (mut size_records, size_records_complete) = match deadline {
@@ -6902,9 +6923,11 @@ impl Broker {
                 }
             }
         };
+        drop(step);
         // The host environment build cache, this repository's part (#1275).
         // Inventory has fixed entry and time caps; an expired pass defers it
         // like the gate cache.
+        let step = crate::phase_telemetry::span("gc_plan_environment_cache");
         let (environment_cache, environment_caches) = if deadline_expired(deadline) {
             deferred_checks.push("environment_cache_inventory".into());
             (None, Vec::new())
@@ -6924,6 +6947,7 @@ impl Broker {
         {
             deferred_checks.push("environment_cache_inventory".into());
         }
+        drop(step);
         if scan.measures() && size_records_complete {
             crate::warn_unrecorded(
                 "record gate cache sizes",
@@ -7217,8 +7241,10 @@ impl Broker {
                 .then_with(|| left.worktree_root.cmp(&right.worktree_root))
         });
 
+        let step = crate::phase_telemetry::span("gc_plan_worktree_reconciliation");
         let reconciliation =
             self.reconcile_worktree_directories_until(scan.measures(), deadline)?;
+        drop(step);
         if !reconciliation.complete {
             deferred_checks.push("unclaimed_worktrees".into());
         }
@@ -7302,8 +7328,10 @@ impl Broker {
         };
         // Reporting only and outside the digest: what the last unattended
         // pass removed and why it kept the rest (#588).
+        let step = crate::phase_telemetry::span("gc_plan_cleanup_reports");
         plan.auto_cleanup = self.last_auto_cleanup_report();
         plan.checkout_retirement_keeps = self.checkout_retirement_keep_report();
+        drop(step);
         if scan.measures() && plan.deferred_checks.is_empty() {
             plan.finish_digest()?;
         }
@@ -7388,6 +7416,7 @@ impl Broker {
             plan.deferred_checks.push("gc_journal".into());
             None
         } else {
+            let _span = crate::phase_telemetry::span("gc_health_journal");
             load_journal(&self.main_root().join(".aethyme/gc-journal.json"))?
         };
         plan.deferred_checks.sort();
@@ -24599,6 +24628,102 @@ mod tests {
                 .any(|item| { item["reason"] == "live_session" && item["path"].is_string() })
         );
         assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+    }
+
+    /// Pool directories Git cannot find a checkout in get Git's verdict
+    /// without a Git probe; the live checkout and paths inside it do not
+    /// change.
+    #[cfg(unix)]
+    #[test]
+    fn pool_directories_git_cannot_read_are_judged_without_a_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let session = broker.start_worktree("ownership fixture", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path)
+            .canonicalize()
+            .unwrap();
+        let pool = worktree.parent().unwrap().to_path_buf();
+        if GitRepo::discover(&pool).is_ok() {
+            // The fixture pool sits inside some checkout; nothing under it
+            // is outside every repository.
+            return;
+        }
+        let common = GitRepo::discover(root).unwrap().git_common_dir().unwrap();
+        let stripped = pool.join("stripped-checkout");
+        std::fs::create_dir(&stripped).unwrap();
+        std::fs::write(stripped.join("left-behind.txt"), "kept\n").unwrap();
+        let ours = pool.join("dangling-ours");
+        std::fs::create_dir(&ours).unwrap();
+        std::fs::write(
+            ours.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                common.join("worktrees/dangling-ours").display()
+            ),
+        )
+        .unwrap();
+        let theirs = pool.join("dangling-theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(
+            theirs.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                pool.join("elsewhere/.git/worktrees/dangling-theirs")
+                    .display()
+            ),
+        )
+        .unwrap();
+        // Git's own answer for each is an error, which the ownership check
+        // turns into the verdicts asserted below.
+        for path in [&stripped, &ours, &theirs] {
+            assert!(GitRepo::worktree_common_dir(path).is_err());
+        }
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let count = |name: &str| recorder.totals().1.get(name).copied().unwrap_or(0);
+        assert!(matches!(
+            broker.is_broker_owned_worktree_checked(&session, &stripped),
+            Err(crate::GitError::NotARepository { .. })
+        ));
+        assert!(!broker.is_broker_owned_worktree(&session, &stripped));
+        assert!(
+            broker
+                .is_broker_owned_worktree_checked(&session, &ours)
+                .unwrap(),
+            "an orphan of this repository is still recognised from its pointer"
+        );
+        assert!(
+            broker
+                .is_broker_owned_worktree_checked(&session, &theirs)
+                .is_err()
+        );
+        assert_eq!(count("worktree_common_dir_probe"), 0, "no Git was needed");
+        assert_eq!(count("worktree_common_dir_no_git_entry"), 2);
+        assert_eq!(count("worktree_common_dir_dangling_pointer"), 2);
+
+        // The live checkout is still answered by its registration or Git,
+        // and a directory inside it is never taken for a pool entry.
+        assert!(
+            broker
+                .is_broker_owned_worktree_checked(&session, &worktree)
+                .unwrap()
+        );
+        let nested = worktree.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(
+            !broker
+                .is_broker_owned_worktree_checked(&session, &nested)
+                .unwrap()
+        );
+        assert_eq!(count("worktree_common_dir_no_git_entry"), 2);
+        assert_eq!(count("worktree_common_dir_dangling_pointer"), 2);
     }
 
     #[test]
