@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.183] - 2026-11-26
+
+### Changed
+
+- The background checkout retirement worker now keeps `.aethyme/logs/command-metrics.jsonl` within `command_metrics_days` (default 30) on its own. Before, only a reviewed `gc plan` / `gc apply` trimmed it, and on the busiest repository it had grown to about 500 MB and 622,000 rows going back three months. The trim runs at most once a day (30 minutes after a run that did not finish) and within the worker run's deadline. It filters old rows before taking the append lock and holds the lock only for rows appended meanwhile, with the same row rule and replace-and-verify safeguards as the reviewed trim, so no row inside retention, malformed line or half-written last line is lost (#2033).
+- Checkout retirement no longer keeps a clean closed checkout because of an ignored directory that holds no files. The plan archived such a directory as zero files and found nothing to preserve, but the re-check before the move refused it as unknown ignored content, so the checkout was kept as "changed" on every run. The re-check now releases it only when a walk under the lifecycle claim, bounded by one shared entry budget and the re-check's deadline and never following a link, finds nothing but directories; any file, link, special node or unreadable entry still keeps the checkout. On the busiest repository 983 of 1,511 retirement judgements in a day were kept as "changed" (#2034).
+- A checkout kept because a stash was made on its branch is remembered with the keep back-off and forgotten as soon as the stash is gone (#2034).
+
+### Added
+
+- Keep codes `changed_session`, `changed_head`, `changed_policy_unavailable`, `changed_uncommitted`, `changed_operation`, `changed_stash`, `changed_ignored`, `changed_unclean_other`, `changed_unclean_unknown` and `changed_after_archive`, each counted as `checkout_retirement_kept_<code>`, replacing the single `changed`; counter `proof_empty_ignored_directory_released`; spans `checkout_retirement_phase_recheck` and `proof_empty_ignored_directory_walk` (#2034).
+- Spans `command_metrics_trim`, `_stage` and `_publish`, attachment `command_metrics_trim` (outcome, rows expired, kept and removed, bytes before and after, elapsed) and its outcome counters (#2033).
+
+### Build and release
+
+- A new dispatch-only workflow, `release-prepare.yml`, renders a release's generated agent-instruction files on GitHub (Linux, read-only token, warm shared Rust cache) and uploads them as a patch of exactly five files. Release preparation no longer compiles the CLI on the maintainer's machine or waits for free memory there; on 2026-11-26 that local build held a release for hours on an overloaded host. The output is identical to a macOS render: it depends only on tracked files and the compiled-in version (#2035).
+
+### Upgrade notes
+
+- `checkout_retirement_kept_changed` is no longer written; read the per-cause codes above (#2034).
+- The unattended metrics trim does not run where the filesystem has no inode numbers (Windows); the reviewed `gc apply` still trims there (#2033).
+
 ## [0.8.182] - 2026-11-26
 
 ### Added
