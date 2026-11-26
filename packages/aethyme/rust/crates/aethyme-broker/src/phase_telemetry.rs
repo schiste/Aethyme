@@ -16,18 +16,59 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Totals {
     micros: u64,
     count: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Accumulated {
     totals: BTreeMap<&'static str, Totals>,
     attachments: BTreeMap<&'static str, serde_json::Value>,
     intervals: Vec<(Instant, Instant, bool)>,
     distinct: BTreeMap<&'static str, BTreeSet<i64>>,
+    /// Spans opened and not yet dropped, by opening order: what an
+    /// interrupted command was doing, and since when.
+    open: BTreeMap<u64, (&'static str, Instant)>,
+    next_open: u64,
+}
+
+impl Accumulated {
+    fn add(&mut self, name: &'static str, start: Instant, end: Instant) {
+        let entry = self.totals.entry(name).or_default();
+        entry.micros = entry
+            .micros
+            .saturating_add(end.saturating_duration_since(start).as_micros() as u64);
+        entry.count += 1;
+        if matches!(
+            name,
+            "subprocess_git" | "subprocess_other" | "review_on_push_child_wait"
+        ) {
+            self.intervals.push((start, end, true));
+        } else if matches!(
+            name,
+            "lifecycle_lock_wait"
+                | "lifecycle_lock_promoted_wait"
+                | "process_spawn_lock_wait"
+                | "repository_write_lock_wait"
+                | "install_slot_wait"
+                | "shared_cache_wait_exhausted"
+                | "shared_cache_waited_for_fill"
+                | "operation_outcome_record_wait"
+                | "gate_verdict_wait"
+        ) {
+            self.intervals.push((start, end, false));
+        }
+    }
+}
+
+/// A span still open when a command was interrupted.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenSpan {
+    pub(crate) name: &'static str,
+    pub(crate) elapsed: Duration,
 }
 
 /// One command's accumulated spans, shared with its worker threads.
@@ -61,19 +102,45 @@ pub(crate) fn active() -> Option<Recorder> {
 pub(crate) struct Span {
     name: &'static str,
     started: Instant,
+    /// Where this span is registered as open, so an interrupted command can
+    /// say which spans it was inside.
+    open: Option<(Recorder, u64)>,
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        record(self.name, self.started, Instant::now());
+        let ended = Instant::now();
+        // Registered as open: close it and add its time under one lock, in
+        // the recorder it was opened in.
+        if let Some((recorder, id)) = self.open.take() {
+            if let Ok(mut accumulated) = recorder.0.lock() {
+                accumulated.open.remove(&id);
+                accumulated.add(self.name, self.started, ended);
+            }
+            return;
+        }
+        record(self.name, self.started, ended);
     }
 }
 
 /// Time the enclosing scope as `name`. Free when no command is recording.
 pub(crate) fn span(name: &'static str) -> Span {
+    let started = Instant::now();
+    let open = ACTIVE.with(|active| {
+        let recorder = active.borrow().clone()?;
+        let id = {
+            let mut accumulated = recorder.0.lock().ok()?;
+            let id = accumulated.next_open;
+            accumulated.next_open += 1;
+            accumulated.open.insert(id, (name, started));
+            id
+        };
+        Some((recorder, id))
+    });
     Span {
         name,
-        started: Instant::now(),
+        started,
+        open,
     }
 }
 
@@ -88,30 +155,7 @@ fn record(name: &'static str, start: Instant, end: Instant) {
         if let Some(recorder) = active.borrow().as_ref()
             && let Ok(mut accumulated) = recorder.0.lock()
         {
-            let entry = accumulated.totals.entry(name).or_default();
-            entry.micros = entry
-                .micros
-                .saturating_add((end - start).as_micros() as u64);
-            entry.count += 1;
-            if matches!(
-                name,
-                "subprocess_git" | "subprocess_other" | "review_on_push_child_wait"
-            ) {
-                accumulated.intervals.push((start, end, true));
-            } else if matches!(
-                name,
-                "lifecycle_lock_wait"
-                    | "lifecycle_lock_promoted_wait"
-                    | "process_spawn_lock_wait"
-                    | "repository_write_lock_wait"
-                    | "install_slot_wait"
-                    | "shared_cache_wait_exhausted"
-                    | "shared_cache_waited_for_fill"
-                    | "operation_outcome_record_wait"
-                    | "gate_verdict_wait"
-            ) {
-                accumulated.intervals.push((start, end, false));
-            }
+            accumulated.add(name, start, end);
         }
     });
 }
@@ -229,6 +273,65 @@ pub(crate) fn subprocess_span(command: &std::process::Command) -> Span {
 }
 
 impl Recorder {
+    /// A copy of what accumulated, with every still-open span closed at
+    /// `now`, and those open spans from outermost (opened first) to innermost.
+    /// For a command interrupted mid-span: its row then carries the time
+    /// spent in the span it never left. Waits at most `wait` for the lock,
+    /// polling, because the interrupted thread may hold it; `None` when it
+    /// stays busy. A poisoned lock still yields its data.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn snapshot_closing_open_spans(
+        &self,
+        now: Instant,
+        wait: Duration,
+    ) -> Option<(Recorder, Vec<OpenSpan>)> {
+        let deadline = Instant::now() + wait;
+        let mut copy = loop {
+            match self.0.try_lock() {
+                Ok(accumulated) => break accumulated.clone(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    break poisoned.into_inner().clone();
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            }
+        };
+        let mut open: Vec<(u64, &'static str, Instant)> = std::mem::take(&mut copy.open)
+            .into_iter()
+            .map(|(id, (name, started))| (id, name, started))
+            .collect();
+        open.sort_by_key(|&(id, _, started)| (started, id));
+        let open = open
+            .into_iter()
+            .map(|(_, name, started)| {
+                copy.add(name, started, now);
+                OpenSpan {
+                    name,
+                    elapsed: now.saturating_duration_since(started),
+                }
+            })
+            .collect();
+        Some((Recorder(Arc::new(Mutex::new(copy))), open))
+    }
+
+    /// The spans open right now, outermost first, without closing them.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn open_spans(&self, now: Instant) -> Vec<OpenSpan> {
+        let Ok(accumulated) = self.0.try_lock() else {
+            return Vec::new();
+        };
+        let mut open: Vec<_> = accumulated.open.iter().map(|(id, v)| (*id, *v)).collect();
+        open.sort_by_key(|&(id, (_, started))| (started, id));
+        open.into_iter()
+            .map(|(_, (name, started))| OpenSpan {
+                name,
+                elapsed: now.saturating_duration_since(started),
+            })
+            .collect()
+    }
+
     /// Disjoint wall-clock attribution. Queue wait takes precedence over a
     /// containing child span (which can also include the spawn-lock wait).
     pub(crate) fn attribution(&self, started: Instant, ended: Instant) -> serde_json::Value {
@@ -439,6 +542,53 @@ mod tests {
                 "gc gc.rs:20": {"count": 1, "total_ms": 5_000, "max_ms": 5_000},
             }))
         );
+    }
+
+    #[test]
+    fn interrupted_snapshots_close_open_spans_without_touching_the_recorder() {
+        let recorder = Recorder::default();
+        let _installed = install(recorder.clone());
+        add("finished", Duration::from_millis(2));
+        let outer = span("outer");
+        std::thread::sleep(Duration::from_millis(3));
+        let inner = span("subprocess_git");
+        std::thread::sleep(Duration::from_millis(3));
+        let started = outer.started;
+        let now = Instant::now();
+        let (snapshot, open) = recorder
+            .snapshot_closing_open_spans(now, Duration::from_millis(100))
+            .expect("the lock is free");
+        let names: Vec<_> = open.iter().map(|span| span.name).collect();
+        assert_eq!(names, ["outer", "subprocess_git"], "outermost first");
+        assert!(open[0].elapsed >= open[1].elapsed);
+        assert!(open[1].elapsed >= Duration::from_millis(3));
+        let (millis, counts) = snapshot.totals();
+        assert!(millis["outer"] >= 6, "{millis:?}");
+        assert_eq!(counts["finished"], 1);
+        assert_eq!(counts["subprocess_git"], 1);
+        assert!(snapshot.attribution(started, now)["child_command_ms"].as_u64() >= Some(3));
+        assert_eq!(
+            recorder.open_spans(now).len(),
+            2,
+            "still open in the original"
+        );
+        assert!(
+            !recorder.totals().1.contains_key("outer"),
+            "not closed in the original"
+        );
+        drop(inner);
+        drop(outer);
+        assert!(recorder.open_spans(Instant::now()).is_empty());
+        assert_eq!(recorder.totals().1["outer"], 1);
+    }
+
+    #[test]
+    fn spans_opened_without_a_recorder_are_not_tracked() {
+        let outer = span("unrecorded");
+        let recorder = Recorder::default();
+        let _installed = install(recorder.clone());
+        drop(outer);
+        assert!(recorder.open_spans(Instant::now()).is_empty());
     }
 
     #[test]

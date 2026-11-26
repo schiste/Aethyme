@@ -1376,6 +1376,18 @@ pub(crate) fn append_command_metric_line(main_root: &Path, path: &Path, line: &[
     append_command_metric_line_waiting(main_root, path, line, APPEND_LOCK_WAIT)
 }
 
+/// [`append_command_metric_line`] with a shorter bound on the lock wait, for
+/// a writer that has its own deadline (an interrupted command flushing its
+/// row before it dies).
+pub(crate) fn append_command_metric_line_within(
+    main_root: &Path,
+    path: &Path,
+    line: &[u8],
+    wait: Duration,
+) -> bool {
+    append_command_metric_line_waiting(main_root, path, line, wait.min(APPEND_LOCK_WAIT))
+}
+
 fn append_command_metric_line_waiting(
     main_root: &Path,
     path: &Path,
