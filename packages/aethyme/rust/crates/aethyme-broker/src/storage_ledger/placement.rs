@@ -581,8 +581,9 @@ pub enum MigrationLane {
     /// No foreground work on either volume and memory not critical: an
     /// ordinary process's disk priority, unpaced, the backlog budget.
     Ordinary,
-    /// Foreground work, or critical memory pressure: the worker's throttled
-    /// disk policy, paced, [`MIGRATION_BUDGET`].
+    /// Foreground work, critical memory pressure or a destination volume
+    /// below its free floor: the worker's throttled disk policy, paced,
+    /// [`MIGRATION_BUDGET`].
     Throttled,
 }
 
@@ -613,10 +614,15 @@ impl MigrationLane {
 }
 
 /// The lane for what the host does now: ordinary only while no foreground
-/// run writes to the source or destination volume and memory is not
-/// critical.
-pub fn migration_lane(foreground_active: bool, memory_critical: bool) -> MigrationLane {
-    if foreground_active || memory_critical {
+/// run writes to the source or destination volume, memory is not critical
+/// and the destination volume is not below its free floor (filling a volume
+/// short of space at full speed competes with whatever else needs it).
+pub fn migration_lane(
+    foreground_active: bool,
+    memory_critical: bool,
+    destination_below_floor: bool,
+) -> MigrationLane {
+    if foreground_active || memory_critical || destination_below_floor {
         MigrationLane::Throttled
     } else {
         MigrationLane::Ordinary
@@ -692,6 +698,9 @@ thread_local! {
     /// Tests: copy even when source and destination share a volume.
     pub(crate) static FORCE_COPY_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Tests: fail this many device flushes.
+    pub(crate) static FLUSH_FAILURES_FOR_TEST: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn crashed_for_test(point: &'static str) -> bool {
@@ -1061,6 +1070,14 @@ fn submit(file: &fs::File) -> io::Result<()> {
 /// `F_FULLFSYNC` on macOS (it empties the device's write cache, so it covers
 /// every earlier [`submit`] on that volume).
 fn flush_device(directory: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FLUSH_FAILURES_FOR_TEST.with(|cell| {
+        let left = cell.get();
+        cell.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(io::Error::other("the device flush failed (test)"));
+    }
     sync_directory(directory)
 }
 
@@ -1311,6 +1328,17 @@ fn migrate_one(
                 tree_entries(&destination, hard_deadline),
             ) {
                 (Ok(Some(left)), Ok(Some(right))) if left == right => {
+                    // Identical in the page cache is not durable: the pass
+                    // that placed it may have stopped (or failed) before its
+                    // device flush. Every copied file was submitted before
+                    // that rename, so this one flush makes it durable; the
+                    // source stays when it fails.
+                    let flush_span =
+                        crate::phase_telemetry::span("storage_placement_migrate_flush");
+                    if let Err(error) = flush_device(&destination_dir) {
+                        return Moved::Failed(format!("sync the destination: {error}"));
+                    }
+                    drop(flush_span);
                     match copy_markers(&source, &destination)
                         .and_then(|()| remove_source(host_state, id, beat))
                         .and_then(|()| remove_source_markers(&source))
@@ -1783,7 +1811,14 @@ pub fn run(
             .iter()
             .filter_map(|path| crate::foreground_io::device_of(path))
             .collect();
+        // The storage worker is its own process (`aethyme storage worker`,
+        // or `storage run`): the checkout trash deleter, which sets the same
+        // process-scope disk policy, runs only in the `gc __trash-catchup`
+        // process and the retirement drain, never here, so the two never
+        // overwrite each other's setting. Only a process that began
+        // throttled is switched at all.
         let base_policy = crate::gc::current_io_policy();
+        let floor = super::Budgets::load(host_state).0.free_floor_bytes;
         let mut raised = false;
         let mut sampled: Option<(Instant, MigrationLane)> = None;
         let mut lane = || {
@@ -1795,7 +1830,14 @@ pub fn run(
             let _span = crate::phase_telemetry::span("storage_placement_lane_sample");
             let foreground = crate::foreground_io::active_on(&devices);
             let memory_critical = crate::checkout_trash::sample_host_pressure().memory_critical;
-            let lane = migration_lane(foreground, memory_critical);
+            let below_floor = super::check::statvfs(root).is_some_and(|(free, _)| free < floor);
+            if below_floor {
+                crate::phase_telemetry::add(
+                    "storage_placement_destination_below_floor",
+                    Duration::ZERO,
+                );
+            }
+            let lane = migration_lane(foreground, memory_critical, below_floor);
             if foreground {
                 crate::phase_telemetry::add(
                     "storage_placement_yielded_to_foreground",

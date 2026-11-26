@@ -77,6 +77,7 @@ impl Drop for Fixture {
         set_local_for_test(None);
         CRASH_FOR_TEST.with(|cell| cell.set(None));
         FORCE_COPY_FOR_TEST.with(|cell| cell.set(false));
+        FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(0));
     }
 }
 
@@ -617,10 +618,19 @@ fn many_file_archive(path: &Path, repository: &Path, files: usize) {
 /// when the lane asks for the other policy.
 #[test]
 fn the_migration_lane_and_its_disk_policy_follow_foreground_work() {
-    assert_eq!(migration_lane(false, false), MigrationLane::Ordinary);
-    assert_eq!(migration_lane(true, false), MigrationLane::Throttled);
-    assert_eq!(migration_lane(false, true), MigrationLane::Throttled);
-    assert_eq!(migration_lane(true, true), MigrationLane::Throttled);
+    assert_eq!(migration_lane(false, false, false), MigrationLane::Ordinary);
+    for (foreground, memory, below_floor) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        assert_eq!(
+            migration_lane(foreground, memory, below_floor),
+            MigrationLane::Throttled,
+            "{foreground} {memory} {below_floor}"
+        );
+    }
 
     // The throttled worker raises itself for the ordinary lane, drops back
     // when foreground work appears, and otherwise leaves its policy alone.
@@ -862,4 +872,37 @@ fn moved_archives_are_accounted_without_measuring_the_roots_again() {
     );
     assert_eq!(archives(&ledger, fixture.storage.as_path()).0.len(), 2);
     assert!(archives(&ledger, fixture.host_state.as_path()).0.is_empty());
+}
+
+/// A copy placed but never flushed (the pass stopped, or its flush failed)
+/// is identical in the page cache only: the source stays until a flush of
+/// the placed copy succeeds, on that pass or a later one.
+#[test]
+fn a_placed_copy_is_flushed_before_its_source_is_removed() {
+    let fixture = Fixture::new();
+    FORCE_COPY_FOR_TEST.with(|cell| cell.set(true));
+    let repository = fixture.storage.with_file_name("gone-repository");
+    archive(&fixture.host_archive("key/1-a"), &repository);
+    let before = entries(&fixture.host_archive("key/1-a"));
+
+    // Placed, then the flush fails: the copy stays, the source too.
+    FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(1));
+    let report = fixture.migrate();
+    assert_eq!(report.archives_failed, 1, "{report:?}");
+    assert_eq!(entries(&fixture.stored_archive("key/1-a")), before);
+    assert_eq!(entries(&fixture.host_archive("key/1-a")), before);
+
+    // The next pass finds them identical, but its flush fails too: the
+    // source is not removed.
+    FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(1));
+    let report = fixture.migrate();
+    assert_eq!(report.archives_migrated, 0, "{report:?}");
+    assert_eq!(report.archives_failed, 1, "{report:?}");
+    assert_eq!(entries(&fixture.host_archive("key/1-a")), before);
+
+    // Once a flush succeeds, the source goes.
+    let report = fixture.migrate();
+    assert_eq!(report.archives_migrated, 1, "{report:?}");
+    assert!(!fixture.host_archive("key/1-a").exists());
+    assert_eq!(entries(&fixture.stored_archive("key/1-a")), before);
 }

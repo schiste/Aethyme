@@ -544,9 +544,12 @@ reads the copy back once against those digests, lists the source again
 of the listing is read again) and makes the placed copy durable with one
 device flush before the source goes. Each worker pass picks a lane before
 every archive (read at most once a second): `ordinary` while no
-foreground-I/O marker names the host state or storage root volume and memory
-is not critical (macOS: the process leaves the background band and takes
-`IOPOL_IMPORTANT`, only when it began at `IOPOL_THROTTLE`; no pace; up to
+foreground-I/O marker names the host state or storage root volume, memory
+is not critical and the storage root's volume is not below the free floor
+(`[budget] free_floor_bytes`) (macOS: the process leaves the background band and takes
+`IOPOL_IMPORTANT`, only when it began at `IOPOL_THROTTLE`; the storage
+worker process never runs the checkout trash deleter, which sets the same
+process-scope policy only in its own `gc __trash-catchup` process; no pace; up to
 20 minutes and 10,000 archives per pass), otherwise `throttled` (back to
 `IOPOL_THROTTLE`, the 200 ms pace, 60 s and 500 archives from the start of the
 pass). The process returns to `IOPOL_THROTTLE` when the migration ends. Moved
@@ -563,7 +566,11 @@ flush), `storage_placement_migrate_remove_source`,
 (its total over its count is the mean per archive). New counters:
 `storage_placement_io_raised`, `storage_placement_io_throttled`,
 `storage_placement_yielded_to_foreground` (a lane reading that saw foreground
-work), `storage_placement_ledger_updated` and `_ledger_noted`. The
+work), `storage_placement_destination_below_floor`,
+`storage_placement_ledger_updated` and `_ledger_noted`. Reconciling two
+identical copies left by an earlier pass flushes the placed copy's volume
+first (`storage_placement_migrate_flush`) and keeps the source when that
+flush fails. The
 `storage_placement` attachment adds `archives_migrated_ordinary`,
 `files_migrated`, `migration_elapsed_ms`, `migration_ordinary_ms`,
 `migration_lane` (the last lane), `migration_lane_changes`,
