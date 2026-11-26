@@ -873,18 +873,21 @@ pub(super) fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<
     })
 }
 
-/// One advice row per session pair whose edits would conflict. Pairs that
-/// merge cleanly stay in `overlap_pairs` and produce no advice.
+/// One advice row per session pair whose edits would conflict when merged.
+/// Pairs that merge cleanly stay in `overlap_pairs` and produce no advice.
+/// Path leases never refuse an edit or a submit, so this is information
+/// (`info`), not a warning; `reason` stays `overlap_conflict` for consumers
+/// that keyed on it (the id was `lease.overlap-conflict` until 2026-11-26).
 pub(super) fn overlap_pair_advice(pairs: &[crate::OverlapPair]) -> Vec<StatusAdvice> {
     pairs
         .iter()
         .filter(|pair| pair.severity == crate::OverlapSeverity::High)
         .map(|pair| StatusAdvice {
-            id: "lease.overlap-conflict",
-            severity: StatusAdviceSeverity::Warning,
+            id: "paths.merge-conflict-risk",
+            severity: StatusAdviceSeverity::Info,
             reason: "overlap_conflict",
             summary: format!(
-                "sessions {} and {} would conflict on {} path(s)",
+                "sessions {} and {} changed the same lines in {} path(s); merging the second may need a rebase (informational: path leases never block edits or submit)",
                 pair.session_a,
                 pair.session_b,
                 pair.conflicting_paths.len()

@@ -721,11 +721,13 @@ fn render_submit_text(
         }
         for warning in &outcome.lease_warnings {
             eprintln!(
-                "⚠ lease overlap ({}): session {} holds {}; {}",
-                warning.severity.as_deref().unwrap_or("low"),
-                warning.session_id,
-                warning.path,
-                warning.reason.as_deref().unwrap_or("not blocking")
+                "note: path overlap ({}): {}",
+                crate::lease_wording::merge_conflict_risk(warning.severity.as_deref()),
+                crate::lease_wording::session_path_overlap(
+                    warning.session_id,
+                    &warning.path,
+                    warning.reason.as_deref()
+                )
             );
             if let Some(changes) = &warning.other_changes {
                 eprintln!("{}", crate::overlap_diff::render(changes, "  "));

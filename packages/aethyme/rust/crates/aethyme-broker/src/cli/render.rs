@@ -38,13 +38,16 @@ pub(super) fn print_overlap_warnings(pairs: &[crate::OverlapPair]) {
         };
         match pair.severity {
             crate::OverlapSeverity::High => eprintln!(
-                "⚠ overlap (high): sessions {} and {} conflict on {}{more}",
+                "note: path overlap ({}): sessions {} and {} changed the same lines in {}{more} ({})",
+                crate::lease_wording::merge_conflict_risk(Some("high")),
                 pair.session_a,
                 pair.session_b,
-                pair.sample_paths.join(", ")
+                pair.sample_paths.join(", "),
+                crate::lease_wording::PATH_LEASE_INFORMATIONAL
             ),
             crate::OverlapSeverity::Low => eprintln!(
-                "overlap (low): sessions {} and {} both touch {}{more}; {}",
+                "note: path overlap ({}): sessions {} and {} both edit {}{more}; {}",
+                crate::lease_wording::merge_conflict_risk(Some("low")),
                 pair.session_a,
                 pair.session_b,
                 pair.sample_paths.join(", "),

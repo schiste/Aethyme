@@ -2949,6 +2949,13 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         downgrade_unsupported_session_operation(session_operation.as_ref())?;
         None
     } else {
+        if session_operation
+            .as_ref()
+            .is_some_and(|context| context.session_open)
+            && task_lease_command == TaskLeaseCommandClass::SessionRead
+        {
+            note_task_lease_read_allowed(session_operation.as_ref());
+        }
         None
     };
 
@@ -3211,6 +3218,11 @@ enum TaskLeaseCommandClass {
     /// Known session work without a child-lifetime witness drops finite
     /// expiry authority before it starts.
     OtherWork,
+    /// A read that may still write broker bookkeeping (lease refresh,
+    /// advisory delivery), so it keeps a writable open, but starts no work
+    /// for the session: a finite task lease neither refuses, renews nor
+    /// downgrades it, whoever runs it.
+    SessionRead,
     /// Administrative cleanup acts on an already-closed session and must not
     /// be rejected by the open-session admission fence or renew its task lease.
     ClosedSessionAdministration,
@@ -3290,6 +3302,7 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" => TaskLeaseCommandClass::OtherWork,
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        _ if session_read_command(subcommand, parsed) => TaskLeaseCommandClass::SessionRead,
         "advance" | "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push"
         | "submit" | "sync" => TaskLeaseCommandClass::GuardedWork,
         "gates" if matches!(action, Some("run" | "pre-push")) => TaskLeaseCommandClass::GuardedWork,
@@ -3314,6 +3327,34 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "checkpoint"
         | "integration" | "events" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
+    }
+}
+
+/// Reads that keep a writable broker open but act for no session: status,
+/// the agent and host-resource inventories, and the plan/status forms of
+/// otherwise state-changing commands. An agent asking what is going on must
+/// never be told a task lease forbids it; that read as a block on repositories
+/// where every path lease is advisory.
+fn session_read_command(subcommand: &str, parsed: &Parsed) -> bool {
+    let action = parsed.positional.first().map(String::as_str);
+    match subcommand {
+        "status" | "agents" | "readiness" => true,
+        "resources" => matches!(action, Some("list" | "pressure" | "plan" | "explain")),
+        "console" => matches!(action, None | Some("status" | "list")),
+        "advisories" => action == Some("list"),
+        "exposures" | "checkpoint" => action == Some("plan"),
+        "doctor" => (action.is_none() && !parsed.fix_version) || action == Some("plan"),
+        "worktree-root" | "storage" => {
+            action.is_none() || (subcommand == "storage" && action == Some("plan"))
+        }
+        "trust" => action == Some("status"),
+        "merge-chain" => parsed.dry_run,
+        "integration" => {
+            action == Some("reconcile")
+                && !parsed.apply
+                && parsed.write_resolution_template.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -3385,6 +3426,35 @@ fn heartbeat_session_task_lease(
         .map_err(UsageError::from)
 }
 
+/// A read from someone other than the finite task lease's holder used to be
+/// refused as uncovered session work. It now runs; count the reads that
+/// would have been refused (`task_lease_read_allowed`) so the change stays
+/// measurable. Best effort: an unreadable store counts nothing.
+fn note_task_lease_read_allowed(context: Option<&SessionOperationContext>) {
+    let Some(context) = context else {
+        return;
+    };
+    let Ok(store) = crate::BrokerStore::open_in_repo(&context.main_root) else {
+        return;
+    };
+    let Ok(Some(latest)) = store.latest_session_holder_event(context.session_id) else {
+        return;
+    };
+    if !crate::session_holder::task_lease_binding_present(&latest) {
+        return;
+    }
+    let bound_holder = latest.payload_json.as_deref().and_then(|payload| {
+        serde_json::from_str::<crate::session_holder::AgentProcess>(payload).ok()
+    });
+    let caller = match crate::session_holder::caller() {
+        crate::session_holder::Caller::Agent(caller) => Some(caller),
+        crate::session_holder::Caller::Unidentified => None,
+    };
+    if bound_holder.is_none() || bound_holder != caller {
+        crate::phase_telemetry::add("task_lease_read_allowed", std::time::Duration::ZERO);
+    }
+}
+
 /// Before an opted-in session starts a command outside the known durable-child
 /// protocols, remove its finite lease while the shared session guard is held.
 /// This keeps the existing live-process protection authoritative for that
@@ -3407,10 +3477,9 @@ fn downgrade_unsupported_session_operation(
     )? {
         crate::session_holder::TaskLeaseDowngrade::NotFinite
         | crate::session_holder::TaskLeaseDowngrade::Downgraded => Ok(()),
-        crate::session_holder::TaskLeaseDowngrade::NotHolder => Err(UsageError::Message(format!(
-            "session {} has a finite task lease; this command is not covered by its child-lifetime protocol and must be run by the current holder or after takeover",
-            context.session_id
-        ))),
+        crate::session_holder::TaskLeaseDowngrade::NotHolder => Err(UsageError::Message(
+            crate::lease_wording::task_lease_holder_refusal(context.session_id),
+        )),
     }
 }
 

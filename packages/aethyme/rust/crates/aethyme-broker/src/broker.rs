@@ -117,7 +117,8 @@ pub enum BrokerOpError {
     /// Another live agent process holds the session (#393).
     #[error(
         "session {session_id} is held by another live agent process: pid {holder_pid} \
-         ({holder_command}){holder_context}. Run this from that agent, or pass `--take-over` \
+         ({holder_command}){holder_context} (the session holder, not a path lease; \
+         read-only commands are never refused). Run this from that agent, or pass `--take-over` \
          to move the session to this agent; the transfer is recorded as a \
          `session.holder_bound` event"
     )]

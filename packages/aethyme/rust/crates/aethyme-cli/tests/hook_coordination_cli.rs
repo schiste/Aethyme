@@ -442,11 +442,16 @@ fn session_start_shows_relevant_paths_and_defers_diffs_to_the_edit() {
 
     let brief = context(&fixture.hook(&my_tree, "SessionStart", &serde_json::json!({})));
     assert!(
-        brief.contains(&format!("session {other} also leases \"shared.txt\".")),
+        brief.contains(&format!("session {other} is also editing \"shared.txt\".")),
         "{brief}"
     );
     assert!(brief.contains(&format!("Aethyme session {me}")), "{brief}");
-    assert!(brief.contains("Before editing: wait"), "{brief}");
+    assert!(brief.contains("Before editing: coordinate"), "{brief}");
+    assert!(
+        brief.contains("path leases never block your edits or submit"),
+        "{brief}"
+    );
+    assert!(!brief.contains("Before editing: wait"), "{brief}");
     assert!(
         brief.contains(&format!(
             "Peer session {other} assignment: \"Parser rework\""

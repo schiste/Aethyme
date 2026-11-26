@@ -958,7 +958,7 @@ pub enum HostResourceError {
     IdempotencyMismatch(String),
     #[error("request {request_id:?} is {state}; use a new request id")]
     RequestNotActive { request_id: String, state: String },
-    #[error("host resource bundle unavailable: {message}")]
+    #[error("{}", crate::lease_wording::host_resource_conflict(code, message))]
     Conflict {
         code: String,
         message: String,
@@ -5524,7 +5524,7 @@ fn plan_allocations(
                                 "capacity",
                                 format!("{pool}:{}/{limit}", bundle.requested_units),
                                 &format!(
-                                    "host memory pressure is {}, so this pool admits {admitted}/{limit} units; {used} are allocated by {} live lease(s) and this bundle requests {} units",
+                                    "host memory pressure is {}, so this pool admits {admitted}/{limit} units; {used} are in use by {} running build/cache slot holder(s) and this bundle requests {} units",
                                     memory.as_str(),
                                     matching.len(),
                                     bundle.requested_units
@@ -5541,7 +5541,7 @@ fn plan_allocations(
                                 "capacity",
                                 format!("{pool}:{}/{limit}", bundle.requested_units),
                                 &format!(
-                                    "pool has {used}/{limit} units allocated by {} live lease(s); this bundle requests {} units",
+                                    "pool has {used}/{limit} units in use by {} running build/cache slot holder(s); this bundle requests {} units",
                                     matching.len(), bundle.requested_units
                                 ),
                                 matching.first().map(|o| o.lease_id.clone()),

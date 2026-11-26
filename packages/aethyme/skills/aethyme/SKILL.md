@@ -25,10 +25,10 @@ graph, task, facts, intents, analyze, enhance, and Explore.
 
 ## Lease Overlaps
 
-Overlaps with another session's explicit lease are advisory unless the
-repository's `[promote]` config in `.aethyme/config.toml` makes them refusals. An
-accepted claim with warnings permits work in your own session. Inspect overlaps,
-reconcile before merging, and resolve refusals; never edit another session's tree.
+Path leases (who edits which paths) never block edits, claims or submit: an
+overlap is information. Build/cache slots (host resources) may make a command
+wait, which is normal. The session holder (task lease) refuses another process's
+state-changing commands, never reads. Never edit another session's tree.
 
 ## Default Contract
 
