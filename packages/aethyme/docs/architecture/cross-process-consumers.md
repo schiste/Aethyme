@@ -336,6 +336,41 @@ reading; counters `storage_host_temp_root_measured` (one per root, with its
 time), `storage_host_temp_partial` (a root left partial by the deadline) and
 `storage_host_temp_lock_lost` (a reading stopped by a lost worker lock).
 
+Recovery archive free-space floor (2026-11-26): each worker pass, after the
+other evictions, applies a floor to every volume holding measured recovery
+archives (host state): the larger of `[budget] free_floor_bytes` (10 GiB) and
+new `[budget] recovery_archive_free_floor_percent` (default 10, `0` leaves the
+fixed floor alone) of the volume's size. While the volume's free space
+(`statvfs`) is below it, the oldest archives on that volume, whichever
+repository they belong to, are removed until the projected free space (the
+reading plus the measured bytes removed) is back at the floor. Never removed
+for the floor: an archive with its owner's keep marker, within its promised
+minimum retention, without a creation time, still being written, or not
+proven landed (re-checked just before removal, as for the budget). Removals
+are paced by the worker's pace even under pressure, share a 60-second budget
+per pass, and are renamed aside first (a removal the budget stops leaves a
+remainder the next pass sweeps). Pressure no longer empties the recovery
+archive budget or removes every landed archive unpaced: below the floor the
+archive floor alone answers it. The pass report (`storage run --json`,
+`storage status --json` `last_pass`) adds `archive_floor[]` (`device`,
+`floor_bytes`, `free_before_bytes`, `free_after_bytes`, `pruned`,
+`pruned_bytes`, `stop` one of `floor_met`, `protected_only`, `deadline`,
+`unsupported`) and the phase `archive_floor`; floor removals are listed in
+`evicted`, and archives kept for the floor in `skipped` with `(archive
+floor)`. Command metrics: span `storage_archive_floor` (the whole step),
+`storage_archive_floor_probe` (each free-space reading) and
+`storage_archive_floor_prune` (removals on a volume below the floor);
+counters `storage_archive_floor_pruned` (one per archive removed),
+`storage_archive_floor_kept` (one per archive a rule kept when reached) and
+one of `storage_archive_floor_stop_floor_met`, `_stop_protected_only`,
+`_stop_deadline` (the budget ran out, or the worker lock was lost) or
+`_stop_unsupported` (free space unreadable: the floor is skipped) per volume;
+attachment `storage_archive_floor` (`volumes[]` with the report's fields
+except `device`). An older binary on the same host rejects a `storage.toml`
+that sets `recovery_archive_free_floor_percent` and runs with default
+budgets, so set it only once every binary on the host is at least this
+version.
+
 Recovery archive landing proofs (2026-11-23): whether an archive's commits
 are in its repository's default branch is answered by one prover per process
 (`storage_ledger::landing`), keyed by the repository path. Each default tip

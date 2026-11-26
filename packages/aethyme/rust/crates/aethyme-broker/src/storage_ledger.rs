@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod archive_floor;
 pub mod check;
 pub mod cli;
 pub mod evict;
@@ -332,8 +333,16 @@ pub struct Budgets {
     pub host_cache_total_bytes: u64,
     pub storage_total_bytes: u64,
     /// Below this free space on a volume, eviction runs unpaced and advice
-    /// warns.
+    /// warns (recovery archives excepted: see
+    /// `recovery_archive_free_floor_percent`).
     pub free_floor_bytes: u64,
+    /// The recovery archive floor of a volume is the larger of
+    /// `free_floor_bytes` and this share (percent) of the volume's size.
+    /// While the volume's free space is below it, the oldest recovery
+    /// archives on it that may go (landed, past their promised retention,
+    /// not kept) are removed, paced and within a time budget, until free
+    /// space is back at the floor. `0` leaves `free_floor_bytes` alone.
+    pub recovery_archive_free_floor_percent: u64,
     /// Below this, commands that write to that volume refuse once a bounded
     /// reclaim did not free enough.
     pub hard_minimum_bytes: u64,
@@ -375,6 +384,7 @@ impl Default for Budgets {
             host_cache_total_bytes: 12 * GIB,
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
+            recovery_archive_free_floor_percent: 10,
             hard_minimum_bytes: 2 * GIB,
             // Archive-then-delete keeps idle work only in its archive, so
             // archives are kept a quarter (was 30 days).
@@ -434,6 +444,17 @@ impl Budgets {
             Class::PreparationCache => Some(self.preparation_cache_bytes),
             _ => None,
         }
+    }
+
+    /// The recovery archive floor of a volume of `total_bytes` (`0` when
+    /// its size is unknown): the larger of `free_floor_bytes` and
+    /// `recovery_archive_free_floor_percent` of it.
+    pub fn recovery_archive_floor(&self, total_bytes: u64) -> u64 {
+        let share = u128::from(total_bytes)
+            * u128::from(self.recovery_archive_free_floor_percent.min(100))
+            / 100;
+        self.free_floor_bytes
+            .max(u64::try_from(share).unwrap_or(u64::MAX))
     }
 
     /// The total for one kind of root (worktrees excluded).
@@ -627,6 +648,9 @@ pub struct PassReport {
     /// counted as unlanded.
     #[serde(default)]
     pub unproven_archives: Vec<String>,
+    /// The recovery archive floor, per volume holding archives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_floor: Vec<archive_floor::FloorReport>,
 }
 
 /// The persisted ledger.

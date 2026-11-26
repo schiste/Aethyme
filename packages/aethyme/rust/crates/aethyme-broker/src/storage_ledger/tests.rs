@@ -453,6 +453,134 @@ fn archives_go_only_when_landed_and_past_their_promised_retention() {
     assert!(ledger.last_pass.unwrap().evicted.is_empty());
 }
 
+fn pass_with_free(
+    host_state: &Path,
+    budgets: Budgets,
+    reading: Option<(u64, u64)>,
+) -> super::Ledger {
+    let registry = host_state.join("host-resources.db");
+    let mut free = |_: &Path| reading;
+    check::run_pass(
+        PassInputs {
+            host_state,
+            roots: vec![root(host_state, RootKind::HostState)],
+            budgets,
+            free: &mut free,
+            measure_budget: Duration::from_secs(60),
+            pace: Duration::ZERO,
+            registry,
+        },
+        None,
+    )
+    .unwrap()
+}
+
+/// Below the archive floor, the oldest removable archives go until the
+/// projected free space is back at it; unlanded, young and kept ones stay
+/// whatever the floor; an unreadable volume skips it.
+#[test]
+fn the_archive_floor_removes_the_oldest_removable_archives_until_met() {
+    use super::archive_floor::FloorStop;
+    let setup = || {
+        let dir = tempfile::tempdir().unwrap();
+        let host_state = dir.path().join("state");
+        let repository = dir.path().join("repository");
+        fs::create_dir_all(&host_state).unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        fs::write(repository.join("a"), "a").unwrap();
+        git(&repository, &["add", "a"]);
+        git(&repository, &["commit", "-q", "-m", "a"]);
+        let landed = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", &landed],
+        );
+        git(&repository, &["checkout", "-q", "-b", "work"]);
+        fs::write(repository.join("b"), "b").unwrap();
+        git(&repository, &["add", "b"]);
+        git(&repository, &["commit", "-q", "-m", "b"]);
+        let unlanded = git(&repository, &["rev-parse", "HEAD"]);
+        archive(&host_state, "older-unlanded", &repository, &unlanded, 90);
+        archive(&host_state, "old-landed", &repository, &landed, 40);
+        archive(&host_state, "kept-landed", &repository, &landed, 35);
+        fs::write(
+            host_state.join("recovery-archives/example-0123/kept-landed.aethyme-keep"),
+            "",
+        )
+        .unwrap();
+        archive(&host_state, "mid-landed", &repository, &landed, 30);
+        archive(&host_state, "young-landed", &repository, &landed, 3);
+        empty_registry(&host_state);
+        (dir, host_state)
+    };
+    // Within every budget; only the floor can remove anything.
+    let floor = 1_000_000_000;
+    let budgets = Budgets {
+        free_floor_bytes: floor,
+        recovery_archive_free_floor_percent: 0,
+        ..Budgets::default()
+    };
+    let present = |host_state: &Path, id: &str| {
+        host_state
+            .join("recovery-archives/example-0123")
+            .join(id)
+            .exists()
+    };
+
+    // One byte short: the oldest removable archive alone goes.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 1, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(
+        report.evicted,
+        vec!["recovery_archives:recovery-archives/example-0123/old-landed".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(report.archive_floor.len(), 1, "{report:?}");
+    assert_eq!(report.archive_floor[0].pruned, 1);
+    assert_eq!(report.archive_floor[0].floor_bytes, floor);
+    assert_eq!(report.archive_floor[0].stop, FloorStop::FloorMet);
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|line| line.contains("older-unlanded (archive floor)")),
+        "{report:?}"
+    );
+    for id in [
+        "older-unlanded",
+        "kept-landed",
+        "mid-landed",
+        "young-landed",
+    ] {
+        assert!(present(&host_state, id), "{id}");
+    }
+
+    // Far short: every removable archive goes, the protected ones stay.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((0, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(report.archive_floor[0].pruned, 2, "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::ProtectedOnly);
+    assert!(!present(&host_state, "old-landed") && !present(&host_state, "mid-landed"));
+    for id in ["older-unlanded", "kept-landed", "young-landed"] {
+        assert!(present(&host_state, id), "{id}");
+    }
+
+    // At the floor, or with the volume unreadable: nothing goes.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::FloorMet);
+    let ledger = pass_with_free(&host_state, budgets, None);
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::Unsupported);
+    assert_eq!(report.archive_floor[0].free_before_bytes, None);
+}
+
 // Must-fix 3: no walk of report-only classes; walks resume within deadlines
 // and refresh the heartbeat.
 #[test]

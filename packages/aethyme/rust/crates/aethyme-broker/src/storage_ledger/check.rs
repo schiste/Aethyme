@@ -1041,7 +1041,9 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         let still_needed = match candidate.reason {
             Reason::Expired => true,
             Reason::OverBudget => {
-                aggressive.contains(&candidate.root_kind)
+                // Archives answer pressure through the archive floor below.
+                (aggressive.contains(&candidate.root_kind)
+                    && candidate.class != Class::RecoveryArchives)
                     || root_bytes.get(&candidate.root_kind).copied().unwrap_or(0)
                         > inputs.budgets.root_total(candidate.root_kind)
                     || match candidate.class {
@@ -1121,12 +1123,30 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                 .skipped
                 .push(format!("{}: {error}", candidate.label())),
         }
-        // Paced, except under pressure.
-        if !report.pressure && !inputs.pace.is_zero() {
+        // Paced, except under pressure (recovery archives always).
+        if (!report.pressure || candidate.class == Class::RecoveryArchives)
+            && !inputs.pace.is_zero()
+        {
             std::thread::sleep(inputs.pace);
         }
     }
     report.phases_ms.insert("evict".into(), elapsed(phase));
+    // The recovery archive floor, after the cheaper classes had their turn.
+    phase = Instant::now();
+    let archive_floor = archive_floor_pass(
+        &mut ledger,
+        &inputs.budgets,
+        &mut *inputs.free,
+        &inputs.registry,
+        inputs.pace,
+        lock.as_deref_mut(),
+        leases.as_ref(),
+        &mut report,
+    );
+    report.archive_floor = archive_floor;
+    report
+        .phases_ms
+        .insert("archive_floor".into(), elapsed(phase));
     {
         let prover = super::landing::shared();
         report.landing = landing_delta(&landing_before, prover.stats());
@@ -1283,6 +1303,171 @@ fn forget(ledger: &mut Ledger, candidate: &Candidate) {
             }
         }
     }
+}
+
+/// The longest the archive floor may remove archives in one pass.
+const ARCHIVE_FLOOR_BUDGET: Duration = Duration::from_secs(60);
+
+/// Apply the recovery archive floor (see [`super::archive_floor`]) to every
+/// volume holding measured archives: while its free space is below the
+/// floor, remove the oldest archives on it that no rule keeps, whichever
+/// repository they belong to, each re-checked just before removal (keep
+/// marker, landing, promised retention), paced, until the projected free
+/// space is back at the floor or [`ARCHIVE_FLOOR_BUDGET`] ran out.
+#[allow(clippy::too_many_arguments)]
+fn archive_floor_pass(
+    ledger: &mut Ledger,
+    budgets: &Budgets,
+    free: &mut dyn FnMut(&Path) -> Option<(u64, u64)>,
+    registry: &Path,
+    pace: Duration,
+    mut lock: Option<&mut WorkerLock>,
+    leases: Option<&BTreeSet<(String, String)>>,
+    report: &mut PassReport,
+) -> Vec<super::archive_floor::FloorReport> {
+    use super::archive_floor::{FloorArchive, FloorProgress, FloorReport, floor_order};
+    let _span = crate::phase_telemetry::span("storage_archive_floor");
+    let now = now_ms();
+    let holds_archives =
+        |item: &super::Item| item.class == Class::RecoveryArchives && item.measured;
+    // One root to read each volume's free space at.
+    let mut volumes: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    for item in ledger.items.iter().filter(|&item| holds_archives(item)) {
+        volumes
+            .entry(item.device)
+            .or_insert_with(|| item.root.clone());
+    }
+    let mut reports = Vec::new();
+    for (device, probe_root) in volumes {
+        let probe = crate::phase_telemetry::span("storage_archive_floor_probe");
+        let reading = free(&probe_root);
+        drop(probe);
+        let floor = reading.map_or(0, |(_, total)| budgets.recovery_archive_floor(total));
+        let mut progress = FloorProgress::new(reading.map(|(available, _)| available), floor);
+        let mut floor_report = FloorReport {
+            device,
+            floor_bytes: floor,
+            free_before_bytes: reading.map(|(available, _)| available),
+            ..FloorReport::default()
+        };
+        let mut out_of_time = false;
+        if progress.short() {
+            let _prune = crate::phase_telemetry::span("storage_archive_floor_prune");
+            let mut entries: Vec<(Candidate, FloorArchive)> = Vec::new();
+            for item in ledger
+                .items
+                .iter()
+                .filter(|&item| holds_archives(item) && item.device == device)
+            {
+                for child in &item.children {
+                    let retention = child
+                        .min_retention_ms
+                        .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
+                    let protected = child.kept
+                        || super::is_partial_archive_name(&child.name)
+                        || child
+                            .created_ms
+                            .is_none_or(|created| now < created.saturating_add(retention));
+                    entries.push((
+                        evict::child_candidate(item, child, Reason::OverBudget),
+                        FloorArchive {
+                            created_ms: child.created_ms.unwrap_or(0),
+                            bytes: child.bytes,
+                            protected,
+                        },
+                    ));
+                }
+            }
+            let archives: Vec<FloorArchive> = entries.iter().map(|(_, archive)| *archive).collect();
+            let deadline = Instant::now() + ARCHIVE_FLOOR_BUDGET;
+            for index in floor_order(&archives) {
+                if !progress.short() {
+                    break;
+                }
+                if Instant::now() >= deadline
+                    || lock
+                        .as_deref()
+                        .is_some_and(|lock| lock.lost() || !lock.held())
+                {
+                    out_of_time = true;
+                    break;
+                }
+                let candidate = &entries[index].0;
+                // Re-read just before removal: the keep marker, then landing
+                // and promised retention.
+                let refusal = if super::keep_marker(&candidate.path()).exists() {
+                    Some("kept by the owner's marker".to_string())
+                } else {
+                    evict::refuse(candidate, leases, now)
+                };
+                if let Some(why) = refusal {
+                    crate::phase_telemetry::add("storage_archive_floor_kept", Duration::ZERO);
+                    report
+                        .skipped
+                        .push(format!("{} (archive floor): {why}", candidate.label()));
+                    continue;
+                }
+                let mut beat = || {
+                    if let Some(lock) = lock.as_deref_mut() {
+                        lock.beat();
+                    }
+                };
+                // Renamed aside first: a removal the deadline stops leaves
+                // only a remainder the next pass sweeps.
+                match evict::remove_protected(candidate, registry, &mut beat, Some(deadline)) {
+                    Ok(_) => {
+                        crate::phase_telemetry::add("storage_archive_floor_pruned", Duration::ZERO);
+                        progress.record(candidate.bytes);
+                        floor_report.pruned += 1;
+                        floor_report.pruned_bytes =
+                            floor_report.pruned_bytes.saturating_add(candidate.bytes);
+                        report.evicted.push(candidate.label());
+                        report.bytes_reclaimed =
+                            report.bytes_reclaimed.saturating_add(candidate.bytes);
+                        let telemetry = ledger.telemetry.entry(candidate.class).or_default();
+                        telemetry.evictions += 1;
+                        telemetry.bytes_reclaimed += candidate.bytes;
+                        forget(ledger, candidate);
+                    }
+                    Err(error) => report
+                        .skipped
+                        .push(format!("{} (archive floor): {error}", candidate.label())),
+                }
+                // Unattended deletion is paced, even below the floor.
+                if !pace.is_zero() {
+                    std::thread::sleep(pace);
+                }
+            }
+        }
+        floor_report.stop = progress.stop(out_of_time);
+        floor_report.free_after_bytes = if floor_report.pruned > 0 {
+            let probe = crate::phase_telemetry::span("storage_archive_floor_probe");
+            let after = free(&probe_root).map(|(available, _)| available);
+            drop(probe);
+            after
+        } else {
+            floor_report.free_before_bytes
+        };
+        crate::phase_telemetry::add(floor_report.stop.counter(), Duration::ZERO);
+        reports.push(floor_report);
+    }
+    crate::phase_telemetry::attach(
+        "storage_archive_floor",
+        serde_json::json!({
+            "volumes": reports
+                .iter()
+                .map(|volume| serde_json::json!({
+                    "floor_bytes": volume.floor_bytes,
+                    "free_before_bytes": volume.free_before_bytes,
+                    "free_after_bytes": volume.free_after_bytes,
+                    "pruned": volume.pruned,
+                    "pruned_bytes": volume.pruned_bytes,
+                    "stop": volume.stop.as_str(),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    reports
 }
 
 fn elapsed(since: Instant) -> u64 {
