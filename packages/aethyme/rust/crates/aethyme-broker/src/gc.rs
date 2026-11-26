@@ -4412,6 +4412,11 @@ pub(crate) fn set_trash_deleter_io_yield(yielding: bool) -> bool {
     background_priority::set_trash_deleter_io_yield(yielding)
 }
 
+/// See `background_priority::set_storage_migration_io`.
+pub(crate) fn set_storage_migration_io(ordinary: bool) -> bool {
+    background_priority::set_storage_migration_io(ordinary)
+}
+
 /// This process's disk I/O policy, as a telemetry label.
 pub(crate) fn current_io_policy() -> &'static str {
     background_priority::current_io_policy()

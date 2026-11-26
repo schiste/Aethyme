@@ -535,6 +535,40 @@ telemetry (`recovery_archive_bound`) adds `storage`. The migration takes a
 repository's lifecycle lock with a storage-only try claim that never queues
 and steps aside while a waiter is queued.
 
+Recovery archive migration lanes (2026-11-26): a cross-volume copy now
+reads each source file once (hashed while copied, by up to 4 threads per
+archive), submits each file and directory with a plain `fsync` (Rust's
+`sync_all` is `F_FULLFSYNC` on macOS, a whole device cache flush per call),
+reads the copy back once against those digests, lists the source again
+(size, inode, modification and status-change time; a file changed within 2 s
+of the listing is read again) and makes the placed copy durable with one
+device flush before the source goes. Each worker pass picks a lane before
+every archive (read at most once a second): `ordinary` while no
+foreground-I/O marker names the host state or storage root volume and memory
+is not critical (macOS: the process leaves the background band and takes
+`IOPOL_IMPORTANT`, only when it began at `IOPOL_THROTTLE`; no pace; up to
+20 minutes and 10,000 archives per pass), otherwise `throttled` (back to
+`IOPOL_THROTTLE`, the 200 ms pace, 60 s and 500 archives from the start of the
+pass). The process returns to `IOPOL_THROTTLE` when the migration ends. Moved
+archives are removed from host state's ledger entry and measured one by one
+into the storage root's, instead of noting both entries for the next pass
+to walk again (noted only when an entry is not yet measured or mid-walk).
+The `placement` pass report adds `files_migrated`, `migration_elapsed_ms`,
+`archives_migrated_ordinary` and `migration_lane_changes`, and
+`migration_stop` may be `throttled` (the throttled budget ran out before the
+ordinary one). New spans: `storage_placement_migrate_flush` (the device
+flush), `storage_placement_migrate_remove_source`,
+`storage_placement_lane_sample` and `storage_placement_account_moved`;
+`storage_placement_archive_migrated` now carries each archive's elapsed time
+(its total over its count is the mean per archive). New counters:
+`storage_placement_io_raised`, `storage_placement_io_throttled`,
+`storage_placement_yielded_to_foreground` (a lane reading that saw foreground
+work), `storage_placement_ledger_updated` and `_ledger_noted`. The
+`storage_placement` attachment adds `archives_migrated_ordinary`,
+`files_migrated`, `migration_elapsed_ms`, `migration_ordinary_ms`,
+`migration_lane` (the last lane), `migration_lane_changes`,
+`bytes_per_second` and `archives_per_minute`.
+
 Recovery archive landing proofs (2026-11-23): whether an archive's commits
 are in its repository's default branch is answered by one prover per process
 (`storage_ledger::landing`), keyed by the repository path. Each default tip

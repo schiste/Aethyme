@@ -1668,23 +1668,8 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
         let name = walk.current.take().unwrap_or_default();
         if child_level {
             let child_path = path.join(&name);
-            let ctime = fs::symlink_metadata(&child_path).map_or(0, |metadata| ctime_ms(&metadata));
-            let meta = if item.class == Class::RecoveryArchives {
-                archive_meta(&child_path)
-            } else {
-                ArchiveMeta::default()
-            };
-            let kept = item.class == Class::RecoveryArchives && keep_marker(&child_path).exists();
-            walk.done.push(Child {
-                name,
-                bytes: walk.usage.bytes,
-                newest_ms: walk.usage.newest_ms,
-                ctime_ms: ctime,
-                created_ms: meta.created_ms,
-                min_retention_ms: meta.min_retention_ms,
-                session_id: meta.session_id,
-                kept,
-            });
+            walk.done
+                .push(child_record(item.class, &child_path, name, &walk.usage));
         } else {
             item.bytes = walk.usage.bytes;
             item.entries = walk.usage.entries;
@@ -1697,26 +1682,81 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
         }
     }
     if child_level {
-        item.bytes = walk.done.iter().map(|child| child.bytes).sum();
-        item.entries = walk.done.len() as u64;
-        item.newest_ms = walk
-            .done
-            .iter()
-            .map(|child| child.newest_ms)
-            .max()
-            .unwrap_or(0);
-        item.oldest_ms = walk
-            .done
-            .iter()
-            .map(|child| child.newest_ms)
-            .filter(|ms| *ms > 0)
-            .min()
-            .unwrap_or(0);
         item.children = walk.done;
+        set_child_totals(item);
     }
     item.measured = true;
     item.measured_at_ms = now_ms();
     true
+}
+
+/// One child's record once its walk finished with `usage`.
+fn child_record(class: Class, child_path: &Path, name: String, usage: &Usage) -> Child {
+    let ctime = fs::symlink_metadata(child_path).map_or(0, |metadata| ctime_ms(&metadata));
+    let meta = if class == Class::RecoveryArchives {
+        archive_meta(child_path)
+    } else {
+        ArchiveMeta::default()
+    };
+    let kept = class == Class::RecoveryArchives && keep_marker(child_path).exists();
+    Child {
+        name,
+        bytes: usage.bytes,
+        newest_ms: usage.newest_ms,
+        ctime_ms: ctime,
+        created_ms: meta.created_ms,
+        min_retention_ms: meta.min_retention_ms,
+        session_id: meta.session_id,
+        kept,
+    }
+}
+
+/// An item evicted child by child: its totals from its children.
+pub(crate) fn set_child_totals(item: &mut Item) {
+    item.bytes = item.children.iter().map(|child| child.bytes).sum();
+    item.entries = item.children.len() as u64;
+    item.newest_ms = item
+        .children
+        .iter()
+        .map(|child| child.newest_ms)
+        .max()
+        .unwrap_or(0);
+    item.oldest_ms = item
+        .children
+        .iter()
+        .map(|child| child.newest_ms)
+        .filter(|ms| *ms > 0)
+        .min()
+        .unwrap_or(0);
+}
+
+/// Measure one child of `item` now, whole (no deadline): what a full walk
+/// of the item would record for it. `None` when it is missing or is a link.
+pub(crate) fn measure_child(item: &Item, name: &str, beat: &mut dyn FnMut()) -> Option<Child> {
+    let child_path = item.path().join(name);
+    let top = fs::symlink_metadata(item.path()).ok()?;
+    let child = fs::symlink_metadata(&child_path).ok()?;
+    if child.file_type().is_symlink() || !child.is_dir() {
+        return None;
+    }
+    let mut pending = vec![child_path.clone()];
+    let mut usage = Usage::default();
+    // A far deadline: the walk always finishes.
+    let deadline = Instant::now() + DAY;
+    walk_until(
+        &mut pending,
+        &mut usage,
+        device(&top),
+        deadline,
+        BEAT_EVERY,
+        beat,
+    );
+    Some(child_record(
+        item.class,
+        &child_path,
+        name.to_string(),
+        &usage,
+    ))
 }
 
 /// Measure entries round robin until `budget` elapses: dirty (noted by a

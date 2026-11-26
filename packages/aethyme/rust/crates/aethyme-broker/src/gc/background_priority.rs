@@ -134,6 +134,23 @@ pub(crate) fn set_trash_deleter_io_yield(yielding: bool) -> bool {
     })
 }
 
+/// Set the storage worker's recovery archive migration to an ordinary
+/// process's disk policy (`ordinary`: leave the macOS background band, then
+/// `IOPOL_IMPORTANT`) or back to `IOPOL_THROTTLE`. Process scope, like the
+/// trash deleter: XNU throttles a thread whenever its process is throttled,
+/// so the copy threads follow the process. Whether the platform accepted
+/// it; always `false` off macOS, where the worker keeps its idle class.
+pub(crate) fn set_storage_migration_io(ordinary: bool) -> bool {
+    if ordinary {
+        platform::leave_darwin_background();
+    }
+    platform::set_process_io_policy(if ordinary {
+        TRASH_DELETER_IOPOL_IMPORTANT
+    } else {
+        TRASH_DELETER_IOPOL_THROTTLE
+    })
+}
+
 /// Apply the retirement lane's priority through the three setters (the
 /// platform calls, or recorders in tests): leave the background band, set
 /// the process-scope disk policy to `IOPOL_IMPORTANT` (the policy an
@@ -272,6 +289,14 @@ mod platform {
         unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, policy) == 0 }
     }
 
+    pub(super) fn leave_darwin_background() -> bool {
+        // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
+        let result = unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, super::TRASH_DELETER_DARWIN_BG)
+        };
+        result == 0
+    }
+
     pub(super) fn lower_current_process() -> BackgroundPriority {
         // SAFETY: plain syscall wrappers with integer arguments; `who = 0`
         // names the calling process and no memory is passed.
@@ -315,6 +340,10 @@ mod platform {
 
     /// Linux keeps the inherited idle class; nothing to switch.
     pub(super) fn set_process_io_policy(_policy: libc::c_int) -> bool {
+        false
+    }
+
+    pub(super) fn leave_darwin_background() -> bool {
         false
     }
 
@@ -388,6 +417,10 @@ mod platform {
     pub(super) fn raise_child_before_exec() {}
 
     pub(super) fn set_process_io_policy(_policy: libc::c_int) -> bool {
+        false
+    }
+
+    pub(super) fn leave_darwin_background() -> bool {
         false
     }
 
