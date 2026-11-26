@@ -143,9 +143,15 @@ impl Drop for Scope {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(path) = running.and_then(|running| running.heartbeat) {
-            let _ = std::fs::remove_file(path);
+            remove_quietly(&path);
         }
     }
+}
+
+/// Remove a heartbeat file or its temporary. Best effort: a file left behind
+/// is what a `SIGKILL` leaves too, and readers check its `pid` and age.
+fn remove_quietly(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// The test seam: hold inside the `test_command_hold` span when asked to.
@@ -160,7 +166,7 @@ pub(super) fn test_hold() {
     std::thread::sleep(Duration::from_millis(millis));
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 fn signal_name(signal: i32) -> &'static str {
     #[cfg(unix)]
     {
@@ -173,7 +179,6 @@ fn signal_name(signal: i32) -> &'static str {
     }
     #[cfg(not(unix))]
     {
-        let _ = signal;
         "other"
     }
 }
@@ -337,7 +342,7 @@ fn remove_heartbeat(deadline: Instant) {
             .as_ref()
             .and_then(|running| running.heartbeat.clone())
     {
-        let _ = std::fs::remove_file(path);
+        remove_quietly(&path);
     }
 }
 
@@ -397,7 +402,7 @@ fn write_heartbeat() {
     if std::fs::write(&temporary, bytes).is_ok() && std::fs::rename(&temporary, &path).is_ok() {
         running.heartbeat = Some(path);
     } else {
-        let _ = std::fs::remove_file(&temporary);
+        remove_quietly(&temporary);
     }
 }
 
@@ -580,16 +585,18 @@ mod unix {
     /// disposition would have.
     fn interrupted(signal: libc::c_int) -> ! {
         let deadline = Instant::now() + super::FLUSH_BUDGET;
-        let (sender, receiver) = std::sync::mpsc::channel();
         let flush = std::thread::Builder::new()
             .name("aethyme-interrupt-flush".into())
             .spawn(move || {
                 super::write_interrupted_row(signal, deadline);
                 super::remove_heartbeat(deadline);
-                let _ = sender.send(());
             });
-        if flush.is_ok() {
-            let _ = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        // Polled rather than joined: past the deadline the signal is raised
+        // whether or not the row was written.
+        if let Ok(flush) = flush {
+            while !flush.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         // SAFETY: restoring the default disposition and unblocking `signal`
         // on this thread only; `raise` then delivers it here, and its default
