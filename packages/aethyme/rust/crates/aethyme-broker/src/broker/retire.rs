@@ -986,12 +986,21 @@ fn recheck_keep_code(reason: &str) -> &'static str {
     if reason.starts_with("ignored content requires explicit cleanup") {
         return "changed_ignored";
     }
+    // "<count> uncommitted or untracked path(s), first: <path>" or "at least
+    // 1 ...": the path may hold any other code's words.
+    let counted = reason.strip_prefix("at least ").unwrap_or(reason);
+    let digits = counted.len()
+        - counted
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    if digits > 0 && counted[digits..].starts_with(" uncommitted or untracked path(s)") {
+        return "changed_uncommitted";
+    }
     match crate::auto_cleanup::kept_reason_code(reason) {
         "uncommitted_changes" => "changed_uncommitted",
         "operation_in_progress" => "changed_operation",
         "stash" => "changed_stash",
         "ignored_content" => "changed_ignored",
-        "ignored_content_unverified" => "changed_unclean_unknown",
         _ => "changed_unclean_other",
     }
 }
@@ -2300,6 +2309,15 @@ impl Broker {
             "operation_unresolved" => self
                 .session_operations_unresolved_since_boot(session_id)
                 .unwrap_or(true),
+            // A dropped stash lifts the keep at once; the key (HEAD and
+            // index) does not see it. An unreadable answer keeps it.
+            "changed_stash" => self
+                .store_ref()
+                .session(session_id)
+                .map_or(true, |session| {
+                    crate::auto_cleanup::stash_made_on_branch(self.main_root(), &session.branch)
+                        .map_or(true, |stash| stash.is_some())
+                }),
             _ => true,
         }
     }
@@ -6084,6 +6102,14 @@ mod tests {
         let second = run(&mut broker);
         assert_eq!(second.keep_memo_skips, 1, "{second:#?}");
         assert_eq!(second.examined, 0, "{second:#?}");
+
+        // Dropping the stash changes neither HEAD nor the index, yet lifts
+        // the keep at once.
+        git(&worktree, &["stash", "drop"]);
+        let third = run(&mut broker);
+        assert_eq!(third.keep_memo_skips, 0, "{third:#?}");
+        assert_eq!(third.retired_clean, 1, "{third:#?}");
+        assert!(is_cleaned(&broker, session.id));
     }
 
     /// A cleanup policy that cannot be read at the re-check keeps the
@@ -6133,8 +6159,8 @@ mod tests {
                 "changed_ignored",
             ),
             (
-                "ignored-path classification exceeded its time budget",
-                "changed_unclean_unknown",
+                "3 uncommitted or untracked path(s), first: a merge is in progress/ignored content requires explicit cleanup",
+                "changed_uncommitted",
             ),
             ("something no proof says", "changed_unclean_other"),
         ] {
@@ -6154,7 +6180,8 @@ mod tests {
         ];
         let counters = codes
             .iter()
-            .map(|code| super::kept_counter(*code))
+            .copied()
+            .map(super::kept_counter)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(counters.len(), codes.len());
         for code in codes {

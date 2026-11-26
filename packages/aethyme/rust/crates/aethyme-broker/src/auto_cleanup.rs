@@ -4486,6 +4486,13 @@ fn ignored_reason_from_status(
     }
     let mut released_by_file_pattern = false;
     let mut released_empty_directories = 0_usize;
+    // One budget for every walk of this re-check, which runs under the
+    // repository-wide lifecycle claim: never more than its entries in all,
+    // never past the listing's deadline.
+    let mut walk_budget = EmptyDirectoryWalkBudget::new(
+        EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+        crate::git::active_git_deadline().map_or(deadline, |active| active.min(deadline)),
+    );
     for relative in ignored {
         ensure_ignored_content_before(deadline)?;
         if relative.len() > PROOF_IGNORED_PATH_BYTES {
@@ -4507,7 +4514,11 @@ fn ignored_reason_from_status(
                 }
                 if unknown_directories == UnknownIgnoredDirectories::ReleaseWhenEmpty
                     && matches!(classification, RecoveryIgnoredClassification::Preserve(_))
-                    && ignored_directory_holds_no_files(worktree, relative)
+                    && {
+                        let _walk =
+                            crate::phase_telemetry::span("proof_empty_ignored_directory_walk");
+                        ignored_directory_holds_no_files(worktree, relative, &mut walk_budget)
+                    }
                 {
                     released_empty_directories += 1;
                     return Ok(());
@@ -4531,36 +4542,68 @@ fn ignored_reason_from_status(
     Ok(None)
 }
 
-/// Entries [`ignored_directory_holds_no_files`] reads before it stops and
-/// calls the directory not empty.
+/// Entries (directories and their entries) all of one re-check's
+/// [`ignored_directory_holds_no_files`] walks read together before they stop
+/// and call the directory being walked not empty.
 const EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT: usize = 4_096;
-/// Directory levels it descends before it calls the directory not empty.
+/// Directory levels one walk descends before it calls the directory not
+/// empty.
 const EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT: usize = 128;
+
+/// What the empty-directory walks of one re-check may still spend: entries
+/// shared across every ignored root, and a deadline.
+#[derive(Debug)]
+pub(crate) struct EmptyDirectoryWalkBudget {
+    entries_left: usize,
+    deadline: Instant,
+}
+
+impl EmptyDirectoryWalkBudget {
+    pub(crate) fn new(entries: usize, deadline: Instant) -> Self {
+        Self {
+            entries_left: entries,
+            deadline,
+        }
+    }
+
+    /// Spend one entry; `false` once the entries or the time are gone.
+    fn spend(&mut self) -> bool {
+        if self.entries_left == 0 || Instant::now() >= self.deadline {
+            return false;
+        }
+        self.entries_left -= 1;
+        true
+    }
+}
 
 /// Whether the ignored path `relative` of `worktree` is a real directory
 /// (never a link) whose whole subtree holds only directories: no regular
-/// file, link or special node. Bounded and never following a link; any
-/// entry it cannot read, and anything past its bounds, answers `false`
-/// (the directory keeps the checkout). An empty directory holds no work:
-/// the recovery archive of such a directory is zero files.
-pub(crate) fn ignored_directory_holds_no_files(worktree: &Path, relative: &str) -> bool {
+/// file, link or special node. Never follows a link, and spends `budget`
+/// for every directory it opens and every entry it reads; any entry it
+/// cannot read, a subtree deeper than its depth limit, and a budget that
+/// runs out answer `false` (the directory keeps the checkout). An empty
+/// directory holds no work: the recovery archive of such a directory is
+/// zero files.
+pub(crate) fn ignored_directory_holds_no_files(
+    worktree: &Path,
+    relative: &str,
+    budget: &mut EmptyDirectoryWalkBudget,
+) -> bool {
     let root = worktree.join(relative.trim_end_matches('/'));
     match std::fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         _ => return false,
     }
     let mut pending = vec![(root, 0_usize)];
-    let mut examined = 0_usize;
     while let Some((directory, depth)) = pending.pop() {
-        if depth > EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT {
+        if depth > EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT || !budget.spend() {
             return false;
         }
         let Ok(entries) = std::fs::read_dir(&directory) else {
             return false;
         };
         for entry in entries {
-            examined += 1;
-            if examined > EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT {
+            if !budget.spend() {
                 return false;
             }
             let Ok(entry) = entry else {
@@ -4821,20 +4864,24 @@ fn in_progress_or_stash_reason(
     }
 
     if let Some(branch) = branch {
-        let stashes = git(main_root, &["stash", "list", "--format=%gs"])?;
-        let made_here = [format!("WIP on {branch}:"), format!("On {branch}:")];
-        if let Some(entry) = stashes
-            .lines()
-            .find(|line| made_here.iter().any(|prefix| line.starts_with(prefix)))
-        {
-            return Ok(Some(format!(
-                "a stash was made on {branch}: {}",
-                entry.trim()
-            )));
-        }
+        return stash_made_on_branch(main_root, branch);
     }
 
     Ok(None)
+}
+
+/// A stash made on `branch` (one `git stash list` in `main_root`), as the
+/// keep reason proof 3 gives for it.
+pub(crate) fn stash_made_on_branch(
+    main_root: &Path,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let stashes = git(main_root, &["stash", "list", "--format=%gs"])?;
+    let made_here = [format!("WIP on {branch}:"), format!("On {branch}:")];
+    Ok(stashes
+        .lines()
+        .find(|line| made_here.iter().any(|prefix| line.starts_with(prefix)))
+        .map(|entry| format!("a stash was made on {branch}: {}", entry.trim())))
 }
 
 /// Shared ignored-content verdict for automatic and finish-time cleanup.
@@ -11398,16 +11445,111 @@ mod tests {
         std::os::unix::fs::symlink(root.join("bare"), root.join("linked_root")).unwrap();
         std::fs::write(root.join("plain.log"), "log\n").unwrap();
 
-        assert!(super::ignored_directory_holds_no_files(root, "empty/"));
-        assert!(super::ignored_directory_holds_no_files(root, "bare"));
-        assert!(!super::ignored_directory_holds_no_files(root, "with_file/"));
-        assert!(!super::ignored_directory_holds_no_files(root, "with_link/"));
+        let walk = |relative: &str| {
+            super::ignored_directory_holds_no_files(
+                root,
+                relative,
+                &mut super::EmptyDirectoryWalkBudget::new(
+                    super::EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+                    Instant::now() + Duration::from_secs(600),
+                ),
+            )
+        };
+        assert!(walk("empty/"));
+        assert!(walk("bare"));
+        assert!(!walk("with_file/"));
+        assert!(!walk("with_link/"));
+        assert!(!walk("linked_root"));
+        assert!(!walk("plain.log"));
+        assert!(!walk("missing/"));
+    }
+
+    /// A FIFO in the directory keeps it: a special node is not a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_inside_an_ignored_directory_keeps_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("holder/nested")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("holder/nested/pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut budget = super::EmptyDirectoryWalkBudget::new(
+            super::EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+            Instant::now() + Duration::from_secs(600),
+        );
         assert!(!super::ignored_directory_holds_no_files(
             root,
-            "linked_root"
+            "holder/",
+            &mut budget
         ));
-        assert!(!super::ignored_directory_holds_no_files(root, "plain.log"));
-        assert!(!super::ignored_directory_holds_no_files(root, "missing/"));
+    }
+
+    /// Past the entry budget, past the depth limit or past the deadline,
+    /// the walk answers "not empty" (keep).
+    #[cfg(unix)]
+    #[test]
+    fn an_exhausted_walk_keeps_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["a", "b", "c", "d"] {
+            std::fs::create_dir_all(root.join("wide").join(name)).unwrap();
+        }
+        let later = Instant::now() + Duration::from_secs(600);
+        // The root, its four entries and the four entries' directories: 9.
+        assert!(super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(9, later)
+        ));
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(8, later)
+        ));
+
+        let mut deep = root.join("deep");
+        for _ in 0..=super::EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT + 1 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "deep",
+            &mut super::EmptyDirectoryWalkBudget::new(usize::MAX, later)
+        ));
+
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(usize::MAX, Instant::now())
+        ));
+    }
+
+    /// One budget is shared by every root of a re-check: what one walk
+    /// spent is gone for the next.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_budget_is_shared_across_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("first/x")).unwrap();
+        std::fs::create_dir_all(root.join("second/y")).unwrap();
+        // Each root alone costs 3: itself, its entry, that entry's directory.
+        let mut budget =
+            super::EmptyDirectoryWalkBudget::new(5, Instant::now() + Duration::from_secs(600));
+        assert!(super::ignored_directory_holds_no_files(
+            root,
+            "first",
+            &mut budget
+        ));
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "second",
+            &mut budget
+        ));
     }
 
     /// The retirement re-check releases an ignored directory nothing
@@ -11448,6 +11590,18 @@ mod tests {
         assert_eq!(
             super::unclean_reason_for_retirement(root, None, root, &policy),
             Ok(None)
+        );
+
+        let strict = AutoCleanupPolicy {
+            strict: true,
+            ..AutoCleanupPolicy::default()
+        };
+        let kept = super::unclean_reason_for_retirement(root, None, root, &strict).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "strict mode never releases: {kept:?}"
         );
 
         std::fs::write(root.join("scratch-area/nested/notes.txt"), "work\n").unwrap();

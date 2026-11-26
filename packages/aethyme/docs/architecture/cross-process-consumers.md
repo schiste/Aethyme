@@ -5835,8 +5835,10 @@ the logs. Each now has its own keep code (counter
   between the copy and the move (was `changed`).
 
 `changed_stash` is remembered with the keep back-off (1 h, 6 h, 24 h, or at
-once when HEAD or the index changes): the plan never looks at stashes, so
-such a checkout was refused by the re-check on every run. The others are not
+once when HEAD or the index changes, or when the next lap finds the stash
+dropped: one `git stash list`, counted as `checkout_retirement_keep_condition_cleared`):
+the plan never looks at stashes, so such a checkout was refused by the
+re-check on every run. The others are not
 remembered, as before. The old counter `checkout_retirement_kept_changed` is
 no longer written.
 
@@ -5847,9 +5849,13 @@ file, which is zero files, so it planned the no-archive path; the re-check's
 `git status --ignored=matching` listing reported the same directory and
 refused it as ignored content, on every run. The re-check
 (`unclean_reason_for_retirement`) now walks such a directory again under the
-claim, bounded (4,096 entries, 128 levels) and never following a link, and
-releases it only when the walk finds nothing but directories; a file, a link
-or anything unreadable still keeps the checkout (`changed_ignored`). Every
+claim and never following a link, and releases it only when the walk finds
+nothing but directories; a file, a link, a special node or anything
+unreadable still keeps the checkout (`changed_ignored`). All the walks of one
+re-check share one budget of 4,096 entries (each directory opened and each
+entry read) and the ignored listing's deadline, and one walk descends at most
+128 levels; a walk past any of them keeps the checkout. Each walk is the span
+`proof_empty_ignored_directory_walk`. Every
 other caller of proof 3 is unchanged. New counter
 `proof_empty_ignored_directory_released` (one per released directory) and
 span `checkout_retirement_phase_recheck` (the proof 3 re-check under the
