@@ -32,19 +32,32 @@
 //! a rename that fails) is left in place; the caller still rotates the tree
 //! when pruning did not bring it under its ceiling.
 //!
-//! [`UnitScope::LocalPackages`] (the storage worker's prune of an over-budget
-//! gate cache) limits candidates to local packages -- workspace members and
-//! other path packages -- by the target's own records: a unit's dep-info file
+//! [`UnitScope::Worker`] (the storage worker's prune of gate caches and of
+//! the Cargo targets it manages) limits candidates to local packages --
+//! workspace members and other path packages -- by the target's own records:
+//! a unit's dep-info file
 //! (`deps/<name>-<hash>.d`) lists the sources it was built from, and cargo
 //! builds a registry or git dependency from its own source directories
 //! (`<cargo home>/registry/src/...`, `<cargo home>/git/checkouts/...`). A
 //! package is local only when some candidate unit's dep-info names sources
 //! and none names a registry or git source; a package without readable
 //! dep-info is never a candidate.
+//!
+//! The worker's in-use signal is also stricter than "nothing read it since
+//! its successor was built" ([`worker_prunable`]): under `relatime` (and
+//! other lazy access-time updates) a read is recorded only when the
+//! previous recorded access is older than the file's modification or a day
+//! old, so a generation read again soon after an earlier read keeps the
+//! earlier time and looked unused. A superseded generation is pruned only
+//! once its last recorded access (or modification) is older than the
+//! artifact max age (a day when that is off). In a gate cache that signal
+//! is also written, not just read: every gate advances the sources of the
+//! tree it tests (#391), so cargo rebuilds -- rewrites -- every local unit
+//! the gate uses.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// What one prune staged.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -63,18 +76,51 @@ pub(crate) struct PruneOutcome {
     /// relative to the target, to tell later whether cargo rebuilt one.
     pub(crate) staged: Vec<String>,
     /// Superseded units left alone because their package is not local
-    /// ([`UnitScope::LocalPackages`] only; not counted in `candidates`).
+    /// ([`UnitScope::Worker`] only; not counted in `candidates`).
     pub(crate) not_local: u64,
+    /// Superseded local units left alone because they were used within the
+    /// rule's `unused_for` ([`UnitScope::Worker`] only; not counted in
+    /// `candidates`).
+    pub(crate) in_use: u64,
 }
 
 /// Which superseded units may be pruned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnitScope {
-    /// Any package's.
+    /// Any package's, once nothing read it since its successor was built
+    /// (the gate's own prune of a cache over its ceiling).
     Any,
-    /// Only local packages' (workspace members and other path packages), by
-    /// their dep-info files.
-    LocalPackages,
+    /// The storage worker's: local packages' only (workspace members and
+    /// other path packages, by their dep-info files), once unused for the
+    /// rule's time ([`worker_prunable`]).
+    Worker(WorkerRule),
+}
+
+/// When the storage worker may prune a superseded local generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerRule {
+    pub(crate) now: SystemTime,
+    /// How long its last recorded access (or modification) must be past:
+    /// the artifact max age, or [`ACCESS_TIME_WINDOW`] when that is off.
+    pub(crate) unused_for: Duration,
+}
+
+/// How long a lazily updated access time (`relatime`) may lag behind a
+/// read: a read is recorded at the latest once the previous recorded access
+/// is this old.
+pub(crate) const ACCESS_TIME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether the worker may prune a superseded generation of a package that is
+/// `local`, last recorded as accessed or modified at `read_at`: local, and
+/// unused for the rule's time. Nothing else about its successor is asked:
+/// a recent read, recorded or not, shows up as an access within a day of
+/// the last recorded one, and the newest generation is never superseded.
+pub(crate) fn worker_prunable(rule: WorkerRule, local: bool, read_at: SystemTime) -> bool {
+    local
+        && rule
+            .now
+            .duration_since(read_at)
+            .is_ok_and(|unused| unused >= rule.unused_for)
 }
 
 struct Unit {
@@ -85,6 +131,8 @@ struct Unit {
     hash: String,
     built_at: SystemTime,
     read_at: SystemTime,
+    /// When the newest generation of its package and kinds was built.
+    successor_built_at: SystemTime,
     /// Logical bytes of the fingerprint directory's files.
     bytes: u64,
 }
@@ -122,14 +170,27 @@ pub(crate) fn prune_superseded_units_in(
     }
     let mut candidates = Vec::new();
     for profile in profiles(target) {
-        let mut found = superseded_units(&profile);
-        if scope == UnitScope::LocalPackages {
-            let local = local_packages(&profile, &found);
-            let before = found.len();
-            found.retain(|unit| local.contains(&unit.package));
-            outcome.not_local += (before - found.len()) as u64;
+        let found = superseded_units(&profile);
+        match scope {
+            UnitScope::Any => candidates.extend(
+                found
+                    .into_iter()
+                    .filter(|unit| unit.read_at <= unit.successor_built_at),
+            ),
+            UnitScope::Worker(rule) => {
+                let local = local_packages(&profile, &found);
+                for unit in found {
+                    let is_local = local.contains(&unit.package);
+                    if worker_prunable(rule, is_local, unit.read_at) {
+                        candidates.push(unit);
+                    } else if is_local {
+                        outcome.in_use += 1;
+                    } else {
+                        outcome.not_local += 1;
+                    }
+                }
+            }
         }
-        candidates.extend(found);
     }
     outcome.candidates = candidates.len() as u64;
     candidates.sort_by(|left, right| {
@@ -239,8 +300,8 @@ fn unit_name(name: &str) -> Option<(&str, &str)> {
         .then_some((package, hash))
 }
 
-/// Every unit of this profile that a newer generation superseded and that
-/// nothing read since that generation was built.
+/// Every unit of this profile that a newer generation superseded, with when
+/// that generation was built (the caller judges whether it is still used).
 fn superseded_units(profile: &Path) -> Vec<Unit> {
     let Ok(entries) = std::fs::read_dir(profile.join(".fingerprint")) else {
         return Vec::new();
@@ -273,6 +334,7 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
                 hash: hash.to_string(),
                 built_at: facts.built_at,
                 read_at: facts.read_at,
+                successor_built_at: facts.built_at,
                 bytes: facts.bytes,
             });
     }
@@ -290,7 +352,11 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
         superseded.extend(
             units
                 .into_iter()
-                .filter(|unit| unit.built_at < newest_built_at && unit.read_at <= newest_built_at),
+                .filter(|unit| unit.built_at < newest_built_at)
+                .map(|mut unit| {
+                    unit.successor_built_at = newest_built_at;
+                    unit
+                }),
         );
     }
     superseded
@@ -759,11 +825,15 @@ mod tests {
             &staging,
             u64::MAX,
             later(),
-            UnitScope::LocalPackages,
+            UnitScope::Worker(WorkerRule {
+                now: at(110) + ACCESS_TIME_WINDOW,
+                unused_for: ACCESS_TIME_WINDOW,
+            }),
         );
 
         assert_eq!(outcome.candidates, 1);
         assert_eq!(outcome.not_local, 2);
+        assert_eq!(outcome.in_use, 0);
         assert_eq!(
             outcome.staged,
             vec![format!("debug/.fingerprint/work-crate-{OLD}")]
@@ -781,6 +851,84 @@ mod tests {
         ] {
             assert!(profile.join(&kept).exists(), "{kept} must be kept");
         }
+    }
+
+    /// The worker's rule: local packages only, and only once the last
+    /// recorded access is past `unused_for`, however it relates to the
+    /// successor's build (a lazily updated access time may lag a day).
+    #[test]
+    fn the_worker_rule_needs_a_local_package_unused_for_its_time() {
+        let rule = WorkerRule {
+            now: at(1_000_000),
+            unused_for: ACCESS_TIME_WINDOW,
+        };
+        let day = ACCESS_TIME_WINDOW.as_secs();
+        assert!(worker_prunable(rule, true, at(1_000_000 - day)));
+        assert!(worker_prunable(rule, true, at(10)));
+        assert!(!worker_prunable(rule, true, at(1_000_000 - day + 1)));
+        assert!(
+            !worker_prunable(rule, false, at(10)),
+            "never a dependency's"
+        );
+        // An access time ahead of the clock is not "unused".
+        assert!(!worker_prunable(rule, true, at(2_000_000)));
+    }
+
+    /// Finding (b) of #2041: a generation read again after its successor was
+    /// built can keep an earlier access time under `relatime`. The legacy
+    /// rule ("not read since the successor was built") prunes it; the
+    /// worker's keeps it until its last recorded access is a day old.
+    #[test]
+    fn a_generation_read_within_the_access_window_is_kept_by_the_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let profile = target.join("debug");
+        unit(&profile, "work-crate", OLD, 10, 20, 1_000);
+        unit(&profile, "work-crate", NEW, 100, 110, 1_000);
+        std::fs::write(
+            profile.join(format!("deps/work_crate-{OLD}.d")),
+            format!("/t/deps/libwork_crate-{OLD}.rlib: crates/work/src/lib.rs\n"),
+        )
+        .unwrap();
+        let rule = |now: SystemTime| {
+            UnitScope::Worker(WorkerRule {
+                now,
+                unused_for: ACCESS_TIME_WINDOW,
+            })
+        };
+        // An hour after the successor: the legacy rule would prune it.
+        let kept = prune_superseded_units_in(
+            &target,
+            &tmp.path().join("staging-1"),
+            u64::MAX,
+            later(),
+            rule(at(110 + 3_600)),
+        );
+        assert_eq!((kept.units, kept.in_use), (0, 1));
+        assert!(
+            profile
+                .join(format!(".fingerprint/work-crate-{OLD}"))
+                .exists()
+        );
+        // A day after its last recorded access: pruned.
+        let pruned = prune_superseded_units_in(
+            &target,
+            &tmp.path().join("staging-2"),
+            u64::MAX,
+            later(),
+            rule(at(20) + ACCESS_TIME_WINDOW),
+        );
+        assert_eq!(pruned.units, 1);
+        assert!(
+            !profile
+                .join(format!(".fingerprint/work-crate-{OLD}"))
+                .exists()
+        );
+        assert!(
+            profile
+                .join(format!(".fingerprint/work-crate-{NEW}"))
+                .exists()
+        );
     }
 
     #[test]
