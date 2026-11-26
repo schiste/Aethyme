@@ -4,6 +4,233 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.182] - 2026-11-26
+
+### Added
+
+- `broker status` now says where its `retention` phase goes: spans `cleanup_retention_policy`, `_inventory`, `_closed_sessions`, `_inode_summary`, `_closed_worktrees`, `_oldest_closed`, `_gate_headroom`, `_reconciliation` and `_artifact_sweep`. On the busiest repository that phase took about 2.8 s per full status view on 0.8.181 with nothing attributed under it (#2031).
+- `blockers_action_required` (about 1 s per full status view there) is split into `blockers_action_required_sessions` and, per live session, `_notice_probe`, `_strip_marker` and `_notice_clear` (#2031).
+
+### Fixed
+
+- The architecture notes said the `gc_plan_*` spans added in 0.8.181 time the `retention` phase of `status`; they time that of `doctor` (#2031).
+
+## [0.8.181] - 2026-11-26
+
+### Changed
+
+- The health and cleanup inventory behind `status` no longer starts Git for a closed session's directory that Git certainly cannot open: one with no `.git` or `HEAD` in it or any parent, or whose `.git` pointer names a directory that does not exist. Git's answer for both is an error, so the same ownership check that followed that error runs as before, and cleanup and retention keep, remove and report exactly what they did. On the busiest repository, 39 full `status` views in an hour started 15,366 such probes (about 394 each, 61 s); 483 of its 1,290 checkout directories have no `.git` entry (#2029).
+
+### Added
+
+- Counters `worktree_common_dir_no_git_entry` and `worktree_common_dir_dangling_pointer`, and spans `gc_plan_retention_policy`, `_cleanup_inventory`, `_store_reads`, `_gate_logs`, `_command_metrics`, `_worktree_blockers`, `_artifact_candidates`, `_orphan_roots`, `_recovery_archives`, `_gate_cache`, `_environment_cache`, `_worktree_reconciliation`, `_cleanup_reports` and `gc_health_journal`, which split the `retention` phase of `status` (#2029).
+
+### Upgrade notes
+
+- For such directories, cleanup's keep and unavailable reasons read "is not inside a git repository" instead of Git's own error text (#2029).
+
+## [0.8.180] - 2026-11-26
+
+### Changed
+
+- The background lane that closes abandoned sessions now looks first at reasons that are cheap to read and keep a session anyway: a held explicit claim, an active merge-queue entry, a running gate or an unresolved command. These are read only in holder states where the full judgement would reach the same check. Before, they were read after the activity probe, the work class, the remote safety check, the process listing and the open-file check. On Aethyme's own repository 48 cleanup passes made 1,142 such judgements in 2,613 s and closed none; 713 kept for a held claim, 186 for the merge queue. The early look only keeps: every check before a close still runs, unchanged, under the claim, and any read error falls through to the full judgement (#2026).
+
+### Added
+
+- Span `session_close_early_look`, counters `session_close_early_kept` and `session_close_early_look_unreadable`, attachment `session_close_early_kept_by_reason` (#2026).
+
+### Upgrade notes
+
+- A session kept by the early look may report that reason instead of an earlier one such as recent activity, and counts as deferred work, so the retirement request stays armed. Its stale-work class and closing-soon time stay as last recorded until a full judgement runs (#2026).
+
+### Known issues
+
+- Sessions kept for an active build-output producer still pay the full judgement: the only check takes the producer's reclaim lock.
+- The remote safety check asks the remote once per session, about 0.9 s each.
+
+## [0.8.179] - 2026-11-25
+
+### Changed
+
+- The step of `submit prepare` that shares dependency files between checkouts no longer hashes or pools Python bytecode. Bytecode usually carries its checkout's path and its source's time, so it rarely matches another checkout; each examined prepare added about 25 MB of it to the pool. In a sample of the pool, 988 of 1,036 entries were bytecode (#2024).
+- A pool entry verified in the last day is not read again while its device, inode, size, modification time and change time are unchanged. Together these should remove about 367 of 685 MB read per pass (estimated from bytes; not timed). The step took 1,293 s over 40 prepares on 0.8.177 on the busiest repository (median 20.8 s, p90 82 s) (#2024).
+
+### Added
+
+- Spans `prepare_output_share_sweep`, `_sample`, `_sizing`, `_hash`, `_verify`, `_add`, `_replace` and `_record`, and counters for skipped bytecode and for pool entries hashed or recognised (#2024).
+
+### Upgrade notes
+
+- `unique_bytes_after` now includes bytecode that is no longer pooled (about 25 MB per checkout there). Bytecode already in the pool stays until the store rotates.
+
+### Known issues
+
+- The first prepare after the upgrade, and one about once a day, still hashes every reused pool entry.
+- Damage on disk that changes no metadata of a pool entry is found within a day instead of by the next prepare.
+
+## [0.8.178] - 2026-11-25
+
+### Fixed
+
+- `start --adopt` after a closed session no longer hashes the patches of every commit the branch has beyond a stale local integration branch. In a repository that lands only by pull request that branch does not move; on the busiest repository it was about 21,000 commits behind, and the scan took 160 to 272 s in three 0.8.176 runs, all while holding the lifecycle lock (18 such runs since 0.8.157 held it for 4,716 s). The same scan, reproduced by hand, took 200 s of CPU. Only the session's own undelivered commits are judged now, and only commits sharing a changed-path set with a candidate are hashed (#2022).
+- The scan for renamed files in the same command runs one listing instead of one Git process per owned commit (#2022).
+
+### Changed
+
+- Commits reachable from `origin/HEAD` no longer count as owned and pending when a session is re-adopted. Work landed by squash or rebase stays with the session, as before. A session with nothing pending but commits that integration holds only by patch match keeps its boundary when other owned commits were left out this way (#2022).
+
+### Added
+
+- Spans `adopt_carried_ownership`, `adopt_drift_report`, `adopt_ownership_candidates` and `session_renamed_targets`; counters `adopt_carried_ownership_error` and `adopt_carried_default_unreadable`; attachment `adopt_ownership` (#2022).
+
+### Known issues
+
+- A commit that integration already holds by one patch match can still be left out of a re-adopted session when nothing was left out by reachability, as before.
+- `finish` still builds the full plan against the local integration branch in one check.
+- One step still walks commit headers in proportion to how far integration is behind.
+
+## [0.8.177] - 2026-11-25
+
+### Fixed
+
+- A background measurement of the shared preparation cache that reaches its 30-minute deadline makes that store wait 6 hours, then 24 hours after each further deadline without a completed walk in between. Before, it was walked again after 10 minutes, doubling. On the busiest repository since 0.8.160, 11 such walks took 19,803 s for no answer; the answers used saved at most about 750 s. The wait is one record per cache root, bound to the store's identity: a new, coalesced or rewritten request does not shorten it; another store identity, a completed walk of the store or a rotation of it by `submit prepare` ends it. What decides a budget and the other interruptions' back-off are unchanged, and `prepare` keeps its own bounded inventory during the wait (#2018).
+
+### Added
+
+- Counters `preparation_cache_measurement_deadline_wait_set` and `_deadline_wait_restored`, duration `preparation_cache_measurement_walk_cpu`, object `preparation_cache_measurement_progress`, request field `unanswered_deadlines` (omitted when zero) (#2018).
+
+### Known issues
+
+- An oversized store whose walk reaches the deadline is noticed later than before (#2018).
+- A remount that renumbers the device reads as another store and allows one walk (#2018).
+
+## [0.8.176] - 2026-11-25
+
+### Fixed
+
+- A recovery archive no longer takes an ignored file twice when Git lists both a directory and the files in it. Before, the copy failed with "File exists" on the second one, after copying what came before it: on one repository 6 of 23 kept checkouts, one after a 312 s copy, and the retirement lane retired nothing in 53 runs (1,955 s) (#2016).
+- An unfinished archive of an earlier state of a checkout no longer always blocks that checkout (9 of the 23). It is removed only when its record names this session, checkout path and branch, its commits are in what the plan archives, none of its prerequisite refs exists, and it holds only the record, the current patches and files the checkout still starts with byte for byte. Anything established to be otherwise keeps it, and the archive uses one alternate staging name; with both kept the apply refuses and says what an owner can do. A failure to judge removes nothing and opens no alternate (#2016).
+- A truncated manifest in unfinished staging no longer stops the release of prerequisite refs in its archive root when its retirement record is sound (#2016).
+
+### Changed
+
+- A plan whose file lists are not unique and sorted is refused before anything is copied (#2016).
+- Reports name a blocking ignored directory once, without its files (#2016).
+
+### Added
+
+- `storage status` (`recovery_archives_by_location.unfinished_staging`) and `storage archives` list unfinished staging, from sizes already recorded (#2016).
+- Counters `recovery_archive_ignored_duplicates_dropped`, `recovery_archive_plan_file_list_refused`, `recovery_archive_stale_partial_removed`, `_kept`, `_undecided`; span `recovery_archive_apply_stale_partial` (#2016).
+
+### Upgrade notes
+
+- `storage` JSON output only gains fields.
+
+### Known issues
+
+- Kept unfinished staging is never expired, at most two per session; staging with a Git bundle is always kept (#2016).
+- A staged copy that can never be read refuses every attempt on its checkout (#2016).
+
+## [0.8.175] - 2026-11-25
+
+### Fixed
+
+- The checkout retirement lane no longer redoes, every slice, a plan or archive that did not fit its 5-minute slice. One cut after at least 4 minutes, or a plan that leaves under 90 s for its archive, is remembered as `out_of_time` with the existing back-off (1, 6, 24 h); a shorter cut gets one whole slice next (`cut_short`). After the back-off the lane gives that checkout 20 minutes from its plan, at most once per lane run. Before, another repository's lane spent 5,872 s in 5 runs and retired nothing, while the busiest repository's lane waited for the volume they share (#2014).
+- The deadline for installing an archive's prerequisite refs is taken at each install, not before the copy, so a long archive no longer fails on a 10-minute Git limit that began before it (#2014).
+- A volume turn lock that cannot be opened ends the lane with `error` instead of reading as held (#2014).
+
+### Changed
+
+- A judgement past its slice observes open files again before the move, for at most 30 s, under the lifecycle claim; an incomplete observation refuses the move (#2014).
+- The retirement lane's recorded time is set only by a run that ran a slice. An `out_of_time` checkout is tried by the worker only when no lane ran a slice for 2 hours, and is not withheld from the other cleanup lanes (#2014).
+
+### Added
+
+- Spans `checkout_retirement_volume_turn_wait`, `checkout_retirement_volume_turn_held` and `recovery_archive_apply_*`; counter `checkout_retirement_long_judgement`; keeps `out_of_time`, `cut_short`, `volume_turn_error` (#2014).
+
+### Upgrade notes
+
+- An older binary that rewrites the kept-checkout record drops the `out_of_time` flag, which only shortens the next attempt.
+
+### Known issues
+
+- One slow checkout can hold a volume's turn for about 25 minutes, once per lane run (5-minute slices before), and critical memory pressure is not read during it (#2014).
+- An incomplete archive whose checkout changed since still blocks that checkout's retirement (not new).
+
+## [0.8.174] - 2026-11-25
+
+### Fixed
+
+- The recovery-archive size check honours its 30-minute interval when it cannot list every archive within its budget but every archive's size is known and the total is within the bound. Before, such a check was due again at the next run: on the busiest repository 22 of 26 recorded checks used their whole 20 s listing budget, with archives at about a third of the bound (#2012).
+
+### Changed
+
+- Listing gets at most three quarters of the check's budget and size walks the rest; archives with no usable size are listed first, and the listing share is taken after the directory entries are read (#2012).
+- Archives the broker does not vouch for keep their last measured size for at most 24 h. A carried size counts in the total and the bound, and never towards removing an archive (#2012).
+- An archive directory that cannot be listed, or a pool that is absent while archives are recorded in it, makes the total unknown, and recorded sizes there are kept. An absent pool alone waits for the interval (#2012).
+- A check that removed an expired archive and ran out of budget with more left is due again at once (#2012).
+
+### Added
+
+- Recorded usage fields `total_known`, `only_pool_absent`, `eviction_unfinished`; pass fields `walk_fell_back`, `size_unknown`, `size_stale`, `listed_first`, `root_failures`, `pool_absent`, `total_known`, `total_from_earlier_sizes`, `eviction_unfinished`; counters `recovery_archive_bound_total_from_earlier_sizes`, `recovery_archive_bound_total_unknown`, `checkout_retirement_archive_bound_not_due_partial` (#2012).
+
+### Upgrade notes
+
+- Each repository runs at least one extra check after the upgrade.
+
+### Known issues
+
+- A check that does not list every archive judges only the listed ones for age expiry, so expiry can take several intervals to cover all of them (#2012).
+
+## [0.8.173] - 2026-11-25
+
+### Changed
+
+- The merged-pull-request close lane takes its first changed-file activity probe (one Git status, at most 2 s) just before the operation claim instead of before the holder check and the landing proof. A close still requires it; the holder is judged again with its time, the index, `HEAD` and hook are read fresh around it, and the look under the claim is unchanged. A pass out of time before the probe keeps the session. On the busiest repository's 0.8.172 runs, 151 such first looks took 280 s in 26 runs and 37 reached the look under the claim. The net gain is unknown: the proof's clean check and the look under the claim may cost more. It is judged per run on `worktree_status_activity`, `landed_proof_worktree_clean` and `session_close_checkout_activity` together, and the change is reverted without a net drop (#2010).
+
+### Upgrade notes
+
+- `worktree_activity_look` `merged_pull_request_first` counts only looks taken; sessions the lane declines before its probe are in `worktree_activity_look_avoided` (#2010).
+
+## [0.8.172] - 2026-11-25
+
+### Changed
+
+- The automatic session-close lanes ask cheap keeps before the changed-file activity probe (one Git status, at most 2 s). Every lane first asks whether activity already known from the session row, last merge, hook, index or `HEAD` is recent; the landed lane also asks for an unmerged pull request, the cleanup policy and no session commits; the no-work lane for its holder, unresolved operations and explicit claims. Every check is still asked where it was, and the index, `HEAD` and hook are read fresh around the probe. In nine 0.8.171 passes over a minute on the busiest repository the probe's looks took about 440 s, nearly all in looks that timed out. The avoidable share there is estimated at about 13% of the timed-out looks, and some skipped probes may be paid by a later lane, so the gain is read after release (#2008).
+
+### Added
+
+- Attachments `worktree_activity_look_avoided` and `session_no_work_kept_other_by_reason`, and span `session_close_before_probe` (#2008).
+
+### Upgrade notes
+
+- Kept-reason counts can shift, because a cheaper reason may be reported first. `worktree_activity_look` `_first` entries no longer count avoided looks, so compare total `worktree_status_activity` across versions instead (#2008).
+
+## [0.8.171] - 2026-11-25
+
+### Fixed
+
+- `start --reuse` no longer recreates a retired checkout from its branch when its recovery archive may exist but cannot be reached (an unmounted volume, an unreadable directory, record or manifest, an incomplete pool binding). Before, the tombstone was removed first and unreadable places were skipped, so the checkout came back without its uncommitted work and without the pointer to the archive. The archive is now looked up before the tombstone is touched; when it cannot be told, the command refuses, leaves the tombstone, and gives a next step for that cause. An archive proven gone still falls back to the branch. Later failures put the tombstone back. An empty directory left by a killed restore is handled as retired (#2005).
+- An unreadable record of archived sessions is no longer overwritten. The next archived retirement keeps its text and restarts the record with the entries that can be read (#2005).
+- The merged-branch lane keeps a branch when an archive root or record cannot be resolved or checked. Before, such a root read as holding no archive (#2003).
+
+### Changed
+
+- The merged-branch lane lists the recovery archives once per slice instead of once per session; the re-check under the lifecycle claim before each delete still reads them afresh. `merged_branches_restorable_state` took 5.4 to 20.3 s in 13 of 14 recorded 0.8.169 passes on the busiest repository; which part of it was slow is inferred, and the new spans measure it (#2003).
+
+### Added
+
+- Spans and counts `merged_branches_archive_record`, `_tombstone`, `_archive_listing`, `_archive_listing_fresh`, `_archive_roots`, `_archive_entries`, `_archive_roots_unknown` (#2003); span `checkout_restore_archive_lookup` and counts `checkout_restore_refused_archive_unknown`, `checkout_restore_tombstone_lost`, `checkout_retirement_tombstone_kept_archive_unknown`, `checkout_retirement_archive_record_restarted`, `checkout_retirement_archive_record_preserve_refused` (#2005).
+- Attachments that split the changed-files activity probe by lane and look: `worktree_activity_look`, `worktree_activity_look_timed_out`, `worktree_activity_probe_newest`, `worktree_activity_index_head_decides`, `worktree_activity_probe_changed_verdict`, `worktree_activity_capped_probe_changed_verdict`, `worktree_activity_probe_answer_differs`, `worktree_activity_after_first_look_timed_out`, `landed_proof_worktree_clean_by_probe` (#2006).
+
+### Upgrade notes
+
+- `start --reuse` can now refuse where it used to recreate a checkout; the message says what to do (#2005).
+
+### Known issues
+
+- After a damaged record of archived sessions, a session closed before the restart can stay refused when no tombstone names its archive and the damaged text cannot answer for it; its archive is then restored by hand (#2005).
+
 ## [0.8.170] - 2026-11-24
 
 ### Fixed

@@ -2738,29 +2738,11 @@ impl Broker {
         integration_head: &str,
     ) -> Result<SubmissionPlan, BrokerOpError> {
         let repo = self.repo_handle();
-        // Once a contribution has been promoted, ownership begins after the
-        // last accepted session HEAD. `diff_base` remains the operational
-        // fallback for a session that has never contributed.
-        let accepted_checkpoint = session.accepted_session_head.as_deref();
-        let accepted_is_ancestor = accepted_checkpoint
-            .is_some_and(|checkpoint| repo.is_ancestor(checkpoint, session_head));
-        let repaired_checkpoint = session.diff_base.as_deref().filter(|checkpoint| {
-            accepted_checkpoint.is_some()
-                && !accepted_is_ancestor
-                && session.adoption_base.as_deref() != Some(*checkpoint)
-                && repo.is_ancestor(checkpoint, session_head)
-        });
-        let selected_checkpoint = if accepted_is_ancestor {
-            accepted_checkpoint
-        } else {
-            repaired_checkpoint.or_else(|| {
-                if accepted_checkpoint.is_none() {
-                    session.diff_base.as_deref()
-                } else {
-                    accepted_checkpoint
-                }
-            })
-        };
+        let crate::submission_ownership::OwnershipCheckpoint {
+            accepted: accepted_checkpoint,
+            repaired: repaired_checkpoint,
+            selected: selected_checkpoint,
+        } = crate::submission_ownership::OwnershipCheckpoint::select(repo, session, session_head);
         let Some(recorded_baseline) = selected_checkpoint else {
             return Ok(SubmissionPlan {
                 session_id: session.id,

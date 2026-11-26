@@ -511,15 +511,15 @@ under the shared-cache lease, renews it, and stops after 90 seconds; a root
 whose sampled large files already share their blocks (a pnpm `node_modules/`
 imported by clone) is skipped. A pool entry is published only when its own
 bytes hash to its name, and an existing entry is checked against its name
-before its first use in a pass; one that does not match is removed and
-counted. A replaced file keeps its mode and its access and modification
+before its first use; one that does not match is removed and counted. A
+match is remembered for a day, bound to the entry's exact device, inode, size
+and timestamps, so an unchanged entry is not read by every preparation. A replaced file keeps its mode and its access and modification
 times, but gets the pool entry's extended attributes, ACLs and file flags,
 a new inode and a new birth time. Temporaries left by an interrupted pass are
 removed by the next one once their process is gone. Nothing is seeded or
-relocated: files whose
-bytes differ between checkouts, such as compiled bytecode that embeds the
-checkout path or scripts with an absolute interpreter path, keep their own
-copy.
+relocated: files whose bytes differ between checkouts, such as scripts with
+an absolute interpreter path, keep their own copy. So does Python bytecode
+(`.pyc`, `.pyo`), which embeds the checkout path and is never pooled.
 
 `npm install` is never drafted. It rewrites a committed lockfile, which is a
 tracked-file mutation the worktree guard refuses without an explicit lease.

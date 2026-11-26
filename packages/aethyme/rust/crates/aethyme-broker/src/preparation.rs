@@ -2222,6 +2222,19 @@ impl Broker {
                     now_ms(),
                 )
             });
+        // The store a rotation below would remove, named before it is gone.
+        let measured_store = cache_root_binding
+            .as_ref()
+            .filter(|_| shared && cache_mode == SharedCacheMode::Exclusive && measure_budget)
+            .map(|binding| {
+                let repository = repository_identity(self);
+                let store = cache_measurement::identity_digest(&binding.path.join(&repository));
+                (
+                    repository,
+                    cache_measurement::cache_root_key(&binding.path),
+                    store,
+                )
+            });
         // Recovery, measurement and rotation move or remove the whole store,
         // so they run only when this preparation holds the cache alone. A
         // sharing holder has already seen that no rotation is unfinished.
@@ -2279,6 +2292,9 @@ impl Broker {
             // The measured store is gone: its result must not outlive it on
             // an inode identity some filesystems reuse.
             self.forget_shared_cache_measurement();
+            if let Some((repository, root_key, store)) = &measured_store {
+                self.end_deadline_wait(repository, root_key, store.as_deref());
+            }
         }
         if shared
             && cache_mode == SharedCacheMode::Exclusive

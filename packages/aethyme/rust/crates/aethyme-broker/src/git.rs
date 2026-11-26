@@ -350,6 +350,18 @@ fn changed_path_log_args() -> Vec<&'static str> {
     ]
 }
 
+/// `(status, path)` per `--name-status` line.
+fn parse_name_status(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let status = parts.next()?.trim().to_string();
+            let path = parts.next()?.trim().to_string();
+            (!status.is_empty() && !path.is_empty()).then_some((status, path))
+        })
+        .collect()
+}
+
 /// Both side-specific patch-equivalence results for one symmetric range.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PairedCherryMarks {
@@ -357,6 +369,26 @@ pub(crate) struct PairedCherryMarks {
     pub(crate) left_only: Vec<(String, bool)>,
     /// Commits unique to the right side, newest first.
     pub(crate) right_only: Vec<(String, bool)>,
+}
+
+/// A directory Git is certain to find no checkout in, and why
+/// (see [`GitRepo::checkout_discovery_certainly_fails`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckoutDiscoveryFailure {
+    /// No `.git` or `HEAD` in the directory or any ancestor.
+    NoGitEntry,
+    /// A `.git` file naming a Git directory that does not exist.
+    DanglingPointer,
+}
+
+impl CheckoutDiscoveryFailure {
+    /// The counter recorded each time this answer saves a Git probe.
+    pub(crate) fn counter(self) -> &'static str {
+        match self {
+            Self::NoGitEntry => "worktree_common_dir_no_git_entry",
+            Self::DanglingPointer => "worktree_common_dir_dangling_pointer",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4510,6 +4542,106 @@ impl GitRepo {
         (common.join("HEAD").is_file() && common.join("objects").is_dir()).then_some(common)
     }
 
+    /// Why `git rev-parse` run in `path` is certain to find no checkout,
+    /// decided from the filesystem alone; `None` leaves the question to Git.
+    ///
+    /// Git's discovery looks at `<dir>/.git` (a directory, or a file naming
+    /// one) and then at `<dir>` itself as a bare repository, which needs a
+    /// `<dir>/HEAD`, for `path` and then each parent in turn, and stops at
+    /// the first `.git` it can use. Two shapes cannot succeed:
+    ///
+    /// - [`CheckoutDiscoveryFailure::NoGitEntry`]: neither `.git` nor `HEAD`
+    ///   exists in `path` or in any ancestor, so every level is passed over.
+    ///   A directory inside a checkout always has its checkout's `.git` in an
+    ///   ancestor and is never answered here.
+    /// - [`CheckoutDiscoveryFailure::DanglingPointer`]: `path/.git` is a
+    ///   regular file of the exact `gitdir: <path>` form whose named directory
+    ///   does not exist. Git refuses an unusable `.git` file outright rather
+    ///   than walking on to the parent.
+    ///
+    /// Everything else goes to Git: any entry that exists or cannot be read,
+    /// a pointer in any other form, symlinked entries, an environment that
+    /// names a Git directory, an expired Git deadline (Git reports that as a
+    /// timeout, which callers must keep seeing) and non-Unix platforms.
+    pub(crate) fn checkout_discovery_certainly_fails(
+        path: &Path,
+    ) -> Option<CheckoutDiscoveryFailure> {
+        fn absent(path: &Path) -> bool {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+        if !cfg!(unix)
+            || !repository_identity_cache::environment_allows_memory()
+            || active_git_deadline().is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return None;
+        }
+        // Git runs with the physical directory as its working directory, so
+        // the ancestors it walks are the canonical path's.
+        let path = path.canonicalize().ok()?;
+        if !std::fs::metadata(&path).ok()?.is_dir() {
+            return None;
+        }
+        match std::fs::symlink_metadata(path.join(".git")) {
+            Ok(metadata) => {
+                return (metadata.is_file() && Self::git_file_names_missing_directory(&path))
+                    .then_some(CheckoutDiscoveryFailure::DanglingPointer);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        if !absent(&path.join("HEAD")) {
+            return None;
+        }
+        for ancestor in path.ancestors().skip(1) {
+            if !absent(&ancestor.join(".git")) || !absent(&ancestor.join("HEAD")) {
+                return None;
+            }
+        }
+        Some(CheckoutDiscoveryFailure::NoGitEntry)
+    }
+
+    /// Whether `<path>/.git` reads exactly as Git parses a `.git` file --
+    /// `gitdir: ` then one path, with only line endings after it -- and the
+    /// directory it names (relative to `path` when relative) does not exist.
+    /// Anything Git might read differently answers `false`.
+    fn git_file_names_missing_directory(path: &Path) -> bool {
+        const POINTER_LIMIT: u64 = 4096;
+        let Ok(file) = std::fs::File::open(path.join(".git")) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(POINTER_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > POINTER_LIMIT
+        {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let Some(target) = text.trim_end_matches(['\n', '\r']).strip_prefix("gitdir: ") else {
+            return false;
+        };
+        if target.is_empty() || target.trim() != target || target.contains(['\n', '\r', '\0']) {
+            return false;
+        }
+        let target = Path::new(target);
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            path.join(target)
+        };
+        matches!(
+            std::fs::symlink_metadata(&target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     fn absolute_common_dir(path: &Path, common: &str) -> PathBuf {
         let mut common_dir = PathBuf::from(common);
         if common_dir.is_relative() {
@@ -6724,13 +6856,22 @@ impl GitRepo {
         head: &str,
         excluded: &str,
     ) -> Result<Vec<String>, GitError> {
-        Ok(run_git(
-            &self.root,
-            &["rev-list", "--reverse", head, "--not", excluded],
-        )?
-        .lines()
-        .map(str::to_string)
-        .collect())
+        self.commits_excluding_all_oldest(head, &[excluded])
+    }
+
+    /// [`Self::commits_excluding_oldest`] for commits none of `excluded`
+    /// reaches.
+    pub(crate) fn commits_excluding_all_oldest(
+        &self,
+        head: &str,
+        excluded: &[&str],
+    ) -> Result<Vec<String>, GitError> {
+        let mut args = vec!["rev-list", "--reverse", head, "--not"];
+        args.extend_from_slice(excluded);
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 
     /// Earliest committer time among `commits`, Unix epoch milliseconds, in
@@ -6867,15 +7008,73 @@ impl GitRepo {
                 commit,
             ],
         )?;
-        Ok(out
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split('\t');
-                let status = parts.next()?.trim().to_string();
-                let path = parts.next()?.trim().to_string();
-                (!status.is_empty() && !path.is_empty()).then_some((status, path))
-            })
-            .collect())
+        Ok(parse_name_status(&out))
+    }
+
+    /// [`Self::commit_changed_paths`] of every commit, concatenated in order,
+    /// from one `diff-tree` however many commits are named.
+    pub(crate) fn commits_changed_paths(
+        &self,
+        commits: &[String],
+    ) -> Result<Vec<(String, String)>, GitError> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stdout = self.run_git_with_stdin(
+            &[
+                "diff-tree",
+                "--stdin",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-m",
+                "--first-parent",
+            ],
+            commits,
+        )?;
+        Ok(parse_name_status(&String::from_utf8_lossy(&stdout)))
+    }
+
+    /// Those of `paths` a tree listing of `rev` names. Reads trees only, in
+    /// batches of paths. A named path exists; one that is not named may still
+    /// (Git lists a directory's entries in its place when a path below it is
+    /// asked for too), so ask [`Self::blob_at`] before reading absence.
+    pub(crate) fn paths_listed_at(
+        &self,
+        rev: &str,
+        paths: &[String],
+    ) -> Result<std::collections::HashSet<String>, GitError> {
+        let mut listed = std::collections::HashSet::new();
+        let mut remaining = paths;
+        while !remaining.is_empty() {
+            let mut bytes = 0_usize;
+            let count = remaining
+                .iter()
+                .take(MAX_LITERAL_PATHSPEC_BATCH_COUNT)
+                .take_while(|path| {
+                    bytes = bytes.saturating_add(path.len());
+                    bytes <= MAX_LITERAL_PATHSPEC_BATCH_BYTES
+                })
+                .count()
+                .max(1);
+            let (batch, rest) = remaining.split_at(count);
+            remaining = rest;
+            let literal = batch
+                .iter()
+                .map(|path| format!(":(literal){path}"))
+                .collect::<Vec<_>>();
+            let mut args = vec!["ls-tree", "-z", "--full-tree", "--name-only", rev, "--"];
+            args.extend(literal.iter().map(String::as_str));
+            let output = self.run_git_output_limited(&args, MAX_GIT_BATCH_OUTPUT_BYTES)?;
+            listed.extend(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| String::from_utf8_lossy(path).into_owned()),
+            );
+        }
+        Ok(listed)
     }
 
     /// Renames git detects between two commits, as `old -> new`.
@@ -7259,7 +7458,7 @@ impl GitRepo {
     ///
     /// Narrowing can only withhold an equivalence, never invent one, and a
     /// listing that is unavailable falls back to every commit.
-    fn commits_sharing_changed_paths(
+    pub(crate) fn commits_sharing_changed_paths(
         &self,
         left: &[(String, bool)],
         right: &[(String, bool)],
@@ -12644,6 +12843,156 @@ mod worktree_common_dir_tests {
             "an unavailable ownership inspection must remain unavailable: {result:?}",
         );
     }
+
+    /// Every directory the filesystem answer claims is checked against Git
+    /// itself, and the shapes it must leave to Git are shown to be left.
+    #[cfg(unix)]
+    #[test]
+    fn a_certain_discovery_failure_is_one_git_also_reports() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        if GitRepo::discover(&root).is_ok() {
+            // The temporary directory sits inside some checkout, so nothing
+            // under it is outside every repository.
+            return;
+        }
+        let main = root.join("main");
+        let pool = root.join("pool");
+        let linked = pool.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&pool).unwrap();
+        run_git(&main, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = GitRepo::discover(&main).unwrap().git_common_dir().unwrap();
+
+        // A retired or stripped checkout: a pool directory with no `.git`.
+        let stripped = pool.join("stripped");
+        std::fs::create_dir(&stripped).unwrap();
+        std::fs::write(stripped.join("left-behind.txt"), "kept\n").unwrap();
+        // Pointers whose Git directory was removed, absolute and relative.
+        let dangling = pool.join("dangling");
+        std::fs::create_dir(&dangling).unwrap();
+        std::fs::write(
+            dangling.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                expected.join("worktrees/dangling").display()
+            ),
+        )
+        .unwrap();
+        let dangling_relative = pool.join("dangling-relative");
+        std::fs::create_dir(&dangling_relative).unwrap();
+        std::fs::write(
+            dangling_relative.join(".git"),
+            "gitdir: ../missing/.git/worktrees/dangling-relative\n",
+        )
+        .unwrap();
+
+        let certain = [
+            (&stripped, CheckoutDiscoveryFailure::NoGitEntry),
+            (&dangling, CheckoutDiscoveryFailure::DanglingPointer),
+            (
+                &dangling_relative,
+                CheckoutDiscoveryFailure::DanglingPointer,
+            ),
+        ];
+        for (path, failure) in certain {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                Some(failure),
+                "{}",
+                path.display()
+            );
+            assert!(
+                GitRepo::worktree_common_dir(path).is_err(),
+                "Git must agree that {} holds no checkout",
+                path.display()
+            );
+        }
+
+        // A checkout, and directories inside one, are Git's to answer: the
+        // nested ones have no `.git` of their own but are inside a checkout.
+        let main_nested = main.join("nested");
+        let linked_nested = linked.join("nested");
+        let legacy_pool_child = main.join(".aethyme/worktrees/stripped");
+        std::fs::create_dir_all(&main_nested).unwrap();
+        std::fs::create_dir_all(&linked_nested).unwrap();
+        std::fs::create_dir_all(&legacy_pool_child).unwrap();
+        for path in [
+            &main,
+            &main_nested,
+            &linked,
+            &linked_nested,
+            &legacy_pool_child,
+        ] {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                None,
+                "{}",
+                path.display()
+            );
+            assert_eq!(GitRepo::worktree_common_dir(path).unwrap(), expected);
+        }
+
+        // Shapes Git might read otherwise are left to it as well.
+        let bare = root.join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        run_git(&bare, &["init", "--bare", "-q"]).unwrap();
+        let padded = pool.join("padded");
+        std::fs::create_dir(&padded).unwrap();
+        std::fs::write(padded.join(".git"), "gitdir:  /missing/worktrees/padded\n").unwrap();
+        let unprefixed = pool.join("unprefixed");
+        std::fs::create_dir(&unprefixed).unwrap();
+        std::fs::write(unprefixed.join(".git"), "/missing/worktrees/unprefixed\n").unwrap();
+        let symlinked = pool.join("symlinked");
+        std::fs::create_dir(&symlinked).unwrap();
+        std::os::unix::fs::symlink(dangling.join(".git"), symlinked.join(".git")).unwrap();
+        for path in [&bare, &padded, &unprefixed, &symlinked] {
+            assert_eq!(
+                GitRepo::checkout_discovery_certainly_fails(path),
+                None,
+                "{}",
+                path.display()
+            );
+        }
+
+        // An expired deadline must still reach Git and read as a timeout.
+        assert_eq!(
+            with_git_deadline(Duration::ZERO, || {
+                GitRepo::checkout_discovery_certainly_fails(&stripped)
+            }),
+            None
+        );
+    }
 }
 
 /// #219: a git that never returns must become an error, not a hang.
@@ -13742,6 +14091,64 @@ mod batched_commit_tests {
             repo.cherry_marked("main", "unrelated", CherrySide::Right)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn batched_changed_paths_and_listings_match_the_per_item_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        for path in ["a.txt", "dir/b.txt", "[x].txt", "caf\u{e9}.txt"] {
+            std::fs::write(root.join(path), "one\n").unwrap();
+        }
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "root"]);
+        run(root, &["mv", "a.txt", "dir/a.txt"]);
+        run(root, &["commit", "-qm", "rename"]);
+        run(root, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        run(root, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+        std::fs::write(root.join("side.txt"), "side\n").unwrap();
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "side"]);
+        run(root, &["checkout", "-q", "main"]);
+        run(root, &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+
+        let repo = GitRepo::discover(root).unwrap();
+        let commits = run(root, &["rev-list", "--reverse", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(commits.len(), 5);
+        assert_eq!(
+            repo.commits_changed_paths(&commits).unwrap(),
+            commits
+                .iter()
+                .flat_map(|commit| repo.commit_changed_paths(commit).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert!(repo.commits_changed_paths(&[]).unwrap().is_empty());
+
+        let mut paths = [
+            "a.txt",
+            "dir/b.txt",
+            "[x].txt",
+            "x.txt",
+            "dir",
+            "caf\u{e9}.txt",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        paths.extend((0..300).map(|index| format!("absent-{index}")));
+        paths.push("side.txt".into());
+        let listed = repo.paths_listed_at("HEAD", &paths).unwrap();
+        for path in &listed {
+            assert!(repo.blob_at("HEAD", path).is_some(), "{path}");
+        }
+        for path in ["dir/b.txt", "[x].txt", "caf\u{e9}.txt", "side.txt"] {
+            assert!(listed.contains(path), "{path}");
+        }
+        assert!(!listed.contains("a.txt") && !listed.contains("x.txt"));
     }
 
     #[test]

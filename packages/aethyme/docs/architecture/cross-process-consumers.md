@@ -2481,6 +2481,37 @@ worktree-volume root otherwise. `auto` serializes as `host`, so no
 preparation digest or trusted policy changes. Older binaries refuse
 `root = "auto"` written explicitly; omit it to stay readable by them.
 
+Changed 2026-11-25 (cheaper output sharing). The pass no longer hashes or
+pools Python bytecode (`.pyc`, `.pyo`): it embeds its source's path and
+modification time, and on the busiest repository 218 such files were added by
+every preparation and none was reused. They keep their own copy, are counted,
+and stay in `unique_bytes_after`, which no longer calls them shared; bytecode
+pooled earlier leaves with the store's rotation. A pool entry is still hashed
+against its name before its first use, but the result is remembered in
+`output-pool/.aethyme-verified-entries.json` (format version 1, at most 2 MiB
+and 4096 entries, replaced atomically, read only as a regular file with one
+link, owned by the user and not writable by others). It is bound to the
+entry's device, inode, size, and modification and change times in
+nanoseconds; any difference means another hash, so a device renumbered by a
+remount costs one. A result is recorded only for an entry unchanged for 60
+seconds when hashed, and stands for 24 hours. An unusable or differently
+versioned record counts as empty. An entry's file state is checked again
+after the clone and before the checkout's file is replaced. Mixed versions:
+older binaries ignore the record and hash every entry they use; concurrent
+writers lose at most each other's results. Without Unix file identities
+nothing is remembered. Output contract (additive): `output_share` and the
+`prepare_dependency_sharing` metric gain `files_skipped_bytecode`,
+`bytes_skipped_bytecode`, `pool_entries_hashed`, `pool_bytes_hashed`,
+`pool_entries_verified_by_record`, `pool_bytes_verified_by_record`,
+`verification_record_ignored` (present but unusable) and
+`verification_record_write_failed`. New spans, each a total added once per
+pass and nested in `prepare_output_share` (the remainder is walking):
+`prepare_output_share_sweep` (stale temporaries in the pool), `_sample`
+(whether a root already shares its blocks), `_sizing` (unshared bytes of
+every file), `_hash` (checkout files), `_verify` (pool entries read), `_add`
+(clone into the pool, hash, publish), `_replace` (clone over a checkout file)
+and `_record` (reading and writing the record).
+
 The preparation schema remains version 1. An empty list is omitted from the
 serialized configuration to preserve existing preparation digests; a
 nonempty selection changes the digest and trusted prepare policy, and requires
@@ -3337,8 +3368,8 @@ at most once an hour, as a sharing one already did, instead of on every
 preparation; recovery of an unfinished rotation still runs every time.
 
 Since 2026-11-15 an inconclusive budget check queues a background measurement
-of the store, additively. Two records live in the repository's broker metadata
-(the `meta` table, never under `.aethyme/`); neither carries a path. The cache
+of the store, additively. Three records live in the repository's broker metadata
+(the `meta` table, never under `.aethyme/`); none carries a path. The cache
 root is named by `cache_root_key` (the 12-hex digest also used in the
 budget-check stamp key) and identities are 32-hex digests of the volume-aware
 directory identity (device, inode, filesystem identifier).
@@ -3360,9 +3391,27 @@ directory identity (device, inode, filesystem identifier).
   running marker and attempt) and by the `gc __continue-artifacts` worker
   (running marker, back-off, clear). The worker's final write applies only
   while `attempts` and `running_since_ms` still match its own walk. A
-  `root_changed` interruption drops the request; repeated `deadline` or
-  `scan_refused` walks of one store back off from 10 minutes, doubling, up to
-  24 hours.
+  `root_changed` interruption drops the request; repeated `scan_refused` walks
+  of one store back off from 10 minutes, doubling, up to 24 hours. Since
+  2026-11-25 a `deadline` walk waits 6 hours, and 24 hours after each further
+  one of the same store without a completed walk in between.
+- `preparation.shared_cache_measurement.deadline_wait.<cache_root_key>`: JSON
+  or `null`, that wait for one cache root: `repository`, `cache_root_key`,
+  `store_identity`, `consecutive` and `until_ms`. Written by the worker at a
+  deadline. Set to `null` by a completed measurement of the same store (an
+  unconfirmed `over_budget` included, so a deadline of the confirming walk
+  waits 6 hours again, and so on while the two alternate; an absent store does
+  not count) and by a `submit prepare` that rotates it. A rotation finished by
+  crash recovery leaves the record: the new store's identity no longer
+  matches it. While `until_ms` is ahead, by at most 24 hours and 10 minutes (a longer wait
+  was written under a wrong clock and is ignored, as is such a
+  `retry_after_ms`), and the live store's identity matches, a new request
+  inherits it as `retry_after_ms`, with `consecutive` as
+  `unanswered_deadlines` (omitted when zero), and the worker walks nothing
+  and restores both on a request that lost them. Another store identity
+  starts afresh. The budget check does not count on a request whose
+  `consecutive_failures` or `unanswered_deadlines` is not zero: it runs its
+  own bounded inventory.
 - `preparation.shared_cache_measurement.result`: JSON or `null`, the last
   completed measurement. Schema `aethyme.preparation-cache-measurement/v1`
   with `schema`, `repository`, `cache_root_key`, nullable `root_identity`,
@@ -3380,8 +3429,9 @@ directory identity (device, inode, filesystem identifier).
   `at_most_half_of_budget`, `at_most_80_percent_of_budget`,
   `above_80_percent_of_budget` or `not_within_budget`), `times_used` and,
   once a budget check decided from it, `used_at_ms`. Interrupted walks never
-  replace it, but reset `over_budget_walks`. A completed rotation sets both
-  records to `null`.
+  replace it, but reset `over_budget_walks`. A `submit prepare` that rotates
+  the store, or recovers a rotation while it gives up its share, sets this
+  record and the request to `null`.
 
 Readers ignore unknown fields and treat a malformed record as absent. A
 budget check uses a result only when its `repository`, `cache_root_key` and
@@ -3424,7 +3474,15 @@ confirmed over budget). Metrics add, in `phase_counts`,
 `preparation_cache_measurement_pacer_memory_pause`,
 `preparation_cache_measurement_pacer_load_wait` and
 `preparation_cache_measurement_scan_limiter_sleep`, and
-`artifact_worker_pacer_scan_limiter_sleep`.
+`artifact_worker_pacer_scan_limiter_sleep`. Since 2026-11-25 `phase_counts`
+adds `preparation_cache_measurement_deadline_wait_set` and
+`preparation_cache_measurement_deadline_wait_restored` (the worker put a lost
+wait back on the request instead of walking), `phase_timings_ms` adds
+`preparation_cache_measurement_walk_cpu` (the walking thread's CPU time, a
+part of `_walk`; what is left after the pacer's waits is I/O and scheduling
+wait), and the metric adds the object
+`preparation_cache_measurement_progress` with the `entries` and `bytes` seen
+by the walk, answered or interrupted.
 
 Successful `broker push` command metrics add `push_preflight`, `push_git`,
 `push_pr_and_watch`, `push_default_branch`, `push_overlap`, and
@@ -4257,7 +4315,7 @@ Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
 - Changed 2026-11-20 (retirement run reaches its closed lap). On 0.8.141 on the busiest repository (closed backlog 335, 683 open sessions), two of three runs never started the closed lap: resolving the open sessions' paths took 80 s and 63 s against a fixed third of the 180 s window (60 s), and a resolution that runs out keeps nothing. The recovery-archive bound then took 105 s and 339 s to list 2,390 archives with nothing listed (one `lstat` per archive root entry, then one per earlier recorded size), which was the 300 s no checkout-retirement span covered. Now:
   - Resolving open paths may use the window less the closed lap's floor, never less than a third (135 s of 180 s at the 45 s backlog floor).
   - While 50 or more closed checkouts wait, the closed lap runs right after the scratch pass, with the rest of the sweep window (at least its floor), and the strip and idle strip passes follow with their floors (counter `checkout_retirement_closed_lap_first`). Below 50 the order is unchanged.
-  - The recovery-archive bound runs at most every 30 minutes while its last recorded pass measured every archive and found them within the bound, and the run's laps (which run before it) wrote no recovery archive. It runs on every run whose last record is over the bound or `partial` (it may undercount), and on every run that archived a checkout or an abandoned operation (from the storage ledger's `observed_at_ms`, `over_bound` and `partial`; counter `checkout_retirement_archive_bound_not_due` when skipped; span `checkout_retirement_archive_bound` around it). The archive listing takes entry types from the directory listing instead of one `lstat` per entry, and carrying earlier sizes forward checks only sizes the pass does not already hold. New spans `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`, and `checkout_retirement_setup` (the trash backlog and progress reads before the open paths).
+  - The recovery-archive bound runs at most every 30 minutes while its last recorded pass measured every archive and found them within the bound, and the run's laps (which run before it) wrote no recovery archive. It runs on every run whose last record is over the bound or `partial` (it may undercount; since 2026-11-25, whose total is not known, see below), and on every run that archived a checkout or an abandoned operation (from the storage ledger's `observed_at_ms`, `over_bound` and `partial`; counter `checkout_retirement_archive_bound_not_due` when skipped; span `checkout_retirement_archive_bound` around it). The archive listing takes entry types from the directory listing instead of one `lstat` per entry, and carrying earlier sizes forward checks only sizes the pass does not already hold. New spans `recovery_archive_listing_entries`, `recovery_archive_bound_state_read`, `recovery_archive_bound_state_carry`, and `checkout_retirement_setup` (the trash backlog and progress reads before the open paths).
   - The `checkout_retirement` attachment adds `closed_lap_first`, `open_sessions` and `open_paths_ms`, and `closed_stop` is `not_reached_open_paths` when the open paths could not be resolved in time (it was empty).
   - Unchanged and why. The plan's `git status` already runs with `GIT_OPTIONAL_LOCKS=0`, `core.fsmonitor=false` and `core.untrackedCache=false`; `git worktree list` takes no index or lock and reads each of about 1,000 registrations, already once per run. No cheaper listing gives the same answer, so both are left as they are.
 Covered by `broker/retire.rs` tests.
@@ -4538,7 +4596,7 @@ Introduced 2026-11-17. Changes consumers may see:
 - When the observation cannot be taken completely, the lap stops at the checkout that needed it (the cursor stays there), nothing is remembered, the report and progress field `process_use_unavailable` say so, and the next run is due within a minute. `cleanup.retirement-stalled` names it after 3 such runs.
 - The rename into the trash reuses the run's observation (`checkout_trash_run_process_use_reused`) instead of taking a second one. A process that enters the checkout after the observation keeps its working directory, which now lies in the trash (on Unix a rename does not fail for a busy directory). The deleter therefore takes one open-file observation per drain before its first deletion and leaves alone any entry a process has its working directory or an open file under (`checkout_trash_entry_in_use`, report field `entries_in_use`, progress field `trash_entries_in_use`); an incomplete observation deletes nothing that run (`checkout_trash_process_use_unknown`, report field `process_use_unknown`). Callers outside the lane still take a fresh observation before the rename.
 - Inside the lane, every live-checkout check (the run's open paths, the plan context, and each check of the archive path) reads the live session list fresh but canonicalizes only sessions the run has not resolved yet, by session id and recorded path (`checkout_retirement_live_paths_reused`). A new session, or one whose recorded path changed, is always resolved again.
-- An archive is started only with at least 90 s of the lane's 180 s budget left and may use that whole budget rather than the sweep's two thirds; otherwise the checkout is kept as `archive_deferred` (not remembered) and the lap stops there unless it was the run's first judgement. An archive cut off by the deadline is kept as `deadline` (not remembered; the verified archive is reused next time) instead of `archive_cleanup_failed` for an hour.
+- An archive is started only with at least 90 s of the lane's 180 s budget left and may use that whole budget rather than the sweep's two thirds; otherwise the checkout is kept as `archive_deferred` (not remembered) and the lap stops there unless it was the run's first judgement. An archive cut off by the deadline is kept as `deadline` (not remembered; only a complete archive is reused next time, once it is verified again, and an incomplete one is removed and written from the start; since 2026-11-25 the lane remembers a cut after a full slice as `out_of_time`, see the end of this document) instead of `archive_cleanup_failed` for an hour.
 - New `[cleanup] abandoned_operation_after_hours` (integer, 1 to 8760, default 24). A merge, rebase, cherry-pick, revert or bisect left in progress (or unmerged index entries) in a closed session's checkout is abandoned only when the newest modification among its operation markers (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_LOG`, `rebase-merge/`, `rebase-apply/`, `sequencer/`), its index, its `logs/HEAD` and every changed, unmerged or untracked working file is older than that, the session's last broker activity and close are older than that, no open session uses the path, and no live holder is bound to the session (`checkout_retirement_kept_holder_alive`, `_holder_unknown`). It is then archived under the lifecycle claim into `<recovery archive root>/<session>-operation-<head12>-<nonce>/`: `git-state/` (the operation files and directories, the raw `index`, `HEAD`, `logs/HEAD`), `worktree/` (every path `git status --no-renames --untracked-files=all` reports, as on disk; missing ones listed as `deleted`), `ignored/` (the protected ignored files), `objects/` (a pack, its index and `ids.txt`: every object the raw index needs at any stage, and the `AUTO_MERGE` tree's objects, that the HEAD tree does not hold; every id is checked present before packing, the pack must pass `git verify-pack` and list every id, otherwise the checkout is kept), `README.md` (restore steps: copy the pack into the repository, recreate the worktree, restore files, index and state; expiry and how to keep it) and, written last, `manifest.json` (schema `aethyme-operation-archive-v1`, `created_at_ms`, `session_id`, each file's size, SHA-256 and original mode, the packed ids and pack hashes). Copies are 0600 and directories 0700; the archive root is made 0700, and refused if it cannot be. HEAD and every commit the state names, the rebase and sequencer todo and done lists included, are pinned as `refs/aethyme/retired/<session>/<commit>`. Immediately before the move every archived source is re-checked (size, modification time, inode; the index by SHA-256), `git status` must report the same paths and the missing ones must still be missing; any difference keeps the checkout as `changed` and forgets its remembered keep. Then the checkout is moved into the trash and the session recorded as cleaned. Over 512 MiB or 50,000 files keeps it as `archive_too_large`; any other failure keeps it as `operation_archive_failed` (remembered). New outcome counter `checkout_retirement_retired_operation_archived`, report field `retired_operation_archived`, progress field `abandoned_operations_archived` (cumulative) and advice `cleanup.retire-abandoned-operations-archived`. These archives expire by age through the storage ledger like every recovery archive (attributed to their pool and session by the manifest; default 30 days, after 7 days named in `broker status`); keep one with `aethyme storage keep-archive <pool>/<archive>`. A partial archive is named `.partial-operation-<session>-<created ms>-<pid>-<process start ms>-<nonce>` and holds no `manifest.json` until it is complete; the storage ledger never lists or expires a `.partial-*` or `*.partial` entry, and each retirement run removes partial operation archives older than a day whose creating process is gone (`checkout_retirement_operation_partial_swept`).
 - Retirement plans (the lane only) no longer refuse a checkout for an ignored directory nothing catalogues as regenerable (`ignored path <dir>/ is neither a regular file nor a symbolic link`): every regular file and link under it is archived as a protected ignored file, at most 20,000 files and 512 MiB per checkout; a special file or a non-UTF-8 name under it still refuses. `finish cleanup resolve` keeps refusing unless given the new flag `--archive-ignored-directories` (on both the plan and its `--confirm`, since the digest covers the archived files).
 - Remembered keeps carry the refusing step's own words (meta key `checkout_retirement.keeps`, field `detail`, at most 400 bytes), and `broker gc plan --json` lists them as `checkout_retirement_keeps` (`session_id`, `reason`, `detail`, `kept_at_ms`, `attempts`; reporting only, outside the digest, omitted when empty).
@@ -4587,6 +4645,8 @@ Changed 2026-11-19 (idle strip on a busy volume). The idle strip's artifact-use 
 Changed 2026-11-18 (archive, then delete). New defaults (every key keeps working; a repository that sets one keeps its value): `stale_landed_close_after_hours` 4 (was 24), `stale_pushed_close_after_hours` 24 (was 72), `stale_unpushed_close_after_hours` 24 (was 168), `stale_closing_notice_hours` 4 (was 24; still counted inside the window), `[retention] session_abandoned_after_hours` 24 (was 72), `session_landed_after_hours` 4 (was 24), `recovery_archive_days` 90 (was 30), and the storage ledger's `[budget] unlanded_archive_days` 90 (was 30). `broker start --reuse` (through `recreate_retired_checkout`) on a session whose checkout was retired with a recovery archive restores the newest archive instead of refusing: the archive is verified whole, the commits come from its bundle when the repository lacks the archived HEAD (`git bundle unbundle`), the checkout is created on the session branch at the archived HEAD (the branch is created there when absent; when it has moved, the archived HEAD is checked out detached), the staged and unstaged patches are applied with `git apply`, and the untracked and protected ignored files are copied with their modes (links as links) and read back against their SHA-256; any failure removes the partial checkout, keeps the archive and refuses with the archive's README path (span `recovery_archive_restore`, counters `recovery_archive_restored`, `recovery_archive_restore_failed`, `checkout_retirement_restored_for_reuse`). An `archive_too_large` keep now records the largest untracked or ignored paths (names and sizes only) as its detail in `checkout_retirement_keeps[].detail`, and the `cleanup.retire-archive-too-large` advice points there. A landed proof that runs out of budget backs that session's landed proof off (new meta key `auto_cleanup.landed_budget_backoff`: 1 h doubling to 24 h, cleared by any other outcome; counters `landed_proof_budget_backoff_set`, `landed_proof_budget_backed_off`). A checkout retired through a recovery archive (`RetiredArchived`, `RetiredOperationArchived`) leaves a tombstone at its path: a directory holding only `ARCHIVED-SESSION.txt`, plain text starting `aethyme: retired session checkout`, saying when it was retired, that its work is saved (branch, and the archive named on an `archive: <path>` line) and the one command that restores it there, `aethyme broker start --reuse '<path>'` (counters `checkout_retirement_tombstone_written`, `_failed`). The strip pass keeps a tombstone as `tombstone` (counter `checkout_strip_refused_tombstone`, remembered as done), the closed and cleaned laps skip it (`checkout_retirement_tombstone_skipped`) and remove it once its archive is gone, or, without one, once it is older than `recovery_archive_days` (`checkout_retirement_tombstone_expired`), and `start --reuse` removes it under the lifecycle claim before restoring at the same path (Git's registration was dropped when the checkout was retired; a failed restore puts the tombstone back). `start` never allocates a recorded path, so a tombstone's path is never handed to a new session. New meta key `checkout_retirement.archived_sessions` (session id to the archive path) records every session retired through an archive; `Broker::session_restorable_archive` answers whether a session still has an archive to restore (other lanes, such as merged-branch deletion, should keep such a session's branch). When the session branch is missing at restore time it is recreated at the tip the archive recorded (`branch_tip`, when the repository has that commit, else the archived HEAD; counter `recovery_archive_restore_branch_recreated`). A session-scoped command refused because its session is closed now appends `restore_required: ... restore it at the same path with `aethyme broker start --reuse '<path>'`` when a tombstone is at the session's path. Day counters `checkouts_archived` and `archive_bytes`; each retirement run attaches `checkout_retirement` (examined, retired clean, archived, operation-archived, cleaned leftovers, archive bytes, keeps by reason, trash entries removed, elapsed ms).
 
 Changed 2026-11-18 (archive location, bound and restore review). The retirement lane (and a retirement-mode resolve plan's `archive_root`) writes new recovery archives under `<pool>/.aethyme-recovery-archives/<repository key>/`; the parent directory is created mode 0700 with the marker `.aethyme-recovery-archives-root.json` (`{"schema":"aethyme.pool-recovery-archives/v1","repository_key":...}`) and is identified by marker and path, never by device (counter `recovery_archive_pool_marker_mismatch`; a mismatch falls back to host state). Pool scanners treat the dot-named directory as infrastructure; it is distinct from `.aethyme-session-scratch`. A reviewed `cleanup resolve` keeps the host state root. `Broker::recovery_archive_roots` (pool first, then host state) is searched by archive ownership (`owned_recovery_archive`, prerequisite-ref release), `recovery_archives`, the gc archive inventory, `newest_recovery_archive`, the partial sweep and `has_restorable_state`; nothing is migrated. New `[cleanup] recovery_archive_bound_gib` (integer 0 to 1048576, default 20; `0` off): each retirement run measures both locations (span `recovery_archive_bound_pass`, budget 20 s), removes fully landed pool archives older than `[retention] recovery_archive_days`, then, over the bound, the oldest fully landed archives past their minimum retention under the lifecycle claim (re-proven, manifest last, prerequisite refs released); archives holding unique work are never removed for size (counters `recovery_archive_bound_within`, `_evicted`, `_expired`, `_evict_failed`, `_over`; attachment `recovery_archive_bound`). New ledger directory `storage-ledger-recovery-archives/<sha256 of the repository root>.json` (`RecoveryArchiveUsage`: `pool` and `host_state` archives and bytes, `bound_bytes`, `over_bound`, `unique_kept_over_bound`, `unique_kept_sessions`, `evicted`, `evicted_bytes`, totals, `partial`), shown as `classes.recovery_archives_by_location` by `storage status --json` and as advice `storage.recovery-archives-over-bound`. Storage worker age expiry no longer removes an archive holding unlanded work: the expired candidate is refused (`unlanded at its retention age, ...`; counter `storage_archive_kept_unlanded_at_age`), listed in the summary's new `unlanded_archives_at_age` and named by advice `storage.unlanded-archives-at-age` (session, restore command, dismiss command) until `storage keep-archive <id> --dismiss` writes `<archive>.aethyme-dismissed` (counter `storage_archive_dismissed`) or new `[budget] expire_unlanded_archives = true`. A `--json` refusal of a closed session whose checkout left a tombstone carries `error.action` = `{"code":"restore_required","session_id":N,"path":...,"command":"aethyme broker start --reuse '<path>'"}` (counter `closed_session_refusal_restore_required`). Restore builds at `.<name>.aethyme-restoring` beside the path and `git worktree move`s it into place; after the staging checkout exists, `.<name>.aethyme-restore-incomplete` is written and removed only on completion or a successful undo; while it exists `start --reuse` and `recreate_retired_checkout` refuse (counter `recovery_archive_restore_undo_failed`). A restore onto a moved branch is reported in `start --reuse` output (text first, and `restore` in `--json` with `detached.branch_tip`, `archived_head`, `reconcile_command`, `compare_command`; counter `recovery_archive_restore_detached`). Operation archives are never selected for restore (`newest_operation_archive` finds them); their tombstone carries `operation archive: <path>` and `restore: manual` with manual steps instead of an `archive:` line. A failed tombstone write removes only its file and then the directory with `remove_dir`. Tombstones are recognised by the cleanup lane (not a present worktree, counter `checkout_cleanup_tombstone_skipped`), the strip backlog counts (`checkout_strip_backlog_tombstone`), reclaim discovery (`reclaim_discovery_tombstone_skipped`) and storage root inspection (kept, never a candidate; `storage_root_tombstone_retained`); the gc orphan-roots lane judges whole roots and needs no change.
+
+Changed 2026-11-24 (checked restore). `recreate_retired_checkout` decides which recovery archive to restore before it changes anything, with a checked lookup (`Broker::lookup_recovery_archive`, span `checkout_restore_archive_lookup`): the archive the tombstone names, else the one in `checkout_retirement.archived_sessions`, else the newest in the archive directories of `checked_recovery_archive_roots`. When it cannot tell, `start --reuse` refuses, the tombstone stays as it was, and the reason says what makes it tellable and the command to run again (counter `checkout_restore_refused_archive_unknown`). It offers `git worktree add --detach <new path> <branch>` for the committed work alone only while the branch is there (retiring through an archive usually deletes it); otherwise it says the commits may be in that archive too. The step it names depends on the reason: an unreachable or unreadable volume or directory, an archive whose manifest is missing (put it back, or copy out what is needed and move the archive away), a tombstone that names another session's archive (correct its `archive:` line or move the tombstone aside), an incomplete worktree-root binding (`aethyme broker advanced worktree-root recovery plan`, then `recovery apply --confirm <its digest>`), a database that cannot be read, or an unreadable record (below). It cannot tell when a named or recorded archive can be neither read nor proven gone (unless one of the same name is found in an archive directory), when an archive directory, an entry or a manifest cannot be read, when the record cannot be read, when an archive of the session has content but no manifest, or when the tombstone names something that is not a recovery archive of the session. An archive is proven gone when it is plainly missing from a directory that is still there, when only its empty directory is left (removal deletes the manifest last), or when its archive directory is plainly absent below a directory resolution proved. A proven-gone archive still leaves the session branch to restore from, as before: expiry, the size bound and `storage keep-archive --dismiss` remove archives on purpose, and only those of landed or dismissed work unless the host opted in. A repository with no pool, a pool with no archive directory yet and a branch-saved tombstone restore as before. The branch is checked before the tombstone is removed; a failed archive restore or a failed `git worktree add` puts the tombstone's note back as it was, as does a tombstone directory that cannot be removed; when even that fails the error carries the note (counter `checkout_restore_tombstone_lost`). A process killed after it removed the tombstone leaves the record and the archive directories for the next lookup. One killed between removing the note and its directory, or while it wrote the note, leaves an empty directory or an empty note; `start --reuse` takes that, at a cleaned spawned session's path and under the claim, for a retired checkout without a note, and removes only such a directory, after the lookup. A note cut short part way (a short single write) is not recognised: that directory has to be removed by hand. A tombstone and its `archived_sessions` entry now name the archive the retirement itself wrote, instead of looking it up again, so no retirement writes a branch-saved tombstone in place of an archive it missed. An `archived_sessions` value that cannot be read recovers at the next retirement through an archive: its text is first kept in the new meta key `checkout_retirement.archived_sessions.unreadable` (JSON list of `{at_ms, text}`, at most 4 different texts of at most 1 MiB, the same text once), then the record starts afresh with the entries that can be read (counter `checkout_retirement_archive_record_restarted`). When the text cannot be kept (a fifth one, too long, or the kept list itself unreadable) the record is left alone (counter `checkout_retirement_archive_record_preserve_refused`); the tombstone still names the archive. Until then, and afterwards for a session closed before the record started afresh, the unreadable text may be the only thing that named that session's archive, and archives can have been outside today's directories (a pool or a host state directory that moved), so a clean listing proves nothing: an archive the tombstone names is still restored, a text that is a JSON object of session ids answers for every id whose value is readable or absent, and anything else is unknown, which refuses the restore and keeps a merged branch. A session closed later is never judged by a kept text. The refusal prints only a read-only query (`sqlite3 -readonly`) for the value; nothing sets the text aside, so a session it keeps refused needs its archive found and restored by hand as the archive's `README.md` describes. A tombstone naming an archive expires only when that archive is proven gone; one whose archive cannot be looked at stays (counter `checkout_retirement_tombstone_kept_archive_unknown`, only for a path that cannot be read or found). `start --reuse` and the restore read what is at the path with `read_checkout_tombstone`, where an I/O error refuses; the other callers of `is_checkout_tombstone` still read an error as no tombstone. Covered by `broker/retire.rs` and `broker/tombstone.rs` tests.
 
 Changed 2026-11-18 (archive re-review). A gc plan keeps an orphaned worktree root whose `.aethyme-recovery-archives/<key>/` holds any archive not proven landed (blocker `orphan_root_holds_recovery_archives`, naming the count and the location; counter `gc_orphan_root_kept_recovery_archives`) and re-checks it before removal (a failure line, no deletion). A manifest without `ignored_files` (schemas 2 to 4) counts as holding uncommitted content in the broker too (`holds_uncommitted_content`), so it is never landed and never evicted for size. The size bound honours `<archive>.aethyme-keep` (counter `recovery_archive_bound_kept_by_owner`). Activity evidence now includes changed files: one `git --no-optional-locks status --porcelain=v1 -z` without ignored files, bounded by 2 s and 2,000 paths (span `worktree_status_activity`; counters `worktree_status_activity_unavailable`, `_capped`, `_fallback`), whose newest modified or untracked path or parent modification time counts as activity in `checked_worktree_activity_ms` (abandonment and close decisions; fallback counter `worktree_activity_status_fallback`) and in the idle strip (`recent_file_activity` evidence `changed_file`; fallback counter `checkout_idle_strip_status_activity_fallback`). The idle strip's declared-output coverage is now exact: only a catalogued directory a step output names exactly is stripped from an open session. After a restore from a recovery archive, when the repository declares its preparation, the broker writes the preparation strip marker for the declared outputs and the same `.aethyme/broker-action-required.md` notice as an idle strip (wording for a restore; counters `checkout_restore_notice_written`, `_not_written`), so the session-scoped blocker and `idle_strip_prepare` advice apply; `start --reuse` prints the prepare command and adds `restore.next_action` in `--json`. `broker push` and `broker sync` print one line `Next: ... prepare before building or testing: aethyme broker submit prepare --session <id>` and add `preparation_next_action` to their `--json` when the session's preparation is stale because of an idle strip or a restore (counter `prepare_next_action_shown`). Later the same day: the host storage lane (`gc storage`) also keeps an orphaned root holding an archive not proven landed (a root blocker with the count and location; counter `storage_orphan_root_kept_recovery_archives`) and re-checks before removing an `orphan_root` candidate. The changed-file probe lists untracked files with `--untracked-files=all` (within the same 2,000-path cap) and reads paths as bytes; in the idle strip a probe that cannot complete keeps the session (refusal `activity_unknown`, counter `checkout_idle_strip_refused_activity_unknown`, not remembered as handled) instead of falling back.
 
@@ -5281,3 +5341,470 @@ Covered by `session_auto_close.rs` tests
 test `the_record_check_reads_an_interrupted_preparation_as_idle` and
 `phase_telemetry.rs` test
 `distinct_counts_count_each_id_once_and_attach_no_id`.
+
+### The checkout activity probe is timed by lane and look
+
+Added 2026-11-24, telemetry only. Each key is from a fixed set and each value
+is `{count, total_ms, max_ms}` (metric attachments):
+
+- `worktree_activity_look`: one look at a checkout's activity (the Git index,
+  `HEAD` and the changed-file probe), by lane and look: `abandonment`,
+  `landed`, `merged_pull_request` or `no_work`, followed by `_first` (before
+  any proof; for `merged_pull_request` after it), `_claimed` (under the operation claim) or `_close` (the landed
+  lanes' last look), and `idle_strip`, whose only look is timed without the
+  index and `HEAD` reads before it.
+- `worktree_activity_look_timed_out`: the looks whose `git status` ran out of
+  time. It mixes fresh timeouts (about 2 s) with ones remembered from earlier
+  in the same process, which run no Git; the count
+  `worktree_status_activity_unavailable_remembered` tells them apart.
+- `worktree_activity_probe_newest`: looks where the probe's newest file was
+  newer than the index, `HEAD` and the session's recorded activity, whatever
+  was decided. An upper bound: zero for a close lane's `_first` and `_claimed`
+  looks means the probe mattered to none of their verdict, class gate,
+  closing-soon notice or moved-on holder check. The hook's and the merge's
+  time are not held against it, because the moved-on check does not read
+  them. For `_close` it compares with the index and `HEAD` alone, and for
+  `idle_strip` with the strip's idle cutoff.
+- `worktree_activity_index_head_decides`: looks the index or `HEAD` alone
+  already decided. A session its own age keeps is not counted. `idle_strip`
+  and the close lanes' first look run no probe then (a `_first` one is counted
+  here and in `worktree_activity_look_avoided`, not in
+  `worktree_activity_look`); the `_claimed` and `_close` looks do.
+- `worktree_activity_probe_changed_verdict`: looks where the probe examined
+  every changed path and only its newest file, not the index, `HEAD` or the
+  other activity, kept the session. `worktree_activity_capped_probe_changed_verdict`
+  is the same for a probe that stopped at its path cap after it found newer
+  evidence. Neither is split by the landed clean check's verdict: that check
+  usually lists the same paths, but not an untracked `.DS_Store` (unless
+  cleanup is strict), and learning its verdict takes another Git call.
+- `_close` looks are judged only while `HEAD` is still the proved one, and,
+  like the check, keep a session whose newest time differs (either way) from
+  the `_claimed` look's: `worktree_activity_index_head_decides` when the index
+  or `HEAD` time alone makes it differ, `worktree_activity_probe_changed_verdict`
+  when both probes examined every path, and
+  `worktree_activity_probe_answer_differs` when one of them did not (timed
+  out, failed or capped), so the difference may be the probe's alone. A look
+  that could not read the checkout is in none of them.
+- `worktree_activity_after_first_look_timed_out`: how a close judgement whose
+  first look timed out ended: the lane, a dot and `closed` or the existing
+  counter name of its keep (`session_abandonment_kept_*`,
+  `session_no_work_kept_*`, `landed_sessions_declined_*`). The idle strip's
+  answer after a timeout is already counted by the `worktree_mtime_walk_*`
+  counters.
+- `landed_proof_worktree_clean_by_probe`: the landed proof's uncommitted-path
+  check (not the one that also lists ignored content for
+  `ignored_directory_sweep`), by what ran before it on the same thread and
+  checkout within 30 s: `after_probe`, `after_timed_out_probe` or `no_probe`.
+  It includes proofs made outside a close judgement, and a remembered timeout
+  reads as `no_probe` once the fresh one is older than that.
+
+A close lane's first look asks cheaper keeps before its probe (added
+2026-11-25). They read the database, file times, small configuration and ref
+files and the process table the pass already holds; none runs Git, lists
+processes or calls a provider. Every check is still asked where it was asked
+before, and the `_claimed` and `_close` looks are unchanged:
+
+- every lane: recent by the session's own activity, its last merge, the hook,
+  the index or `HEAD`;
+- `landed`: an unmerged linked pull request, the cleanup policy
+  (`policy_unavailable`, `auto_remove_disabled`, `pinned`), and
+  `no_session_commits` with `HEAD` read from its files;
+- `no_work`: no recorded holder, a live holder that has not moved on, an
+  unresolved operation, an explicit claim.
+
+`abandonment` and `merged_pull_request` ask only the first; `abandonment`
+also asks its early look (see "Early look in the abandonment window"). The
+abandonment work class comes next, runs Git, and records the due time later
+passes wait for. The looks that do reach the probe read the index, `HEAD` and the hook
+again, the hook after the probe. `idle_strip` already asked its
+cheap refusals first.
+
+`merged_pull_request` puts its first probe off until just before the operation
+claim, after the holder check, the landing proof and its fresh search (added
+2026-11-25). Until then it judges by the index and `HEAD`. Then it takes the
+whole look, reads the hook and asks a moved-on holder again with the probe's
+time; a pass out of time is kept as `budget_exhausted` without a probe. A
+session kept before the probe is counted in `worktree_activity_look_avoided`
+under the landed code of the keep.
+`worktree_activity_after_first_look_timed_out` for this lane has only endings
+at or after that look. A session only the probe would have kept as
+`recent_activity` is proved first and can end in any of the proof's answers,
+with what they write or decide: the proof-timeout streak and the unprovable
+mark, the landing memos (keyed by `HEAD` and tip), the landed decline memo
+and, for `budget_exhausted`, the end of the likely-landed queue's pass.
+The probe also warmed the file cache for the proof's clean check, and a
+timeout it remembered made the `_claimed` look free.
+`landed_proof_worktree_clean_by_probe` mostly reads `no_probe` for this lane
+now; that key is per thread and checkout within 30 s and shared with the
+landed lane, so it does not tell the lanes apart. Judge the order per gc run
+by `worktree_status_activity` plus `landed_proof_worktree_clean` plus
+`session_close_checkout_activity`, with sessions judged and closed; `_first`
+time alone proves nothing.
+
+- `worktree_activity_look_avoided`: first looks whose probe did not run, by
+  look, a dot and the code of the keep (`no_work_first.no_work_explicit_claim`);
+  times are zero. A missing checkout is not counted: it has nothing to probe.
+  These are not in `worktree_activity_look`, whose `_first` entries now count
+  the looks that came to the probe, the missing checkouts no cheap check
+  refused (they have nothing to probe; a missing `merged_pull_request` one is
+  kept by the proof before its look and is counted nowhere) and the checkouts that could not be
+  read. The denominators of `worktree_activity_probe_newest`,
+  `worktree_activity_look_timed_out`, the verdict counts and
+  `worktree_activity_after_first_look_timed_out` leave avoided looks out too,
+  so their rates before 2026-11-25 are not comparable.
+- A probe skipped in one lane can be paid in a later lane of the same pass, or
+  in a `_claimed` look: the remembered timeouts work as before, but a skipped
+  probe leaves none. Judge the order by `worktree_status_activity` in total
+  per pass, sessions judged and closed, and `budget_exhausted`, over all lanes.
+- `session_no_work_kept_other_by_reason`: the keeps behind the counter
+  `session_no_work_kept_other`, by code.
+- New phase span `session_close_before_probe`: those checks.
+
+Keep counts shift: a session the probe alone would have kept as
+`recent_activity` can now be counted under one of the codes above. What reads
+the codes: the abandonment window's not-due memo (a recent session may be
+judged again earlier, never later), the landed decline memo
+(`no_session_commits` is remembered, under a key that names what it depends
+on) and the proof-timeout streaks (`no_session_commits` ends one, as the same
+answer from the proof does). The landed codes allow the abandonment and
+no-work windows just as `recent_activity` does; no new code stops a lane,
+holds its cursor or backs a session off.
+
+The looks run on the thread that judges the session, which is the thread that
+records; none is handed to a worker thread. Covered by
+`worktree_status_activity.rs` and `broker/leases.rs` tests.
+
+Changed 2026-11-25 (a partial archive bound pass that knows its total waits).
+On the busiest repository (0.8.173) 22 of 26 recovery-archive bound passes used
+their whole 20 s and ended `partial`, so each was due again at the next run
+although the archives were at a third of the bound. The storage ledger's
+`RecoveryArchiveUsage` adds `total_known`: every archive found is in the total,
+measured by the pass or counted with the size an earlier pass measured. The
+bound pass is due when it is over the bound, its total is not known (instead of
+`partial`), its removals removed some and stopped on their budget with aged-out archives
+left (`eviction_unfinished`), its record is 30 minutes old, the clock went back, or
+the run archived something. A record without the field reads as not known. `partial`
+keeps its meaning. The bound state (`<sha256>.archive-sizes`) adds
+`unowned_sizes` (path to `bytes`, `measured_at_ms` and `tried_at_ms`): the last
+size of an archive the broker cannot vouch for. While its walk cannot run it
+counts in the total and against the bound, but never towards removing an
+archive; after 24 hours, or a failed walk, it still counts but the total is not
+known. The state also adds `pool_root`: while a pool seen before is absent and
+sizes under it are recorded, they are kept and the total is not known; when that
+is the only reason (`only_pool_absent`), the bound waits its interval. Three quarters of what the 20 s leave
+once the directories are read are for the listing (a third of that at most for
+archives with no usable size, which are listed first and do not move the
+cursor), the rest for size walks: own archives first, then unowned ones longest
+untried first, then own ones whose walk ran out of budget before. A pass whose
+rotation listed nothing while archives wait, or that could not read an archive
+directory, does not know its total.
+
+Attachment `recovery_archive_bound_pass` adds `walk_fell_back` (archives listed
+but counted with an earlier size because their walk did not complete),
+`size_stale` (counted with an earlier size too old or failed since),
+`listed_first` (archives listed ahead of the rotation), `pool_absent`,
+`size_unknown` (archives with no size from this pass or an earlier one, which
+makes the pass due again), `root_failures` (archive directories that could not
+be listed), `total_known` and `total_from_earlier_sizes` (known only with the
+help of earlier sizes); `recovery_archive_bound` adds `total_known`,
+`only_pool_absent` and `eviction_unfinished`. New
+counters: `recovery_archive_bound_total_from_earlier_sizes` and
+`recovery_archive_bound_total_unknown` (one per such pass), and
+`checkout_retirement_archive_bound_not_due_partial` (runs that skipped the bound
+after a partial pass with a known total, also counted in
+`checkout_retirement_archive_bound_not_due`). Covered by `broker/retire.rs` and
+`broker/archive_bound.rs` tests.
+
+Changed 2026-11-25 (retirement work that runs out of time is not redone every
+slice). Two repositories' lanes share one volume. In five runs of one lane
+(0.8.173 and 0.8.174) 5,872 s retired nothing: 17 keeps were `deadline`, 14
+`archive_failed`, and 4,227 s went to `checkout_retirement_phase_archive`. An
+archive cut by the slice's deadline was not remembered, so every slice planned
+it, planned it again and archived it from nothing. The other lane meanwhile
+waited for the volume's turn for whole slices (7 in one run of 2,511 s), in no
+span. Now:
+
+- In the lane process, a plan or archive (an abandoned operation's too) cut by
+  its deadline in a judgement granted at least 4 minutes of its 5-minute slice is
+  kept as `out_of_time` (counter `checkout_retirement_kept_out_of_time`),
+  remembered with the keep back-off (1 h, 6 h, 24 h) and its key (HEAD and
+  index): a checkout whose HEAD or index changed is judged again at once.
+- A plan that leaves less than 90 s for its archive is such a cut in the lane
+  (elsewhere it stays `archive_deferred`).
+- A shorter cut in the lane is `cut_short` (counter
+  `checkout_retirement_kept_cut_short`, not remembered) and stops the lap with
+  its cursor before the checkout (`closed_stop` `cut_short`). The next slice
+  gives that checkout 5 minutes from its plan, once per lane run; a second short
+  cut (the lane ending) is `deadline`, as is every cut in the worker or at close.
+- The remembered keep adds `out_of_time`: one of its attempts ran out of time
+  (absent: false). Attempts of one key go on through `out_of_time`,
+  `archive_failed` and `archive_cleanup_failed`, so neither back-off nor budget
+  starts again when they alternate.
+- A keep whose reason is `out_of_time` does not take the checkout from the other
+  cleanup lanes.
+- Once the back-off is over, the lane gives such a checkout 20 minutes from its
+  plan, only with that much left before its own end and once per lane run; lane
+  runs can follow each other, and the back-off bounds each checkout. A judgement
+  that ends within 5 minutes with a keep that is not remembered leaves it to the
+  next checkout; one that spends it counts `checkout_retirement_long_judgement`.
+  An abandoned operation's archive stays within its slice (it is written under
+  the lifecycle claim). Otherwise the lane keeps the checkout as
+  `deferred_to_lane`. The worker does too while a lane run had a slice in the
+  last 2 hours (`last_at_ms` of the lane record, now set only by such a run);
+  without one it tries the checkout.
+- A judgement past its slice takes a fresh open-file observation before the move,
+  under the claim, between the re-plan and the rename, for up to 30 s (added to
+  the 60 s of proofs there) instead of reusing the run's. The archive's
+  verification and read-back, the re-plan under the claim and its 60 s, the
+  deletion rules and the archive format are unchanged. The lease, gate and
+  unresolved-operation checks are made only at the judgement's start, as before,
+  so they can now be about 20 minutes old at the move. Memory pressure is read
+  between slices, so a long judgement is not stopped by critical memory pressure.
+- A turn held elsewhere is waited for as before. A turn
+  lock that cannot be opened is `volume_turn_error` (counter
+  `checkout_retirement_kept_volume_turn_error`) and ends the lane `error`. A lane
+  with too little left for an inspection before its 60 minutes ends `cap`.
+- The deadline of an archive's prerequisite-ref installs is taken at each
+  install, not before the copy, still bounded by the operation's own deadline.
+- Spans: `checkout_retirement_volume_turn_wait` and
+  `checkout_retirement_volume_turn_held`, both inside
+  `checkout_retirement_judge`. Inside `checkout_retirement_phase_archive` (and in
+  any command's recovery-archive apply): `recovery_archive_apply_plan` (the
+  second plan), `recovery_archive_apply_verify_existing` (a complete archive or a
+  partial found in place; for a complete one it contains the ref install),
+  `recovery_archive_apply_restart_plan` (before an incomplete partial is
+  restarted), `recovery_archive_apply_copy` (patches, bundle and files, each file
+  read back as it is written), `recovery_archive_apply_read_back` (the whole
+  archive), `recovery_archive_apply_sync` (directory syncs),
+  `recovery_archive_apply_replan_under_claim` and
+  `recovery_archive_apply_verify_under_claim`. The other ref installs and the
+  wait for the claim (`lifecycle_lock_wait`) are in none of these.
+
+Recovery archive file lists and earlier retirement staging:
+
+- Git lists a directory that holds only files ignored by a pattern, and again
+  each file and nested directory in it. A plan takes each path once; counter
+  `recovery_archive_ignored_duplicates_dropped` (one per dropped path). Before,
+  6 of the 15 `archive_failed` keeps of one repository (0.8.175: 53 lane runs,
+  0 retired, 1,366 s in archives) were the second copy of such a file. A path
+  that differs only by case or Unicode form is never dropped. `ignored_blockers`
+  lists such a directory without the files in it.
+- A plan whose file lists are not sorted and unique (the archive's own
+  verification rule) is refused before any copy: `plan_refused`, counter
+  `recovery_archive_plan_file_list_refused`.
+- Staging left by an earlier state of the same session, checkout path and branch
+  (`<session>.retirement-v6.partial`, no longer matching the content identity;
+  9 of those 15 keeps) is removed only when every commit its record names is one
+  the plan archives or in its history, it holds nothing but its record, the
+  checkout's current patches, and files the plan archives from the same path
+  whose checkout file starts with every staged byte (links: the same link), and
+  none of its prerequisite refs exists. An empty staging directory, and one that
+  holds only a record cut short, are removed too. Counter
+  `recovery_archive_stale_partial_removed`. A removal that stops midway keeps the
+  record and whatever it had not reached, and is proven again next time.
+- Staging established to hold something else (a manifest, a bundle, a file the
+  checkout lost or changed) is kept and the archive is written in
+  `<session>.retirement-v6-next.partial`, the only other staging name; counter
+  `recovery_archive_stale_partial_kept`. With both kept the apply is refused
+  before any copy. A failure to judge (I/O, Git, time) establishes nothing: the
+  attempt ends and the alternate is not opened; counter
+  `recovery_archive_stale_partial_undecided`. Staging of another checkout, or
+  with another unreadable record, is refused as before. The staging place an
+  apply does not use is settled the same way for up to 10 s, whatever comes of it,
+  never into the 10 s an apply reserves and not with under 1 s left. The three
+  counters and the span cover both the staging an apply needs and the one it does
+  not use.
+- With both places kept, an owner reads the two directories under the archive
+  root (`storage archives` lists them once the bound pass has), copies back what
+  only they hold and removes them, or archives the checkout without them with
+  `broker finish cleanup resolve <session> --archive` (add
+  `--archive-ignored-directories` if it refuses an ignored directory).
+- No lane expires kept staging. It is listed as `unfinished_staging` by
+  `storage archives` (path, bytes) and counted under
+  `recovery_archives_by_location` by `storage status`, from the sizes the archive
+  bound pass recorded; staging being written is listed too.
+- Releasing prerequisite refs reads a staging directory's `retirement.json` when
+  its manifest cannot be parsed, and still refuses without a sound record.
+- Span `recovery_archive_apply_stale_partial` covers that proof.
+
+Whether the `archive_failed` keeps above follow from deadline cuts is not
+verified. Readers must accept the new keep reasons, fields, counters and spans.
+Covered by tests in `broker/retire.rs`, `cleanup_resolve.rs`, `auto_cleanup.rs`
+and `storage_ledger/tests.rs`.
+
+### Carried ownership on re-adoption (2026-11-25)
+
+Introduced 2026-11-25. `broker start --adopt` after a closed session no longer
+builds a submission plan against the local integration ref while it holds the
+repository lifecycle claim. In a repository that lands work only through pull
+requests that ref is stale, and the plan hashed every commit between it and the
+session's HEAD.
+
+- `carried_ownership.pending_owned_commits` is the submission plan's pending owned
+  count against the integration view, minus the commits reachable from the fetched
+  remote default branch. Only reachability counts there, never a patch match: a
+  patch cannot tell a landed commit from the same change applied again after a
+  revert. Squash- and rebase-landed commits stay carried, as before. When
+  reachability took commits out and nothing pending is left, the owned commits
+  that remain and that integration holds only by patch match (one or several) keep
+  the boundary and are what is counted, so the count is then not what submit
+  replays. When it took nothing out, the answer is exactly the plan's.
+- The default branch is `refs/remotes/origin/HEAD` only, never the main checkout's
+  `@{upstream}`; origin is trusted as the landing remote, as auto-cleanup does.
+  Without it, when it names the previous session's own branch, or when it cannot
+  be read, the answer is integration's alone.
+- A wrongly omitted commit loses its owner: `adoption_base`, `diff_base` and
+  `adopted_head` all become `HEAD`, submit replays nothing and the unsubmitted and
+  unpushed guards of `finish` no longer see the work. A patch match against
+  integration still omits a commit exactly as the plan does, reland included.
+- Where the plan failed on history it did not need (an unreadable inherited blob,
+  a timeout), ownership was dropped and is now carried, and `integration_drift`
+  can name commits that are safe to submit. Otherwise `integration_drift` is
+  unchanged, its base included.
+- Only adoption changed. Other commands that build a submission plan, `finish`
+  among them, still hash the history they did.
+- Span `adopt_carried_ownership` covers the ownership carry and span
+  `adopt_drift_report` the drift report, on every adoption path that runs them.
+- Span `adopt_ownership_candidates`, inside either, covers listing the base's
+  commits and the changed paths that decide which are hashed.
+- Metric attachment `adopt_ownership`: `carried_commits_hashed` and
+  `drift_commits_hashed`, the commits each one handed to patch hashing, counted
+  before the attempt so a timeout is not 0. A key is absent
+  when that step did not run. Counts only: no path, id or branch name.
+- Counter `adopt_carried_ownership_error`: the carry returned an error, which
+  leaves the baseline at `HEAD`. An ancestry test that fails reads as "not an
+  ancestor" and is not counted. Counter `adopt_carried_default_unreadable`: the
+  listing that excludes the default branch failed and was retried without it; an
+  `origin/HEAD` that is missing or does not resolve is not counted.
+- Span `session_renamed_targets` covers the renamed-path advisory, which now lists
+  the changed paths of all commits at once; its answer is unchanged.
+
+Readers must accept the new spans and attachment. Covered by tests in
+`submission_ownership.rs`.
+
+### Early look in the abandonment window (2026-11-25)
+
+The abandonment window now asks a few cheap keeps before its first activity
+probe, the work class, the early-close safety rule (with its remote lookup),
+the operation claim and the open-file observation. They read only the
+database, the lease policy (`[leases]` in the repository's `broker.toml`, as the
+claim check reads it),
+the gate run directory, probing each recorded gate's process group (and its
+leader) with signal 0 and stopping at the pass deadline, and a process table
+the pass already took for the session's binding; none is taken there. Each is asked only for a
+holder whose state lets the later path reach the same check:
+
+- a running gate and an unresolved operation, for a task-lease holder that is
+  gone or has moved on;
+- an active merge-queue entry, for a live holder whose task lease is current
+  and that was bound elsewhere after the index and `HEAD` times;
+- an explicit claim that holds: a moved-on live holder's, a gone holder's
+  whose stale grace already runs (a holder never recorded gone is left to the
+  later check, which records the first sighting), and that of a session with
+  no holder recorded created since holders are recorded.
+
+Artifact producers are not asked early: their only check takes the reclaim
+lock. The early look only keeps. Every check still runs where it did, under
+the operation claim, before any close; an error in the early look falls
+through to that path.
+
+- Span `session_close_early_look`: one per look (abandonment lane only).
+- Counter `session_close_early_kept`: looks that kept the session.
+- Counter `session_close_early_look_unreadable`: looks where a read failed
+  and was not taken as a keep.
+- Attachment `session_close_early_kept_by_reason`: early keeps by keep code
+  (`lease_held`, `merge_queue_active`, `gate_running`,
+  `operation_unresolved`), `{count, total_ms, max_ms}` with zero times.
+- An early keep is counted under `session_abandonment_kept_<code>` and in
+  `worktree_activity_look_avoided` (`abandonment_first.<code>`) like any keep
+  before the probe, and no longer in `worktree_activity_look`.
+
+What changes for readers: a session with several reasons can be reported
+under the early one (the keep record behind `sessions.abandonment-held`, the
+retirement summary's kept counts). A session kept early records no not-due
+time, so the next pass judges it again (cheaply) rather than waiting; once
+the reason goes, the full judgement runs and records it as before. It is not
+classified in that pass either: `sessions.stale-backlog` and
+`sessions.closing-soon` read its last recorded class and due time, or leave
+it out until a full judgement classifies it. An early keep is one the landed
+lane would also make on the same evidence; where the full judgement would
+have ended with a not-due or live-process answer first (a probe showing
+recent activity, a holder the probe shows not moved on), the session is now
+reported under the early code and is not offered to the landed lane in that
+pass, which would have kept it too. An early keep counts as deferred in the
+retirement summary, as the same keep did later in the full judgement: a held
+claim under the deferred reason `LeaseLivenessUnavailable`, running work
+under `OperationActive`. Where the full judgement could have ended first as not
+due (`recent_activity`, `work_class_not_due`), which is not deferred, the
+pass now reports deferred work: the retirement request stays armed, the
+retirement issue reads as actionable, and the checkout-cleanup generation is
+not completed as having no deferred work. Covered by `session_auto_close.rs` tests.
+
+Changed 2026-11-26 (status retention stops probing Git for pool directories
+Git cannot read). Measured on 0.8.180 in the busiest repository: over about an
+hour, 39 full `broker status` views spent 145 s in the `retention` phase, 61 s
+of it in 15,366 `worktree_common_dir_probe` spans (about 394 Git processes per
+status). The managed worktree root held 1,290 directories: 758 with a valid
+`.git` file, 24 whose `.git` file names a removed Git directory, and 483 with
+no `.git` at all (retired and stripped checkouts). The ownership check behind
+the cleanup inventory (`is_broker_owned_worktree_checked`) put each of the
+last two kinds to Git on every status. It now answers them from the
+filesystem when Git's discovery is certain to fail: no `.git` or `HEAD` in the
+directory or any ancestor, or a `.git` file of the exact `gitdir: <path>` form
+naming a directory that does not exist. Git's answer for both is an error, so
+the existing error branch runs unchanged (an orphan pointer naming this
+repository's `worktrees/` directory is still owned; anything else is still an
+inspection error, which the boolean form reads as not owned). Paths inside a
+checkout, every other pointer shape, a Git environment override and an
+expired Git deadline (still a timeout) still go to Git.
+
+- Counter `worktree_common_dir_no_git_entry`: ownership checks answered
+  without Git because no `.git` or `HEAD` exists on the path or above it.
+- Counter `worktree_common_dir_dangling_pointer`: ownership checks answered
+  without Git because the `.git` file names a missing Git directory.
+- Span `worktree_common_dir_probe` is unchanged and still counts each Git
+  probe that remains.
+
+The GC plan behind `doctor`'s `retention` phase (also used by `gc plan` and
+the GC service) now times its steps, each a span: `gc_plan_retention_policy`,
+`gc_plan_cleanup_inventory` (encloses `cleanup_plan`), `gc_plan_store_reads`,
+`gc_plan_gate_logs`, `gc_plan_command_metrics`, `gc_plan_worktree_blockers`,
+`gc_plan_artifact_candidates`, `gc_plan_orphan_roots`,
+`gc_plan_recovery_archives`, `gc_plan_gate_cache` (size records and the gate
+cache inventory), `gc_plan_environment_cache`,
+`gc_plan_worktree_reconciliation` and `gc_plan_cleanup_reports`;
+`gc_health_journal` times the GC journal read that follows the plan.
+
+Changed 2026-11-26 (status attributes its `retention` and action-required
+time). Measured on 0.8.181 in the busiest repository: 42 `broker status`
+views recorded a `retention` phase and none carried a `gc_plan_*` span. The
+`retention` phase of `broker status` times the cleanup retention summary
+(`cleanup_retention_with_audit`), not the GC plan: only `doctor` reaches
+`gc_health_until` and the `gc_plan_*` spans. Routine status takes the
+observed inventory (no `cleanup_plan` span either); `--refresh` takes the
+recorded-size plan, whose `cleanup_plan` span nests under the inventory span
+below. Each step of the summary is now a span:
+
+- `cleanup_retention_policy`: reading `[retention]` from `.aethyme/broker.toml`.
+- `cleanup_retention_inventory`: the cleanup inventory (observed for routine
+  status, recorded-size with eligibility for `--refresh` and `finish`).
+- `cleanup_retention_closed_sessions`: the closed-session store read.
+- `cleanup_retention_inode_summary`: recorded inode totals of retained
+  checkouts, including the ownership check per checkout.
+- `cleanup_retention_closed_worktrees`: the closed-worktree summary.
+- `cleanup_retention_oldest_closed`: finding the oldest retained closed
+  checkout (an existence and ownership check per closed session).
+- `cleanup_retention_gate_headroom`: free space and inodes on the gate
+  volumes.
+- `cleanup_retention_reconciliation`: the read-only worktree directory
+  reconciliation (its `worktree_reconcile_*` counters nest here).
+- `cleanup_retention_artifact_sweep`: reading the last artifact sweep report.
+
+`blockers_action_required` (about 1 s per full status there) now nests
+`blockers_action_required_sessions` (the live-session read), and per live
+session `blockers_action_required_notice_probe` (the action-required notice
+existence check in its checkout and, when present, reading whether it is the
+idle strip's), `blockers_action_required_strip_marker` (comparing the idle
+strip marker with the preparation record) and
+`blockers_action_required_notice_clear` (removing a satisfied idle strip
+notice). The per-session spans' counts are the number of sessions probed.

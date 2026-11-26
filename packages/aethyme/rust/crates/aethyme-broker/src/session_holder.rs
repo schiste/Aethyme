@@ -1384,6 +1384,11 @@ pub(crate) struct RecordedHolderProcessTable {
     /// The session being judged passed the early-close safety rule
     /// (`abandonment_safety`) before its class window.
     early_safe_close: std::cell::Cell<bool>,
+    /// The first activity look of the session being judged timed out.
+    first_look_timed_out: std::cell::Cell<bool>,
+    /// The session being judged has a checkout whose first activity probe is
+    /// put off and has not run (telemetry only).
+    probe_put_off: std::cell::Cell<bool>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -1579,6 +1584,28 @@ impl RecordedHolderProcessTable {
     /// Whether the session being judged passed the early-close safety rule.
     pub(crate) fn early_safe_close(&self) -> bool {
         self.early_safe_close.get()
+    }
+
+    /// Record whether the first activity look of the session being judged
+    /// timed out (telemetry only).
+    pub(crate) fn note_first_look_timed_out(&self, timed_out: bool) {
+        self.first_look_timed_out.set(timed_out);
+    }
+
+    /// Whether that look timed out.
+    pub(crate) fn first_look_timed_out(&self) -> bool {
+        self.first_look_timed_out.get()
+    }
+
+    /// Record whether the first probe of the session being judged is put off
+    /// and has not run (telemetry only).
+    pub(crate) fn note_probe_put_off(&self, put_off: bool) {
+        self.probe_put_off.set(put_off);
+    }
+
+    /// Whether that probe has not run.
+    pub(crate) fn probe_put_off(&self) -> bool {
+        self.probe_put_off.get()
     }
 
     /// Record that the session being judged cannot be due before `at_ms`

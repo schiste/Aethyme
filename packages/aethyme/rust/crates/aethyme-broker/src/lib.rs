@@ -179,6 +179,7 @@ mod runtime_paths;
 pub use runtime_paths::broker_runtime_ignore_patterns;
 mod scopes;
 pub mod scoreboard;
+mod submission_ownership;
 mod submit_progress;
 pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
