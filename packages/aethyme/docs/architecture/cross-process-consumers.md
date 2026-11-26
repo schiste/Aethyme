@@ -6209,3 +6209,13 @@ uncertain outcome installed again from the start. The changes:
     `shared_cache_waited_for_fill_gave_up`: the same when it then gave up.
   - `prepare status --json` gains `retry_after_seconds` (120 while waiting on
     another session, 30 while in progress; absent otherwise).
+- **Step output is kept.** Each step's stdout and stderr pass through pipes:
+  forwarded to the broker's own streams as before, the last 16 KiB of each
+  kept. After each step the tails are written to one log of at most 64 KiB,
+  `preparation-output.log` in the session's scratch directory (retired with
+  the session), or `.aethyme/run/preparation/session-<id>.output.log` when
+  the session has none. A failed step's message names the log.
+  - Counter `preparation_step_output_uncaptured`: the pipes could not be
+    opened and the step's streams were inherited as before.
+  - Counter `preparation_step_output_drain_timed_out`: a stream stayed open
+    2 s after the step (a descendant kept it); the tail so far was kept.

@@ -44,6 +44,8 @@ pub(crate) mod rotation_debt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "preparation_rotation_journal.rs"]
 pub(crate) mod rotation_journal;
+#[path = "preparation_step_output.rs"]
+pub(crate) mod step_output;
 
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
@@ -128,12 +130,14 @@ pub enum PreparationError {
     )]
     OfflineUnavailable { step: String },
     #[error(
-        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output, then retry `aethyme broker submit prepare --session {session_id}`"
+        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output{output_log}, then retry `aethyme broker submit prepare --session {session_id}`"
     )]
     StepFailed {
         step: String,
         exit_code: Option<i32>,
         session_id: i64,
+        /// ` (last lines: <path>)` naming the step output log, or empty.
+        output_log: String,
     },
     #[error(
         "preparation command supervision is unavailable: {reason}; no repository command was started"
@@ -2832,6 +2836,12 @@ impl Broker {
         // would fail the same way, and the quarantined lease still excludes
         // other holders while this process runs.
         let mut lease_quarantined_during_step = false;
+        let step_log_path = step_output::log_path(
+            self.session_scratch_dir(session_id).as_deref(),
+            self.main_root(),
+            session_id,
+        );
+        let mut step_log = String::new();
         for (index, step) in config.steps.iter().enumerate() {
             if resumed_steps.contains(&step.name) {
                 step_timings.push(PreparationStepTiming::ran(
@@ -2869,6 +2879,7 @@ impl Broker {
             } else {
                 &step.command
             };
+            let mut step_capture = None;
             let step_result = require_preparation_storage_with_cache_root(
                 &main_root,
                 &storage_paths,
@@ -2898,10 +2909,11 @@ impl Broker {
                 {
                     environment.push((install_cap::PARENT_SLOT_ENV.into(), lease));
                 }
-                let supervisor = match next_supervisor.take() {
+                let (supervisor, capture) = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
                 };
+                step_capture = capture;
                 self.guarded_preparation_exec_with_supervisor(
                     session_id,
                     command,
@@ -2967,9 +2979,37 @@ impl Broker {
                     },
                 )
             });
+            let output_log = match step_capture.take() {
+                Some(capture) => {
+                    let output = capture.finish();
+                    let outcome = match &step_result {
+                        Ok(report) => preparation_step_outcome(report),
+                        Err(error) => preparation_step_error_outcome(error),
+                    };
+                    step_log = step_output::bounded_log(
+                        &step_log,
+                        &step_output::render_section(&step.name, outcome, &output),
+                        step_output::LOG_MAX_BYTES,
+                    );
+                    match step_output::write_log(&step_log_path, &step_log) {
+                        Ok(()) => format!(" (last lines: {})", step_log_path.display()),
+                        Err(error) => {
+                            crate::warn_unrecorded(
+                                "write the preparation step output log",
+                                Err::<(), _>(error),
+                            );
+                            String::new()
+                        }
+                    }
+                }
+                None => String::new(),
+            };
             let report = match step_result {
                 Ok(report) => report,
                 Err(error) => {
+                    if !output_log.is_empty() {
+                        eprintln!("preparation step {:?} output{output_log}", step.name);
+                    }
                     if matches!(
                         &error,
                         BrokerOpError::Preparation(PreparationError::CommandOutcomeUnknown { .. })
@@ -3039,6 +3079,7 @@ impl Broker {
                     step: step.name.clone(),
                     exit_code: report.exit_code,
                     session_id,
+                    output_log: output_log.clone(),
                 };
                 let error = BrokerOpError::from(error);
                 let restart_storage_worker = route_preparation_command_failure(
@@ -7897,6 +7938,7 @@ mod tests {
             step: "deps".into(),
             exit_code: Some(1),
             session_id: 1,
+            output_log: String::new(),
         });
         broker.recover_storage_pressure_after_command_failure(&unrelated, || Ok(()));
         assert!(!broker.artifact_sweep_recovery_requested().unwrap());
@@ -8669,6 +8711,7 @@ mod tests {
             step: "dependencies".into(),
             exit_code: Some(17),
             session_id,
+            output_log: String::new(),
         }
         .into();
 
