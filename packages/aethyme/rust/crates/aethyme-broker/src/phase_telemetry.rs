@@ -106,6 +106,7 @@ fn record(name: &'static str, start: Instant, end: Instant) {
                     | "repository_write_lock_wait"
                     | "install_slot_wait"
                     | "shared_cache_wait_exhausted"
+                    | "shared_cache_waited_for_fill"
                     | "operation_outcome_record_wait"
                     | "gate_verdict_wait"
             ) {

@@ -402,6 +402,13 @@ pub(crate) fn set_refusal_action_for_test(action: serde_json::Value) {
     REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action));
 }
 
+/// Leave `action` as this thread's structured refusal action: a JSON-mode
+/// error then carries it as `error.action` (a preparation refused for a busy
+/// shared cache says when to retry, instead of leaving the agent to poll).
+pub(crate) fn set_refusal_action(action: serde_json::Value) {
+    REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action));
+}
+
 /// Forget any structured refusal action left on this thread.
 pub(crate) fn clear_refusal_action() {
     REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = None);

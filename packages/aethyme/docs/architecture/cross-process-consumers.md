@@ -6149,3 +6149,63 @@ throttled worker, Linux's idle class) is never switched.
   foreground work on a trash volume.
 - Counter `checkout_trash_catchup_io_restored`: laps that returned to
   `important` at their end.
+
+### Preparation keeps finished installs and waits for another session's (2026-11-26)
+
+On a pnpm repository with worktrees on an external volume and host state on
+the internal disk, 38 of 51 preparations in one window failed. Installs that
+had run for up to 30 minutes were discarded after dispatch, and every
+uncertain outcome installed again from the start. The changes:
+
+- **Space is checked before dispatch, bookkeeping after.** The build reserve
+  (8 GiB) is checked before each step is dispatched, as before. While a step
+  runs, its heartbeat now requires only the bookkeeping reserve
+  (`BOOKKEEPING_RESERVE_BYTES`, 256 MiB, and 1,000 inodes) on the watched
+  paths, the host resource database included.
+  - Counter `prepare_storage_refused_before_dispatch`: a step not started
+    because a watched path was below the build reserve.
+- **A quarantined lease no longer stops a running step.** A renewal that
+  finds the step's lease quarantined (its expiry passed while the process was
+  starved or suspended) lets the step continue: while the holder runs, a
+  quarantined lease keeps excluding every other holder, and its release
+  still works. Every other renewal failure still stops the step.
+  - Counter `prepare_lease_quarantined_step_continued`.
+- **A record that cannot be written is journaled.** Each finished step (exit
+  0, outputs verified) is now recorded at once, and the final record too.
+  When the repository's record (`.aethyme/run/preparation/session-<id>.json`)
+  cannot be written, the record goes to `preparation-outcome.json` in the
+  session's scratch directory (the worktree's volume), and the next read
+  reconciles it: a journaled outcome from a later run, or one that ends the
+  run the repository's record still calls in progress, replaces it.
+  - Counter `prepare_outcome_fallback_written`: a record journaled instead.
+  - Counter `prepare_outcome_fallback_reconciled`: a journal written back and
+    removed; `prepare_outcome_fallback_read`: used, but the write back failed.
+- **An interrupted run is verified, not repeated.** When the record says in
+  progress and its preparer is gone (`interrupted`), the inputs still hash to
+  the recorded key, and no declared output is missing or stripped, the
+  leading steps the run recorded as finished are not run again. When every
+  step was recorded, the install is accepted without running anything. A step
+  whose own exit was never observed runs again even when its outputs exist: a
+  package manager stopped mid-import leaves them present and incomplete.
+  - Counter `prepare_verified_after_uncertain`: an install accepted without
+    running a step.
+  - Counter `prepare_resumed_after_uncertain` (one per preparation) and
+    `prepare_step_resumed_after_uncertain` (one per skipped step).
+  - A step whose outcome could not be confirmed leaves the `--json` error a
+    structured `error.action`: `kind: retry_prepare`, `reason:
+    outcome_unconfirmed`, `retry_after_seconds: 0`, `command`.
+- **A busy shared cache is waited for, not failed.** When `--wait` runs out
+  and the holder is another session whose live activity record shows progress
+  (fresher than 90 s), the preparation keeps waiting, one window of `--wait`
+  at a time, printing `waiting for session <id>'s <operation> (running <n>s,
+  last progress <n>s ago)` once per window, for at most two hours. `--wait 0s`
+  still fails at once. When it gives up, the `--json` error carries
+  `error.action` with `kind: retry_prepare`, `reason: shared_cache_busy`,
+  `retry_after_seconds` (120 while the holder works, 30 when it reported
+  nothing), `holder_session_id` and `command`.
+  - Counter `shared_cache_followed_holder`: one per extra wait window.
+  - Duration `shared_cache_waited_for_fill`: time from the first attempt to
+    the grant, for a preparation that followed a holder;
+    `shared_cache_waited_for_fill_gave_up`: the same when it then gave up.
+  - `prepare status --json` gains `retry_after_seconds` (120 while waiting on
+    another session, 30 while in progress; absent otherwise).
