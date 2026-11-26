@@ -5765,8 +5765,8 @@ expired Git deadline (still a timeout) still go to Git.
 - Span `worktree_common_dir_probe` is unchanged and still counts each Git
   probe that remains.
 
-The GC plan behind `retention` (also used by `gc plan`, `doctor` and the GC
-service) now times its steps, each a span: `gc_plan_retention_policy`,
+The GC plan behind `doctor`'s `retention` phase (also used by `gc plan` and
+the GC service) now times its steps, each a span: `gc_plan_retention_policy`,
 `gc_plan_cleanup_inventory` (encloses `cleanup_plan`), `gc_plan_store_reads`,
 `gc_plan_gate_logs`, `gc_plan_command_metrics`, `gc_plan_worktree_blockers`,
 `gc_plan_artifact_candidates`, `gc_plan_orphan_roots`,
@@ -5774,3 +5774,37 @@ service) now times its steps, each a span: `gc_plan_retention_policy`,
 cache inventory), `gc_plan_environment_cache`,
 `gc_plan_worktree_reconciliation` and `gc_plan_cleanup_reports`;
 `gc_health_journal` times the GC journal read that follows the plan.
+
+Changed 2026-11-26 (status attributes its `retention` and action-required
+time). Measured on 0.8.181 in the busiest repository: 42 `broker status`
+views recorded a `retention` phase and none carried a `gc_plan_*` span. The
+`retention` phase of `broker status` times the cleanup retention summary
+(`cleanup_retention_with_audit`), not the GC plan: only `doctor` reaches
+`gc_health_until` and the `gc_plan_*` spans. Routine status takes the
+observed inventory (no `cleanup_plan` span either); `--refresh` takes the
+recorded-size plan, whose `cleanup_plan` span nests under the inventory span
+below. Each step of the summary is now a span:
+
+- `cleanup_retention_policy`: reading `[retention]` from `.aethyme/broker.toml`.
+- `cleanup_retention_inventory`: the cleanup inventory (observed for routine
+  status, recorded-size with eligibility for `--refresh` and `finish`).
+- `cleanup_retention_closed_sessions`: the closed-session store read.
+- `cleanup_retention_inode_summary`: recorded inode totals of retained
+  checkouts, including the ownership check per checkout.
+- `cleanup_retention_closed_worktrees`: the closed-worktree summary.
+- `cleanup_retention_oldest_closed`: finding the oldest retained closed
+  checkout (an existence and ownership check per closed session).
+- `cleanup_retention_gate_headroom`: free space and inodes on the gate
+  volumes.
+- `cleanup_retention_reconciliation`: the read-only worktree directory
+  reconciliation (its `worktree_reconcile_*` counters nest here).
+- `cleanup_retention_artifact_sweep`: reading the last artifact sweep report.
+
+`blockers_action_required` (about 1 s per full status there) now nests
+`blockers_action_required_sessions` (the live-session read), and per live
+session `blockers_action_required_notice_probe` (the action-required notice
+existence check in its checkout and, when present, reading whether it is the
+idle strip's), `blockers_action_required_strip_marker` (comparing the idle
+strip marker with the preparation record) and
+`blockers_action_required_notice_clear` (removing a satisfied idle strip
+notice). The per-session spans' counts are the number of sessions probed.
