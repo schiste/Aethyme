@@ -6336,6 +6336,8 @@ fn run_gate_command(
     context: GateCommandContext<'_>,
     artifact_use: &mut GateArtifactUseGuard,
 ) -> Result<GateCommandOutcome, std::io::Error> {
+    // Unattended bulk deleters on this volume yield the disk while it runs.
+    let _foreground_io = crate::foreground_io::ForegroundIoMark::enter("gate", context.cwd);
     run_gate_command_inner(command, &context, artifact_use)
 }
 

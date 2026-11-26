@@ -4398,6 +4398,20 @@ pub(crate) fn raise_trash_deleter_priority() -> background_priority::DeleterPrio
     background_priority::raise_for_trash_deleter()
 }
 
+/// See `background_priority::trash_deleter_io_switch`.
+pub(crate) fn trash_deleter_io_switch(
+    base_policy: &str,
+    yielding_now: bool,
+    foreground_active: bool,
+) -> Option<bool> {
+    background_priority::trash_deleter_io_switch(base_policy, yielding_now, foreground_active)
+}
+
+/// See `background_priority::set_trash_deleter_io_yield`.
+pub(crate) fn set_trash_deleter_io_yield(yielding: bool) -> bool {
+    background_priority::set_trash_deleter_io_yield(yielding)
+}
+
 /// This process's disk I/O policy, as a telemetry label.
 pub(crate) fn current_io_policy() -> &'static str {
     background_priority::current_io_policy()

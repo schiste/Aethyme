@@ -7374,16 +7374,45 @@ impl Broker {
         result
     }
 
+    /// The helper for one preparation step, with the step's stdout and
+    /// stderr captured (forwarded as before, their tails kept) when the pipes
+    /// could be opened.
     pub(crate) fn start_preparation_exec_supervisor(
         &self,
-    ) -> Result<crate::inline_exec_supervisor::InlineExecSupervisor, BrokerOpError> {
+    ) -> Result<
+        (
+            crate::inline_exec_supervisor::InlineExecSupervisor,
+            Option<crate::preparation::step_output::Capture>,
+        ),
+        BrokerOpError,
+    > {
         let executable = crate::agent_supervisor::resolve_executable(
             self.agent_supervisor_executable.as_deref(),
         )
         .map_err(|error| crate::PreparationError::SupervisorUnavailable {
             reason: error.to_string(),
         })?;
-        crate::inline_exec_supervisor::InlineExecSupervisor::start(&executable).map_err(|error| {
+        let (capture, started) = match crate::preparation::step_output::start() {
+            Ok((capture, ends)) => (
+                Some(capture),
+                crate::inline_exec_supervisor::InlineExecSupervisor::start_capturing(
+                    &executable,
+                    ends.stdout,
+                    ends.stderr,
+                ),
+            ),
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "preparation_step_output_uncaptured",
+                    std::time::Duration::ZERO,
+                );
+                (
+                    None,
+                    crate::inline_exec_supervisor::InlineExecSupervisor::start(&executable),
+                )
+            }
+        };
+        started.map(|supervisor| (supervisor, capture)).map_err(|error| {
             match error {
                 crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
                     crate::PreparationError::SupervisorUnavailable {
