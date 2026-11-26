@@ -8210,9 +8210,8 @@ impl GitRepo {
         per_path: usize,
         budget: Duration,
     ) -> Result<BTreeMap<String, Vec<String>>, GitError> {
-        let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if paths.is_empty() || per_path == 0 {
-            return Ok(found);
+            return Ok(BTreeMap::new());
         }
         let wanted: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
         let range = format!("{from}..{to}");
