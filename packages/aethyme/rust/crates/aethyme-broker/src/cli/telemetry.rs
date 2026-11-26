@@ -196,11 +196,13 @@ pub(super) fn mark_wrapped_command_failure() {
 }
 
 pub(super) fn set_metric_session(id: i64) {
+    super::interrupted::note_session(id);
     METRIC_SESSION_ID.with(|slot| slot.set(Some(id)));
 }
 
 /// Preserve the repository context of a command that can remove its own cwd.
 pub(super) fn set_metric_repository(root: &std::path::Path) {
+    super::interrupted::note_repository(root);
     METRIC_REPOSITORY.with(|path| *path.borrow_mut() = Some(root.to_path_buf()));
 }
 
@@ -431,24 +433,60 @@ fn append_command_metric(
     output_bytes: u64,
     session_id: Option<i64>,
     attribution: serde_json::Value,
-    mut details: serde_json::Map<String, serde_json::Value>,
+    details: serde_json::Map<String, serde_json::Value>,
 ) {
+    let line = command_metric_line(
+        label,
+        duration_ms,
+        exit,
+        output_bytes,
+        session_id,
+        attribution,
+        details,
+    );
+    // Opt-in latency telemetry, not broker state: a command must never fail
+    // or grow stderr noise because its own timing line could not be written.
+    let Some(path) = command_metrics_path(main_root) else {
+        return;
+    };
+    // Under the shared append lock, so a GC trim replacing this log can never
+    // drop the row with the inode it replaces.
+    crate::gc::metrics_trim::append_command_metric_line(main_root, &path, line.as_bytes());
+}
+
+/// `<main>/.aethyme/logs/command-metrics.jsonl`, its directory created.
+pub(super) fn command_metrics_path(main_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = main_root.join(".aethyme/logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("command-metrics.jsonl"))
+}
+
+/// One command-metrics row, newline included. A row carrying `interrupted`
+/// has the outcome `interrupted` whatever its exit status.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn command_metric_line(
+    label: &str,
+    duration_ms: i64,
+    exit: u8,
+    output_bytes: u64,
+    session_id: Option<i64>,
+    attribution: serde_json::Value,
+    mut details: serde_json::Map<String, serde_json::Value>,
+) -> String {
     details.insert("session_id".into(), serde_json::json!(session_id));
     details.insert("attribution".into(), attribution);
-    details.insert(
-        "outcome".into(),
-        serde_json::json!(match exit {
+    let outcome = if details.contains_key("interrupted") {
+        "interrupted"
+    } else {
+        match exit {
             crate::exit_status::SUCCESS => "succeeded",
             crate::exit_status::OUTCOME_UNKNOWN => "outcome_unknown",
             crate::exit_status::REFUSED => "refused",
             crate::exit_status::ENVIRONMENT => "environment_failure",
             _ => "failed",
-        }),
-    );
-    // Opt-in latency telemetry, not broker state: a command must never fail
-    // or grow stderr noise because its own timing line could not be written.
-    let dir = main_root.join(".aethyme/logs");
-    let _ = std::fs::create_dir_all(&dir);
+        }
+    };
+    details.insert("outcome".into(), serde_json::json!(outcome));
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -458,14 +496,7 @@ fn append_command_metric(
         .map(|json| json[1..json.len().saturating_sub(1)].to_string())
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
-    let line = metric_line(ts, label, duration_ms, exit, output_bytes, &extra_fields);
-    // Under the shared append lock, so a GC trim replacing this log can never
-    // drop the row with the inode it replaces.
-    crate::gc::metrics_trim::append_command_metric_line(
-        main_root,
-        &dir.join("command-metrics.jsonl"),
-        line.as_bytes(),
-    );
+    metric_line(ts, label, duration_ms, exit, output_bytes, &extra_fields)
 }
 
 /// Record the actual hook transport result without changing its exit or stdout.
@@ -515,7 +546,7 @@ pub(crate) fn record_hook_metric(
 /// runs for minutes on a shared machine (the detached worker) shows here
 /// whether it computed or waited.
 #[cfg(unix)]
-fn process_cpu_ms() -> Option<serde_json::Value> {
+pub(super) fn process_cpu_ms() -> Option<serde_json::Value> {
     fn usage(who: libc::c_int) -> Option<(u64, u64)> {
         // SAFETY: `rusage` is plain data that `getrusage` fully initialises
         // on success; it is read only then.
@@ -541,7 +572,7 @@ fn process_cpu_ms() -> Option<serde_json::Value> {
 }
 
 #[cfg(not(unix))]
-fn process_cpu_ms() -> Option<serde_json::Value> {
+pub(super) fn process_cpu_ms() -> Option<serde_json::Value> {
     None
 }
 
@@ -549,7 +580,7 @@ fn process_cpu_ms() -> Option<serde_json::Value> {
 /// fields. A phase or count the command named itself wins over a span of the
 /// same name; `phase_counts` says how many times each span ran, beside any
 /// counts the command attached.
-fn with_spans(
+pub(super) fn with_spans(
     mut fields: serde_json::Map<String, serde_json::Value>,
     spans: &crate::phase_telemetry::Recorder,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -724,7 +755,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
 /// Decide whether this invocation writes a timing line. A GC plan is a
 /// special case: its candidate set may rewrite this same metrics file, so
 /// recording the plan afterward would invalidate the digest it just produced.
-fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) -> bool {
+pub(super) fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) -> bool {
     // Explicit output measurement cannot make this temporary smoke command
     // write telemetry into the unrelated repository that invoked it.
     if args.first().map(String::as_str) == Some("quick-test") {

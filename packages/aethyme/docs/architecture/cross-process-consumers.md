@@ -635,6 +635,71 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Interrupted commands write their row; running commands keep a heartbeat (2026-11-26)
+
+A broker command killed by `SIGINT` (an interrupt), `SIGTERM` or `SIGHUP`
+(an agent's tool timeout, a closed terminal) used to write no
+`.aethyme/logs/command-metrics.jsonl` row, so a command stopped after an hour
+in one step left no trace. Unix only; on other platforms nothing changes.
+
+- **Who is covered.** Every command that would write a row on return
+  (`command_metric_enabled` without attached details). Read-only inspection
+  stays telemetry-free when interrupted, and the commands that record only
+  by attaching details on return (`gates affected`, `reclaim plan`) write no
+  interrupted row. `service` keeps its own handlers.
+- **The row.** The same fields as a normal row (`ts`, `aethyme_version`,
+  `command`, `duration_ms`, `output_bytes`, `session_id`, `attribution`,
+  `cpu_ms`, `phase_timings_ms`, `phase_counts`, attachments), with
+  `exit` = 128 + the signal number (130, 143, 129), `outcome` =
+  `"interrupted"`, and a new field:
+
+  ```json
+  "interrupted": {
+    "signal": "SIGINT",
+    "in_span": "gate_run",
+    "open_spans": ["submit_verification", "gate_run"],
+    "open_span_elapsed_ms": {"submit_verification": 3600120, "gate_run": 3599870}
+  }
+  ```
+
+  `signal` is `SIGINT`, `SIGTERM` or `SIGHUP`. `open_spans` lists the spans
+  still open, outermost (opened first) to innermost, across all of the
+  command's threads; `in_span` is the innermost (last opened), or `null` when
+  none was open. `open_span_elapsed_ms` maps each open span's name to its
+  elapsed milliseconds (the longest when a name is open on several threads).
+  The open spans' elapsed time is also folded into `phase_timings_ms`,
+  `phase_counts` (one occurrence each) and `attribution`, as if each had
+  ended at the signal. `session_id` comes from what the command resolved, or
+  from its `--session` flag unvalidated: the interrupted row never opens the
+  broker store. `output_bytes` counts stdout printed by every thread. Readers
+  that bucket `outcome` must accept `"interrupted"`.
+- **Exit and children unchanged.** The handler only records the signal and
+  writes a byte to a pipe; a watcher thread writes the row, then restores
+  the default disposition and re-raises, so the process still dies of the
+  signal and a parent sees the same status. The flush is bounded at 2 s
+  (lock waits poll; the append lock waits at most 500 ms, then appends
+  unlocked, as every command does past its wait); a second signal kills at
+  once. A signal ignored at start (`nohup`) stays ignored; a thread that
+  blocks these signals itself (`resources run` waiting with `sigwait`) still
+  receives them, because the watcher blocks them too.
+- **No fallback file.** The shared append lock is held exclusively only by a
+  GC trim, which already copies rows appended to the replaced file during its
+  settle window, so an interrupted row degrades to the same unlocked append
+  as a normal row instead of a second file that every reader would need to
+  fold in.
+- **Heartbeat: `.aethyme/run/commands/<pid>.json`.** While a covered command
+  runs, every 30 s (`AETHYME_COMMAND_HEARTBEAT_MS` overrides, minimum 50) it
+  replaces this file atomically, only in a checkout that already has
+  `.aethyme/`: `{"schema_version": 1, "pid", "aethyme_version", "command",
+  "session_id", "started_at_ms", "updated_at_ms", "elapsed_ms", "in_span",
+  "open_spans", "open_span_elapsed_ms"}` (same meanings as above, at the time
+  of writing). It is removed when the command ends, including on an
+  interrupt. A process killed by `SIGKILL` leaves its file: readers must
+  check that `pid` is alive and treat an `updated_at_ms` older than the
+  interval as stale. No broker command lists these files yet.
+- **New span.** `test_command_hold`: only under `AETHYME_TEST_COMMAND_HOLD_MS`
+  (milliseconds), the test seam that holds a command before it runs.
+
 ## Read-only Git queries answered in-process (2026-11-23)
 
 Four read-only queries no longer start a `git` process when gitoxide (`gix`,

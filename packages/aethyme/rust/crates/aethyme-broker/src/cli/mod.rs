@@ -20,6 +20,7 @@ mod gc_storage;
 mod git_gh;
 pub(crate) mod insights;
 mod integration;
+mod interrupted;
 mod leases;
 mod merge_chain;
 mod render;
@@ -1231,6 +1232,17 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("service") {
         return service::run_service(&args[1..]);
     }
+    let internal_hook = args.first().map(String::as_str) == Some("hooks")
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("pre-commit" | "post-commit")
+        );
+    // A command killed by SIGINT, SIGTERM or SIGHUP still writes its metric
+    // row, naming the span it was in, before dying of the signal.
+    let interrupted_scope = (mode == CompatibilityMode::Normal && !internal_hook)
+        .then(|| interrupted::enter(args, started, &spans))
+        .flatten();
+    interrupted::test_hold();
     // O(1) storage check: a statvfs per root and a read of the ledger
     // summary. Starts the storage worker when a budget or floor is breached;
     // a command that needs space reclaims regenerable data first and refuses
@@ -1281,11 +1293,9 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         Err(UsageError::SilentExit(code)) => (code, true, None),
     };
     let code = crate::cli_output::exit_code_after_output(command_output, code);
-    let internal_hook = args.first().map(String::as_str) == Some("hooks")
-        && matches!(
-            args.get(1).map(String::as_str),
-            Some("pre-commit" | "post-commit")
-        );
+    // The command returned: from here a signal kills as it always did, so
+    // the row is written once, below.
+    drop(interrupted_scope);
     if mode == CompatibilityMode::Normal && !internal_hook && !idle_delivery_poll(code) {
         let ended = std::time::Instant::now();
         if record_outcome {
