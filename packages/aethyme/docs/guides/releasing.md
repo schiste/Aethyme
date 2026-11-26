@@ -75,6 +75,16 @@ the requested version change.
 6. Create and push the matching annotated tag through the coordinated Git
    lane. Wait for the release workflow and verify the signed manifest,
    checksums, installer, and every supported archive.
+
+   The macOS workspace suite for the tag runs inside the same "Release
+   binaries" run, as the `macOS tests` job group that starts once the release
+   builds finish (it no longer starts on its own tag push, where it competed
+   with the macOS release builds for runners). Read its verdict from the job
+   named `macOS tests / macOS tests`: `gh run list --workflow release.yml
+   --branch vX.Y.Z --json databaseId`, then `gh run view <id> --json jobs`.
+   It is not a release gate: the release is attached, and the tap updated,
+   without waiting for it, so the run completes about 40 minutes after the
+   release is published.
 7. For a stable release, `release.yml` calls `homebrew-tap.yml`, which
    verifies the signed manifest, renders `aethyme.rb` from the tag's exact
    source commit, and checks that this matches the release asset. It then
