@@ -308,10 +308,11 @@ pub(super) enum UnattendedTrim {
     /// Staging ran out of its budget at log offset `bytes_scanned` (counting
     /// what earlier attempts staged when this one resumed); the log is
     /// unchanged. `resume` is where the next attempt continues, its staged
-    /// temporary kept; `None` when nothing was staged.
+    /// temporary kept; `None` when nothing was staged. Boxed: the record is
+    /// several times larger than every other variant.
     BudgetExhausted {
         bytes_scanned: u64,
-        resume: Option<StagingResume>,
+        resume: Option<Box<StagingResume>>,
     },
     /// Every row with a timestamp is older than the cutoff, newest included:
     /// the clock is suspect (or the repository has been idle for the whole
@@ -707,7 +708,7 @@ fn stage_retained_rows_checking(
         return done(
             UnattendedTrim::BudgetExhausted {
                 bytes_scanned: progress.staged_len,
-                resume: Some(StagingResume {
+                resume: Some(Box::new(StagingResume {
                     device,
                     inode,
                     fingerprint,
@@ -718,7 +719,7 @@ fn stage_retained_rows_checking(
                     newest: progress.newest,
                     cutoff,
                     temporary: name,
-                }),
+                })),
             },
             resumed_from_bytes,
         );
@@ -797,8 +798,10 @@ fn resume_staged_temporary(
     }
     // Touched, so a sweep that judges temporaries by age sees it in use.
     let _ = file.set_modified(std::time::SystemTime::now());
-    let temporary =
-        tempfile::NamedTempFile::from_parts(file, tempfile::TempPath::from_path(temporary_path));
+    let temporary = tempfile::NamedTempFile::from_parts(
+        file,
+        tempfile::TempPath::try_from_path(temporary_path)?,
+    );
     Ok(Some((
         temporary,
         StagingProgress {
@@ -1981,7 +1984,7 @@ mod tests {
         assert_eq!(exhausted.next_due_in_ms(), UNATTENDED_TRIM_RETRY_MS);
         let resumable = UnattendedTrim::BudgetExhausted {
             bytes_scanned: 1,
-            resume: Some(StagingResume {
+            resume: Some(Box::new(StagingResume {
                 device: 1,
                 inode: 2,
                 fingerprint: String::new(),
@@ -1992,7 +1995,7 @@ mod tests {
                 newest: None,
                 cutoff: 10,
                 temporary: ".command-metrics.jsonl-a1B2c3".into(),
-            }),
+            })),
         };
         assert_eq!(
             resumable.next_due_in_ms(),
@@ -2078,7 +2081,7 @@ mod tests {
                 resume: Some(resume),
             }) => {
                 assert_eq!(bytes_scanned, resume.source_offset);
-                resume
+                *resume
             }
             Err(other) => panic!("expected an exhausted budget, got {other:?}"),
             Ok(_) => panic!("expected an exhausted budget, got a staged log"),
