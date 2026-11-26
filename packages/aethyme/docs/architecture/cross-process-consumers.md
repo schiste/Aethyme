@@ -2262,9 +2262,13 @@ whole file. Now:
   back). Staging gets the lesser of 60 s and the time left before the run's
   deadline; with less than 5 s left the trim does not start and the key is
   left as it is (counter `command_metrics_trim_no_time_this_run`). Before it
-  runs the key is set 30 minutes ahead. After an outcome that a retry would
-  not change (`trimmed`, `nothing_expired`, `missing`, `clock_suspect`,
-  `unsupported`) it is set a day ahead; otherwise it stays 30 minutes ahead.
+  runs the key is set 30 minutes ahead, by compare-and-set against the value
+  read, so only one worker runs a trim at a time (a worker that loses the
+  race counts `command_metrics_trim_claimed_elsewhere` and does nothing).
+  After an outcome that a retry would not change (`trimmed`,
+  `nothing_expired`, `missing`, `clock_suspect`, `unsupported`) it is set a
+  day ahead; after `budget_exhausted` with a resume record it is set to now,
+  so the next run resumes; otherwise it stays 30 minutes ahead.
   Read-only stores never trim. The cutoff is the one a plan made the same
   UTC day reviews: rows with `ts` older than the day's midnight UTC less
   `command_metrics_days`. A size trigger was not added: the policy is by age,
@@ -2291,6 +2295,34 @@ whole file. Now:
   or unattended, now removes only temporaries last modified at least 120 s
   ago (the staging budget and a margin; staging writes at least every 1 MiB),
   and an unattended trim also spares its own.
+- **Row rule (changed 2026-11-26, PR #2038).** Rows are classified without
+  building a JSON tree, with the same keep/remove result as before: a row is
+  removed only when a validating `serde_json` walk (the same
+  `deserialize_any` path `serde_json::Value` takes, so the same UTF-8,
+  surrogate-escape, number-range and nesting checks, and the last duplicate
+  `ts` wins) reads an integer `ts` older than the cutoff. A row that starts
+  with the broker's own `{"ts":<integer>,` and whose leading `ts` is inside
+  retention is kept without being read further. Two reported values differ
+  for such a row, never what is kept: if it is damaged after its leading
+  `ts`, `gc plan` no longer counts it as a malformed line (no
+  `command_metric_line` blocker for it), and its leading `ts`, not a later
+  duplicate, feeds the clock check below.
+- **Resumable staging (changed 2026-11-26, PR #2038).** When staging runs out
+  of its budget it keeps its synced temporary and stores a resume record in
+  broker meta key `command_metrics_trim.resume` (JSON: the log's `device`
+  and `inode`, a SHA-256 `fingerprint` of the log's first 64 KiB and of the
+  64 KiB ending at the offset, `source_offset` (always a line boundary),
+  `staged_bytes`, `removed`, `kept`, `newest`, `cutoff` and the `temporary`
+  file name). The next attempt resumes only when the log has the same device
+  and inode, is at least `source_offset` long and matches the fingerprint,
+  the cutoff is not earlier than the recorded one, and the temporary still
+  exists with exactly `staged_bytes`; otherwise it removes the recorded
+  temporary and starts over. Rows staged under an earlier cutoff were kept
+  by that cutoff, so a resumed trim at worst keeps a row the current cutoff
+  would remove. The record is replaced after each `budget_exhausted` and
+  cleared (set empty) after any other outcome. Every stale-temporary sweep
+  (the reviewed trim's too) spares the recorded temporary while its record
+  still matches the log and the temporary's length.
 - **Clock check.** When every timestamped row, the newest included, is older
   than the cutoff, nothing is removed (`clock_suspect`): the clock is suspect,
   or the repository was idle for the whole window, and in either case keeping
@@ -2304,9 +2336,15 @@ whole file. Now:
   and as they apply `rows_expired` and `rows_kept` (what staging and the tail
   found, also when the outcome removed nothing), `rows_removed` (0 unless
   `trimmed`), `bytes_before`, `bytes_after`, `attempts`,
-  `recovered_tail_bytes`, `stale_temporaries_removed`, `bytes_scanned`,
-  `cutoff_ms` and `newest_row_ts`; and counters
-  `command_metrics_trim_not_due`, `command_metrics_trim_no_time_this_run`,
+  `recovered_tail_bytes`, `stale_temporaries_removed`, `bytes_scanned` (the
+  log offset staging reached, including what earlier attempts staged),
+  `resume_recorded` (with `budget_exhausted`: whether a resume record was
+  stored), `cutoff_ms` and `newest_row_ts`, and always `resumed_from_bytes`
+  (the log offset staging resumed from; 0 when it started from the first
+  byte, so `bytes_scanned - resumed_from_bytes` is this attempt's work); and
+  counters `command_metrics_trim_not_due`,
+  `command_metrics_trim_no_time_this_run`,
+  `command_metrics_trim_claimed_elsewhere`, `command_metrics_trim_resumed`,
   `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
   `command_metrics_trim_missing`,
   `command_metrics_trim_skipped_concurrent_append`,
