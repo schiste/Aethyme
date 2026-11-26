@@ -135,9 +135,9 @@ fn forward_stream(
                 let chunk = &buffer[..read];
                 // Forwarding is what the inherited descriptor used to do; a
                 // closed terminal must not stop the capture or the step.
-                let _ = match forward {
-                    Forward::Stdout => std::io::stdout().write_all(chunk),
-                    Forward::Stderr => std::io::stderr().write_all(chunk),
+                match forward {
+                    Forward::Stdout => std::io::stdout().write_all(chunk).ok(),
+                    Forward::Stderr => std::io::stderr().write_all(chunk).ok(),
                 };
                 if let Ok(mut tail) = tail.lock() {
                     tail.push(chunk);
@@ -147,7 +147,8 @@ fn forward_stream(
             Err(_) => break,
         }
     }
-    let _ = drained.send(());
+    // The receiver may have stopped waiting after its grace period.
+    drained.send(()).ok();
 }
 
 impl Capture {

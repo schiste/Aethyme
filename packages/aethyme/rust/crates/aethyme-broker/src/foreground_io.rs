@@ -56,7 +56,7 @@ impl Drop for ForegroundIoMark {
     fn drop(&mut self) {
         // Best effort: a marker left behind names a process that is gone,
         // which readers ignore and remove.
-        let _ = std::fs::remove_file(&self.path);
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -95,7 +95,7 @@ pub(crate) fn active_on_in(directory: &Path, devices: &[u64], alive: impl Fn(u32
             continue;
         };
         if !alive(pid) {
-            let _ = std::fs::remove_file(entry.path());
+            std::fs::remove_file(entry.path()).ok();
             continue;
         }
         if devices.contains(&device) {
