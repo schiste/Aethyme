@@ -4357,6 +4357,57 @@ pub(crate) fn unclean_reason(
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    unclean_reason_with(
+        worktree,
+        branch,
+        main_root,
+        policy,
+        UnknownIgnoredDirectories::Keep,
+    )
+}
+
+/// [`unclean_reason`] for the checkout retirement lane's re-check under the
+/// lifecycle claim: an ignored directory nothing catalogues as regenerable
+/// that holds no file at all (only directories, or nothing) does not keep
+/// the checkout. The lane's plan archives such a directory file by file
+/// (`ArchiveIgnoredDirectoriesScope`), which is zero files, so it already
+/// called the checkout "nothing to preserve"; without this the re-check
+/// refused every run what the plan had just approved. The directory is
+/// walked again here, under the claim, so a file written into it after the
+/// plan still keeps the checkout.
+pub(crate) fn unclean_reason_for_retirement(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+    policy: &AutoCleanupPolicy,
+) -> Result<Option<String>, String> {
+    unclean_reason_with(
+        worktree,
+        branch,
+        main_root,
+        policy,
+        UnknownIgnoredDirectories::ReleaseWhenEmpty,
+    )
+}
+
+/// How proof 3 treats an ignored directory nothing catalogues as
+/// regenerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownIgnoredDirectories {
+    /// It keeps the checkout, whatever it holds.
+    Keep,
+    /// It keeps the checkout unless its whole subtree holds no file, link
+    /// or special node ([`ignored_directory_holds_no_files`]).
+    ReleaseWhenEmpty,
+}
+
+fn unclean_reason_with(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+    policy: &AutoCleanupPolicy,
+    unknown_directories: UnknownIgnoredDirectories,
+) -> Result<Option<String>, String> {
     let _span = crate::phase_telemetry::span("proof_unclean_check");
     let strict = policy.strict;
     let listing = match run_proof_git(
@@ -4396,7 +4447,7 @@ pub(crate) fn unclean_reason(
     if let Some(reason) = in_progress_or_stash_reason(worktree, branch, main_root)? {
         return Ok(Some(reason));
     }
-    ignored_reason_from_status(worktree, &records, policy)
+    ignored_reason_from_status(worktree, &records, policy, unknown_directories)
 }
 
 /// The ignored-content verdict ([`ignored_content_reason`]) over the `!!`
@@ -4406,6 +4457,7 @@ fn ignored_reason_from_status(
     worktree: &Path,
     records: &[(&str, &str)],
     policy: &AutoCleanupPolicy,
+    unknown_directories: UnknownIgnoredDirectories,
 ) -> Result<Option<String>, String> {
     let _span = crate::phase_telemetry::span("proof_ignored_check");
     let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
@@ -4433,6 +4485,7 @@ fn ignored_reason_from_status(
         ));
     }
     let mut released_by_file_pattern = false;
+    let mut released_empty_directories = 0_usize;
     for relative in ignored {
         ensure_ignored_content_before(deadline)?;
         if relative.len() > PROOF_IGNORED_PATH_BYTES {
@@ -4452,6 +4505,13 @@ fn ignored_reason_from_status(
                     ),
                     IgnoredEntryRule::Other => {}
                 }
+                if unknown_directories == UnknownIgnoredDirectories::ReleaseWhenEmpty
+                    && matches!(classification, RecoveryIgnoredClassification::Preserve(_))
+                    && ignored_directory_holds_no_files(worktree, relative)
+                {
+                    released_empty_directories += 1;
+                    return Ok(());
+                }
                 ignored_verdict(relative, classification)
             },
         );
@@ -4465,7 +4525,58 @@ fn ignored_reason_from_status(
     if released_by_file_pattern {
         crate::phase_telemetry::add("cleanup_checkout_released_by_file_pattern", Duration::ZERO);
     }
+    for _ in 0..released_empty_directories {
+        crate::phase_telemetry::add("proof_empty_ignored_directory_released", Duration::ZERO);
+    }
     Ok(None)
+}
+
+/// Entries [`ignored_directory_holds_no_files`] reads before it stops and
+/// calls the directory not empty.
+const EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT: usize = 4_096;
+/// Directory levels it descends before it calls the directory not empty.
+const EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT: usize = 128;
+
+/// Whether the ignored path `relative` of `worktree` is a real directory
+/// (never a link) whose whole subtree holds only directories: no regular
+/// file, link or special node. Bounded and never following a link; any
+/// entry it cannot read, and anything past its bounds, answers `false`
+/// (the directory keeps the checkout). An empty directory holds no work:
+/// the recovery archive of such a directory is zero files.
+pub(crate) fn ignored_directory_holds_no_files(worktree: &Path, relative: &str) -> bool {
+    let root = worktree.join(relative.trim_end_matches('/'));
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let mut pending = vec![(root, 0_usize)];
+    let mut examined = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            examined += 1;
+            if examined > EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return false;
+            }
+            pending.push((entry.path(), depth + 1));
+        }
+    }
+    true
 }
 
 /// Proof 3 without the ignored-path listing: no uncommitted or untracked
@@ -11268,6 +11379,85 @@ mod tests {
                 ))
             );
         }
+    }
+
+    /// Only a real directory whose subtree holds nothing but directories is
+    /// empty: a file, a link (to a directory too) or a link as the root is
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_directory_holds_no_files_only_when_its_subtree_is_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("empty/nested/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("bare")).unwrap();
+        std::fs::create_dir_all(root.join("with_file/nested")).unwrap();
+        std::fs::write(root.join("with_file/nested/data.txt"), "work\n").unwrap();
+        std::fs::create_dir_all(root.join("with_link")).unwrap();
+        std::os::unix::fs::symlink(root.join("bare"), root.join("with_link/to_bare")).unwrap();
+        std::os::unix::fs::symlink(root.join("bare"), root.join("linked_root")).unwrap();
+        std::fs::write(root.join("plain.log"), "log\n").unwrap();
+
+        assert!(super::ignored_directory_holds_no_files(root, "empty/"));
+        assert!(super::ignored_directory_holds_no_files(root, "bare"));
+        assert!(!super::ignored_directory_holds_no_files(root, "with_file/"));
+        assert!(!super::ignored_directory_holds_no_files(root, "with_link/"));
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "linked_root"
+        ));
+        assert!(!super::ignored_directory_holds_no_files(root, "plain.log"));
+        assert!(!super::ignored_directory_holds_no_files(root, "missing/"));
+    }
+
+    /// The retirement re-check releases an ignored directory nothing
+    /// catalogues as regenerable only while it holds no file; every other
+    /// caller of proof 3 still keeps the checkout for it.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_retirement_recheck_releases_an_empty_unknown_ignored_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Proof test"]);
+        git(&["config", "user.email", "proof@example.invalid"]);
+        std::fs::write(root.join(".gitignore"), "scratch-area/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join("scratch-area/nested")).unwrap();
+        let policy = AutoCleanupPolicy::default();
+
+        let kept = super::unclean_reason(root, None, root, &policy).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "{kept:?}"
+        );
+        assert_eq!(
+            super::unclean_reason_for_retirement(root, None, root, &policy),
+            Ok(None)
+        );
+
+        std::fs::write(root.join("scratch-area/nested/notes.txt"), "work\n").unwrap();
+        let kept = super::unclean_reason_for_retirement(root, None, root, &policy).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "{kept:?}"
+        );
     }
 
     /// A stopped listing takes its whole process group with it: a child the

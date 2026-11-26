@@ -942,7 +942,16 @@ fn kept_counter(code: &'static str) -> &'static str {
         "plan_refused" => "checkout_retirement_kept_plan_refused",
         "inspection_failed" => "checkout_retirement_kept_inspection_failed",
         "lifecycle_busy" => "checkout_retirement_kept_lifecycle_busy",
-        "changed" => "checkout_retirement_kept_changed",
+        "changed_session" => "checkout_retirement_kept_changed_session",
+        "changed_head" => "checkout_retirement_kept_changed_head",
+        "changed_policy_unavailable" => "checkout_retirement_kept_changed_policy_unavailable",
+        "changed_uncommitted" => "checkout_retirement_kept_changed_uncommitted",
+        "changed_operation" => "checkout_retirement_kept_changed_operation",
+        "changed_stash" => "checkout_retirement_kept_changed_stash",
+        "changed_ignored" => "checkout_retirement_kept_changed_ignored",
+        "changed_unclean_other" => "checkout_retirement_kept_changed_unclean_other",
+        "changed_unclean_unknown" => "checkout_retirement_kept_changed_unclean_unknown",
+        "changed_after_archive" => "checkout_retirement_kept_changed_after_archive",
         "trash_refused" => "checkout_retirement_kept_trash_refused",
         "archive_too_large" => "checkout_retirement_kept_archive_too_large",
         "archive_failed" => "checkout_retirement_kept_archive_failed",
@@ -961,6 +970,29 @@ fn kept_counter(code: &'static str) -> &'static str {
         "holder_unknown" => "checkout_retirement_kept_holder_unknown",
         "leftover_superseded" => "checkout_retirement_kept_leftover_superseded",
         _ => "checkout_retirement_kept_other",
+    }
+}
+
+/// The keep code of a re-check under the lifecycle claim that found the
+/// checkout unclean, by the reason proof 3 gave
+/// ([`crate::auto_cleanup::kept_reason_code`]): each cause is counted on its
+/// own instead of one `changed`.
+fn recheck_keep_code(reason: &str) -> &'static str {
+    // By the reason's own opening words first: a stash entry quotes its
+    // commit subject, which may hold any other code's words.
+    if reason.starts_with("a stash was made on ") {
+        return "changed_stash";
+    }
+    if reason.starts_with("ignored content requires explicit cleanup") {
+        return "changed_ignored";
+    }
+    match crate::auto_cleanup::kept_reason_code(reason) {
+        "uncommitted_changes" => "changed_uncommitted",
+        "operation_in_progress" => "changed_operation",
+        "stash" => "changed_stash",
+        "ignored_content" => "changed_ignored",
+        "ignored_content_unverified" => "changed_unclean_unknown",
+        _ => "changed_unclean_other",
     }
 }
 
@@ -1040,6 +1072,11 @@ fn remembered_keep(code: &str) -> bool {
             | "not_owned"
             | "adopted"
             | "trash_refused"
+            // A stash made on the session's branch: the plan does not
+            // look at stashes, so the re-check under the claim refused the
+            // same checkout on every run. It stays kept (the stash is
+            // somebody's parked work), now with the back-off.
+            | "changed_stash"
     )
 }
 
@@ -3436,28 +3473,41 @@ impl Broker {
                 || current.cleanup_state != session.cleanup_state
                 || current.worktree_path != session.worktree_path
             {
-                return Ok(Kept("changed"));
+                return Ok(Kept("changed_session"));
             }
             let head = GitRepo::discover(&worktree)
                 .ok()
                 .and_then(|checkout| checkout.head_commit().ok());
             if head.as_deref() != Some(plan.head.as_str()) {
-                return Ok(Kept("changed"));
+                return Ok(Kept("changed_head"));
             }
-            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
-                .ok()
-                .and_then(|policy| {
-                    crate::auto_cleanup::unclean_reason(
-                        &worktree,
-                        Some(current.branch.as_str()),
-                        self.main_root(),
-                        &policy,
-                    )
-                    .ok()
-                })
-                .is_some_and(|reason| reason.is_none());
-            if !clean {
-                return Ok(Kept("changed"));
+            let policy = match crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    run.keep_detail = Some(error);
+                    return Ok(Kept("changed_policy_unavailable"));
+                }
+            };
+            let unclean = {
+                let _phase = crate::phase_telemetry::span("checkout_retirement_phase_recheck");
+                crate::auto_cleanup::unclean_reason_for_retirement(
+                    &worktree,
+                    Some(current.branch.as_str()),
+                    self.main_root(),
+                    &policy,
+                )
+            };
+            match unclean {
+                Ok(None) => {}
+                Ok(Some(reason)) => {
+                    let code = recheck_keep_code(&reason);
+                    run.keep_detail = Some(reason);
+                    return Ok(Kept(code));
+                }
+                Err(error) => {
+                    run.keep_detail = Some(error);
+                    return Ok(Kept("changed_unclean_unknown"));
+                }
             }
             let moved = {
                 let _phase = crate::phase_telemetry::span("checkout_retirement_phase_move");
@@ -3623,7 +3673,7 @@ impl Broker {
             || current.cleanup_state != session.cleanup_state
             || current.worktree_path != session.worktree_path
         {
-            return Ok(Kept("changed"));
+            return Ok(Kept("changed_session"));
         }
         let policy = match crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) {
             Ok(policy) => policy,
@@ -3687,7 +3737,7 @@ impl Broker {
                 archived.path.display()
             ));
             self.forget_keep(session.id);
-            return Ok(Kept("changed"));
+            return Ok(Kept("changed_after_archive"));
         }
         let moved = {
             let _phase = crate::phase_telemetry::span("checkout_retirement_phase_move");
@@ -5915,9 +5965,206 @@ mod tests {
         let report = run(&mut broker);
         set_hook(None);
 
-        assert_eq!(report.kept.get("changed"), Some(&1), "{report:#?}");
+        assert_eq!(report.kept.get("changed_ignored"), Some(&1), "{report:#?}");
         assert!(worktree.join("secrets.local").exists());
         assert!(!is_cleaned(&broker, session.id));
+    }
+
+    /// An ignored directory nothing catalogues as regenerable that holds no
+    /// file: the plan archives it as zero files ("nothing to preserve") and
+    /// the re-check under the claim now agrees, so the checkout is retired
+    /// instead of being kept as changed on every run.
+    #[test]
+    fn an_empty_unknown_ignored_directory_does_not_keep_a_clean_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "empty ignored directory", |worktree| {
+            std::fs::create_dir_all(worktree.join("secrets.local/nested/deeper")).unwrap();
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(retired_away(&worktree));
+        assert!(is_cleaned(&broker, session.id));
+        assert!(archives(&broker, session.id).is_empty());
+    }
+
+    /// A file written into that empty ignored directory after the plan
+    /// keeps the checkout: the re-check walks the directory again under the
+    /// claim.
+    #[test]
+    fn a_file_written_into_an_empty_ignored_directory_after_the_plan_keeps_the_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "late file in directory", |worktree| {
+            std::fs::create_dir_all(worktree.join("secrets.local/nested")).unwrap();
+        });
+        let late = worktree.join("secrets.local/nested/notes.txt");
+        let written = late.clone();
+        set_hook(Some(Box::new(move || {
+            std::fs::write(&written, "written late\n").unwrap();
+        })));
+        let report = run(&mut broker);
+        set_hook(None);
+
+        assert_eq!(report.kept.get("changed_ignored"), Some(&1), "{report:#?}");
+        assert_eq!(std::fs::read_to_string(&late).unwrap(), "written late\n");
+        assert!(!is_cleaned(&broker, session.id));
+        assert!(
+            !broker.checkout_retirement_keeps().contains_key(&session.id),
+            "a late write is planned again on the next run, not remembered"
+        );
+    }
+
+    /// A commit made after the plan keeps the checkout as `changed_head`.
+    #[test]
+    fn a_commit_after_the_plan_keeps_the_checkout_as_changed_head() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "late commit", |_| {});
+        let late = worktree.clone();
+        set_hook(Some(Box::new(move || {
+            git(&late, &["commit", "--allow-empty", "-qm", "late commit"]);
+        })));
+        let report = run(&mut broker);
+        set_hook(None);
+
+        assert_eq!(report.kept.get("changed_head"), Some(&1), "{report:#?}");
+        assert!(worktree.exists());
+        assert!(!is_cleaned(&broker, session.id));
+    }
+
+    /// A session row that changed after the plan keeps the checkout as
+    /// `changed_session`.
+    #[test]
+    fn a_session_row_changed_after_the_plan_keeps_the_checkout_as_changed_session() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "late row change", |_| {});
+        let database = broker.store_ref().db_path().to_path_buf();
+        let session_id = session.id;
+        set_hook(Some(Box::new(move || {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.busy_timeout(Duration::from_secs(30)).unwrap();
+            connection
+                .execute(
+                    "UPDATE sessions SET worktree_path = worktree_path || '.moved' WHERE id = ?1",
+                    [session_id],
+                )
+                .unwrap();
+        })));
+        let report = run(&mut broker);
+        set_hook(None);
+
+        assert_eq!(report.kept.get("changed_session"), Some(&1), "{report:#?}");
+        assert!(worktree.exists());
+    }
+
+    /// A stash made on the session's branch: the plan does not look at
+    /// stashes, so the re-check refused the same checkout on every run. It
+    /// stays kept, as `changed_stash`, and is remembered with the keep
+    /// back-off instead of being judged again on the next run.
+    #[test]
+    fn a_stash_on_the_branch_keeps_the_checkout_with_the_back_off() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "stashed", |worktree| {
+            std::fs::write(worktree.join("base.txt"), "parked work\n").unwrap();
+            git(worktree, &["stash"]);
+        });
+
+        let first = run(&mut broker);
+        assert_eq!(first.kept.get("changed_stash"), Some(&1), "{first:#?}");
+        assert!(worktree.exists());
+        assert!(!is_cleaned(&broker, session.id));
+        assert_eq!(
+            broker
+                .checkout_retirement_keeps()
+                .get(&session.id)
+                .map(|keep| keep.reason.as_str()),
+            Some("changed_stash")
+        );
+
+        let second = run(&mut broker);
+        assert_eq!(second.keep_memo_skips, 1, "{second:#?}");
+        assert_eq!(second.examined, 0, "{second:#?}");
+    }
+
+    /// A cleanup policy that cannot be read at the re-check keeps the
+    /// checkout as `changed_policy_unavailable`.
+    #[test]
+    fn an_unreadable_policy_at_the_recheck_keeps_the_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "policy unreadable", |_| {});
+        let config = broker.main_root().join(".aethyme/config.toml");
+        let written = config.clone();
+        set_hook(Some(Box::new(move || {
+            std::fs::write(&written, "[cleanup]\nno_such_key = true\n").unwrap();
+        })));
+        let report = run(&mut broker);
+        set_hook(None);
+        std::fs::remove_file(&config).unwrap();
+
+        assert_eq!(
+            report.kept.get("changed_policy_unavailable"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(worktree.exists());
+        assert!(!is_cleaned(&broker, session.id));
+    }
+
+    /// Every reason proof 3 gives at the re-check has its own keep code and
+    /// counter; none falls back to one shared `changed`.
+    #[test]
+    fn each_recheck_reason_has_its_own_keep_code() {
+        for (reason, code) in [
+            (
+                "2 uncommitted or untracked path(s), first: notes.txt",
+                "changed_uncommitted",
+            ),
+            (
+                "at least 1 uncommitted or untracked path(s), first: notes.txt",
+                "changed_uncommitted",
+            ),
+            ("a merge is in progress", "changed_operation"),
+            (
+                "a stash was made on agent/x: WIP on agent/x: 1234567 a merge is in progress",
+                "changed_stash",
+            ),
+            (
+                "ignored content requires explicit cleanup: ignored path logs/ is not a recognised build-output directory",
+                "changed_ignored",
+            ),
+            (
+                "ignored-path classification exceeded its time budget",
+                "changed_unclean_unknown",
+            ),
+            ("something no proof says", "changed_unclean_other"),
+        ] {
+            assert_eq!(super::recheck_keep_code(reason), code, "{reason}");
+        }
+        let codes = [
+            "changed_session",
+            "changed_head",
+            "changed_policy_unavailable",
+            "changed_uncommitted",
+            "changed_operation",
+            "changed_stash",
+            "changed_ignored",
+            "changed_unclean_other",
+            "changed_unclean_unknown",
+            "changed_after_archive",
+        ];
+        let counters = codes
+            .iter()
+            .map(|code| super::kept_counter(*code))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(counters.len(), codes.len());
+        for code in codes {
+            assert_eq!(
+                super::kept_counter(code),
+                format!("checkout_retirement_kept_{code}")
+            );
+        }
+        assert!(super::remembered_keep("changed_stash"));
+        assert!(!super::remembered_keep("changed_ignored"));
     }
 
     /// The run's one observation decides: a process arriving after it does
@@ -7009,7 +7256,11 @@ mod tests {
         let report = run(&mut broker);
         super::BEFORE_OPERATION_MOVE.with(|hook| *hook.borrow_mut() = None);
 
-        assert_eq!(report.kept.get("changed"), Some(&1), "{report:#?}");
+        assert_eq!(
+            report.kept.get("changed_after_archive"),
+            Some(&1),
+            "{report:#?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&scratch).unwrap(),
             "edited after the copy\n"
