@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.184] - 2026-11-26
+
+### Changed
+
+- The unattended metrics trim now finishes on busy repositories. In 0.8.183 its first run on the busiest repository staged 177 MB of a 508 MB log within its 50-second budget (3.5 MB/s inside the CPU-starved background worker) and gave up, and every retry restarted from the first byte. Rows in the broker's own shape whose leading `ts` is inside retention are now kept without being parsed; a row about to be removed is still fully validated, by a checker that accepts and rejects exactly what the previous JSON parse did (UTF-8, surrogates, number range, nesting, last duplicate `ts`) without building a tree. A trim that runs out of budget keeps its staged file and resumes from the same line on the next worker run, after proving the log is the same file (device, inode and content fingerprints); anything else restarts it (#2038).
+- The host storage worker keeps a free-space floor on every volume that holds recovery archives: the larger of `free_floor_bytes` (10 GiB) and the smaller of 10% of the volume and 20 GiB. Below it, the oldest archives across repositories are removed, paced (200 ms each, one 60-second budget per pass), and only archives proven landed, past their minimum retention and without a keep marker; the keep marker is re-read immediately before each removal. Below 10 GiB free the worker no longer removes every landed archive at once and unpaced, and the per-class archive budget no longer removes an archive marked to keep (#2039).
+
+### Added
+
+- `storage.toml` `[budget]` keys `recovery_archive_free_floor_percent` (default 10) and `recovery_archive_free_floor_cap_bytes` (default 20 GiB); pass-report fields `archive_floor[]` and `budget_error`; spans `storage_archive_floor`, `_probe`, `_prune`; counters `storage_archive_floor_pruned`, `_kept`, `_interrupted`, `_remove_failed`, `_stop_{floor_met,protected_only,cannot_close,deadline,unsupported}`, `storage_budget_config_invalid`; `broker status` advice `storage.budget-config-invalid` (#2039).
+- `command_metrics_trim` attachment fields `resumed_from_bytes` and `resume_recorded`; counters `command_metrics_trim_resumed` and `command_metrics_trim_claimed_elsewhere` (#2038).
+
+### Build and release
+
+- The x86_64 macOS release binaries are cross-compiled on the Apple Silicon runner instead of the Intel runner. On v0.8.183 the Intel build took 1,482 s against 823 s for the arm64 build and was the critical path of the 31-minute release-binaries workflow. The binary-running release steps run the x86_64 binaries under Rosetta 2 with `arch -x86_64`, and a `lipo` check proves each macOS archive holds the architecture it ships for (#2037).
+
+### Upgrade notes
+
+- Binaries before 0.8.184 reject a `storage.toml` that sets the new floor keys and fall back to default budgets; 0.8.184 reports such a fallback as `budget_error` and in `broker status` (#2039).
+- `command_metrics_trim.bytes_scanned` is now the absolute offset reached; this attempt's work is `bytes_scanned - resumed_from_bytes` (#2038).
+- A recent metrics row damaged after its leading `ts` is still kept but is no longer counted as a malformed-line blocker by `gc plan` (#2038).
+- A host-state root over `host_state_total_bytes` no longer removes recovery archives unless their class is over `recovery_archives_bytes`; the free-space floor covers disk pressure (#2039).
+
 ## [0.8.183] - 2026-11-26
 
 ### Changed
