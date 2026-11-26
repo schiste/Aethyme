@@ -375,8 +375,10 @@ fn gate_cache_entries_to_prune_are_the_over_budget_repositories_largest_first() 
         gate_cache_bytes_per_repository: 2048,
         ..Budgets::default()
     };
-    let names = |aggressive: &std::collections::BTreeSet<RootKind>| -> Vec<String> {
-        super::gate_prune::entries_to_prune(&ledger, &budgets, aggressive)
+    let names = |ledger: &super::Ledger,
+                 aggressive: &std::collections::BTreeSet<RootKind>|
+     -> Vec<String> {
+        super::gate_prune::entries_to_prune(ledger, &budgets, aggressive)
             .into_iter()
             .map(|(index, name)| {
                 assert_eq!(index, 0);
@@ -384,15 +386,18 @@ fn gate_cache_entries_to_prune_are_the_over_budget_repositories_largest_first() 
             })
             .collect()
     };
-    assert_eq!(names(&Default::default()), vec!["over/b-v1", "over/a-v1"]);
+    assert_eq!(
+        names(&ledger, &Default::default()),
+        vec!["over/b-v1", "over/a-v1"]
+    );
     let pressing: std::collections::BTreeSet<RootKind> = [RootKind::HostCache].into();
     assert_eq!(
-        names(&pressing),
+        names(&ledger, &pressing),
         vec!["over/b-v1", "over/a-v1", "under/a-v1"]
     );
     ledger.items[0].measured = false;
     assert!(
-        names(&pressing).is_empty(),
+        names(&ledger, &pressing).is_empty(),
         "an unmeasured cache is not judged"
     );
 }
