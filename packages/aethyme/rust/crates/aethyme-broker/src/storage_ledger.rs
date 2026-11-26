@@ -35,6 +35,7 @@ pub mod evict;
 pub mod gate_prune;
 pub mod host_temp;
 pub mod landing;
+pub mod placement;
 #[cfg(test)]
 mod tests;
 
@@ -240,7 +241,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | landing::CACHE_FILE
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
-                | check::GATE_BUDGETS_FILE => Class::Coordination,
+                | check::GATE_BUDGETS_FILE
+                | placement::ARCHIVE_STORAGE_ROOTS_FILE
+                | placement::ARCHIVE_STORAGE_ROOTS_LOCK_FILE
+                | placement::MIGRATION_STATE_FILE => Class::Coordination,
                 _ => Class::Unclassified,
             }
         }
@@ -277,6 +281,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | "task-caches" => Class::ToolCaches,
                 "qualification-retained" => Class::QualificationRetained,
                 "preparation-cache" | "preparation-cache-isolated" => Class::PreparationCache,
+                // Placed here by `storage.toml` `[placement]`, in the same
+                // layout as in host state and the host cache.
+                placement::RECOVERY_ARCHIVE_DIRECTORY => Class::RecoveryArchives,
+                placement::GATE_CACHE_DIRECTORY => Class::GateCache,
                 "worktrees" | "checkout-preserved" => Class::Worktrees,
                 STORAGE_ROOT_MARKER => Class::Coordination,
                 _ => Class::Unclassified,
@@ -443,6 +451,10 @@ impl Default for Budgets {
 struct BudgetFile {
     #[serde(default)]
     budget: Budgets,
+    /// Read by [`placement::Placement::load`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    placement: Option<toml::Value>,
 }
 
 impl Budgets {
@@ -704,6 +716,10 @@ pub struct PassReport {
     /// The recovery archive floor, per volume holding archives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_floor: Vec<archive_floor::FloorReport>,
+    /// Where archives and gate caches went and what moved, when
+    /// `storage.toml` `[placement]` places either off the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<placement::PlacementReport>,
     /// What pruning superseded workspace build units out of over-budget gate
     /// caches did this pass; `None` when no gate cache was over budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1033,6 +1049,9 @@ pub struct RecoveryArchiveUsage {
     pub pool: ArchiveLocationUsage,
     /// Archives in host state (written before the move; still restorable).
     pub host_state: ArchiveLocationUsage,
+    /// Archives on adopted storage roots (`storage.toml` `[placement]`).
+    #[serde(default)]
+    pub storage: ArchiveLocationUsage,
     /// `[cleanup] recovery_archive_bound_gib` in bytes (`0`: off).
     pub bound_bytes: u64,
     pub over_bound: bool,

@@ -909,7 +909,17 @@ fn homebrew_tap_workflow_publishes_from_the_signed_manifest() {
     let publish = tap.find("Publish and verify formula").unwrap();
     assert!(verify < render && render < publish);
     assert!(tap.contains("release.yml@refs/tags/${TAG}"));
-    assert!(tap.contains("--source-sha \"$(git rev-parse \"refs/tags/${TAG}^{commit}\")\""));
+    assert!(tap.contains("source_sha=\"$(git rev-parse \"refs/tags/${TAG}^{commit}\")\""));
+    assert!(tap.contains("--source-sha \"$source_sha\""));
+    // A publication reuses the release run's renderer only when it was built
+    // from the tag's commit and its checksum holds; anything else compiles.
+    let fetch = tap
+        .find("Fetch the release run's formula renderer")
+        .unwrap();
+    assert!(fetch < verify);
+    assert!(tap.contains("name: release-helpers-${{ github.sha }}"));
+    assert!(tap.contains("[ \"$(cat \"$helper_dir/source.sha\")\" = \"$source_sha\" ]"));
+    assert!(tap.contains("sha256sum --check --quiet SHA256SUMS"));
 
     // Only a publication sees the tap token; a rehearsal passes --dry-run
     // with the read-only job token.

@@ -635,6 +635,40 @@ fn gate_cache_entries_unused_for_the_max_age_expire_whatever_the_budget() {
     );
 }
 
+/// Gate caches placed on an adopted storage root (`[placement]`) expire by
+/// the max age like the host cache's, and are pruned each pass too.
+#[test]
+fn gate_caches_on_a_storage_root_follow_the_max_age() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let mut ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v1", now - 30 * hour),
+        gate_child("repo/lint-v1", now - 2 * hour),
+    ]);
+    ledger.items[0].root = PathBuf::from("/storage-root");
+    ledger.items[0].root_kind = RootKind::Storage;
+    assert_eq!(
+        classify(RootKind::Storage, "gates"),
+        Class::GateCache,
+        "placement's layout"
+    );
+    let planned: Vec<(String, Reason)> =
+        evict::plan(&ledger, &Budgets::default(), now, &Default::default())
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect();
+    assert_eq!(
+        planned,
+        vec![("gates/repo/rust-workspace-v1".to_string(), Reason::Expired)]
+    );
+    let pruned: Vec<String> =
+        super::gate_prune::entries_to_prune(&ledger, &Budgets::default(), &Default::default())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    assert_eq!(pruned, vec!["repo/lint-v1"]);
+}
+
 /// With the max age on, every gate cache entry used within it is pruned
 /// each pass (no pile-up), whatever the budget; an expired one is left to
 /// go whole.

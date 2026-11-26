@@ -488,6 +488,53 @@ same host rejects a `storage.toml` that sets either new key and runs with
 default budgets, so set them only once every binary on the host is at least
 this version.
 
+Storage placement (2026-11-26): `<host state>/storage.toml` `[placement]`
+(`recovery_archives`, `gate_caches`: `host` or `storage`; optional
+`storage_root`) puts recovery archives and managed gate caches on an adopted
+storage root, in host state's layout (`<root>/recovery-archives/<key>/<id>`,
+`<root>/gates/<key>/<cache key>`); the ledger classifies those two names in a
+storage root as `recovery_archives` and `gate_cache`. New host state files,
+classified `coordination`: `storage-archive-roots.json` (storage roots that
+received archives, written durably under the exclusive lock
+`storage-archive-roots.lock` whenever an archive writer resolves a storage
+path and before each migration pass, so before any archive lands; read by
+every archive reader) and `storage-placement.json` (the migration's `cursor`,
+`archives_migrated_total`, `bytes_migrated_total`, `archives_failed_total`).
+`storage status --json` adds `placement` (`recovery_archives` and
+`gate_caches`, each `configured`, `placed`, `fallback`; `storage_root`,
+`error`, `archive_storage_roots`, `migration`) and
+`classes.recovery_archives_by_location.storage`; the per-repository usage
+record gains `storage` beside `pool` and `host_state`. The pass report adds
+`placement` when either kind is configured off the host (`recovery_archives`,
+`gate_caches`, `*_fallback`, `storage_root`, `archives_migrated`,
+`bytes_migrated`, `archives_skipped`, `archives_failed`, `archives_left`,
+`migration_stop` one of `done`, `deadline`, `per_pass_cap`, `lock_lost`,
+`host_gate_caches_evicted`, `host_gate_cache_bytes_evicted`, `reasons[]`) and
+the phase `placement`. Command metrics: spans `storage_placement` (the whole
+step), `storage_placement_migrate`, `storage_placement_migrate_list`,
+`storage_placement_migrate_rename`, `storage_placement_migrate_copy`,
+`storage_placement_migrate_verify`, `storage_placement_migrate_reconcile`
+and `storage_placement_host_gate_cache_evict` and `storage_placement_record_root`
+(recording a new root); counters `storage_placement_root_recorded`,
+`storage_placement_fallback_unrecorded` (the root could not be recorded, so
+the archive stays in host state),
+`storage_placement_archive_migrated`, `_archive_skipped` (partial, no
+manifest, lifecycle lock busy or unavailable), `_archive_failed`,
+`_archive_out_of_time`, `_archive_reconciled` (a crash left two identical
+copies), `storage_placement_migrate_failed` (the destination could not be
+prepared), `storage_placement_host_gate_cache_evicted` and `_kept`, one
+`storage_placement_fallback_<reason>` per resolution that fell back
+(`config_invalid`, `no_storage_root`, `ambiguous_storage_root`,
+`unavailable`, `symlink`, `not_adopted`, `foreign_owner`, `not_local`;
+counted by the worker, gates and archive writers), and
+`recovery_archive_storage_root_unreachable` (a root that received archives
+is away, so a deleting decision is deferred); attachment `storage_placement`
+(`archives_migrated`, `bytes_migrated`, `archives_skipped`,
+`archives_failed`, `archives_left`, `migration_stop`). Archive bound
+telemetry (`recovery_archive_bound`) adds `storage`. The migration takes a
+repository's lifecycle lock with a storage-only try claim that never queues
+and steps aside while a waiter is queued.
+
 Recovery archive landing proofs (2026-11-23): whether an archive's commits
 are in its repository's default branch is answered by one prover per process
 (`storage_ledger::landing`), keyed by the repository path. Each default tip

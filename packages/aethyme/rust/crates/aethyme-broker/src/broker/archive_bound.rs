@@ -413,6 +413,14 @@ impl Broker {
                 .as_ref()
                 .is_some_and(|root| path.starts_with(root))
         };
+        // Archives placed on, or moved to, an adopted storage root
+        // (`storage.toml` `[placement]`): expired by the storage worker, as
+        // host state ones are.
+        let storage_roots = scan.storage_roots.clone();
+        usage.storage.root = storage_roots
+            .first()
+            .map(|root| root.to_string_lossy().into_owned());
+        let in_storage = |path: &Path| storage_roots.iter().any(|root| path.starts_with(root));
         let key = |path: &Path| path.to_string_lossy().into_owned();
 
         // Sizing. A complete archive the broker owns never changes, so its
@@ -556,6 +564,8 @@ impl Broker {
                     if let Some(bytes) = record.bytes {
                         let location = if in_pool(&path) {
                             &mut usage.pool
+                        } else if in_storage(&path) {
+                            &mut usage.storage
                         } else {
                             &mut usage.host_state
                         };
@@ -606,6 +616,8 @@ impl Broker {
             stats.counted_from_earlier_size += 1;
             let location = if in_pool(path) {
                 &mut usage.pool
+            } else if in_storage(path) {
+                &mut usage.storage
             } else {
                 &mut usage.host_state
             };
@@ -637,6 +649,8 @@ impl Broker {
         for (archive, bytes) in sized {
             let location = if in_pool(&archive.path) {
                 &mut usage.pool
+            } else if in_storage(&archive.path) {
+                &mut usage.storage
             } else {
                 &mut usage.host_state
             };
@@ -673,7 +687,11 @@ impl Broker {
                 landed,
             });
         }
-        let mut total = usage.pool.bytes.saturating_add(usage.host_state.bytes);
+        let mut total = usage
+            .pool
+            .bytes
+            .saturating_add(usage.host_state.bytes)
+            .saturating_add(usage.storage.bytes);
 
         // Eviction, with its own budget: oldest first, an archive whose
         // last proof ran out of budget or failed is passed over until its
@@ -776,6 +794,8 @@ impl Broker {
                     usage.evicted_bytes = usage.evicted_bytes.saturating_add(entry.bytes);
                     let location = if in_pool(&entry.archive.path) {
                         &mut usage.pool
+                    } else if in_storage(&entry.archive.path) {
+                        &mut usage.storage
                     } else {
                         &mut usage.host_state
                     };
@@ -902,6 +922,7 @@ impl Broker {
                 "bound_bytes": usage.bound_bytes,
                 "pool": usage.pool,
                 "host_state": usage.host_state,
+                "storage": usage.storage,
                 "evicted": usage.evicted,
                 "evicted_bytes": usage.evicted_bytes,
                 "over_bound": usage.over_bound,

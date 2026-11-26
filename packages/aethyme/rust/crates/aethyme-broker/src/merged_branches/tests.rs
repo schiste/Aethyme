@@ -959,3 +959,152 @@ fn a_root_is_plainly_absent_only_below_a_directory_that_is_still_there() {
     std::fs::create_dir(&root.path).unwrap();
     assert!(!root.plainly_absent());
 }
+
+/// An adopted storage root beside the fixture's host state, and this
+/// repository's archive directory on it (`storage.toml` `[placement]`).
+fn adopt_storage_root(fixture: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+    let host_state = fixture._storage.host_state_dir();
+    std::fs::create_dir_all(&host_state).unwrap();
+    let storage = fixture.root.with_file_name("storage-root");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::write(
+        storage.join(crate::storage_ledger::STORAGE_ROOT_MARKER),
+        "adopted\n",
+    )
+    .unwrap();
+    crate::storage_ledger::check::register_root(
+        &host_state,
+        &storage,
+        crate::storage_ledger::RootKind::Storage,
+        None,
+    );
+    let host_root = fixture.broker.recovery_archive_root().unwrap();
+    let key = host_root.file_name().unwrap();
+    let archive_dir = storage.join("recovery-archives").join(key);
+    (storage, archive_dir)
+}
+
+/// Readers find an archive on an adopted storage root as they do in host
+/// state: it is among the roots, and it keeps its session's branch.
+#[test]
+fn an_archive_only_on_a_storage_root_keeps_the_branch() {
+    let mut fixture = fixture();
+    let session = merged_branch(&mut fixture);
+    let (_, archive_dir) = adopt_storage_root(&fixture);
+    std::fs::create_dir_all(archive_dir.join(format!("{session}-archive"))).unwrap();
+    assert!(
+        fixture
+            .broker
+            .recovery_archive_roots()
+            .contains(&archive_dir)
+    );
+    let checked = fixture.broker.checked_recovery_archive_roots().unwrap();
+    assert!(checked.iter().any(|root| root.path == archive_dir));
+
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(kept(&summary, "recovery_archive"), Some(1), "{summary:?}");
+    assert!(
+        !counts.contains_key("merged_branches_archive_roots_unknown"),
+        "{counts:?}"
+    );
+}
+
+/// A storage root that received archives and is away (its volume
+/// unmounted) may hold some: nothing is judged absent. One that never did
+/// does not hold deletions back.
+#[test]
+fn a_storage_root_that_received_archives_and_is_away_keeps_the_branch() {
+    let mut fixture = fixture();
+    merged_branch(&mut fixture);
+    let (storage, _) = adopt_storage_root(&fixture);
+    let away = storage.with_file_name("storage-away");
+    std::fs::rename(&storage, &away).unwrap();
+    assert!(
+        fixture.broker.checked_recovery_archive_roots().is_some(),
+        "an adopted root that never received archives is not needed"
+    );
+    crate::storage_ledger::placement::record_archive_storage_root(
+        &fixture._storage.host_state_dir(),
+        &storage,
+    )
+    .unwrap();
+    assert!(fixture.broker.checked_recovery_archive_roots().is_none());
+
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert!(
+        counts.contains_key("merged_branches_archive_roots_unknown"),
+        "{counts:?}"
+    );
+    std::fs::rename(&away, &storage).unwrap();
+    let (summary, _) = run_counted(&fixture);
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+}
+
+/// New archives go to the storage root while placement says so and it
+/// qualifies; with the root away they go to host state instead.
+#[test]
+fn new_archives_follow_the_placement_and_fall_back_to_host_state() {
+    let fixture = fixture();
+    let (storage, archive_dir) = adopt_storage_root(&fixture);
+    let host_root = fixture.broker.recovery_archive_root().unwrap();
+    assert_eq!(
+        fixture.broker.placed_recovery_archive_root().unwrap(),
+        host_root,
+        "the default is host state"
+    );
+    std::fs::write(
+        fixture._storage.host_state_dir().join("storage.toml"),
+        "[placement]\nrecovery_archives = \"storage\"\n",
+    )
+    .unwrap();
+    crate::storage_ledger::placement::set_local_for_test(Some(true));
+    assert_eq!(
+        fixture.broker.placed_recovery_archive_root().unwrap(),
+        archive_dir
+    );
+    let away = storage.with_file_name("storage-away");
+    std::fs::rename(&storage, &away).unwrap();
+    assert_eq!(
+        fixture.broker.placed_recovery_archive_root().unwrap(),
+        host_root
+    );
+    crate::storage_ledger::placement::set_local_for_test(None);
+}
+
+/// The operation archive lane takes its root from `retirement_archive_root`
+/// and writes there without the resolve path's recording: resolving a
+/// storage root records it, so an archive written there and then made
+/// unreachable (an unmounted volume) defers absence and keeps the branch.
+#[test]
+fn an_operation_archive_on_an_unmounted_storage_root_keeps_the_branch() {
+    let mut fixture = fixture();
+    let session = merged_branch(&mut fixture);
+    let (storage, archive_dir) = adopt_storage_root(&fixture);
+    std::fs::write(
+        fixture._storage.host_state_dir().join("storage.toml"),
+        "[placement]\nrecovery_archives = \"storage\"\n",
+    )
+    .unwrap();
+    crate::storage_ledger::placement::set_local_for_test(Some(true));
+    // No pool is bound: the lane's root is the placed one.
+    let lane_root = fixture.broker.retirement_archive_root().unwrap();
+    assert_eq!(lane_root, archive_dir);
+    std::fs::create_dir_all(lane_root.join(format!("{session}-operation-archive"))).unwrap();
+    let away = storage.with_file_name("storage-away");
+    std::fs::rename(&storage, &away).unwrap();
+
+    assert!(fixture.broker.checked_recovery_archive_roots().is_none());
+    let (summary, counts) = run_counted(&fixture);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert!(
+        counts.contains_key("merged_branches_archive_roots_unknown"),
+        "{counts:?}"
+    );
+    assert!(branch_exists(&fixture.root, "agent/merged"));
+    crate::storage_ledger::placement::set_local_for_test(None);
+}
