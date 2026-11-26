@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.181] - 2026-11-26
+
+### Changed
+
+- The health and cleanup inventory behind `status` no longer starts Git for a closed session's directory that Git certainly cannot open: one with no `.git` or `HEAD` in it or any parent, or whose `.git` pointer names a directory that does not exist. Git's answer for both is an error, so the same ownership check that followed that error runs as before, and cleanup and retention keep, remove and report exactly what they did. On the busiest repository, 39 full `status` views in an hour started 15,366 such probes (about 394 each, 61 s); 483 of its 1,290 checkout directories have no `.git` entry (#2029).
+
+### Added
+
+- Counters `worktree_common_dir_no_git_entry` and `worktree_common_dir_dangling_pointer`, and spans `gc_plan_retention_policy`, `_cleanup_inventory`, `_store_reads`, `_gate_logs`, `_command_metrics`, `_worktree_blockers`, `_artifact_candidates`, `_orphan_roots`, `_recovery_archives`, `_gate_cache`, `_environment_cache`, `_worktree_reconciliation`, `_cleanup_reports` and `gc_health_journal`, which split the `retention` phase of `status` (#2029).
+
+### Upgrade notes
+
+- For such directories, cleanup's keep and unavailable reasons read "is not inside a git repository" instead of Git's own error text (#2029).
+
 ## [0.8.180] - 2026-11-26
 
 ### Changed
