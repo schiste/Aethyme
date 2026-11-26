@@ -156,7 +156,7 @@ fn report_only_commands_do_not_append_metrics() {
 mod interrupted {
     use super::{aethyme, assert_success, init_git_repo};
     use std::fs;
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -181,7 +181,8 @@ mod interrupted {
     /// wait for its heartbeat to name that span, then send `signal`.
     fn interrupt_held_command(root: &Path, signal: libc::c_int) -> serde_json::Value {
         let rows_before = metric_rows(root).len();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_aethyme"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aethyme"));
+        command
             .args(["broker", "status", "--json"])
             .current_dir(root)
             .env(
@@ -192,9 +193,19 @@ mod interrupted {
             .env("AETHYME_COMMAND_HEARTBEAT_MS", "100")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn aethyme");
+            .stderr(Stdio::piped());
+        // SAFETY: runs in the child between fork and exec and calls only
+        // `signal`, which is async-signal-safe. A harness that started this
+        // test with the signals ignored would otherwise pass that on, and an
+        // ignored signal is deliberately left ignored.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn aethyme");
         let heartbeat = root.join(format!(".aethyme/run/commands/{}.json", child.id()));
         let deadline = Instant::now() + Duration::from_secs(60);
         let record = loop {
@@ -231,9 +242,18 @@ mod interrupted {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!heartbeat.exists(), "the heartbeat is removed");
-        let rows = metric_rows(root);
-        assert_eq!(rows.len(), rows_before + 1, "one row: {rows:?}");
-        rows.last().cloned().unwrap()
+        // Only this command's rows: a background worker may append its own.
+        let rows = status_rows_since(root, rows_before);
+        assert_eq!(rows.len(), 1, "one row: {rows:?}");
+        rows.into_iter().next().unwrap()
+    }
+
+    fn status_rows_since(root: &Path, before: usize) -> Vec<serde_json::Value> {
+        metric_rows(root)
+            .into_iter()
+            .skip(before)
+            .filter(|row| row["command"] == "status")
+            .collect()
     }
 
     fn assert_interrupted_row(row: &serde_json::Value, signal: &str, exit: u64) {
@@ -284,9 +304,9 @@ mod interrupted {
         let rows_before = metric_rows(temp.path()).len();
         let args = ["broker", "status", "--json"];
         let output = aethyme(temp.path(), &args);
-        let rows = metric_rows(temp.path());
-        assert_eq!(rows.len(), rows_before + 1, "{rows:?}");
-        let row = rows.last().unwrap();
+        let rows = status_rows_since(temp.path(), rows_before);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
         assert_eq!(row["command"], "status", "{row}");
         assert_eq!(
             row["exit"].as_i64(),
