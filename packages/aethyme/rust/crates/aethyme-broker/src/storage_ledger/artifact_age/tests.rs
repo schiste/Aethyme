@@ -517,3 +517,83 @@ fn leftover_worktree_roots_go_when_empty_unregistered_and_old() {
     assert_eq!(outcome.removed_for_age, 2);
     assert_eq!(outcome.kept_in_use, 1, "the recent one");
 }
+
+/// The detached worker may inherit a Git hook's routing variables: they are
+/// dropped, so a foreign index never makes a tracked target look untracked.
+#[test]
+fn inherited_git_routing_never_reads_another_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let tracked = dir.path().join("tracked");
+    fs::create_dir_all(&tracked).unwrap();
+    git(&tracked, &["init", "-q"]);
+    cargo_target(&tracked.join("target"));
+    git(&tracked, &["add", "-f", "target/CACHEDIR.TAG"]);
+    git(&tracked, &["commit", "-qm", "track a target"]);
+    let foreign = dir.path().join("foreign");
+    fs::create_dir_all(&foreign).unwrap();
+    git(&foreign, &["init", "-q"]);
+    write(&foreign.join("other.txt"), b"other");
+    git(&foreign, &["add", "other.txt"]);
+    git(&foreign, &["commit", "-qm", "other"]);
+    let index = foreign.join(".git/index");
+    let git_dir = foreign.join(".git");
+    for inherited in [
+        vec![("GIT_INDEX_FILE", index.to_str().unwrap())],
+        vec![
+            ("GIT_DIR", git_dir.to_str().unwrap()),
+            ("GIT_WORK_TREE", foreign.to_str().unwrap()),
+        ],
+    ] {
+        assert_eq!(
+            untracked_and_ignored_inheriting(&tracked, "target", &inherited),
+            Some(false),
+            "{inherited:?}"
+        );
+    }
+}
+
+/// A build between the first listing and the locks is seen: last use is
+/// read again under the locks, so the fresh target stays.
+#[test]
+fn a_build_just_before_the_locks_keeps_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    let container = scratch_container(&root);
+    let target = container.join("s1-abc/target");
+    cargo_target(&target);
+    age_tree(&target, 2 * DAY);
+    BEFORE_LOCK_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|target: &Path| {
+            set_times(&target.join(".rustc_info.json"), SystemTime::now());
+        }));
+    });
+    let report = run_on(&[worktree_root(&root, Vec::new())]);
+    BEFORE_LOCK_FOR_TEST.with(|hook| *hook.borrow_mut() = None);
+    assert!(target.exists(), "used just before the locks");
+    let outcome = &report.classes[SESSION_SCRATCH_BUILD];
+    assert_eq!((outcome.removed_for_age, outcome.kept_in_use), (0, 1));
+}
+
+/// Cargo creates `.cargo-lock` before anything else in a profile: such a
+/// profile counts, and a build holding it keeps an old target.
+#[test]
+fn a_profile_holding_only_its_lock_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    let container = scratch_container(&root);
+    let target = container.join("s1-abc/target");
+    cargo_target(&target);
+    write(&target.join("release/.cargo-lock"), b"");
+    assert!(profiles(&target).contains(&target.join("release")));
+    age_tree(&target, 2 * DAY);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target.join("release/.cargo-lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let report = run_on(&[worktree_root(&root, Vec::new())]);
+    assert!(target.exists(), "a build holds the new profile");
+    assert_eq!(report.classes[SESSION_SCRATCH_BUILD].kept_in_use, 1);
+    drop(held);
+}

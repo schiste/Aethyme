@@ -31,7 +31,15 @@
 //! age keeps its newest generations, and the superseded generations of its
 //! local packages unused for the max age are pruned, again only under every
 //! profile's lock ([`crate::cargo_target_prune::UnitScope::Worker`]).
-//! Removal costs a rebuild, never a wrong result.
+//! Removal costs a rebuild, never a wrong result. The profiles are listed
+//! and the last use read again once the locks are held, so a build that ran
+//! just before is seen; a profile directory counts as soon as it holds
+//! `.cargo-lock`, which Cargo creates first. Known limit: a Cargo process
+//! already blocked on a lock the worker holds opened the lock file by path
+//! before the rename; once the worker releases it, that process holds a lock
+//! on the renamed (doomed) tree, not on the new target it then builds into,
+//! so a second build starting at the same moment is not excluded from it.
+//! Each builds correct output; at worst one rebuilds.
 //!
 //! A leftover worktree root is a directory in `<host state, host cache or
 //! storage root>/worktrees` that no registered repository still uses (no
@@ -410,24 +418,62 @@ fn scratch_targets(root: &Path, found: &mut Found) {
 /// The profile directories of a Cargo target: those holding `.fingerprint`,
 /// directly (`debug`) or under a target triple (`<triple>/debug`).
 fn profiles(target: &Path) -> Vec<PathBuf> {
+    // Cargo creates a profile's `.cargo-lock` before anything else in it, so
+    // a directory holding only the lock is a profile being built.
+    let is_profile = |path: &Path| {
+        is_real_directory(&path.join(".fingerprint"))
+            || fs::symlink_metadata(path.join(".cargo-lock"))
+                .is_ok_and(|metadata| metadata.is_file())
+    };
     let mut found = Vec::new();
     for name in names(target) {
         let path = target.join(&name);
         if !is_real_directory(&path) || is_staged_name(&name) {
             continue;
         }
-        if is_real_directory(&path.join(".fingerprint")) {
+        if is_profile(&path) {
             found.push(path);
             continue;
         }
         for inner in names(&path) {
             let inner = path.join(inner);
-            if is_real_directory(&inner) && is_real_directory(&inner.join(".fingerprint")) {
+            if is_real_directory(&inner) && is_profile(&inner) {
                 found.push(inner);
             }
         }
     }
     found
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs on a target's path after its profiles were first
+    /// listed, just before their build locks are taken.
+    pub(super) static BEFORE_LOCK_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the build locks of `target`'s profiles, then list its profiles and
+/// read its last use again under them: a build that ran between the first
+/// listing and the locks is seen, and a profile that appeared meanwhile
+/// (not locked) counts as a running build. `None` for the locks when a build
+/// holds one.
+fn lock_then_read(target: &Path) -> (Option<ProfileLocks>, u64) {
+    let first = profiles(target);
+    #[cfg(test)]
+    BEFORE_LOCK_FOR_TEST.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(target);
+        }
+    });
+    let locks = lock_profiles(&first);
+    let current = profiles(target);
+    let last_use = last_use_ms(target, &current);
+    let unlocked_new = current.iter().any(|profile| !first.contains(profile));
+    if unlocked_new {
+        return (None, last_use);
+    }
+    (locks, last_use)
 }
 
 /// Cargo's build locks on a target's profiles, held by this worker.
@@ -497,11 +543,38 @@ fn last_use_ms(target: &Path, profiles: &[PathBuf]) -> u64 {
     newest
 }
 
+/// Variables that route Git to another repository, index or configuration.
+/// The detached worker inherits the environment of the command that spawned
+/// it, which may run inside a Git hook of another repository.
+const GIT_ROUTING_VARIABLES: [&str; 11] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
 /// Run one bounded Git query in `dir`; its exit code, `None` when it did not
-/// complete.
-fn git_exit_code(dir: &Path, args: &[&str]) -> Option<i32> {
+/// complete. `inherited` is added to the environment first (tests model a
+/// hook's environment with it); every routing variable is then dropped,
+/// pathspecs are literal and no file-system monitor is asked.
+fn git_exit_code_inheriting(dir: &Path, args: &[&str], inherited: &[(&str, &str)]) -> Option<i32> {
     let mut command = crate::git::git_command();
-    command.args(args).current_dir(dir);
+    command.envs(inherited.iter().copied());
+    for variable in GIT_ROUTING_VARIABLES {
+        command.env_remove(variable);
+    }
+    command
+        .args(["--literal-pathspecs", "-c", "core.fsmonitor=false", "-C"])
+        .arg(dir)
+        .args(args)
+        .current_dir(dir);
     match crate::bounded_output::output_limited(&mut command, crate::git::git_timeout(), 4096) {
         Ok(crate::bounded_output::LimitedOutput::Completed(output)) => output.status.code(),
         _ => None,
@@ -512,12 +585,21 @@ fn git_exit_code(dir: &Path, args: &[&str]) -> Option<i32> {
 /// and is ignored: `Some(true)`; `Some(false)` when it is tracked or not
 /// ignored; `None` when Git could not tell.
 fn untracked_and_ignored(checkout: &Path, relative: &str) -> Option<bool> {
-    match git_exit_code(checkout, &["ls-files", "--error-unmatch", "--", relative])? {
+    untracked_and_ignored_inheriting(checkout, relative, &[])
+}
+
+fn untracked_and_ignored_inheriting(
+    checkout: &Path,
+    relative: &str,
+    inherited: &[(&str, &str)],
+) -> Option<bool> {
+    let git = |args: &[&str]| git_exit_code_inheriting(checkout, args, inherited);
+    match git(&["ls-files", "--error-unmatch", "--", relative])? {
         0 => return Some(false),
         1 => {}
         _ => return None,
     }
-    match git_exit_code(checkout, &["check-ignore", "-q", "--", relative])? {
+    match git(&["check-ignore", "-q", "--", relative])? {
         0 => Some(true),
         1 => Some(false),
         _ => None,
@@ -590,9 +672,7 @@ impl Step<'_> {
     fn handle_target(&mut self, class: &'static str, target: &Path, untracked: Option<bool>) {
         let _span = crate::phase_telemetry::span("storage_artifact_age_target");
         self.outcome(class).found += 1;
-        let profiles = profiles(target);
-        let last_use = last_use_ms(target, &profiles);
-        let locks = lock_profiles(&profiles);
+        let (locks, last_use) = lock_then_read(target);
         let facts = BuildDirFacts {
             tagged: crate::auto_cleanup::has_cache_directory_tag(target),
             untracked,
