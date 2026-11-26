@@ -3358,9 +3358,60 @@ fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error
     )
 }
 
-/// The pruned-units record inside a managed cache: which units the last
-/// prune staged, read by the next gate to count rebuilds.
+/// The pruned-units record inside a managed cache: which units prunes
+/// staged (the gate's own, or the storage worker's between gates), read
+/// after the next gate's build to count the units it rebuilt.
 pub(crate) const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+
+/// After a gate's build: count the units the pruned-units record names that
+/// cargo rebuilt with the very hash a prune removed (the prune misjudged
+/// them as unused), then remove the record. Read after the build, not
+/// before it: a prune the storage worker made between gates has had no
+/// build yet when the next gate starts, so counting then always found
+/// nothing. Returns how many were rebuilt (`None`: no record).
+pub(crate) fn count_units_rebuilt_after_prune(directory: &Path) -> Option<u64> {
+    let marker = directory.join(PRUNED_UNITS_MARKER);
+    let text = std::fs::read_to_string(&marker).ok()?;
+    let staged: Vec<String> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let rebuilt = crate::cargo_target_prune::rebuilt_units(directory, &staged);
+    crate::phase_telemetry::attach(
+        "managed_cache_prune",
+        serde_json::json!({"rebuilt_after_previous_prune": rebuilt}),
+    );
+    for _ in 0..rebuilt {
+        crate::phase_telemetry::add(
+            "managed_cache_prune_rebuilt_unit",
+            std::time::Duration::ZERO,
+        );
+    }
+    crate::warn_unrecorded(
+        "remove the pruned-units record",
+        std::fs::remove_file(&marker),
+    );
+    Some(rebuilt)
+}
+
+/// Add `staged` to the pruned-units record of the cache at `directory`
+/// (one unit per line), keeping what an earlier prune recorded and no build
+/// has counted yet.
+pub(crate) fn append_pruned_units(directory: &Path, staged: &[String]) {
+    let marker = directory.join(PRUNED_UNITS_MARKER);
+    let mut lines: Vec<String> = std::fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.extend(staged.iter().cloned());
+    crate::warn_unrecorded(
+        "record the pruned units",
+        std::fs::write(&marker, lines.join("\n")),
+    );
+}
 
 /// How long a gate may spend moving superseded units out of its managed
 /// cache before it runs its command.
@@ -3402,27 +3453,8 @@ fn prepare_managed_gate_cache_in(
         Err(error) => return Err(error),
     };
     let bytes_before = usage_before.bytes;
-    // Units the previous prune staged that cargo has since rebuilt with the
-    // same hash: the prune misjudged them as unused.
-    let marker = directory.join(PRUNED_UNITS_MARKER);
-    if let Ok(text) = std::fs::read_to_string(&marker) {
-        let staged: Vec<String> = text.lines().map(str::to_string).collect();
-        let rebuilt = crate::cargo_target_prune::rebuilt_units(&directory, &staged);
-        crate::phase_telemetry::attach(
-            "managed_cache_prune",
-            serde_json::json!({"rebuilt_after_previous_prune": rebuilt}),
-        );
-        for _ in 0..rebuilt {
-            crate::phase_telemetry::add(
-                "managed_cache_prune_rebuilt_unit",
-                std::time::Duration::ZERO,
-            );
-        }
-        crate::warn_unrecorded(
-            "remove the pruned-units record",
-            std::fs::remove_file(&marker),
-        );
-    }
+    // Rebuilt units are counted after the build
+    // (`count_units_rebuilt_after_prune`), whoever pruned.
     // Over its ceiling, first move superseded build units (earlier
     // generations of a unit nothing has read since its successor was built)
     // out of the tree, down to three quarters of the ceiling, so the next
@@ -3473,10 +3505,7 @@ fn prepare_managed_gate_cache_in(
                 "gate {gate_name} pruned {} superseded build units ({} bytes) from managed cache {}",
                 pruned.units, pruned.bytes, policy.key
             ));
-            crate::warn_unrecorded(
-                "record the pruned units",
-                std::fs::write(&marker, pruned.staged.join("\n")),
-            );
+            append_pruned_units(&directory, &pruned.staged);
         }
         if staging.exists()
             && let Some(host_state) = deferred_to
@@ -5043,6 +5072,11 @@ where
                 .flatten();
             cache.provenance.bytes_after = usage_after.map(|usage| usage.bytes);
             cache.provenance.inodes_after = usage_after.map(|usage| usage.inodes);
+            // What this build rebuilt of what a prune removed; a writer still
+            // running leaves the record for the next gate.
+            if writers_quiescent {
+                count_units_rebuilt_after_prune(&cache.directory);
+            }
         }
         let release_error = match resource_runtime.as_mut() {
             Some(runtime) => runtime.finish(writers_quiescent),
@@ -6302,6 +6336,8 @@ fn run_gate_command(
     context: GateCommandContext<'_>,
     artifact_use: &mut GateArtifactUseGuard,
 ) -> Result<GateCommandOutcome, std::io::Error> {
+    // Unattended bulk deleters on this volume yield the disk while it runs.
+    let _foreground_io = crate::foreground_io::ForegroundIoMark::enter("gate", context.cwd);
     run_gate_command_inner(command, &context, artifact_use)
 }
 
@@ -11397,10 +11433,10 @@ end = 55999
         }
     }
 
-    /// The gate after a prune counts the units cargo rebuilt with a pruned
+    /// A gate counts, after its build, the units cargo rebuilt with a pruned
     /// hash, so a misjudged access time shows up in the metrics.
     #[test]
-    fn the_gate_after_a_prune_counts_units_rebuilt_with_a_pruned_hash() {
+    fn the_build_after_a_prune_counts_units_rebuilt_with_a_pruned_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let directory = tmp.path().join("gates/repository/cargo");
         let profile = directory.join("debug");
@@ -11409,28 +11445,26 @@ end = 55999
             key: "cargo".into(),
             max_bytes: 1_000,
         };
-        let prepare = || {
-            prepare_managed_gate_cache_in(
-                Some(&policy),
-                "repository",
-                &StderrGateProgressSink,
-                "test",
-                tmp.path(),
-                None,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        prepare();
-        // Cargo rebuilds the pruned generation.
+        prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // This gate's build rebuilds the pruned generation.
         std::fs::create_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
 
         let recorder = crate::phase_telemetry::Recorder::default();
-        {
+        let rebuilt = {
             let _installed = crate::phase_telemetry::install(recorder.clone());
-            prepare();
-        }
+            count_units_rebuilt_after_prune(&directory)
+        };
 
+        assert_eq!(rebuilt, Some(1));
         let (_, counts) = recorder.totals();
         assert_eq!(
             counts.get("managed_cache_prune_rebuilt_unit"),
@@ -11442,6 +11476,58 @@ end = 55999
             1
         );
         assert!(!directory.join(PRUNED_UNITS_MARKER).exists());
+        assert_eq!(count_units_rebuilt_after_prune(&directory), None);
+    }
+
+    /// Finding (a) of #2041: a prune the storage worker recorded between
+    /// gates survives the next gate's preparation (nothing was built since
+    /// it), and that gate's build is what gets counted.
+    #[test]
+    fn a_worker_prune_record_is_counted_after_the_next_build_not_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("gates/repository/cargo");
+        let profile = directory.join("debug");
+        write_unit_generations(&profile);
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: u64::MAX,
+        };
+        // What the worker staged (it renamed the unit away).
+        std::fs::remove_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/work-aaaaaaaaaaaaaaaa".into()],
+        );
+        prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            directory.join(PRUNED_UNITS_MARKER).exists(),
+            "the record waits for a build"
+        );
+        // The gate's build rebuilds it.
+        std::fs::create_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
+        assert_eq!(count_units_rebuilt_after_prune(&directory), Some(1));
+        // A later prune adds to a record no build has counted yet.
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/a-1111111111111111".into()],
+        );
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/b-2222222222222222".into()],
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(PRUNED_UNITS_MARKER)).unwrap(),
+            "debug/.fingerprint/a-1111111111111111\ndebug/.fingerprint/b-2222222222222222"
+        );
     }
 
     #[test]

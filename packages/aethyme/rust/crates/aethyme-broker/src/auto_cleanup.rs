@@ -1136,7 +1136,7 @@ const TAGGED_CACHE_ENTRY_LIMIT: usize = 20_000;
 
 /// Whether `directory` holds a regular `CACHEDIR.TAG` that begins with the
 /// standard signature: the tool that wrote the cache declared it regenerable.
-fn has_cache_directory_tag(directory: &Path) -> bool {
+pub(crate) fn has_cache_directory_tag(directory: &Path) -> bool {
     use std::io::Read;
     let tag = directory.join("CACHEDIR.TAG");
     let Ok(metadata) = std::fs::symlink_metadata(&tag) else {

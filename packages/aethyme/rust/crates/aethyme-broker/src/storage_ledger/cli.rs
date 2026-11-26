@@ -194,6 +194,7 @@ pub fn status_value(host_state: &Path) -> Value {
                 "bytes": class_bytes.get(class),
                 "entries": items.iter().map(|item| item.entries).sum::<u64>(),
                 "oldest_ms": oldest,
+                "oldest_age_ms": oldest.map(|ms| super::now_ms().saturating_sub(ms)),
                 "budget_bytes": budget_bytes,
                 "reclaimable_bytes": reclaimable,
                 "why_not": why_not,
@@ -352,12 +353,88 @@ pub fn status_value(host_state: &Path) -> Value {
         // Host temp folders: not Aethyme's roots; read by the worker, never
         // deleted (`storage.host-temp-large`).
         "host_temp": super::host_temp::Reading::load(host_state),
+        "artifact_max_age": artifact_max_age_status(&ledger, &budgets, super::now_ms()),
         "budgets": budgets,
         "budget_error": budget_error,
         // `storage.toml` `[placement]`: where archives and gate caches go.
         "placement": super::placement::status(host_state),
         "last_pass": ledger.last_pass,
         "phases_ms": {"read": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)},
+    })
+}
+
+/// Compliance with the artifact max age, per class it applies to: the age
+/// of the least recently used artifact still there (`oldest_age_ms`) against
+/// the max age (`within`: `null` when unknown or the max age is off).
+/// Gate cache entries and the Node.js compile cache come from the ledger;
+/// gate cache units and the classes outside the ledger from the last pass.
+pub fn artifact_max_age_status(ledger: &Ledger, budgets: &Budgets, now: u64) -> Value {
+    let max_age_ms = budgets.artifact_max_age().map(super::evict::duration_ms);
+    let within = |age: Option<u64>| -> Value {
+        match (age, max_age_ms) {
+            (Some(age), Some(max)) => json!(age <= max),
+            _ => Value::Null,
+        }
+    };
+    let oldest_child = |class: Class, name: Option<&str>| -> Option<u64> {
+        ledger
+            .items
+            .iter()
+            .filter(|item| item.class == class && item.measured)
+            .filter(|item| name.is_none_or(|name| item.name == name))
+            .flat_map(|item| item.children.iter())
+            .map(|child| child.newest_ms.max(child.ctime_ms))
+            .filter(|ms| *ms > 0)
+            .min()
+            .map(|ms| now.saturating_sub(ms))
+    };
+    let mut classes = serde_json::Map::new();
+    let gate = oldest_child(Class::GateCache, None);
+    classes.insert(
+        "gate_cache".into(),
+        json!({"oldest_age_ms": gate, "within": within(gate)}),
+    );
+    let node = oldest_child(
+        Class::ToolCaches,
+        Some(crate::node_compile_cache::CACHE_DIRECTORY),
+    );
+    classes.insert(
+        "node_compile_cache".into(),
+        json!({
+            "oldest_age_ms": node,
+            // Today's directory is kept whatever its age; past days go an
+            // hour after their last change.
+            "rule": "past UTC days go an hour after their last change; today's stays",
+        }),
+    );
+    let last = ledger.last_pass.as_ref();
+    if let Some(prune) = last.and_then(|pass| pass.gate_cache_prune.as_ref()) {
+        classes.insert(
+            "gate_cache_units".into(),
+            json!({
+                "pruned_for_pile_up": prune.units,
+                "pruned_bytes": prune.bytes,
+                "kept_in_use": prune.in_use,
+                "kept_not_local": prune.not_local,
+                "stop": prune.stop,
+            }),
+        );
+    }
+    let age = last.and_then(|pass| pass.artifact_age.as_ref());
+    if let Some(age) = age {
+        for (class, outcome) in &age.classes {
+            let mut value = json!(outcome);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("within".into(), within(outcome.oldest_kept_age_ms));
+            }
+            classes.insert(class.clone(), value);
+        }
+    }
+    json!({
+        "max_age_hours": budgets.artifact_max_age_hours,
+        "max_age_ms": max_age_ms,
+        "classes": classes,
+        "stop": age.map(|age| age.stop.clone()),
     })
 }
 
@@ -376,6 +453,29 @@ fn status(json_output: bool) -> u8 {
     }
     if let Some(error) = value["budget_error"].as_str() {
         println!("Warning: {error}; default storage budgets in use");
+    }
+    match value["artifact_max_age"]["max_age_hours"].as_u64() {
+        Some(0) | None => println!("artifact max age: off"),
+        Some(hours) => {
+            let over: Vec<&str> = value["artifact_max_age"]["classes"]
+                .as_object()
+                .map(|classes| {
+                    classes
+                        .iter()
+                        .filter(|(_, entry)| entry["within"] == json!(false))
+                        .map(|(class, _)| class.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if over.is_empty() {
+                println!("artifact max age: {hours}h, every class within it");
+            } else {
+                println!(
+                    "artifact max age: {hours}h; older artifacts still in: {}",
+                    over.join(", ")
+                );
+            }
+        }
     }
     for data in ["recovery_archives", "gate_caches"] {
         let placement = &value["placement"][data];

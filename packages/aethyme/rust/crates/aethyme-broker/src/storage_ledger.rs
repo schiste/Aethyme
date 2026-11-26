@@ -28,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod archive_floor;
+pub mod artifact_age;
 pub mod check;
 pub mod cli;
 pub mod evict;
@@ -52,6 +53,8 @@ const LEDGER_SCHEMA: u32 = 2;
 const GIB: u64 = 1024 * 1024 * 1024;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
+/// The default of `[budget] artifact_max_age_hours`.
+pub const DEFAULT_ARTIFACT_MAX_AGE_HOURS: u64 = 24;
 /// Directory entries counted for a class that is not walked.
 const COUNT_LIMIT: u64 = 100_000;
 /// How often a walk refreshes the worker's heartbeat.
@@ -399,6 +402,14 @@ pub struct Budgets {
     pub host_temp_advice_entries: u64,
     /// ... or a sizeable one sits on a volume with less free space than this.
     pub host_temp_free_floor_bytes: u64,
+    /// The host-wide artifact max age, in hours (`0` turns it off): build
+    /// output and caches Aethyme can prove rebuildable and unused are
+    /// removed once unused this long, whatever the budgets
+    /// ([`artifact_age`]): gate cache entries and superseded local build
+    /// units, Cargo targets in session scratch directories and in the main
+    /// checkouts of registered repositories, empty leftover worktree roots,
+    /// and (by the idle strip) the Cargo targets of sessions idle this long.
+    pub artifact_max_age_hours: u64,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -429,6 +440,7 @@ impl Default for Budgets {
             host_temp_advice_bytes: 8 * GIB,
             host_temp_advice_entries: 5_000,
             host_temp_free_floor_bytes: 10 * GIB,
+            artifact_max_age_hours: DEFAULT_ARTIFACT_MAX_AGE_HOURS,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
@@ -462,6 +474,12 @@ impl Budgets {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         (budgets, error)
+    }
+
+    /// The artifact max age, `None` when `artifact_max_age_hours` is 0.
+    pub fn artifact_max_age(&self) -> Option<Duration> {
+        (self.artifact_max_age_hours > 0)
+            .then(|| Duration::from_secs(self.artifact_max_age_hours.saturating_mul(60 * 60)))
     }
 
     /// A repository's gate cache budget: its configured one, else the
@@ -706,6 +724,11 @@ pub struct PassReport {
     /// caches did this pass; `None` when no gate cache was over budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_cache_prune: Option<gate_prune::GatePruneReport>,
+    /// What the artifact max age removed outside the ledger's classes this
+    /// pass (session scratch and main-checkout Cargo targets, leftover
+    /// worktree roots); `None` when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_age: Option<artifact_age::ArtifactAgeReport>,
 }
 
 /// The persisted ledger.

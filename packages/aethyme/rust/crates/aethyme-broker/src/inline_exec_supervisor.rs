@@ -449,16 +449,53 @@ impl InlineExecSupervisor {
         )
     }
 
+    /// Preparation's helper with null stdin, and its stdout and stderr (and
+    /// so the command's) written to the given pipes, which the caller drains.
+    #[cfg(unix)]
+    pub(crate) fn start_capturing(
+        executable: &Path,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> Result<Self, InlineExecError> {
+        Self::start_with_stdio(
+            executable,
+            std::process::Stdio::null(),
+            stdout,
+            stderr,
+            false,
+            false,
+        )
+    }
+
     #[cfg(unix)]
     fn start_with_stdin(
         executable: &Path,
         stdin: std::process::Stdio,
         stdout: std::process::Stdio,
         fail_cleanup_watcher: bool,
+        fail_after_launch: bool,
+    ) -> Result<Self, InlineExecError> {
+        Self::start_with_stdio(
+            executable,
+            stdin,
+            stdout,
+            std::process::Stdio::inherit(),
+            fail_cleanup_watcher,
+            fail_after_launch,
+        )
+    }
+
+    #[cfg(unix)]
+    fn start_with_stdio(
+        executable: &Path,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+        fail_cleanup_watcher: bool,
         _fail_after_launch: bool,
     ) -> Result<Self, InlineExecError> {
         use std::os::unix::process::CommandExt as _;
-        use std::process::{Command, Stdio};
+        use std::process::Command;
         use std::time::Instant;
 
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -525,7 +562,7 @@ impl InlineExecSupervisor {
         command
             .stdin(stdin)
             .stdout(stdout)
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .process_group(0);
         // SAFETY: the child-side stream is created before spawn. The hook uses
         // only dup2/fcntl syscalls, and retains no Rust state or locks.
@@ -609,6 +646,15 @@ impl InlineExecSupervisor {
     #[cfg(not(unix))]
     pub(crate) fn start_inheriting_stdin(
         executable: &Path,
+        _: std::process::Stdio,
+    ) -> Result<Self, InlineExecError> {
+        Self::start(executable)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn start_capturing(
+        executable: &Path,
+        _: std::process::Stdio,
         _: std::process::Stdio,
     ) -> Result<Self, InlineExecError> {
         Self::start(executable)

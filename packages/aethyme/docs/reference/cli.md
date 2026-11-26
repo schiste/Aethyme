@@ -466,6 +466,38 @@ version. Known limit: the one-level listing calls `lstat` on each entry, and
 a dead network or automount mount inside a temp folder can block that call
 with no timeout.
 
+Artifact max age: `[budget] artifact_max_age_hours` (default 24, `0` off) is
+one host-wide age past which rebuildable build output and caches Aethyme can
+prove unused are removed, whatever the budgets. Each worker pass removes gate
+cache entries unused for it (their newest change; every gate rebuilds the
+workspace members it tests into its entry), under the entry's exclusive gate
+cache lease, the repository's newest entry included; and, in every entry still
+in use, prunes the superseded generations of local packages (by their dep-info:
+no registry or git dependency) whose last recorded access or change is older
+than the max age, so a busy entry never piles up generations. In session
+scratch directories and in the main checkouts of registered repositories
+(directories named `target` up to three levels deep, only when Git says they
+hold no tracked file and are ignored), a Cargo target (it carries Cargo's
+`CACHEDIR.TAG`) unused for the max age is removed whole, and one used within
+it is pruned like a gate cache entry, in both cases only while the worker holds
+every profile's `.cargo-lock` (a running build keeps it). Empty leftover
+worktree roots in Aethyme's `worktrees` containers (no registered repository
+uses them, nothing in them but Aethyme's markers and empty directories, nothing
+changed for the max age; quick-test pools included) are removed. The idle
+strip removes the Cargo targets of open sessions with no activity for the max
+age, declared as preparation outputs or not (Cargo rebuilds them); other
+regenerable directories still go only as declared outputs, after `[cleanup]
+idle_strip_after_hours`. Recovery archives, preparation caches (rotated by
+the preparation cache), tracked paths and anything without a rebuild proof
+are never removed by age. `storage status --json` gives every class an
+`oldest_age_ms` and adds `artifact_max_age` (`max_age_hours`, `max_age_ms`,
+`stop`, and per class `oldest_age_ms` or `oldest_kept_age_ms` with `within`:
+whether the least recently used artifact still there is within the max age;
+for the classes outside the ledger also `found`, `removed_for_age`,
+`removed_for_age_bytes`, `pruned_for_pile_up`, `pruned_for_pile_up_bytes`,
+`kept_in_use`, `kept_unproven`); the human output says which classes still
+hold older artifacts.
+
 ## Broker Commands
 
 The broker is the stable product front door for multi-agent coordination:

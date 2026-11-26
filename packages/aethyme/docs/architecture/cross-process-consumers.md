@@ -343,6 +343,56 @@ class to `entries` and `bytes` removed this pass; `stop`: `done` or
 `last_prune` (the last pass's `gate_cache_prune`), and the gate cache's
 over-budget clock now runs while any repository is over its budget.
 
+Changed 2026-11-26 (artifact max age). `storage.toml` `[budget]
+artifact_max_age_hours` (default 24, `0` off; an older binary rejects the key
+and runs on default budgets). Gate caches: an entry unused for the max age is
+planned as `expired` whatever the budget and refused at removal when a gate
+wrote into it since it was measured; while the max age is on, every other
+entry is pruned each pass (not only over budget), and the prune's in-use
+signal is the unit's last recorded access or modification older than the max
+age (a day when it is off), local packages only (`relatime` may leave a read
+unrecorded for up to a day, so "not read since its successor was built" was
+not a safe signal). `storage_gate_cache_prune` attachment and
+`gate_cache_prune` report add `in_use` (superseded local units kept as used)
+and `for_pile_up` (entries judged only because the max age is on); counter
+`storage_gate_cache_prune_in_use` per kept unit. Under pressure from a volume
+below its free floor, the eviction loop re-reads the volume's free space after
+each budget removal and stops removing for pressure once it is back above the
+floor (counter `storage_eviction_pressure_relieved`).
+`storage_node_compile_cache_day_evicted` now counts `d<days>` directories only.
+New pass step `artifact_age` (phase `artifact_age`, 60 s budget, paced):
+Cargo targets in session scratch directories and in the main checkouts of
+registered repositories, and empty leftover worktree roots (see the CLI
+reference). Spans `storage_artifact_age` (the step),
+`storage_artifact_age_discover` (finding targets in one root or checkout),
+`storage_artifact_age_target` (judging one target),
+`storage_artifact_age_remove` (renaming one aside and deleting it),
+`storage_artifact_age_prune` (pruning one target in use) and
+`storage_artifact_age_leftover_roots`; counters
+`storage_artifact_age_<class>_removed`, `..._pruned_unit`,
+`..._kept_in_use` and `..._kept_unproven` for `session_scratch_build` and
+`main_checkout_target`, `storage_artifact_age_leftover_worktree_root_removed`
+and `..._kept_unproven`, and one of `storage_artifact_age_stop_done`,
+`storage_artifact_age_stop_deadline` or `storage_artifact_age_stop_lock_lost`
+per step; attachment `storage_artifact_age` (`max_age_hours`, `stop`,
+`classes`: per class `found`, `removed_for_age`, `removed_for_age_bytes`,
+`pruned_for_pile_up`, `pruned_for_pile_up_bytes`, `kept_in_use`,
+`kept_unproven`, `oldest_kept_age_ms`), also in the pass report as
+`artifact_age`. `storage status --json` adds `oldest_age_ms` to every class and
+`artifact_max_age` (see the CLI reference). Gates count the units a prune
+removed that cargo rebuilt (`managed_cache_prune_rebuilt_unit`, attachment
+`managed_cache_prune.rebuilt_after_previous_prune`) after their build instead
+of before it, so a prune the worker made between gates is counted too; a
+gate's own prune adds to the `.aethyme-pruned-units` record instead of
+replacing it. The idle strip removes the Cargo targets of sessions idle for
+the max age (counters `checkout_idle_strip_covered_cargo_target_max_age`,
+`checkout_idle_strip_max_age_targets_only`; attachment `checkout_idle_strip`
+adds `artifact_max_age_hours`; meta key `checkout_strip.idle_max_age_done`).
+An expired metrics-trim resume record's temporary is removed only once it was
+not modified for 120 s (counter
+`command_metrics_trim_resume_expired_recently_modified` when it is left for the
+stale-temporary sweep).
+
 Host temp folders (2026-11-22): after each pass the worker reads the per-user
 temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
 `/tmp`, at most every 10 minutes, into
@@ -772,6 +822,24 @@ and `cat-file blob` of the selected file
   `path_through_non_tree`, `not_a_regular_file`, `malformed_tree`,
   `not_a_blob`, `too_large`, `unexpected_target`. Each answered query is one
   `subprocess_git` fewer (`file_at_revision` two: `cat-file -e` and `show`).
+
+## Submit's conflict report reads integration history in one bounded log (2026-11-26)
+
+When a replayed session commit conflicts, `broker submit` lists, per
+conflicting path, the integration-side commits that touched it
+(`integration_side_commits` in the conflict details). It used to start two
+Git processes per first-parent commit per path between the merge base and
+the integration head; on a merge-heavy history with an old merge base this
+ran for over an hour with no deadline and the submission never reached its
+gates. It now reads one `git log --first-parent --diff-merges=first-parent
+--no-renames --name-only -z` over the newest 2,000 first-parent commits,
+keeps at most 20 commits per path (oldest first, as before) and stops after
+20 s; on any Git error or timeout the list is empty. A change a merge brought
+in from its side branch is attributed to the merge. Span
+`submission_conflict_history` times the read; count
+`submission_conflict_history_unavailable` records an empty list caused by an
+error or the budget. The list is a hint: an empty or shorter list never
+changes the submission verdict.
 
 ## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
 
@@ -6191,3 +6259,105 @@ other caller of proof 3 is unchanged. New counter
 `proof_empty_ignored_directory_released` (one per released directory) and
 span `checkout_retirement_phase_recheck` (the proof 3 re-check under the
 claim).
+
+### Unattended deletion yields to foreground I/O (2026-11-26)
+
+A 30-minute offline install on an external volume used about 6 s of child
+CPU while the checkout trash catch-up removed 17.7 GB on the same volume:
+the deleter, raised to `IOPOL_IMPORTANT` so a busy disk cannot starve it,
+starved the install instead.
+
+Each preparation step and each gate command leaves a marker in `<host state>/run/foreground-io/`
+naming its volume (device number), its process and that process's start
+time, removed when it ends. A marker whose process is gone, whose pid now
+names another process (a different start time), or that is older than four
+hours (`MAX_MARKER_AGE`) counts for nothing; every reader judges each entry
+it reads (at most 4,096) and removes such markers before answering. Before each slice, the checkout trash catch-up reads the markers
+for the volumes of its trash entries. While one is live, a deleter that
+raised itself to `IOPOL_IMPORTANT` drops to `IOPOL_THROTTLE` (macOS) and
+waits 5 s instead of 1 s between slices; it returns to `important` when
+the work ends or the lap does. A process that was not `important` (the
+throttled worker, Linux's idle class) is never switched.
+
+- Counter `foreground_io_marked`: one per marker written.
+- Counter `checkout_trash_catchup_yielded_to_foreground`: slices that found
+  foreground work on a trash volume.
+- Counter `checkout_trash_catchup_io_restored`: laps that returned to
+  `important` at their end.
+
+### Preparation keeps finished installs and waits for another session's (2026-11-26)
+
+On a pnpm repository with worktrees on an external volume and host state on
+the internal disk, 38 of 51 preparations in one window failed. Installs that
+had run for up to 30 minutes were discarded after dispatch, and every
+uncertain outcome installed again from the start. The changes:
+
+- **Space is checked before dispatch, bookkeeping after.** The build reserve
+  (8 GiB) is checked before each step is dispatched, as before. While a step
+  runs, its heartbeat requires 2 GiB and 10,000 inodes
+  (`INSTALL_RESERVE_BYTES`) on the volumes the install writes (the worktree
+  and the shared cache directory), so an install cannot drive them to zero,
+  and only the bookkeeping reserve (`BOOKKEEPING_RESERVE_BYTES`, 256 MiB and
+  1,000 inodes) on the broker's state (`.aethyme`, the host resource
+  database).
+  - Counter `prepare_storage_refused_before_dispatch`: a step not started
+    because a watched path was below the build reserve.
+- **A quarantined lease no longer stops a running step.** A renewal that
+  finds the step's lease quarantined (its expiry passed while the process was
+  starved or suspended) lets the step continue: while the holder runs, a
+  quarantined lease keeps excluding every other holder, and its release
+  still works. Every other renewal failure still stops the step.
+  - Counter `prepare_lease_quarantined_step_continued`.
+- **A record that cannot be written is journaled.** Each finished step (exit
+  0, outputs verified) is now recorded at once, and the final record too.
+  When the repository's record (`.aethyme/run/preparation/session-<id>.json`)
+  cannot be written, the record goes to `preparation-outcome.json` in the
+  session's scratch directory (the worktree's volume), and the next read
+  reconciles it: a journaled outcome from a later run, or one that ends the
+  run the repository's record still calls in progress, replaces it.
+  - Counter `prepare_outcome_fallback_written`: a record journaled instead.
+  - Counter `prepare_outcome_fallback_reconciled`: a journal written back and
+    removed; `prepare_outcome_fallback_read`: used, but the write back failed.
+- **An interrupted run is verified, not repeated.** When the record says in
+  progress and its preparer is gone (`interrupted`), the inputs still hash to
+  the recorded key, and no declared output is missing or stripped, the
+  leading steps the run recorded as finished are not run again. When every
+  step was recorded, the install is accepted without running anything. A step
+  whose own exit was never observed runs again even when its outputs exist: a
+  package manager stopped mid-import leaves them present and incomplete.
+  - Counter `prepare_verified_after_uncertain`: an install accepted without
+    running a step.
+  - Counter `prepare_resumed_after_uncertain` (one per preparation) and
+    `prepare_step_resumed_after_uncertain` (one per skipped step).
+  - A step whose outcome could not be confirmed but whose cleanup was
+    verified now releases its lease (it used to be quarantined, which held
+    the record in progress and refused every retry); unverified cleanup
+    still quarantines it. The run then reads `interrupted` once its
+    preparer exits, and the `--json` error carries a structured
+    `error.action`: `kind: retry_prepare`, `reason:
+    outcome_unconfirmed`, `retry_after_seconds: 0`, `command`.
+- **A busy shared cache is waited for, not failed.** When `--wait` runs out
+  and the holder is another session whose live activity record shows progress
+  (fresher than 90 s), the preparation keeps waiting, one window of `--wait`
+  at a time, printing `waiting for session <id>'s <operation> (running <n>s,
+  last progress <n>s ago)` once per window, for at most two hours. `--wait 0s`
+  still fails at once. When it gives up, the `--json` error carries
+  `error.action` with `kind: retry_prepare`, `reason: shared_cache_busy`,
+  `retry_after_seconds` (120 while the holder works, 30 when it reported
+  nothing), `holder_session_id` and `command`.
+  - Counter `shared_cache_followed_holder`: one per extra wait window.
+  - Duration `shared_cache_waited_for_fill`: time from the first attempt to
+    the grant, for a preparation that followed a holder;
+    `shared_cache_waited_for_fill_gave_up`: the same when it then gave up.
+  - `prepare status --json` gains `retry_after_seconds` (120 while waiting on
+    another session, 30 while in progress; absent otherwise).
+- **Step output is kept.** Each step's stdout and stderr pass through pipes:
+  forwarded to the broker's own streams as before, the last 16 KiB of each
+  kept. After each step the tails are written to one log of at most 64 KiB,
+  `preparation-output.log` in the session's scratch directory (retired with
+  the session), or `.aethyme/run/preparation/session-<id>.output.log` when
+  the session has none. A failed step's message names the log.
+  - Counter `preparation_step_output_uncaptured`: the pipes could not be
+    opened and the step's streams were inherited as before.
+  - Counter `preparation_step_output_drain_timed_out`: a stream stayed open
+    2 s after the step (a descendant kept it); the tail so far was kept.

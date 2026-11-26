@@ -255,6 +255,7 @@ fn an_over_budget_gate_cache_keeps_its_newest_entry_and_every_leased_one() {
     let _held = lease(&registry, "gate-run", "rust-workspace-v1");
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     pass(
@@ -326,6 +327,7 @@ fn whole_gate_cache_entries_go_least_recently_used_after_older_generations() {
     ]);
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 2048,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     let planned = |aggressive: &std::collections::BTreeSet<RootKind>| -> Vec<String> {
@@ -349,6 +351,7 @@ fn whole_gate_cache_entries_go_least_recently_used_after_older_generations() {
     ]);
     let tight = Budgets {
         gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     assert!(evict::plan(&recent, &tight, now, &Default::default()).is_empty());
@@ -373,6 +376,7 @@ fn gate_cache_entries_to_prune_are_the_over_budget_repositories_largest_first() 
     ledger.items[0].children[1].bytes = 4096;
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 2048,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     let names = |ledger: &super::Ledger,
@@ -505,6 +509,7 @@ fn an_over_budget_gate_cache_is_pruned_of_superseded_workspace_units_first() {
     let profile = entry.join("debug");
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     let roots = || {
@@ -583,6 +588,243 @@ fn an_over_budget_gate_cache_is_pruned_of_superseded_workspace_units_first() {
         serde_json::json!(4 * 1024 * 1024 * 1024u64)
     );
     assert_eq!(gate["last_prune"]["units"], serde_json::json!(1));
+}
+
+/// A gate cache entry unused for the artifact max age goes whatever the
+/// budget, the repository's newest included; one used within it stays.
+#[test]
+fn gate_cache_entries_unused_for_the_max_age_expire_whatever_the_budget() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v1", now - 30 * hour),
+        gate_child("repo/lint-v1", now - 2 * hour),
+        gate_child("idle/rust-workspace-v1", now - 25 * hour),
+    ]);
+    let planned = |budgets: &Budgets| -> Vec<(String, Reason)> {
+        evict::plan(&ledger, budgets, now, &Default::default())
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect()
+    };
+    assert_eq!(
+        planned(&Budgets::default()),
+        vec![
+            ("gates/repo/rust-workspace-v1".to_string(), Reason::Expired),
+            ("gates/idle/rust-workspace-v1".to_string(), Reason::Expired),
+        ]
+    );
+    let off = Budgets {
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    assert!(planned(&off).is_empty(), "under budget, nothing goes");
+    assert!(evict::gate_entry_expired(
+        &gate_child("r/k", now - 24 * hour),
+        &Budgets::default(),
+        now
+    ));
+    assert!(!evict::gate_entry_expired(
+        &gate_child("r/k", now - 24 * hour + 1),
+        &Budgets::default(),
+        now
+    ));
+    assert!(
+        !evict::gate_entry_expired(&gate_child("r/k", 0), &Budgets::default(), now),
+        "unknown recency is kept"
+    );
+}
+
+/// Gate caches placed on an adopted storage root (`[placement]`) expire by
+/// the max age like the host cache's, and are pruned each pass too.
+#[test]
+fn gate_caches_on_a_storage_root_follow_the_max_age() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let mut ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v1", now - 30 * hour),
+        gate_child("repo/lint-v1", now - 2 * hour),
+    ]);
+    ledger.items[0].root = PathBuf::from("/storage-root");
+    ledger.items[0].root_kind = RootKind::Storage;
+    assert_eq!(
+        classify(RootKind::Storage, "gates"),
+        Class::GateCache,
+        "placement's layout"
+    );
+    let planned: Vec<(String, Reason)> =
+        evict::plan(&ledger, &Budgets::default(), now, &Default::default())
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect();
+    assert_eq!(
+        planned,
+        vec![("gates/repo/rust-workspace-v1".to_string(), Reason::Expired)]
+    );
+    let pruned: Vec<String> =
+        super::gate_prune::entries_to_prune(&ledger, &Budgets::default(), &Default::default())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    assert_eq!(pruned, vec!["repo/lint-v1"]);
+}
+
+/// With the max age on, every gate cache entry used within it is pruned
+/// each pass (no pile-up), whatever the budget; an expired one is left to
+/// go whole.
+#[test]
+fn with_the_max_age_on_every_gate_cache_entry_is_pruned_each_pass() {
+    let now = super::now_ms();
+    let ledger = gate_ledger(vec![
+        gate_child("over/a-v1", now),
+        gate_child("under/a-v1", now),
+        gate_child("old/a-v1", now - 2 * DAY_MS),
+    ]);
+    let names: Vec<String> =
+        super::gate_prune::entries_to_prune(&ledger, &Budgets::default(), &Default::default())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    assert_eq!(names, vec!["over/a-v1", "under/a-v1"]);
+}
+
+/// Expired by the max age, an entry a gate wrote into since it was
+/// measured is refused at removal.
+#[test]
+fn an_expired_gate_cache_entry_used_since_it_was_measured_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    gate_entry(&cache, "rust-workspace-v1", 2);
+    let entry = cache.join("gates/example-0123/rust-workspace-v1");
+    let candidate = Candidate {
+        class: Class::GateCache,
+        root_kind: RootKind::HostCache,
+        root: cache.clone(),
+        relative: "gates/example-0123/rust-workspace-v1".into(),
+        bytes: 1,
+        newest_ms: super::now_ms() - 2 * DAY_MS + 1_000,
+        reason: Reason::Expired,
+        expires_ms: None,
+        allow_unlanded: false,
+    };
+    let leases = std::collections::BTreeSet::new();
+    assert_eq!(
+        evict::refuse(&candidate, Some(&leases), super::now_ms()),
+        None
+    );
+    file(&entry.join(".rustc_info.json"), 16);
+    assert_eq!(
+        evict::refuse(&candidate, Some(&leases), super::now_ms()).as_deref(),
+        Some("used since it was measured")
+    );
+}
+
+/// Finding (c) of #2041: under disk pressure, gate cache entries go one at
+/// a time while free space is re-read, and removal stops once the volume
+/// is back above its floor, instead of cutting the repository to one entry.
+#[test]
+fn pressure_eviction_stops_once_free_space_is_back_above_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let registry = empty_registry(&host_state);
+    for (key, days) in [
+        ("rust-workspace-v1", 9),
+        ("rust-workspace-v2", 5),
+        ("rust-workspace-v3", 1),
+    ] {
+        gate_entry(&cache, key, days);
+    }
+    let gib = 1024 * 1024 * 1024_u64;
+    let entries = cache.join("gates/example-0123");
+    let mut free = |_: &Path| {
+        let present = super::read_names(&entries).len();
+        Some(if present >= 3 {
+            (gib, 100 * gib)
+        } else {
+            (100 * gib, 100 * gib)
+        })
+    };
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        check::run_pass(
+            PassInputs {
+                host_state: &host_state,
+                roots: vec![
+                    root(&host_state, RootKind::HostState),
+                    root(&cache, RootKind::HostCache),
+                ],
+                budgets: Budgets {
+                    artifact_max_age_hours: 0,
+                    ..Budgets::default()
+                },
+                free: &mut free,
+                measure_budget: Duration::from_secs(60),
+                pace: Duration::ZERO,
+                registry,
+                budget_error: None,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        super::read_names(&entries),
+        vec![
+            "rust-workspace-v2".to_string(),
+            "rust-workspace-v3".to_string()
+        ],
+        "one removal brought free space back"
+    );
+    let (_, counts) = recorder.totals();
+    assert_eq!(counts.get("storage_eviction_pressure_relieved"), Some(&1));
+}
+
+/// `storage_node_compile_cache_day_evicted` counts day directories only.
+#[test]
+fn only_node_compile_cache_days_count_as_evicted_days() {
+    let now = super::now_ms();
+    let today = now / DAY_MS;
+    assert!(check::is_node_compile_cache_day(
+        &format!("node-compile-cache/d{}", today - 3),
+        now
+    ));
+    assert!(!check::is_node_compile_cache_day(
+        "node-compile-cache/v22.1.0",
+        now
+    ));
+    assert!(!check::is_node_compile_cache_day("cargo/registry", now));
+    assert!(!check::is_node_compile_cache_day("node-compile-cache", now));
+
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let node = cache.join("node-compile-cache");
+    for child in [format!("d{}", today - 20), "v22.1.0".to_string()] {
+        file(&node.join(&child).join("entry"), 4096);
+        age(&node.join(&child), 20);
+    }
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        pass(
+            &host_state,
+            vec![
+                root(&host_state, RootKind::HostState),
+                root(&cache, RootKind::HostCache),
+            ],
+            Budgets::default(),
+        );
+    }
+    assert!(super::read_names(&node).is_empty(), "both expired");
+    let (_, counts) = recorder.totals();
+    assert_eq!(
+        counts.get("storage_node_compile_cache_day_evicted"),
+        Some(&1)
+    );
 }
 
 #[test]

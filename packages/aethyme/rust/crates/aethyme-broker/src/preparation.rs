@@ -27,6 +27,8 @@ pub(crate) mod cache_activity;
 pub(crate) mod cache_measurement;
 #[path = "preparation_install_cap.rs"]
 pub(crate) mod install_cap;
+#[path = "preparation_outcome_recovery.rs"]
+mod outcome_recovery;
 #[path = "preparation_output_share.rs"]
 pub(crate) mod output_share;
 #[path = "preparation_package_store.rs"]
@@ -42,6 +44,8 @@ pub(crate) mod rotation_debt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "preparation_rotation_journal.rs"]
 pub(crate) mod rotation_journal;
+#[path = "preparation_step_output.rs"]
+pub(crate) mod step_output;
 
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
@@ -126,12 +130,14 @@ pub enum PreparationError {
     )]
     OfflineUnavailable { step: String },
     #[error(
-        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output, then retry `aethyme broker submit prepare --session {session_id}`"
+        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output{output_log}, then retry `aethyme broker submit prepare --session {session_id}`"
     )]
     StepFailed {
         step: String,
         exit_code: Option<i32>,
         session_id: i64,
+        /// ` (last lines: <path>)` naming the step output log, or empty.
+        output_log: String,
     },
     #[error(
         "preparation command supervision is unavailable: {reason}; no repository command was started"
@@ -570,6 +576,85 @@ fn acquire_preparation_cache(
     }
 }
 
+/// [`acquire_preparation_cache`], waiting past `--wait` for as long as the
+/// holder is another session making progress (its live activity record,
+/// `holder`), bounded by [`outcome_recovery::SHARED_CACHE_FOLLOW_MAX`].
+///
+/// One session's 30-minute install used to fail every other session's
+/// prepare after 60 s, and their agents retried in a loop (one polled
+/// `prepare status` 31 times). Waiting for the fill and then taking the
+/// cache reuses what the holder just stored. When it does give up, the
+/// refusal carries a structured `retry_prepare` action with
+/// `retry_after_seconds`.
+#[allow(clippy::too_many_arguments)]
+fn acquire_preparation_cache_following_holder(
+    coordinator: &mut HostResourceCoordinator,
+    request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
+    sharing: bool,
+    budget_check: Option<ExclusiveNeed>,
+    wait: Duration,
+    rotation_unsettled: &mut dyn FnMut() -> bool,
+    holder_activity: &dyn Fn() -> Option<String>,
+    holder: &dyn Fn() -> Option<cache_activity::PreparationCacheActivity>,
+    session_id: i64,
+) -> Result<
+    (
+        crate::HostResourceGrant,
+        SharedCacheMode,
+        Option<ExclusiveNeed>,
+    ),
+    PreparationError,
+> {
+    let started = Instant::now();
+    let mut followed = false;
+    loop {
+        let attempt = acquire_preparation_cache(
+            coordinator,
+            request_for,
+            sharing,
+            budget_check,
+            wait,
+            &mut *rotation_unsettled,
+            holder_activity,
+        );
+        let contended = matches!(
+            &attempt,
+            Err(PreparationError::HostResource(error)) if is_resource_contention(error)
+        );
+        if !contended {
+            if followed {
+                crate::phase_telemetry::add("shared_cache_waited_for_fill", started.elapsed());
+            }
+            return attempt;
+        }
+        let current = holder();
+        match outcome_recovery::follow_holder_decision(
+            wait,
+            started.elapsed(),
+            current.as_ref(),
+            now_ms(),
+        ) {
+            outcome_recovery::FollowDecision::Follow { line } => {
+                followed = true;
+                crate::phase_telemetry::add("shared_cache_followed_holder", Duration::ZERO);
+                eprintln!("{line}");
+            }
+            outcome_recovery::FollowDecision::GiveUp => {
+                if followed {
+                    crate::phase_telemetry::add(
+                        "shared_cache_waited_for_fill_gave_up",
+                        started.elapsed(),
+                    );
+                }
+                crate::session_auto_close::set_refusal_action(
+                    outcome_recovery::busy_cache_retry_action(session_id, current.as_ref()),
+                );
+                return attempt;
+            }
+        }
+    }
+}
+
 /// A preparation reclaims at most this many dead holders before it reports
 /// the conflict. One is the expected case; the bound only stops a loop.
 const DEAD_HOLDER_RECLAIMS_PER_PREPARATION: u32 = 3;
@@ -992,6 +1077,11 @@ pub struct PreparationStatus {
     /// preparation was keyed on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runtimes: Vec<package_store::RuntimeIdentity>,
+    /// While a preparation runs or waits for another session's: when to
+    /// read this status again, so an agent schedules one read instead of
+    /// polling. Absent when nothing is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1318,6 +1408,94 @@ impl Broker {
         false
     }
 
+    /// Where a session's preparation outcome is journaled when its record in
+    /// the repository cannot be written: the session's scratch directory, on
+    /// the worktree's volume, retired with the session.
+    fn preparation_outcome_fallback_path(&self, session_id: i64) -> Option<PathBuf> {
+        self.session_scratch_dir(session_id)
+            .map(|scratch| outcome_recovery::fallback_outcome_path(&scratch))
+    }
+
+    /// Write a preparation record. When the repository's record cannot be
+    /// written (its disk is full, its directory unwritable), journal it in
+    /// the session's scratch directory instead and succeed: the next status
+    /// read reconciles it. A finished install is never discarded for want of
+    /// a few KB of bookkeeping on another disk.
+    fn write_preparation_outcome(
+        &self,
+        session_id: i64,
+        state_path: &Path,
+        record: &PreparationRecord,
+    ) -> Result<(), PreparationError> {
+        let error = match write_record(state_path, record) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(fallback) = self.preparation_outcome_fallback_path(session_id) else {
+            return Err(error);
+        };
+        match write_record(&fallback, record) {
+            Ok(()) => {
+                crate::phase_telemetry::add("prepare_outcome_fallback_written", Duration::ZERO);
+                eprintln!(
+                    "warning: could not write the preparation record ({error}); journaled it at \
+                     {} instead, to be reconciled on the next read",
+                    fallback.display()
+                );
+                Ok(())
+            }
+            Err(_) => Err(error),
+        }
+    }
+
+    /// A session's preparation record, reconciled with its fallback journal:
+    /// a journaled outcome newer than the repository's record (or one that
+    /// ends the run that record still calls in progress) replaces it, and the
+    /// journal is removed once the record is written.
+    fn read_preparation_record(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<PreparationRecord>, PreparationError> {
+        let state_path = record_path(self.main_root(), session_id);
+        let primary = read_record(&state_path);
+        let Some(fallback_path) = self
+            .preparation_outcome_fallback_path(session_id)
+            .filter(|path| path.is_file())
+        else {
+            return primary;
+        };
+        let fallback = match read_record(&fallback_path) {
+            Ok(Some(fallback)) if fallback.session_id == session_id => fallback,
+            _ => return primary,
+        };
+        let primary = primary.ok().flatten();
+        match outcome_recovery::reconcile_choice(primary.as_ref(), &fallback) {
+            outcome_recovery::ReconciledRecord::Primary => {
+                // Superseded by a later run's record.
+                crate::warn_unrecorded(
+                    "remove a superseded preparation outcome journal",
+                    fs::remove_file(&fallback_path),
+                );
+                Ok(primary)
+            }
+            outcome_recovery::ReconciledRecord::Fallback => {
+                if write_record(&state_path, &fallback).is_ok() {
+                    crate::warn_unrecorded(
+                        "remove a reconciled preparation outcome journal",
+                        fs::remove_file(&fallback_path),
+                    );
+                    crate::phase_telemetry::add(
+                        "prepare_outcome_fallback_reconciled",
+                        Duration::ZERO,
+                    );
+                } else {
+                    crate::phase_telemetry::add("prepare_outcome_fallback_read", Duration::ZERO);
+                }
+                Ok(Some(fallback))
+            }
+        }
+    }
+
     /// Git-ignored top-level directories that exist in the primary checkout but
     /// not in this worktree.
     ///
@@ -1491,6 +1669,7 @@ impl Broker {
                     shared_cache_background_measurement: None,
                     package_store: None,
                     runtimes: Vec::new(),
+                    retry_after_seconds: None,
                 });
             }
             Ok(Some(config)) => config,
@@ -1527,7 +1706,7 @@ impl Broker {
             Err(error) => return Ok(invalid_status(session_id, error.to_string())),
         };
         let missing_outputs = missing_outputs(root, config)?;
-        let record = read_record(&record_path(self.main_root(), session_id))?;
+        let record = self.read_preparation_record(session_id)?;
         let package_store = record
             .as_ref()
             .and_then(|record| record.package_store.clone());
@@ -1625,6 +1804,8 @@ impl Broker {
         let waiting_on = current_operation
             .as_ref()
             .and_then(|activity| self.preparation_cache_waiting_on(activity));
+        let retry_after_seconds =
+            outcome_recovery::status_retry_after_seconds(state, waiting_on.is_some());
         Ok(PreparationStatus {
             schema_version: PREPARATION_SCHEMA_VERSION,
             session_id,
@@ -1651,6 +1832,7 @@ impl Broker {
                 .flatten(),
             package_store,
             runtimes: recorded_runtimes,
+            retry_after_seconds,
         })
     }
 
@@ -1807,6 +1989,72 @@ impl Broker {
         }
         ensure_preparation_retry_allowed(session_id, status.state)?;
         let cache_outcome = PreparationCacheOutcome::miss(&status);
+        // A prior run interrupted after it recorded finished steps: accept a
+        // complete install, or resume after its last finished step, instead
+        // of installing again from the start.
+        let step_names: Vec<&str> = config.steps.iter().map(|step| step.name.as_str()).collect();
+        let prior_record = if status.state == PreparationState::Interrupted {
+            self.read_preparation_record(session_id).ok().flatten()
+        } else {
+            None
+        };
+        let uncertain_verdict = outcome_recovery::uncertain_outcome_verdict(
+            status.state,
+            prior_record.as_ref(),
+            &source_digest,
+            &status.missing_outputs,
+            stripped_since_prepared(self.main_root(), session_id),
+            &step_names,
+        );
+        if uncertain_verdict == outcome_recovery::UncertainVerdict::AcceptComplete
+            && let Some(mut record) = prior_record
+        {
+            record.state = PreparationState::Current;
+            record.completed_at = Some(now_ms());
+            record.failed_step = None;
+            record.exit_code = None;
+            record.host_lease_id = None;
+            record.host_lease_generation = None;
+            self.write_preparation_outcome(
+                session_id,
+                &record_path(self.main_root(), session_id),
+                &record,
+            )?;
+            crate::phase_telemetry::add("prepare_verified_after_uncertain", Duration::ZERO);
+            eprintln!(
+                "the interrupted preparation of session {session_id} had finished and recorded \
+                 every step, and the declared outputs match its digest: accepted without \
+                 installing again"
+            );
+            attach_preparation_steps(&preparation_step_timings(&config.steps, &[]));
+            return Ok(PreparationReport {
+                schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
+                session_id,
+                digest,
+                state: PreparationState::Current,
+                offline,
+                shared_cache_coordinated: false,
+                shared_cache_wait_ms: 0,
+                shared_cache_mode: None,
+                shared_cache_rotation: None,
+                shared_cache_operations: Vec::new(),
+                shared_cache_background_measurement: None,
+                steps: Vec::new(),
+                cache_outcome: PreparationCacheOutcome::hit(),
+                package_store: record.package_store,
+                install_slot: None,
+                next_action: "dependencies were verified after an interrupted preparation; \
+                              continue work in the prepared session"
+                    .into(),
+            });
+        }
+        let resumed_steps = match uncertain_verdict {
+            outcome_recovery::UncertainVerdict::Resume(steps) => {
+                crate::phase_telemetry::add("prepare_resumed_after_uncertain", Duration::ZERO);
+                steps
+            }
+            _ => BTreeSet::new(),
+        };
         // Everything below runs the repository's own commands. The policy is
         // this worktree's: its gates and the preparation just loaded.
         let gates = match crate::gates::load_gates(&root) {
@@ -2009,6 +2257,13 @@ impl Broker {
         if let Some(resource_db_path) = &resource_db_path {
             storage_paths.push(resource_db_path.clone());
         }
+        // What a running step's heartbeat watches, by what it holds: the
+        // install's own volumes need room to finish the install, the
+        // broker's state only room to record it.
+        let mut install_paths = vec![root.clone()];
+        install_paths.extend(cache_dir.iter().cloned());
+        let mut bookkeeping_paths = vec![self.main_root().join(".aethyme")];
+        bookkeeping_paths.extend(resource_db_path.iter().cloned());
         let main_root = self.main_root().to_path_buf();
         self.require_storage_or_reclaim(
             cache_root_binding.as_ref(),
@@ -2120,7 +2375,7 @@ impl Broker {
                 None,
                 false,
             );
-            let (acquired, mode, need) = acquire_preparation_cache(
+            let (acquired, mode, need) = acquire_preparation_cache_following_holder(
                 coordinator,
                 &|mode| {
                     preparation_resource_request(
@@ -2149,6 +2404,8 @@ impl Broker {
                     current_cache_holder(probe_db, &repository, session_id, now)
                         .map(|record| cache_activity::describe_holder(&record, now))
                 },
+                &|| current_cache_holder(probe_db, &repository, session_id, now_ms()),
+                session_id,
             )?;
             cache_activity::lease_acquired();
             cache_activity::leave();
@@ -2582,7 +2839,38 @@ impl Broker {
         let main_root = self.main_root().to_path_buf();
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         let mut step_timings: Vec<PreparationStepTiming> = Vec::new();
+        // Set once a renewal finds the lease quarantined: renewing again
+        // would fail the same way, and the quarantined lease still excludes
+        // other holders while this process runs.
+        let mut lease_quarantined_during_step = false;
+        let step_log_path = step_output::log_path(
+            self.session_scratch_dir(session_id).as_deref(),
+            self.main_root(),
+            session_id,
+        );
+        let mut step_log = String::new();
         for (index, step) in config.steps.iter().enumerate() {
+            if resumed_steps.contains(&step.name) {
+                step_timings.push(PreparationStepTiming::ran(
+                    index,
+                    step,
+                    offline,
+                    Duration::ZERO,
+                    "ok",
+                ));
+                record.steps = preparation_step_timings(&config.steps, &step_timings);
+                crate::phase_telemetry::add("prepare_step_resumed_after_uncertain", Duration::ZERO);
+                eprintln!(
+                    "preparation step {:?} finished before the interrupted run stopped and its \
+                     outputs verify: not run again",
+                    step.name
+                );
+                continue;
+            }
+            // Unattended bulk deleters on this volume yield the disk while
+            // the step runs.
+            let _foreground_io =
+                crate::foreground_io::ForegroundIoMark::enter("preparation", &root);
             let step_started = Instant::now();
             let step_free_before = package_store::volume_free_bytes(&root);
             let _step_span = crate::phase_telemetry::span("preparation_step");
@@ -2598,11 +2886,18 @@ impl Broker {
             } else {
                 &step.command
             };
-            let report = match require_preparation_storage_with_cache_root(
+            let mut step_capture = None;
+            let step_result = require_preparation_storage_with_cache_root(
                 &main_root,
                 &storage_paths,
                 cache_root_binding.as_ref(),
             )
+            .inspect_err(|_| {
+                crate::phase_telemetry::add(
+                    "prepare_storage_refused_before_dispatch",
+                    Duration::ZERO,
+                );
+            })
             .map_err(BrokerOpError::from)
             .and_then(|()| {
                 let mut environment = preparation_step_environment_with_store(
@@ -2621,10 +2916,11 @@ impl Broker {
                 {
                     environment.push((install_cap::PARENT_SLOT_ENV.into(), lease));
                 }
-                let supervisor = match next_supervisor.take() {
+                let (supervisor, capture) = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
                 };
+                step_capture = capture;
                 self.guarded_preparation_exec_with_supervisor(
                     session_id,
                     command,
@@ -2635,24 +2931,48 @@ impl Broker {
                         heartbeat.tick(
                             Instant::now(),
                             || {
-                                require_preparation_storage_with_cache_root(
+                                // The build reserve was checked before the
+                                // step was dispatched; a running step needs
+                                // room to finish and to record its outcome.
+                                require_running_step_storage(
                                     &main_root,
-                                    &storage_paths,
+                                    &install_paths,
+                                    &bookkeeping_paths,
                                     cache_root_binding.as_ref(),
                                 )
                             },
                             || {
-                                if let (Some(coordinator), Some(grant)) =
-                                    (coordinator.as_mut(), grant.as_mut())
+                                if !lease_quarantined_during_step
+                                    && let (Some(coordinator), Some(grant)) =
+                                        (coordinator.as_mut(), grant.as_mut())
                                 {
-                                    grant.lease = coordinator
-                                        .renew(
-                                            &grant.lease.lease_id,
-                                            grant.lease.generation,
-                                            &grant.ownership_token,
-                                            PREPARATION_LEASE_TTL_SECONDS,
-                                        )
-                                        .map_err(PreparationError::from)?;
+                                    match coordinator.renew(
+                                        &grant.lease.lease_id,
+                                        grant.lease.generation,
+                                        &grant.ownership_token,
+                                        PREPARATION_LEASE_TTL_SECONDS,
+                                    ) {
+                                        Ok(lease) => grant.lease = lease,
+                                        Err(error)
+                                            if !outcome_recovery::renewal_failure_stops_step(
+                                                &error,
+                                            ) =>
+                                        {
+                                            lease_quarantined_during_step = true;
+                                            crate::phase_telemetry::add(
+                                                "prepare_lease_quarantined_step_continued",
+                                                Duration::ZERO,
+                                            );
+                                            eprintln!(
+                                                "warning: session {session_id}'s preparation \
+                                                 lease passed its {PREPARATION_LEASE_TTL_SECONDS}s \
+                                                 expiry while a step ran and was quarantined; it \
+                                                 still excludes other holders while this process \
+                                                 runs, so the step continues"
+                                            );
+                                        }
+                                        Err(error) => return Err(PreparationError::from(error)),
+                                    }
                                 }
                                 // Never stops a running install; see
                                 // `InstallSlot::renew_best_effort`.
@@ -2666,9 +2986,46 @@ impl Broker {
                         )
                     },
                 )
-            }) {
+            });
+            let output_log = match step_capture.take() {
+                Some(capture) => {
+                    let output = capture.finish();
+                    let outcome = match &step_result {
+                        Ok(report) => preparation_step_outcome(report),
+                        Err(error) => preparation_step_error_outcome(error),
+                    };
+                    step_log = step_output::bounded_log(
+                        &step_log,
+                        &step_output::render_section(&step.name, outcome, &output),
+                        step_output::LOG_MAX_BYTES,
+                    );
+                    match step_output::write_log(&step_log_path, &step_log) {
+                        Ok(()) => format!(" (last lines: {})", step_log_path.display()),
+                        Err(error) => {
+                            crate::warn_unrecorded(
+                                "write the preparation step output log",
+                                Err::<(), _>(error),
+                            );
+                            String::new()
+                        }
+                    }
+                }
+                None => String::new(),
+            };
+            let report = match step_result {
                 Ok(report) => report,
                 Err(error) => {
+                    if !output_log.is_empty() {
+                        eprintln!("preparation step {:?} output{output_log}", step.name);
+                    }
+                    if matches!(
+                        &error,
+                        BrokerOpError::Preparation(PreparationError::CommandOutcomeUnknown { .. })
+                    ) {
+                        crate::session_auto_close::set_refusal_action(
+                            outcome_recovery::uncertain_outcome_retry_action(session_id),
+                        );
+                    }
                     step_timings.push(PreparationStepTiming::ran(
                         index,
                         step,
@@ -2730,6 +3087,7 @@ impl Broker {
                     step: step.name.clone(),
                     exit_code: report.exit_code,
                     session_id,
+                    output_log: output_log.clone(),
                 };
                 let error = BrokerOpError::from(error);
                 let restart_storage_worker = route_preparation_command_failure(
@@ -2810,6 +3168,12 @@ impl Broker {
                 }
                 .into());
             }
+            // Record the finished step: a run interrupted from here on
+            // resumes after it (or, after the last step, is accepted)
+            // instead of installing again. Best effort.
+            if let Err(error) = self.write_preparation_outcome(session_id, &state_path, &record) {
+                crate::warn_unrecorded("record a finished preparation step", Err::<(), _>(error));
+            }
         }
         if let Some(slot) = install_slot.take() {
             slot.release();
@@ -2880,7 +3244,7 @@ impl Broker {
         record.package_store = package_store_report.clone();
         record.runtimes = probes;
         self.release_grant_after_error(
-            write_record(&state_path, &record),
+            self.write_preparation_outcome(session_id, &state_path, &record),
             &mut coordinator,
             &mut grant,
             || {
@@ -6965,15 +7329,26 @@ fn route_preparation_command_failure(
     } = context;
     if matches!(
         error,
-        BrokerOpError::Preparation(
-            PreparationError::CommandOutcomeUnknown { .. }
-                | PreparationError::CleanupUnknown { .. }
-        )
+        BrokerOpError::Preparation(PreparationError::CleanupUnknown { .. })
     ) {
-        // The command may have changed the worktree even when its process is
-        // gone. Keep the durable in-progress record and host lease until an
-        // operator inspects the effects and chooses how to reconcile them.
+        // A process of the step may still run. Keep the durable in-progress
+        // record and quarantine the host lease until an operator inspects
+        // the effects and chooses how to reconcile them.
         quarantine_grant_best_effort(coordinator, grant);
+        return false;
+    }
+    if matches!(
+        error,
+        BrokerOpError::Preparation(PreparationError::CommandOutcomeUnknown { .. })
+    ) {
+        // Cleanup was verified: no process of the step remains, but its
+        // effects are unknown. Keep the in-progress record (which records
+        // only the steps that finished) and release the lease, so the run
+        // reads `interrupted` once this process exits and the next prepare
+        // verifies its finished steps and reruns the rest, as the refusal's
+        // `retry_prepare` action promises. A quarantined lease would hold the
+        // record in progress and refuse that retry.
+        release_grant_best_effort(coordinator, grant);
         return false;
     }
 
@@ -7081,8 +7456,71 @@ fn warn_preparation_cleanup_failure(action: &str, error: &impl std::fmt::Display
 
 fn preparation_storage_with(
     paths: &[PathBuf],
+    unavailable: impl FnMut(&Path) -> Option<String>,
+    headroom: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> Result<(), PreparationError> {
+    preparation_storage_within(
+        paths,
+        unavailable,
+        headroom,
+        crate::DEFAULT_GATE_HEADROOM_BYTES,
+        crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+    )
+}
+
+/// What a running step's heartbeat requires, never the build reserve (which
+/// is checked before each step is dispatched): the install's own volumes
+/// (`install`: the worktree and the shared cache directory) keep
+/// [`outcome_recovery::INSTALL_RESERVE_BYTES`], so an install cannot drive
+/// them to zero; the broker's state (`bookkeeping`: `.aethyme` and the host
+/// resource database) keeps [`outcome_recovery::BOOKKEEPING_RESERVE_BYTES`],
+/// room to record the outcome. Under the build reserve a heartbeat stopped
+/// installs that had run for 20 minutes because the host state disk dipped
+/// to 8 GiB.
+fn require_running_step_storage(
+    main_root: &Path,
+    install: &[PathBuf],
+    bookkeeping: &[PathBuf],
+    binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> Result<(), PreparationError> {
+    running_step_storage_with(
+        install,
+        bookkeeping,
+        crate::verification::removable_volume_unavailable_reason,
+        |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
+    )?;
+    ensure_preparation_cache_root_binding(binding)
+}
+
+/// [`require_running_step_storage`]'s floors, with the probes injected.
+fn running_step_storage_with(
+    install: &[PathBuf],
+    bookkeeping: &[PathBuf],
     mut unavailable: impl FnMut(&Path) -> Option<String>,
     mut headroom: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> Result<(), PreparationError> {
+    preparation_storage_within(
+        install,
+        &mut unavailable,
+        &mut headroom,
+        outcome_recovery::INSTALL_RESERVE_BYTES,
+        outcome_recovery::INSTALL_RESERVE_INODES,
+    )?;
+    preparation_storage_within(
+        bookkeeping,
+        unavailable,
+        headroom,
+        outcome_recovery::BOOKKEEPING_RESERVE_BYTES,
+        outcome_recovery::BOOKKEEPING_RESERVE_INODES,
+    )
+}
+
+fn preparation_storage_within(
+    paths: &[PathBuf],
+    mut unavailable: impl FnMut(&Path) -> Option<String>,
+    mut headroom: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+    required_bytes: u64,
+    required_inodes: u64,
 ) -> Result<(), PreparationError> {
     for path in paths {
         let reason = unavailable(path).or_else(|| {
@@ -7090,8 +7528,8 @@ fn preparation_storage_with(
             crate::disk_headroom::refusal_with_headroom(
                 reading.map(|reading| reading.bytes),
                 reading.and_then(|reading| reading.inodes),
-                crate::DEFAULT_GATE_HEADROOM_BYTES,
-                crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+                required_bytes,
+                required_inodes,
             )
         });
         if let Some(reason) = reason {
@@ -7159,6 +7597,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         shared_cache_background_measurement: None,
         package_store: None,
         runtimes: Vec::new(),
+        retry_after_seconds: None,
     }
 }
 
@@ -7545,6 +7984,7 @@ mod tests {
             step: "deps".into(),
             exit_code: Some(1),
             session_id: 1,
+            output_log: String::new(),
         });
         broker.recover_storage_pressure_after_command_failure(&unrelated, || Ok(()));
         assert!(!broker.artifact_sweep_recovery_requested().unwrap());
@@ -8225,14 +8665,13 @@ mod tests {
         assert_eq!(record.steps[1].outcome, "cancelled");
     }
 
+    /// Only unverified cleanup (a step process may still run) keeps the
+    /// lease quarantined and the retry refused; an unconfirmed outcome with
+    /// verified cleanup is covered by
+    /// `an_unconfirmed_outcome_is_retried_as_its_action_advertises`.
     #[test]
-    fn unknown_command_outcomes_keep_preparation_unresolved_and_retry_blocked() {
+    fn unverified_cleanup_keeps_preparation_unresolved_and_retry_blocked() {
         let errors: Vec<BrokerOpError> = vec![
-            PreparationError::CommandOutcomeUnknown {
-                session_id: 41,
-                reason: "injected lost result".into(),
-            }
-            .into(),
             PreparationError::CleanupUnknown {
                 session_id: 41,
                 reason: "injected unconfirmed cleanup".into(),
@@ -8300,6 +8739,87 @@ mod tests {
         }
     }
 
+    /// An unconfirmed outcome (cleanup verified) advertises a retry with
+    /// `retry_after_seconds: 0`. The retry must not be refused: the lease is
+    /// released, the record still in progress reads `interrupted` once its
+    /// preparer is gone, the retry gate admits it, the cache can be taken
+    /// again, and the steps the run recorded as finished are accepted.
+    #[test]
+    fn an_unconfirmed_outcome_is_retried_as_its_action_advertises() {
+        let owner = tempfile::tempdir().unwrap();
+        let db = owner.path().join("host-resources.db");
+        let mut coordinator = Some(HostResourceCoordinator::open(&db).unwrap());
+        // The preparer is a process that has already exited.
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = exited.id();
+        exited.wait().unwrap();
+        let mut request = preparation_failure_test_request("unconfirmed");
+        request.holder_pid = Some(dead_pid);
+        let mut grant = Some(coordinator.as_mut().unwrap().acquire(&request).unwrap());
+        let session_id = 43;
+        let mut record = in_progress_test_record(session_id, grant.as_ref().unwrap());
+        record.steps = vec![PreparationStepTiming {
+            index: 0,
+            name: "dependencies".into(),
+            outcome: "ok".into(),
+            ..PreparationStepTiming::default()
+        }];
+        let state_path = record_path(owner.path(), session_id);
+        write_record(&state_path, &record).unwrap();
+        let (lease_id, generation) = (
+            record.host_lease_id.clone().unwrap(),
+            record.host_lease_generation.unwrap(),
+        );
+        let error: BrokerOpError = PreparationError::CommandOutcomeUnknown {
+            session_id,
+            reason: "injected lost result".into(),
+        }
+        .into();
+
+        let restart_storage_worker = route_preparation_command_failure(
+            &error,
+            PreparationCommandFailureContext {
+                step: "build",
+                state_path: &state_path,
+                record: &mut record,
+                coordinator: &mut coordinator,
+                grant: &mut grant,
+                exit_code: None,
+                write_exit_code: false,
+            },
+            |_| panic!("unknown outcomes must not trigger storage recovery"),
+        );
+
+        assert!(!restart_storage_worker);
+        assert!(grant.is_none());
+        let persisted = read_record(&state_path).unwrap().unwrap();
+        assert_eq!(persisted.state, PreparationState::InProgress);
+        assert!(
+            lease_released_in(&db, &lease_id, generation),
+            "the lease is released, so the run reads interrupted"
+        );
+        ensure_preparation_retry_allowed(session_id, PreparationState::Interrupted)
+            .expect("the advertised retry is admitted");
+        assert_eq!(
+            outcome_recovery::uncertain_outcome_verdict(
+                PreparationState::Interrupted,
+                Some(&persisted),
+                &persisted.source_digest,
+                &[],
+                false,
+                &["dependencies"],
+            ),
+            outcome_recovery::UncertainVerdict::AcceptComplete
+        );
+        let mut retry = preparation_failure_test_request("unconfirmed-retry");
+        retry.run_id = "unconfirmed-retry-run".into();
+        coordinator
+            .as_mut()
+            .unwrap()
+            .acquire(&retry)
+            .expect("the cache is free for the retry");
+    }
+
     #[test]
     fn known_command_failure_records_failed_state_and_releases_lease() {
         let owner = tempfile::tempdir().unwrap();
@@ -8317,6 +8837,7 @@ mod tests {
             step: "dependencies".into(),
             exit_code: Some(17),
             session_id,
+            output_log: String::new(),
         }
         .into();
 

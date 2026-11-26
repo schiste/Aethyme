@@ -198,6 +198,10 @@ const DELETER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(
 pub(crate) const TRASH_CATCHUP_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
 /// The gap between catch-up slices.
 const TRASH_CATCHUP_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+/// The gap between catch-up slices while foreground work (a dependency
+/// install, a gate) writes to a volume the trash is on: the lane keeps
+/// reclaiming, but leaves the disk to the work an agent waits on.
+const TRASH_CATCHUP_FOREGROUND_GAP: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long the catch-up lane keeps retrying a deleter lock held elsewhere
 /// before it ends.
 const TRASH_CATCHUP_BUSY_MAX: std::time::Duration = std::time::Duration::from_secs(120);
@@ -368,6 +372,17 @@ impl TrashCatchupReport {
             lane_held_by_own_repository: false,
         }
     }
+}
+
+/// The volumes (device numbers) the trash rows' entries are on, each once.
+fn trash_row_devices(rows: &crate::checkout_trash::TrashRows) -> Vec<u64> {
+    let mut devices: Vec<u64> = rows
+        .values()
+        .flat_map(|entries| entries.values().map(|row| row.device))
+        .collect();
+    devices.sort_unstable();
+    devices.dedup();
+    devices
 }
 
 /// How one trash drain takes the deleter lock and paces itself.
@@ -4677,12 +4692,30 @@ impl Broker {
         self.clear_own_catchup_lane_waiter(dir);
         let deleter_lock = dir.join(crate::checkout_trash::DELETER_LOCK_FILE);
         let mut busy_since: Option<Instant> = None;
+        // Foreground-first I/O: the disk policy this process had when the
+        // lap began, and whether it has dropped to the throttle for
+        // foreground work on a trash volume.
+        let base_io_policy = crate::gc::current_io_policy();
+        let mut io_yielding = false;
         report.end = loop {
             let now = Instant::now();
             if now >= end_at {
                 break TrashCatchupEnd::Cap;
             }
             let rows = self.checkout_trash_rows();
+            let foreground_active = crate::foreground_io::active_on(&trash_row_devices(&rows));
+            if foreground_active {
+                crate::phase_telemetry::add(
+                    "checkout_trash_catchup_yielded_to_foreground",
+                    std::time::Duration::ZERO,
+                );
+            }
+            if let Some(target) =
+                crate::gc::trash_deleter_io_switch(base_io_policy, io_yielding, foreground_active)
+                && crate::gc::set_trash_deleter_io_yield(target)
+            {
+                io_yielding = target;
+            }
             let deletable = self.checkout_trash_deletable_backlog(&rows);
             let done = if until_empty {
                 deletable.entries == 0
@@ -4739,11 +4772,21 @@ impl Broker {
                 break TrashCatchupEnd::NoProgress;
             }
             // Let a retirement drain (this repository's next run, or
-            // another repository's) take the deleter lock.
-            std::thread::sleep(
-                TRASH_CATCHUP_GAP.min(end_at.saturating_duration_since(Instant::now())),
-            );
+            // another repository's) take the deleter lock; leave the disk to
+            // foreground work for longer.
+            let gap = if foreground_active {
+                TRASH_CATCHUP_FOREGROUND_GAP
+            } else {
+                TRASH_CATCHUP_GAP
+            };
+            std::thread::sleep(gap.min(end_at.saturating_duration_since(Instant::now())));
         };
+        if io_yielding && crate::gc::set_trash_deleter_io_yield(false) {
+            crate::phase_telemetry::add(
+                "checkout_trash_catchup_io_restored",
+                std::time::Duration::ZERO,
+            );
+        }
         report.elapsed = started.elapsed();
         crate::phase_telemetry::add(
             match report.end {

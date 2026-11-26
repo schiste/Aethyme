@@ -2414,6 +2414,36 @@ fn parse_graph_snapshot_inventory(bytes: &[u8]) -> Result<(u64, u64), GitError> 
     Ok((allocated_bytes, inodes))
 }
 
+/// Parse `git log --name-only -z --format=%x01%H` output (newest first)
+/// into the commits that changed each wanted path, oldest first, keeping at
+/// most the `per_path` newest commits per path.
+fn commits_touching_paths_from_log(
+    output: &str,
+    wanted: &BTreeSet<&str>,
+    per_path: usize,
+) -> BTreeMap<String, Vec<String>> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut commit: Option<&str> = None;
+    for token in output.split('\0') {
+        let token = token.trim_start_matches('\n');
+        if let Some(hash) = token.strip_prefix('\u{1}') {
+            commit = Some(hash.trim());
+            continue;
+        }
+        let (Some(commit), true) = (commit, wanted.contains(token)) else {
+            continue;
+        };
+        let entry = found.entry(token.to_string()).or_default();
+        if entry.len() < per_path && entry.last().map(String::as_str) != Some(commit) {
+            entry.push(commit.to_string());
+        }
+    }
+    for commits in found.values_mut() {
+        commits.reverse();
+    }
+    found
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     if active_git_deadline().is_some() || GRAPH_VERIFICATION_GIT.with(std::cell::Cell::get) {
         return run_git_inner(cwd, None, args);
@@ -8160,6 +8190,50 @@ impl GitRepo {
             });
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// First-parent commits in `from..to` that changed each of `paths`,
+    /// oldest first, from ONE bounded `git log` (at most `max_commits`
+    /// newest first-parent commits, at most `per_path` commits kept per
+    /// path). Merges are compared with their first parent, so a change a
+    /// merge brought in from its side branch is attributed to the merge.
+    ///
+    /// This replaces a walk that spawned two Git processes per commit per
+    /// path: on a merge-heavy history with an old merge base and several
+    /// conflicting paths it ran for over an hour inside `broker submit`.
+    pub(crate) fn first_parent_commits_touching_paths(
+        &self,
+        from: &str,
+        to: &str,
+        paths: &[String],
+        max_commits: usize,
+        per_path: usize,
+        budget: Duration,
+    ) -> Result<BTreeMap<String, Vec<String>>, GitError> {
+        if paths.is_empty() || per_path == 0 {
+            return Ok(BTreeMap::new());
+        }
+        let wanted: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+        let range = format!("{from}..{to}");
+        let max = format!("--max-count={max_commits}");
+        let output = run_git_own_bound(
+            &self.root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "log",
+                "--first-parent",
+                "--diff-merges=first-parent",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "--format=%x01%H",
+                &max,
+                &range,
+            ],
+            budget,
+        )?;
+        Ok(commits_touching_paths_from_log(&output, &wanted, per_path))
     }
 
     /// Read one commit's complete message without diff or decoration.
@@ -17135,5 +17209,93 @@ exit $status
         let dir = victim(&f);
         assert!(crate::removal::remove_tree(&dir).removed);
         assert!(ensure_fresh_git_verdict().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod conflict_history_tests {
+    use super::*;
+
+    #[test]
+    fn commits_touching_paths_parse_newest_first_log_into_oldest_first_lists() {
+        let wanted: BTreeSet<&str> = ["a.txt", "dir/b c.txt"].into_iter().collect();
+        let log =
+            "\u{1}c3\n\0a.txt\0other\0\u{1}c2\n\0dir/b c.txt\0\u{1}c1\n\0a.txt\0dir/b c.txt\0";
+        let found = commits_touching_paths_from_log(log, &wanted, 10);
+        assert_eq!(found["a.txt"], vec!["c1".to_string(), "c3".to_string()]);
+        assert_eq!(
+            found["dir/b c.txt"],
+            vec!["c1".to_string(), "c2".to_string()]
+        );
+        let capped = commits_touching_paths_from_log(log, &wanted, 1);
+        assert_eq!(capped["a.txt"], vec!["c3".to_string()]);
+    }
+
+    #[test]
+    fn first_parent_commits_touching_paths_attributes_merged_side_changes_to_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let head = || {
+            String::from_utf8(
+                std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "0").unwrap();
+        std::fs::write(root.join("b.txt"), "0").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let base = head();
+        std::fs::write(root.join("a.txt"), "1").unwrap();
+        git(&["commit", "-qam", "touch a"]);
+        let touch_a = head();
+        git(&["checkout", "-qb", "side"]);
+        std::fs::write(root.join("b.txt"), "side").unwrap();
+        git(&["commit", "-qam", "side touches b"]);
+        git(&["checkout", "-q", "main"]);
+        git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        let merge = head();
+        let repo = GitRepo::discover(root).unwrap();
+        let found = repo
+            .first_parent_commits_touching_paths(
+                &base,
+                &merge,
+                &[
+                    "a.txt".to_string(),
+                    "b.txt".to_string(),
+                    "c.txt".to_string(),
+                ],
+                100,
+                10,
+                Duration::from_secs(20),
+            )
+            .unwrap();
+        assert_eq!(found.get("a.txt"), Some(&vec![touch_a]));
+        assert_eq!(found.get("b.txt"), Some(&vec![merge]));
+        assert!(!found.contains_key("c.txt"));
     }
 }
