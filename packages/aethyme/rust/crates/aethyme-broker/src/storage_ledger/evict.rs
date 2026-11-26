@@ -74,7 +74,7 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
+pub(super) fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
     Candidate {
         class: item.class,
         root_kind: item.root_kind,
@@ -176,11 +176,11 @@ pub fn plan(
             }
             Policy::GateCache => over.extend(plan_gate_cache(item, budgets, pressing)),
             Policy::RecoveryArchives => {
-                let budget = if pressing {
-                    0
-                } else {
-                    budgets.recovery_archives_bytes
-                };
+                // Pressure does not empty this budget: below a volume's
+                // floor, the archive floor removes the oldest removable
+                // archives only until free space is back at it, paced
+                // (`archive_floor`), instead of every landed one at once.
+                let budget = budgets.recovery_archives_bytes;
                 let over_budget = class_bytes.get(&item.class).copied().unwrap_or(0) > budget;
                 // Oldest by manifest creation; one without it is kept.
                 let mut children: Vec<(&Child, u64)> = item

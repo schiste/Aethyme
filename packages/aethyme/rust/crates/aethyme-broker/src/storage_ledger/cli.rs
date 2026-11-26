@@ -334,6 +334,9 @@ fn status(json_output: bool) -> u8 {
     if value["updated_at_ms"].as_u64().unwrap_or(0) == 0 {
         println!("storage: not measured yet (the worker starts with the next broker command)");
     }
+    if let Some(error) = value["budget_error"].as_str() {
+        println!("Warning: {error}; default storage budgets in use");
+    }
     // Roots and one total first.
     let total: u64 = value["classes"]
         .as_object()
@@ -581,11 +584,34 @@ pub(super) fn unlanded_archive_evidence(archives: &[String]) -> Vec<String> {
     evidence
 }
 
+/// `storage.budget-config-invalid`: `storage.toml` cannot be read, so the
+/// worker runs on default budgets (an older binary on the host rejects keys
+/// it does not know in the same way).
+fn budget_config_invalid_advice(error: String) -> crate::StatusAdvice {
+    crate::StatusAdvice {
+        id: "storage.budget-config-invalid",
+        severity: crate::StatusAdviceSeverity::Warning,
+        reason: "the host's storage.toml cannot be read; the storage worker runs on default budgets until it is fixed",
+        summary: "storage.toml is invalid: default storage budgets in use".into(),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![error],
+        commands: vec!["aethyme storage status".into()],
+    }
+}
+
 /// `broker status` advice: over budget, below floor, unclassified. Class
 /// names and sizes only; archive ids are paths inside Aethyme's own root.
 pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
     let summary = Summary::load(host_state);
     let mut advice = Vec::new();
+    if let (_, Some(error)) = Budgets::load(host_state) {
+        crate::phase_telemetry::add(
+            "storage_budget_config_invalid_advised",
+            std::time::Duration::ZERO,
+        );
+        advice.push(budget_config_invalid_advice(error));
+    }
     if !summary.over_budget.is_empty() {
         let mut evidence: Vec<String> = summary
             .over_budget
