@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use crate::file_lock::open_command_metrics_lock;
 
 use super::{
-    metric_row_timestamp, open_regular_file_nonblocking, retained_metric_bytes_until,
+    metric_row_verdict, open_regular_file_nonblocking, retained_metric_bytes_until,
     same_regular_file_version,
 };
 
@@ -256,19 +256,16 @@ impl RowCounts {
     /// so a malformed or timestamp-free line is kept. `newest` tracks the
     /// latest `ts` seen.
     fn keep(&mut self, line: &[u8], cutoff: i64, newest: &mut Option<i64>) -> bool {
-        let timestamp = metric_row_timestamp(line);
+        let (expired, timestamp) = metric_row_verdict(line, cutoff);
         if let Some(timestamp) = timestamp {
             *newest = Some(newest.map_or(timestamp, |seen| seen.max(timestamp)));
         }
-        match timestamp {
-            Some(timestamp) if timestamp < cutoff => {
-                self.removed = self.removed.saturating_add(1);
-                false
-            }
-            _ => {
-                self.kept = self.kept.saturating_add(1);
-                true
-            }
+        if expired {
+            self.removed = self.removed.saturating_add(1);
+            false
+        } else {
+            self.kept = self.kept.saturating_add(1);
+            true
         }
     }
 }

@@ -2964,11 +2964,71 @@ where
 }
 
 /// A command metric row's `ts`, or `None` for a malformed or timestamp-free
-/// line. Every trim (reviewed or unattended) classifies rows with this rule.
+/// line.
 fn metric_row_timestamp(line: &[u8]) -> Option<i64> {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
         .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64))
+}
+
+/// The `ts` of a row that starts `{"ts":<integer>,` (or `}`), the shape the
+/// broker writes, without parsing the rest; `None` for any other start, so
+/// the caller falls back to the full parse.
+fn leading_metric_row_timestamp(line: &[u8]) -> Option<i64> {
+    let rest = line.strip_prefix(b"{\"ts\":")?;
+    let (negative, digits) = match rest.strip_prefix(b"-") {
+        Some(digits) => (true, digits),
+        None => (false, rest),
+    };
+    let length = digits
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if length == 0 || (length > 1 && digits[0] == b'0') {
+        return None;
+    }
+    if !matches!(digits.get(length), Some(b',' | b'}')) {
+        return None;
+    }
+    let mut value = 0_i64;
+    for digit in &digits[..length] {
+        value = value
+            .checked_mul(10)?
+            .checked_add(i64::from(digit - b'0'))?;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// One row's trim verdict: whether it is removed (a well-formed row whose
+/// `ts` is older than `cutoff`), and the `ts` it carries for the newest-row
+/// clock check. Every trim (reviewed or unattended) classifies rows with
+/// this rule; a malformed or timestamp-free line is always kept.
+///
+/// Measured on 2026-11-26, parsing every row into a JSON tree staged a
+/// 508 MB log at 3.5 MB/s inside a background worker, so the unattended
+/// trim never finished in its budget. A row in the broker's own shape is
+/// now classified from its leading `ts`: a row inside retention is kept
+/// without being parsed (keeping is the verdict a malformed line gets
+/// too), and a row about to be removed is still checked to be well-formed
+/// JSON, without building a tree, so a damaged line is never dropped.
+fn metric_row_verdict(line: &[u8], cutoff: i64) -> (bool, Option<i64>) {
+    match leading_metric_row_timestamp(line) {
+        Some(timestamp) if timestamp >= cutoff => (false, Some(timestamp)),
+        Some(timestamp) => {
+            if serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok() {
+                (true, Some(timestamp))
+            } else {
+                (false, None)
+            }
+        }
+        None => {
+            let timestamp = metric_row_timestamp(line);
+            (
+                timestamp.is_some_and(|timestamp| timestamp < cutoff),
+                timestamp,
+            )
+        }
+    }
 }
 
 fn retained_metric_bytes_until(
@@ -2983,10 +3043,10 @@ fn retained_metric_bytes_until(
         if deadline_expired(deadline) {
             return None;
         }
-        match metric_row_timestamp(line) {
-            Some(timestamp) if timestamp < cutoff => removed = true,
-            Some(_) => after.extend_from_slice(line),
-            None => {
+        match metric_row_verdict(line, cutoff) {
+            (true, _) => removed = true,
+            (false, Some(_)) => after.extend_from_slice(line),
+            (false, None) => {
                 malformed_lines = malformed_lines.saturating_add(1);
                 after.extend_from_slice(line);
             }
@@ -19839,6 +19899,78 @@ mod tests {
         .unwrap()
         .expect("a fresh positive pass completes after the partial pass");
         assert_eq!(complete, content);
+    }
+
+    #[test]
+    fn leading_metric_row_timestamp_reads_only_the_brokers_row_shape() {
+        assert_eq!(
+            leading_metric_row_timestamp(b"{\"ts\":42,\"a\":1}\n"),
+            Some(42)
+        );
+        assert_eq!(leading_metric_row_timestamp(b"{\"ts\":42}\n"), Some(42));
+        assert_eq!(
+            leading_metric_row_timestamp(b"{\"ts\":-7,\"a\":1}"),
+            Some(-7)
+        );
+        assert_eq!(leading_metric_row_timestamp(b"{\"ts\":0}"), Some(0));
+        for other in [
+            &b"{\"ts\": 42}"[..],
+            b"{ \"ts\":42}",
+            b"{\"a\":1,\"ts\":42}",
+            b"{\"ts\":4.2}",
+            b"{\"ts\":4e2}",
+            b"{\"ts\":042}",
+            b"{\"ts\":42",
+            b"{\"ts\":\"42\"}",
+            b"{\"ts\":-}",
+            b"{\"ts\":99999999999999999999}",
+            b"not-json",
+        ] {
+            assert_eq!(leading_metric_row_timestamp(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn metric_row_verdict_never_removes_a_damaged_or_timestamp_free_line() {
+        // Expired and well-formed: removed.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"a\":[1]}\n", 2),
+            (true, Some(1))
+        );
+        // Expired by its leading ts but damaged later: kept, as malformed.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"a\":[1\n", 2),
+            (false, None)
+        );
+        // Inside retention: kept without being parsed.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":3,\"a\":[1\n", 2),
+            (false, Some(3))
+        );
+        // Other shapes take the full parse, with the same verdicts as before.
+        assert_eq!(
+            metric_row_verdict(b"{\"a\":1,\"ts\":1}\n", 2),
+            (true, Some(1))
+        );
+        assert_eq!(metric_row_verdict(b"{ \"ts\": 3 }\n", 2), (false, Some(3)));
+        assert_eq!(metric_row_verdict(b"{\"ts\":1.5}\n", 2), (false, None));
+        assert_eq!(metric_row_verdict(b"{}\n", 2), (false, None));
+        assert_eq!(metric_row_verdict(b"not-json\n", 2), (false, None));
+    }
+
+    #[test]
+    fn metric_row_verdict_matches_the_full_parse_on_well_formed_rows() {
+        let cutoff = 1_000;
+        for ts in [-5_i64, 0, 999, 1_000, 1_001, i64::MAX] {
+            let row = format!("{{\"ts\":{ts},\"command\":\"gc\",\"n\":{{\"x\":[1,2]}}}}\n");
+            let full = metric_row_timestamp(row.as_bytes());
+            let expected = (full.is_some_and(|value| value < cutoff), full);
+            assert_eq!(
+                metric_row_verdict(row.as_bytes(), cutoff),
+                expected,
+                "{row}"
+            );
+        }
     }
 
     #[test]
