@@ -442,16 +442,39 @@ pub(super) fn resumable_temporary(store: &crate::BrokerStore, log: &Path) -> Opt
 
 /// Whether `resume` is expired at `now_ms` ([`StagingResume::expired`]);
 /// when it is, its temporary (a regular file with a trim temporary's name,
-/// beside `log`) is removed and the expiry counted.
+/// beside `log`) is removed, unless it was modified within
+/// [`STALE_TEMPORARY_MIN_AGE`] (a trim may be staging into it: the
+/// stale-temporary sweep removes it later), and the expiry counted.
 fn expire_resume_if_old(resume: &StagingResume, log: &Path, now_ms: i64) -> bool {
     if !resume.expired(now_ms) {
         return false;
     }
     crate::phase_telemetry::add("command_metrics_trim_resume_expired", Duration::ZERO);
     if let Some(temporary) = resume.temporary_path(log) {
-        remove_recorded_temporary(&temporary);
+        if modified_at_least(
+            &temporary,
+            STALE_TEMPORARY_MIN_AGE,
+            std::time::SystemTime::now(),
+        ) {
+            remove_recorded_temporary(&temporary);
+        } else {
+            crate::phase_telemetry::add(
+                "command_metrics_trim_resume_expired_recently_modified",
+                Duration::ZERO,
+            );
+        }
     }
     true
+}
+
+/// Whether the file at `path` was last modified at least `age` before
+/// `now`. A missing file or an unreadable time is not.
+fn modified_at_least(path: &Path, age: Duration, now: std::time::SystemTime) -> bool {
+    std::fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 /// `resume`'s temporary, while the record still describes the log at `log`
@@ -2425,8 +2448,25 @@ mod tests {
         );
         assert!(temporary.exists());
 
-        // A day old: not spared, the temporary removed, the record cleared.
+        // A day old but its temporary just written: not spared, the record
+        // cleared, but the temporary stays for the stale-temporary sweep
+        // (a trim may be staging into it).
         resume.recorded_at_ms = now - RESUME_SPARE_MAX_AGE_MS - 1;
+        broker
+            .store_ref()
+            .meta_set(UNATTENDED_TRIM_RESUME_KEY, &resume.to_json())
+            .unwrap();
+        assert_eq!(resumable_temporary(broker.store_ref(), &path), None);
+        assert!(temporary.exists(), "a recently modified temporary stays");
+
+        // A day old and quiet for the guard: the temporary removed, the
+        // record cleared.
+        std::fs::File::options()
+            .write(true)
+            .open(&temporary)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_TEMPORARY_MIN_AGE)
+            .unwrap();
         broker
             .store_ref()
             .meta_set(UNATTENDED_TRIM_RESUME_KEY, &resume.to_json())

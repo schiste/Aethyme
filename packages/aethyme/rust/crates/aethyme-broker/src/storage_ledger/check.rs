@@ -1054,6 +1054,16 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     // Entries and bytes removed per class this pass, and why it stopped.
     let mut evicted_by_class: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     let mut eviction_stop = "done";
+    // Kinds of root under pressure only because a volume was below its free
+    // floor: once a removal brings that volume back above it, pressure no
+    // longer justifies removals there (finding (c) of #2041).
+    let mut floor_pressed: BTreeSet<RootKind> = aggressive
+        .iter()
+        .copied()
+        .filter(|kind| {
+            ledger.root_bytes().get(kind).copied().unwrap_or(0) <= inputs.budgets.root_total(*kind)
+        })
+        .collect();
     for candidate in candidates {
         let age_expiry =
             candidate.class == Class::RecoveryArchives && candidate.reason == Reason::Expired;
@@ -1143,8 +1153,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                 removed.0 += 1;
                 removed.1 = removed.1.saturating_add(candidate.bytes);
                 if candidate.class == Class::ToolCaches
-                    && candidate.relative.split('/').next()
-                        == Some(crate::node_compile_cache::CACHE_DIRECTORY)
+                    && is_node_compile_cache_day(&candidate.relative, now)
                 {
                     crate::phase_telemetry::add(
                         "storage_node_compile_cache_day_evicted",
@@ -1170,6 +1179,18 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                     }
                 }
                 forget(&mut ledger, &candidate);
+                if candidate.reason == Reason::OverBudget
+                    && floor_pressed.contains(&candidate.root_kind)
+                    && (inputs.free)(&candidate.root)
+                        .is_some_and(|(free, _)| free >= inputs.budgets.free_floor_bytes)
+                {
+                    floor_pressed.remove(&candidate.root_kind);
+                    aggressive.remove(&candidate.root_kind);
+                    crate::phase_telemetry::add(
+                        "storage_eviction_pressure_relieved",
+                        Duration::ZERO,
+                    );
+                }
             }
             Err(error) => report
                 .skipped
@@ -1195,6 +1216,20 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             "stop": eviction_stop,
         }),
     );
+    // The artifact max age outside the ledger's classes: Cargo targets in
+    // session scratch directories and main checkouts, leftover worktree
+    // roots.
+    phase = Instant::now();
+    report.artifact_age = super::artifact_age::run(
+        &ledger.roots,
+        &inputs.budgets,
+        Instant::now() + super::artifact_age::ARTIFACT_AGE_BUDGET,
+        inputs.pace,
+        lock.as_deref_mut(),
+    );
+    report
+        .phases_ms
+        .insert("artifact_age".into(), elapsed(phase));
     // The recovery archive floor, after the cheaper classes had their turn.
     phase = Instant::now();
     let archive_floor = archive_floor_pass(
@@ -1347,6 +1382,19 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     };
     summary.save(inputs.host_state)?;
     Ok(ledger)
+}
+
+/// Whether `relative` (`<entry>/<child>`) is a day directory of the
+/// Node.js compile cache (`node-compile-cache/d<days>`): what
+/// `storage_node_compile_cache_day_evicted` counts.
+pub(super) fn is_node_compile_cache_day(relative: &str, now: u64) -> bool {
+    let mut parts = relative.split('/');
+    parts.next() == Some(crate::node_compile_cache::CACHE_DIRECTORY)
+        && parts
+            .next()
+            .and_then(|child| crate::node_compile_cache::past_day(child, now))
+            .is_some()
+        && parts.next().is_none()
 }
 
 /// Drop a removed entry or child from the ledger.
