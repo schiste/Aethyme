@@ -31,6 +31,16 @@
 //! Anything unexpected (an unreadable entry, a name that is not a cargo unit,
 //! a rename that fails) is left in place; the caller still rotates the tree
 //! when pruning did not bring it under its ceiling.
+//!
+//! [`UnitScope::LocalPackages`] (the storage worker's prune of an over-budget
+//! gate cache) limits candidates to local packages -- workspace members and
+//! other path packages -- by the target's own records: a unit's dep-info file
+//! (`deps/<name>-<hash>.d`) lists the sources it was built from, and cargo
+//! builds a registry or git dependency from its own source directories
+//! (`<cargo home>/registry/src/...`, `<cargo home>/git/checkouts/...`). A
+//! package is local only when some candidate unit's dep-info names sources
+//! and none names a registry or git source; a package without readable
+//! dep-info is never a candidate.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,10 +62,24 @@ pub(crate) struct PruneOutcome {
     /// The staged units as `<profile>/.fingerprint/<package>-<hash>`
     /// relative to the target, to tell later whether cargo rebuilt one.
     pub(crate) staged: Vec<String>,
+    /// Superseded units left alone because their package is not local
+    /// ([`UnitScope::LocalPackages`] only; not counted in `candidates`).
+    pub(crate) not_local: u64,
+}
+
+/// Which superseded units may be pruned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitScope {
+    /// Any package's.
+    Any,
+    /// Only local packages' (workspace members and other path packages), by
+    /// their dep-info files.
+    LocalPackages,
 }
 
 struct Unit {
     profile: PathBuf,
+    package: String,
     profile_name: String,
     directory_name: String,
     hash: String,
@@ -81,13 +105,31 @@ pub(crate) fn prune_superseded_units(
     wanted_bytes: u64,
     deadline: Instant,
 ) -> PruneOutcome {
+    prune_superseded_units_in(target, staging, wanted_bytes, deadline, UnitScope::Any)
+}
+
+/// [`prune_superseded_units`] limited to the units `scope` admits.
+pub(crate) fn prune_superseded_units_in(
+    target: &Path,
+    staging: &Path,
+    wanted_bytes: u64,
+    deadline: Instant,
+    scope: UnitScope,
+) -> PruneOutcome {
     let mut outcome = PruneOutcome::default();
     if wanted_bytes == 0 {
         return outcome;
     }
     let mut candidates = Vec::new();
     for profile in profiles(target) {
-        candidates.extend(superseded_units(&profile));
+        let mut found = superseded_units(&profile);
+        if scope == UnitScope::LocalPackages {
+            let local = local_packages(&profile, &found);
+            let before = found.len();
+            found.retain(|unit| local.contains(&unit.package));
+            outcome.not_local += (before - found.len()) as u64;
+        }
+        candidates.extend(found);
     }
     outcome.candidates = candidates.len() as u64;
     candidates.sort_by(|left, right| {
@@ -225,6 +267,7 @@ fn superseded_units(profile: &Path) -> Vec<Unit> {
             .or_default()
             .push(Unit {
                 profile: profile.to_path_buf(),
+                package: package.to_string(),
                 profile_name: profile_name.clone(),
                 directory_name: name.clone(),
                 hash: hash.to_string(),
@@ -297,6 +340,90 @@ fn fingerprint_facts(directory: &Path) -> Option<FingerprintFacts> {
     }
     facts.kinds.sort();
     Some(facts)
+}
+
+/// Where a unit's sources came from, by its dep-info file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceOrigin {
+    /// A path package: a workspace member or another local package.
+    Local,
+    /// A registry or git dependency.
+    External,
+}
+
+/// Path fragments of the source directories cargo builds registry and git
+/// dependencies from, under its home.
+const EXTERNAL_SOURCE_MARKERS: [&str; 2] = ["/registry/src/", "/git/checkouts/"];
+
+/// The most of a dep-info file read to judge it.
+const DEP_INFO_READ_LIMIT: u64 = 256 * 1024;
+
+/// The origin a dep-info file's text gives: the sources of its first rule
+/// (`<output>: <source> ...`). `None` when it names none.
+fn origin_of_dep_info(text: &str) -> Option<SourceOrigin> {
+    let (_, sources) = text.lines().next()?.split_once(": ")?;
+    let sources = sources.trim();
+    if sources.is_empty() {
+        return None;
+    }
+    let sources = sources.replace('\\', "/");
+    Some(
+        if EXTERNAL_SOURCE_MARKERS
+            .iter()
+            .any(|marker| sources.contains(marker))
+        {
+            SourceOrigin::External
+        } else {
+            SourceOrigin::Local
+        },
+    )
+}
+
+/// The origin of the dep-info file at `path`, `None` when it cannot be read
+/// or names no source.
+fn dep_info_origin(path: &Path) -> Option<SourceOrigin> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(DEP_INFO_READ_LIMIT)
+        .read_to_string(&mut text)
+        .ok()?;
+    origin_of_dep_info(&text)
+}
+
+/// The packages of `units` (one profile's) that are local: some unit's
+/// dep-info in `deps/` names local sources and none names an external one.
+fn local_packages(profile: &Path, units: &[Unit]) -> std::collections::BTreeSet<String> {
+    let outputs = outputs_by_hash(&profile.join("deps"));
+    let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
+    for unit in units {
+        let origin = outputs
+            .get(&unit.hash)
+            .into_iter()
+            .flatten()
+            .filter(|output| {
+                output
+                    .path
+                    .extension()
+                    .is_some_and(|extension| extension == "d")
+            })
+            .find_map(|output| dep_info_origin(&output.path));
+        match origin {
+            Some(SourceOrigin::External) => {
+                verdicts.insert(&unit.package, false);
+            }
+            Some(SourceOrigin::Local) => {
+                verdicts.entry(&unit.package).or_insert(true);
+            }
+            None => {}
+        }
+    }
+    verdicts
+        .into_iter()
+        .filter(|(_, local)| *local)
+        .map(|(package, _)| package.to_string())
+        .collect()
 }
 
 /// Entries of `deps/` or `examples/` by the unit hash in their name:
@@ -550,6 +677,110 @@ mod tests {
         assert_eq!(outcome.units, 0);
         assert!(outcome.deadline_stopped);
         assert!(profile.join(format!(".fingerprint/first-{OLD}")).exists());
+    }
+
+    fn dep_info(profile: &Path, package: &str, hash: &str, source: &str) {
+        let crate_name = package.replace('-', "_");
+        let deps = profile.join("deps");
+        std::fs::write(
+            deps.join(format!("{crate_name}-{hash}.d")),
+            format!(
+                "{}: {source}\n\n{source}:\n",
+                deps.join(format!("lib{crate_name}-{hash}.rlib")).display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_dep_info_names_a_local_or_an_external_origin() {
+        use SourceOrigin::*;
+        for (text, origin) in [
+            (
+                "/t/deps/libx-1.rlib: crates/x/src/lib.rs crates/x/src/a.rs\n",
+                Some(Local),
+            ),
+            (
+                "/t/deps/libx-1.rlib: /repo/crates/x/src/lib.rs\n",
+                Some(Local),
+            ),
+            (
+                "/t/deps/libserde-1.rlib: /home/u/.cargo/registry/src/index.crates.io-1/serde-1.0.0/src/lib.rs\n",
+                Some(External),
+            ),
+            (
+                "/t/deps/libdep-1.rlib: /home/u/.cargo/git/checkouts/dep-1/abc/src/lib.rs\n",
+                Some(External),
+            ),
+            (
+                "C:\\t\\deps\\libx-1.rlib: C:\\Users\\u\\.cargo\\registry\\src\\i\\x-1\\src\\lib.rs\n",
+                Some(External),
+            ),
+            ("/t/deps/libx-1.rlib:\n", None),
+            ("", None),
+            ("not a rule\n", None),
+        ] {
+            assert_eq!(origin_of_dep_info(text), origin, "{text}");
+        }
+    }
+
+    /// The storage worker's scope prunes superseded units of local packages
+    /// only: never a registry dependency's, nor a package whose dep-info
+    /// cannot tell.
+    #[test]
+    fn the_local_scope_prunes_only_superseded_local_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let staging = tmp.path().join("staging");
+        let profile = target.join("debug");
+        // Unit hashes are unique in a cargo target.
+        const DEP_OLD: &str = "1111111111111111";
+        const DEP_NEW: &str = "2222222222222222";
+        const UNKNOWN_OLD: &str = "3333333333333333";
+        const UNKNOWN_NEW: &str = "4444444444444444";
+        unit(&profile, "work-crate", OLD, 10, 20, 1_000);
+        unit(&profile, "work-crate", NEW, 100, 110, 1_000);
+        dep_info(&profile, "work-crate", OLD, "crates/work-crate/src/lib.rs");
+        unit(&profile, "registry-dep", DEP_OLD, 10, 20, 500);
+        unit(&profile, "registry-dep", DEP_NEW, 100, 110, 500);
+        dep_info(
+            &profile,
+            "registry-dep",
+            DEP_OLD,
+            "/home/u/.cargo/registry/src/index.crates.io-1/registry-dep-1.0.0/src/lib.rs",
+        );
+        // An empty dep-info says nothing: the package is not judged local.
+        unit(&profile, "unknown", UNKNOWN_OLD, 10, 20, 300);
+        unit(&profile, "unknown", UNKNOWN_NEW, 100, 110, 300);
+        std::fs::write(profile.join(format!("deps/unknown-{UNKNOWN_OLD}.d")), "").unwrap();
+
+        let outcome = prune_superseded_units_in(
+            &target,
+            &staging,
+            u64::MAX,
+            later(),
+            UnitScope::LocalPackages,
+        );
+
+        assert_eq!(outcome.candidates, 1);
+        assert_eq!(outcome.not_local, 2);
+        assert_eq!(
+            outcome.staged,
+            vec![format!("debug/.fingerprint/work-crate-{OLD}")]
+        );
+        assert!(
+            !profile
+                .join(format!("deps/libwork_crate-{OLD}.rlib"))
+                .exists()
+        );
+        for kept in [
+            format!(".fingerprint/work-crate-{NEW}"),
+            format!(".fingerprint/registry-dep-{DEP_OLD}"),
+            format!("deps/libregistry_dep-{DEP_OLD}.rlib"),
+            format!(".fingerprint/unknown-{UNKNOWN_OLD}"),
+        ] {
+            assert!(profile.join(&kept).exists(), "{kept} must be kept");
+        }
     }
 
     #[test]

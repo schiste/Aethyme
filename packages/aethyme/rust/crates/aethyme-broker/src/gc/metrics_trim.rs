@@ -246,6 +246,12 @@ pub(crate) const UNATTENDED_TRIM_NEXT_DUE_KEY: &str = "command_metrics_trim.next
 /// Broker meta key: where the next unattended trim resumes staging (a JSON
 /// [`StagingResume`]), or empty when it starts over.
 pub(crate) const UNATTENDED_TRIM_RESUME_KEY: &str = "command_metrics_trim.resume";
+/// How long a resume record spares its temporary, counted from when the
+/// record was written (every attempt that runs out of budget rewrites it).
+/// Past this the record no longer resumes or spares anything: it is cleared
+/// and its temporary removed, so a temporary is never kept indefinitely
+/// once unattended trims stop running.
+pub(super) const RESUME_SPARE_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 /// A resume record fingerprints this many bytes from the log's start and as
 /// many ending at the offset reached, so a log whose inode number was reused
 /// by another file is not mistaken for the one staged.
@@ -376,12 +382,22 @@ pub(super) struct StagingResume {
     pub(super) cutoff: i64,
     /// The temporary's file name, beside the log.
     pub(super) temporary: String,
+    /// When the record was written (epoch ms). A record from before this
+    /// field reads as 0, so it counts as expired.
+    #[serde(default)]
+    pub(super) recorded_at_ms: i64,
 }
 
 impl StagingResume {
     /// Parse a stored record; `None` for an empty or unreadable one.
     pub(super) fn parse(value: &str) -> Option<Self> {
         serde_json::from_str(value).ok()
+    }
+
+    /// Whether the record is [`RESUME_SPARE_MAX_AGE_MS`] old or older at
+    /// `now_ms`. A record dated ahead of the clock is not expired.
+    pub(super) fn expired(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.recorded_at_ms) >= RESUME_SPARE_MAX_AGE_MS
     }
 
     fn to_json(&self) -> String {
@@ -405,11 +421,37 @@ impl StagingResume {
 }
 
 /// The recorded resumable temporary of the log at `log`, while the record
-/// still describes the log and the temporary; a trim's stale-temporary sweep
-/// spares it.
+/// still describes the log and the temporary and is younger than
+/// [`RESUME_SPARE_MAX_AGE_MS`]; a trim's stale-temporary sweep spares it.
+/// An older record is cleared (only if unchanged since it was read) and its
+/// temporary removed.
 pub(super) fn resumable_temporary(store: &crate::BrokerStore, log: &Path) -> Option<PathBuf> {
-    let resume = StagingResume::parse(&store.meta_get(UNATTENDED_TRIM_RESUME_KEY).ok()??)?;
+    let recorded = store.meta_get(UNATTENDED_TRIM_RESUME_KEY).ok()??;
+    let resume = StagingResume::parse(&recorded)?;
+    if expire_resume_if_old(&resume, log, crate::clock::epoch_ms()) {
+        crate::warn_unrecorded(
+            "clear an expired command metrics trim resume record",
+            store
+                .meta_compare_and_set(UNATTENDED_TRIM_RESUME_KEY, Some(&recorded), "")
+                .map(drop),
+        );
+        return None;
+    }
     recorded_temporary_if_valid(&resume, log)
+}
+
+/// Whether `resume` is expired at `now_ms` ([`StagingResume::expired`]);
+/// when it is, its temporary (a regular file with a trim temporary's name,
+/// beside `log`) is removed and the expiry counted.
+fn expire_resume_if_old(resume: &StagingResume, log: &Path, now_ms: i64) -> bool {
+    if !resume.expired(now_ms) {
+        return false;
+    }
+    crate::phase_telemetry::add("command_metrics_trim_resume_expired", Duration::ZERO);
+    if let Some(temporary) = resume.temporary_path(log) {
+        remove_recorded_temporary(&temporary);
+    }
+    true
 }
 
 /// `resume`'s temporary, while the record still describes the log at `log`
@@ -719,6 +761,7 @@ fn stage_retained_rows_checking(
                     newest: progress.newest,
                     cutoff,
                     temporary: name,
+                    recorded_at_ms: crate::clock::epoch_ms(),
                 })),
             },
             resumed_from_bytes,
@@ -1142,7 +1185,12 @@ impl crate::Broker {
             .ok()
             .flatten()
             .filter(|value| !value.is_empty());
-        let resume = recorded_resume.as_deref().and_then(StagingResume::parse);
+        // A record older than a day is not resumed: its temporary goes and
+        // staging starts over (the outcome below clears or replaces it).
+        let resume = recorded_resume
+            .as_deref()
+            .and_then(StagingResume::parse)
+            .filter(|resume| !expire_resume_if_old(resume, &path, now_ms));
         let started = Instant::now();
         let (result, resumed_from_bytes) = match trim_expired_rows_resuming(
             main_root,
@@ -1995,6 +2043,7 @@ mod tests {
                 newest: None,
                 cutoff: 10,
                 temporary: ".command-metrics.jsonl-a1B2c3".into(),
+                recorded_at_ms: 0,
             })),
         };
         assert_eq!(
@@ -2330,6 +2379,70 @@ mod tests {
         assert!(temporaries(&path).is_empty());
     }
 
+    /// A resume record spares its temporary for a day after it was written;
+    /// past that (or with no time recorded) the record is cleared, only if
+    /// unchanged, and the temporary removed, so a temporary is never spared
+    /// indefinitely once unattended trims stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_record_spares_its_temporary_for_a_day_only() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().canonicalize().unwrap();
+        git_repository(&root);
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        let path = log(broker.main_root(), &format!("{OLD}{KEPT}{OLD}{MALFORMED}"));
+        let mut resume = exhausted(stage_rows(&path, 10, None, Some(2)));
+        let temporary = path.with_file_name(&resume.temporary);
+        let now = crate::clock::epoch_ms();
+        assert!(now - resume.recorded_at_ms < 60_000, "dated when written");
+
+        // Pure expiry: a day after it was written, a legacy record without a
+        // time, but not a record dated ahead of the clock.
+        assert!(!resume.expired(resume.recorded_at_ms + RESUME_SPARE_MAX_AGE_MS - 1));
+        assert!(resume.expired(resume.recorded_at_ms + RESUME_SPARE_MAX_AGE_MS));
+        assert!(!resume.expired(resume.recorded_at_ms - 1));
+        let legacy = StagingResume::parse(
+            &serde_json::to_string(&serde_json::json!({
+                "device": 1, "inode": 2, "fingerprint": "", "source_offset": 1,
+                "staged_bytes": 0, "removed": 0, "kept": 0, "newest": null,
+                "cutoff": 10, "temporary": ".command-metrics.jsonl-L3gacy",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy.recorded_at_ms, 0);
+        assert!(legacy.expired(now));
+
+        // Fresh: spared, nothing removed.
+        broker
+            .store_ref()
+            .meta_set(UNATTENDED_TRIM_RESUME_KEY, &resume.to_json())
+            .unwrap();
+        assert_eq!(
+            resumable_temporary(broker.store_ref(), &path).as_deref(),
+            Some(temporary.as_path())
+        );
+        assert!(temporary.exists());
+
+        // A day old: not spared, the temporary removed, the record cleared.
+        resume.recorded_at_ms = now - RESUME_SPARE_MAX_AGE_MS - 1;
+        broker
+            .store_ref()
+            .meta_set(UNATTENDED_TRIM_RESUME_KEY, &resume.to_json())
+            .unwrap();
+        assert_eq!(resumable_temporary(broker.store_ref(), &path), None);
+        assert!(!temporary.exists(), "the expired temporary is removed");
+        assert_eq!(
+            broker
+                .store_ref()
+                .meta_get(UNATTENDED_TRIM_RESUME_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn the_unattended_trim_does_not_run_without_inode_numbers() {
@@ -2433,6 +2546,7 @@ mod tests {
             newest: None,
             cutoff,
             temporary: ".command-metrics.jsonl-Orph4n".into(),
+            recorded_at_ms: crate::clock::epoch_ms(),
         };
         broker
             .store_ref()

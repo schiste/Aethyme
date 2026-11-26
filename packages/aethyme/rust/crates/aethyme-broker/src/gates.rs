@@ -3315,7 +3315,7 @@ fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error
 
 /// The pruned-units record inside a managed cache: which units the last
 /// prune staged, read by the next gate to count rebuilds.
-const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+pub(crate) const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
 
 /// How long a gate may spend moving superseded units out of its managed
 /// cache before it runs its command.

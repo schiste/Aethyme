@@ -31,6 +31,7 @@ pub mod archive_floor;
 pub mod check;
 pub mod cli;
 pub mod evict;
+pub mod gate_prune;
 pub mod host_temp;
 pub mod landing;
 #[cfg(test)]
@@ -119,10 +120,24 @@ pub enum Policy {
         idle: Duration,
         expire: Option<Duration>,
     },
+    /// Children named for a UTC day (`d<days since the epoch>`, the Node.js
+    /// compile cache): a past day's child goes once unchanged for
+    /// `past_day_idle`, whatever the budget; today's (or a later day's) is
+    /// never removed. Other children are kept as [`Policy::LruChildren`]
+    /// with `idle` and `expire`.
+    DailyChildren {
+        idle: Duration,
+        expire: Duration,
+        past_day_idle: Duration,
+    },
     /// The whole entry goes once nothing in it changed for `age`.
     ExpireEntry { age: Duration },
-    /// Over budget, every entry but the most recently used one per gate
-    /// kind goes; an entry with a live lease is never touched.
+    /// Over budget, superseded workspace build units are pruned out of each
+    /// entry first ([`gate_prune`]); then every entry but the most recently
+    /// used one per gate kind goes, then, least recently used first, the
+    /// other kinds' entries idle for a day (any idle time under pressure),
+    /// never the repository's most recently used entry. An entry with a live
+    /// lease is never touched.
     GateCache,
     /// Over budget, oldest first, only archives proven landed and past their
     /// recorded minimum retention; never by age alone.
@@ -300,17 +315,25 @@ pub fn policy(class: Class) -> Policy {
 /// once the day is over.
 pub const NODE_COMPILE_CACHE_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// How long a past day's Node.js compile cache directory must be unchanged
+/// before it goes. No new command is pointed at a past day's directory; this
+/// covers a process started before midnight that writes its entries when it
+/// exits.
+pub const NODE_COMPILE_CACHE_PAST_DAY_IDLE: Duration = HOUR;
+
 /// How the top-level entry `name` of `class` is enforced: its class's
-/// policy, except that the Node.js compile cache's daily directories also
-/// expire by age, whatever the tool-cache budget.
+/// policy, except that the Node.js compile cache's daily directories go once
+/// their day is over (and unchanged for an hour), whatever the tool-cache
+/// budget, and today's directory never goes.
 pub fn entry_policy(class: Class, name: &str) -> Policy {
     match policy(class) {
         Policy::LruChildren { idle, .. }
             if class == Class::ToolCaches && name == crate::node_compile_cache::CACHE_DIRECTORY =>
         {
-            Policy::LruChildren {
+            Policy::DailyChildren {
                 idle,
-                expire: Some(NODE_COMPILE_CACHE_EXPIRY),
+                expire: NODE_COMPILE_CACHE_EXPIRY,
+                past_day_idle: NODE_COMPILE_CACHE_PAST_DAY_IDLE,
             }
         }
         policy => policy,
@@ -663,6 +686,10 @@ pub struct PassReport {
     /// The recovery archive floor, per volume holding archives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_floor: Vec<archive_floor::FloorReport>,
+    /// What pruning superseded workspace build units out of over-budget gate
+    /// caches did this pass; `None` when no gate cache was over budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_cache_prune: Option<gate_prune::GatePruneReport>,
 }
 
 /// The persisted ledger.
@@ -1464,9 +1491,13 @@ pub fn archive_deletable(
 const EARLIEST_MANIFEST_MS: u64 = 1_500_000_000_000;
 const MANIFEST_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Add top-level entries that appeared under the roots and drop those that
-/// disappeared.
+/// Add top-level entries that appeared under the roots, drop those that
+/// disappeared, and classify known entries again: an entry first seen by a
+/// binary that did not know its name (an older one) was recorded as
+/// unclassified, which is never measured, so it is measured afresh as what
+/// it is.
 pub fn discover(ledger: &mut Ledger) {
+    reclassify(ledger);
     let mut seen = Vec::new();
     for root in &ledger.roots {
         let Some(device) = device_of(&root.path) else {
@@ -1504,6 +1535,31 @@ pub fn discover(ledger: &mut Ledger) {
         seen.iter()
             .any(|(root, name)| *root == item.root && *name == item.name)
     });
+}
+
+/// Give every known item the class [`classify`] gives its name now; an item
+/// whose class changed is reset to unmeasured (counter
+/// `storage_ledger_reclassified`). Returns how many changed.
+pub fn reclassify(ledger: &mut Ledger) -> usize {
+    let mut changed = 0;
+    for item in &mut ledger.items {
+        let class = classify(item.root_kind, &item.name);
+        if class == item.class {
+            continue;
+        }
+        crate::phase_telemetry::add("storage_ledger_reclassified", Duration::ZERO);
+        changed += 1;
+        item.class = class;
+        item.bytes = 0;
+        item.measured = false;
+        item.entries = 0;
+        item.oldest_ms = 0;
+        item.newest_ms = 0;
+        item.measured_at_ms = 0;
+        item.children.clear();
+        item.walk = None;
+    }
+    changed
 }
 
 /// Measure (or count) one item until `deadline`; `true` when it finished.
@@ -1667,13 +1723,21 @@ pub fn measure_some(
     (measured, resumable)
 }
 
-/// Record over-budget time for each class.
+/// Record over-budget time for each class. The gate cache is over budget
+/// while any repository's gate caches are over that repository's budget.
 pub fn update_over_budget_clock(ledger: &mut Ledger, budgets: &Budgets, now: u64) {
     let totals = ledger.class_bytes();
+    let gate_over = evict::gate_cache_by_repository(ledger)
+        .iter()
+        .any(|(repository, bytes)| *bytes > budgets.gate_budget(repository));
     for class in totals.keys().copied().collect::<Vec<_>>() {
-        let over = budgets
-            .class_bytes(class)
-            .is_some_and(|budget| totals.get(&class).copied().unwrap_or(0) > budget);
+        let over = if class == Class::GateCache {
+            gate_over
+        } else {
+            budgets
+                .class_bytes(class)
+                .is_some_and(|budget| totals.get(&class).copied().unwrap_or(0) > budget)
+        };
         let telemetry = ledger.telemetry.entry(class).or_default();
         match (over, telemetry.over_budget_since_ms) {
             (true, None) => telemetry.over_budget_since_ms = Some(now),
