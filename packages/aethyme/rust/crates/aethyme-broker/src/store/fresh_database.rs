@@ -137,7 +137,7 @@ pub(super) fn open_in_repo(
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    crate::db_busy::install_handler(&connection)?;
+    crate::db_busy::install_handler(&connection, requested_db_path)?;
     let version = schema::current_version(&connection)?;
     if version > crate::SCHEMA_VERSION {
         return Err(BrokerError::SchemaTooNew {
@@ -1418,7 +1418,7 @@ mod unix {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        crate::db_busy::install_handler(&connection)?;
+        crate::db_busy::install_handler(&connection, db_path)?;
         connection.pragma_update(None, "query_only", true)?;
         let version = strict_schema_version(&connection)?;
         if version != crate::SCHEMA_VERSION {
@@ -1654,7 +1654,7 @@ mod unix {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        crate::db_busy::install_handler(&connection)?;
+        crate::db_busy::install_handler(&connection, &paths.final_path)?;
         connection.pragma_update(None, "query_only", true)?;
         let version = read_version_if_present(&connection)?;
         if version != crate::SCHEMA_VERSION {

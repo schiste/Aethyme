@@ -6446,25 +6446,34 @@ across a child process, a sleep or a network call.
   the write lock is waited for (and retried) at the start instead of failing
   mid-transaction. A read-only snapshot transaction on a writable connection
   asks for `DEFERRED` explicitly.
-- **Holder record.** When a transaction on a writable broker connection
-  first changes a row, it writes `<database>.writer` beside the database
-  (mode 0600; JSON `pid`, `command`, `since_ms`) and removes it when the
-  transaction commits or rolls back, or the connection closes. `command` is
-  the command's metric surface (`gc.__trash-catchup`), never a path, id or
-  task text. The record is written to a fresh private file
+- **Holder record.** As soon as a writable broker connection holds the
+  write lock (checked after every statement: `BEGIN IMMEDIATE` returned, or
+  the first row of an implicit write changed), it writes `<database>.writer`
+  beside the database (mode 0600; JSON `pid`, `start`, `command`,
+  `since_ms`) and removes it when the transaction commits or rolls back, or
+  the connection closes. `start` is the process start token
+  (`gates::process_start_time`; absent where the platform cannot say).
+  `command` is the command's metric surface (`gc.__trash-catchup`), never a
+  path, id or task text. The record is written to a fresh private file
   (`O_CREAT|O_EXCL|O_NOFOLLOW`, `<database>.writer.<pid>.<n>.tmp`) renamed
-  into place, so a symlink planted at its name is replaced, never followed.
+  into place, so a symlink planted at its name is replaced, never followed;
+  at most once a minute per process, temporary files of that pattern older
+  than a minute (left by a writer that died before renaming) are removed.
   A reader accepts only a regular file it owns, not group- or
   world-writable, with one link, opened without following links, of at most
   4 KiB, whose `command` is already a clean label (ASCII letters, digits,
-  `.`, `_`, `-`; at most 96 characters); anything else, and a record naming
-  a dead process, is ignored. The window between `BEGIN IMMEDIATE` and the
-  first changed row is not recorded. The record is not part of SQLite's
-  sidecar checks, which probe files as SQLite journals.
+  `.`, `_`, `-`; at most 96 characters), and whose process is alive with the
+  recorded start token (a reused pid does not match); anything else is
+  ignored. The record is not part of SQLite's sidecar checks, which probe
+  files as SQLite journals.
 - **Named errors.** A wait that runs out of budget fails as before
   (`database is locked`), with `after waiting <n> s; database write lock held
   by pid <pid> (`aethyme broker <command>`) for <n> s` appended, or a note
-  that the holder was not recorded.
+  that the holder was not recorded. The holder is read from the record of
+  the waiting connection's own database, and the text is attached when the
+  error is created, once: a later busy error on the same thread does not
+  repeat it, a new wait discards an unclaimed one, and one older than a
+  second is not attached.
 - **`broker status`** (compact form) adds `database_write_lock` (`pid`,
   `command`, `held_ms`, `message`) in `--json`, and the `message` line in
   text, when a live recorded holder has held the lock for at least 5 s. The

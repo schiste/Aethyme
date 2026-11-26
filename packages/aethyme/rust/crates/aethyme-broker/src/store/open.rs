@@ -286,7 +286,7 @@ impl BrokerStore {
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        crate::db_busy::install_handler(&conn)?;
+        crate::db_busy::install_handler(&conn, &path)?;
         let found = schema::current_version(&conn)?;
         if found > crate::SCHEMA_VERSION && schema::newer_schema_is_compatible(&conn, found)? {
             conn.pragma_update(None, "query_only", true)?;
@@ -331,7 +331,7 @@ impl BrokerStore {
         conn.execute("VACUUM INTO ?1", [snapshot_path.to_string_lossy().as_ref()])?;
         drop(conn);
         let snapshot = Connection::open(&snapshot_path)?;
-        crate::db_busy::install_handler(&snapshot)?;
+        crate::db_busy::install_handler(&snapshot, &path)?;
         schema::migrate(&snapshot)?;
         snapshot.pragma_update(None, "query_only", true)?;
         Ok(Self {
@@ -393,7 +393,7 @@ impl BrokerStore {
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        crate::db_busy::install_handler(&conn)?;
+        crate::db_busy::install_handler(&conn, &path)?;
         let found = schema::current_version(&conn)?;
         if found != crate::SCHEMA_VERSION {
             return Err(BrokerError::SnapshotSchemaMismatch {
@@ -1780,7 +1780,7 @@ impl BrokerStore {
             }
             transition => transition,
         };
-        crate::db_busy::install_handler(&self.conn)?;
+        crate::db_busy::install_handler(&self.conn, &self.path)?;
         transition
     }
 

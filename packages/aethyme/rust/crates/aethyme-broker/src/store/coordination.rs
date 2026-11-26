@@ -610,7 +610,7 @@ impl BrokerStore {
         let settled =
             self.settle_coordinated_operation_once(binding, status, exit_code, details_json);
         let synchronous = self.conn.pragma_update(None, "synchronous", "NORMAL");
-        let restored = crate::db_busy::install_handler(&self.conn);
+        let restored = crate::db_busy::install_handler(&self.conn, &self.path);
         let settled = settled?;
         synchronous?;
         restored?;
@@ -1944,7 +1944,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        crate::db_busy::install_handler(&self.conn)?;
+        crate::db_busy::install_handler(&self.conn, &self.path)?;
         result
     }
 

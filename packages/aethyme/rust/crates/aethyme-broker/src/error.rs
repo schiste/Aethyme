@@ -17,10 +17,10 @@ pub enum BrokerError {
         source: std::io::Error,
     },
 
-    /// A busy error also says how long it waited and who holds the write
-    /// lock (see `db_busy`).
-    #[error("broker db: {error}{context}", error = .0, context = crate::db_busy::busy_context(.0))]
-    Sqlite(#[from] rusqlite::Error),
+    /// A busy error also says how long it waited and who held the write
+    /// lock, attached when the error is converted (see `db_busy`).
+    #[error("broker db: {0}")]
+    Sqlite(#[source] rusqlite::Error),
 
     /// A `.aethyme` configuration file could not be resolved or parsed.
     /// Boxed so the error enum stays small.
@@ -209,5 +209,11 @@ pub enum BrokerError {
 impl From<aethyme_config::ConfigSourceError> for BrokerError {
     fn from(error: aethyme_config::ConfigSourceError) -> Self {
         Self::Config(Box::new(error))
+    }
+}
+
+impl From<rusqlite::Error> for BrokerError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(crate::db_busy::with_busy_context(error))
     }
 }

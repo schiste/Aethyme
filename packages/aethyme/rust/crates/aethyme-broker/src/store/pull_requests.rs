@@ -1031,7 +1031,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        crate::db_busy::install_handler(&self.conn)?;
+        crate::db_busy::install_handler(&self.conn, &self.path)?;
         result
     }
 
@@ -1057,7 +1057,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        crate::db_busy::install_handler(&self.conn)?;
+        crate::db_busy::install_handler(&self.conn, &self.path)?;
         result
     }
 

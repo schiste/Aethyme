@@ -14,21 +14,24 @@
 //! - writable connections start every `transaction()` with `BEGIN
 //!   IMMEDIATE`, so a transaction that reads before it writes cannot fail at
 //!   once with `SQLITE_BUSY_SNAPSHOT`, which SQLite never retries;
-//! - a holder record (`<database>.writer`: pid, command, since) written when
-//!   a transaction first changes a row and removed when it commits or rolls
-//!   back, so a timed-out waiter and `broker status` can name the writer;
+//! - a holder record (`<database>.writer`: pid, process start, command,
+//!   since) written as soon as a connection holds the write lock (after
+//!   `BEGIN IMMEDIATE`, or at the first changed row of an implicit write) and
+//!   removed when the transaction commits or rolls back or the connection
+//!   closes, so a timed-out waiter and `broker status` can name the writer;
 //! - telemetry: `broker_db_busy_wait` (time slept waiting, one occurrence per
 //!   retry), `broker_db_busy_retry` and `broker_db_busy_failure` counters, and
 //!   the `broker_db_busy_wait_by_holder` attachment keyed by the holder's
 //!   command name (never a path or an id).
 
 use std::cell::{Cell, RefCell};
+use std::os::raw::{c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior, ffi};
 
 /// Longest a statement waits for another connection's lock before failing.
 /// Long enough to absorb ordinary contention between many agents, short
@@ -50,7 +53,8 @@ thread_local! {
     static WAIT_STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The holder's command name read when the current wait started.
     static WAIT_HOLDER: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The last wait on this thread that ran out of budget.
+    /// The last wait on this thread that ran out of budget, until the error
+    /// it caused is converted (or a new wait starts).
     static LAST_FAILURE: RefCell<Option<BusyFailure>> = const { RefCell::new(None) };
     static JITTER_STATE: Cell<u64> = const { Cell::new(0) };
     #[cfg(test)]
@@ -60,21 +64,41 @@ thread_local! {
 /// The command this process runs, as its metric surface (`gc.__trash-catchup`).
 static PROCESS_COMMAND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// Holder-record paths of every database this process configured, so a
-/// timed-out wait (whose handler cannot know its connection) can find them.
-static HOLDER_PATHS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+/// One busy-handler context per database path, kept for the process's life
+/// so SQLite may hold a plain pointer to it.
+static BUSY_TARGETS: OnceLock<Mutex<Vec<&'static BusyTarget>>> = OnceLock::new();
+
+/// What a connection's busy handler knows about its database.
+struct BusyTarget {
+    db_path: PathBuf,
+    holder_path: Option<PathBuf>,
+}
+
+/// SQLite constants used here (stable since 3.14 and 3.34).
+const TRACE_PROFILE: c_uint = 0x02;
+const TXN_WRITE: c_int = 2;
+
+/// A failure older than this is not attached to an error: it belongs to an
+/// earlier statement whose error was handled some other way.
+const FAILURE_FRESHNESS: Duration = Duration::from_secs(1);
 
 /// A wait that ran out of budget, as the error message reports it.
 #[derive(Clone, Debug)]
 pub(crate) struct BusyFailure {
     pub(crate) waited: Duration,
     pub(crate) holder: Option<WriterHolder>,
+    at: Instant,
 }
 
 /// Who holds (or last took) the database write lock.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WriterHolder {
     pub(crate) pid: u32,
+    /// The holder's process start token (`gates::process_start_time`), so a
+    /// record left by a crashed process is not mistaken for a later process
+    /// that reused its pid. `None` where the platform cannot say.
+    #[serde(default)]
+    pub(crate) start: Option<u64>,
     /// The holder's command surface (`gc.__trash-catchup`), or `unknown`.
     pub(crate) command: String,
     pub(crate) since_ms: i64,
@@ -133,17 +157,55 @@ fn sanitize_label(label: &str) -> String {
     }
 }
 
-/// Install the bounded busy handler. Every broker-database connection gets
-/// it, read-only ones included, and code that temporarily disables waiting
-/// (`busy_timeout(ZERO)` for a try-lock) restores it with this.
-pub(crate) fn install_handler(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_handler(Some(busy_handler))
+/// Install the bounded busy handler for the database at `db_path`. Every
+/// broker-database connection gets it, read-only ones included, and code
+/// that temporarily disables waiting (`busy_timeout(ZERO)` for a try-lock)
+/// restores it with this.
+pub(crate) fn install_handler(conn: &Connection, db_path: &Path) -> rusqlite::Result<()> {
+    let target: *const BusyTarget = busy_target(db_path);
+    // SAFETY: `handle` is this open connection's database handle, used only
+    // for this call. The context is a `'static` BusyTarget that is never
+    // freed, so SQLite may keep the pointer for the connection's life.
+    let rc = unsafe {
+        ffi::sqlite3_busy_handler(conn.handle(), Some(busy_callback), target as *mut c_void)
+    };
+    if rc == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None))
+    }
+}
+
+fn busy_target(db_path: &Path) -> &'static BusyTarget {
+    let targets = BUSY_TARGETS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut targets = match targets.lock() {
+        Ok(targets) => targets,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(known) = targets.iter().find(|target| target.db_path == db_path) {
+        return known;
+    }
+    let target: &'static BusyTarget = Box::leak(Box::new(BusyTarget {
+        db_path: db_path.to_path_buf(),
+        holder_path: holder_path(db_path),
+    }));
+    targets.push(target);
+    target
+}
+
+unsafe extern "C" fn busy_callback(context: *mut c_void, count: c_int) -> c_int {
+    // SAFETY: the context was registered by `install_handler` and points to a
+    // leaked, never-freed BusyTarget.
+    let target = unsafe { &*(context as *const BusyTarget) };
+    let retry = std::panic::catch_unwind(|| busy_wait(count, target.holder_path.as_deref()))
+        .unwrap_or(false);
+    c_int::from(retry)
 }
 
 /// Configure a writable broker-database connection: the busy handler,
 /// `BEGIN IMMEDIATE` for every `transaction()`, and the holder record.
 pub(crate) fn configure_writer(conn: &mut Connection, db_path: &Path) -> rusqlite::Result<()> {
-    install_handler(conn)?;
+    install_handler(conn, db_path)?;
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
     if let Some(holder_path) = holder_path(db_path) {
         install_holder_hooks(conn, holder_path);
@@ -160,30 +222,51 @@ pub(crate) fn holder_path(db_path: &Path) -> Option<PathBuf> {
     Some(db_path.with_file_name(format!("{name}{HOLDER_SUFFIX}")))
 }
 
-fn register_holder_path(path: &Path) {
-    let paths = HOLDER_PATHS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut paths) = paths.lock()
-        && !paths.iter().any(|known| known == path)
-    {
-        paths.push(path.to_path_buf());
-    }
+/// This process's start token, read once.
+fn own_start() -> Option<u64> {
+    static START: OnceLock<Option<u64>> = OnceLock::new();
+    *START.get_or_init(|| {
+        i32::try_from(std::process::id())
+            .ok()
+            .and_then(crate::gates::process_start_time)
+    })
 }
 
-/// Per-connection holder state shared by the three hooks. Dropped when the
-/// connection closes (rusqlite drops its hooks then), which removes a record
-/// a transaction abandoned mid-way would otherwise leave behind.
+/// Per-connection holder state shared by the hooks and the statement trace.
+/// Dropped when the connection closes (rusqlite drops its hooks first), which
+/// unregisters the trace and removes a record a transaction abandoned
+/// mid-way would otherwise leave behind.
 struct HolderState {
     path: PathBuf,
     armed: AtomicBool,
+    /// The connection's `sqlite3*`, for the trace; 0 when none is registered.
+    db: usize,
 }
 
 impl HolderState {
+    /// After each statement: a connection that now holds the write lock
+    /// (`BEGIN IMMEDIATE` returned, or an implicit write is under way) records
+    /// itself before it does anything else.
+    fn after_statement(&self) {
+        if self.db == 0 || self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: `db` is the open connection whose statement just finished;
+        // the trace is unregistered before the connection closes.
+        let state =
+            unsafe { ffi::sqlite3_txn_state(self.db as *mut ffi::sqlite3, c"main".as_ptr()) };
+        if state == TXN_WRITE {
+            self.arm();
+        }
+    }
+
     fn arm(&self) {
         if self.armed.load(Ordering::Relaxed) || self.armed.swap(true, Ordering::AcqRel) {
             return;
         }
         let holder = WriterHolder {
             pid: std::process::id(),
+            start: own_start(),
             command: process_command(),
             since_ms: crate::clock::epoch_ms(),
         };
@@ -202,16 +285,54 @@ impl HolderState {
 
 impl Drop for HolderState {
     fn drop(&mut self) {
+        if self.db != 0 {
+            // SAFETY: rusqlite drops the hooks holding this state before it
+            // closes the connection, so `db` is still open here; clearing the
+            // trace keeps SQLite from calling into freed state.
+            unsafe {
+                ffi::sqlite3_trace_v2(self.db as *mut ffi::sqlite3, 0, None, std::ptr::null_mut());
+            }
+        }
         self.disarm();
     }
 }
 
+unsafe extern "C" fn trace_callback(
+    mask: c_uint,
+    context: *mut c_void,
+    _statement: *mut c_void,
+    _detail: *mut c_void,
+) -> c_int {
+    if mask & TRACE_PROFILE != 0 {
+        // SAFETY: the context is the HolderState that registered this trace
+        // and unregisters it in its Drop, so it is alive here.
+        let state = unsafe { &*(context as *const HolderState) };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.after_statement()))
+            .unwrap_or(());
+    }
+    0
+}
+
 fn install_holder_hooks(conn: &Connection, path: PathBuf) {
-    register_holder_path(&path);
+    // SAFETY: only the handle's address is kept; it is used while the
+    // connection is open (see HolderState::drop).
+    let db = unsafe { conn.handle() } as usize;
     let state = Arc::new(HolderState {
         path,
         armed: AtomicBool::new(false),
+        db,
     });
+    let context = Arc::as_ptr(&state) as *mut c_void;
+    // SAFETY: `context` stays valid until HolderState::drop, which clears
+    // this trace first.
+    unsafe {
+        ffi::sqlite3_trace_v2(
+            db as *mut ffi::sqlite3,
+            TRACE_PROFILE,
+            Some(trace_callback),
+            context,
+        );
+    }
     // A changed row means this connection holds the write lock until the
     // transaction ends. Only the main database takes that lock.
     let on_update = Arc::clone(&state);
@@ -234,7 +355,58 @@ fn install_holder_hooks(conn: &Connection, path: PathBuf) {
 const MAX_HOLDER_RECORD_BYTES: u64 = 4096;
 
 /// Distinguishes this process's temporary record files.
-static HOLDER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOLDER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// When this process last swept leftover temporary record files.
+static LAST_TEMP_SWEEP_MS: AtomicI64 = AtomicI64::new(0);
+
+/// A temporary record file older than this was left by a writer that died
+/// between creating and renaming it.
+const TEMP_LEFTOVER_AGE: Duration = Duration::from_secs(60);
+
+/// Remove `<record>.*.tmp` files older than [`TEMP_LEFTOVER_AGE`], at most
+/// once a minute per process.
+fn sweep_temporary_records(path: &Path, name: &str) {
+    let now_ms = crate::clock::epoch_ms();
+    let last = LAST_TEMP_SWEEP_MS.load(Ordering::Relaxed);
+    let interval = i64::try_from(TEMP_LEFTOVER_AGE.as_millis()).unwrap_or(i64::MAX);
+    if now_ms.saturating_sub(last) < interval
+        || LAST_TEMP_SWEEP_MS
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    remove_temporary_leftovers(path, name);
+}
+
+fn remove_temporary_leftovers(path: &Path, name: &str) {
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with(&prefix) || !file_name.ends_with(".tmp") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= TEMP_LEFTOVER_AGE);
+        if old && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            remove_record_file(&entry.path());
+        }
+    }
+}
 
 /// Write the record to a fresh private file beside it and rename that into
 /// place. Nothing at the record's name is ever opened for writing, so a
@@ -245,6 +417,7 @@ fn write_holder(path: &Path, holder: &WriterHolder) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| std::io::Error::other("holder record path has no name"))?;
+    sweep_temporary_records(path, name);
     let sequence = HOLDER_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_file_name(format!("{name}.{}.{sequence}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
@@ -311,7 +484,24 @@ pub(crate) fn long_held_write_lock(db_path: &Path) -> Option<LongHeldWriteLock> 
 
 fn read_live_holder(path: &Path) -> Option<WriterHolder> {
     let holder = parse_holder(&read_holder_bytes(path)?)?;
-    process_alive(holder.pid).then_some(holder)
+    holder_process_matches(&holder).then_some(holder)
+}
+
+/// The record's process is the one running now: alive, and, when the record
+/// carries a start token, started at that same time (not a reused pid).
+fn holder_process_matches(holder: &WriterHolder) -> bool {
+    if !process_alive(holder.pid) {
+        return false;
+    }
+    match holder.start {
+        Some(recorded) => {
+            i32::try_from(holder.pid)
+                .ok()
+                .and_then(crate::gates::process_start_time)
+                == Some(recorded)
+        }
+        None => true,
+    }
 }
 
 /// The record's bytes, only from a private regular file this user owns, not
@@ -369,18 +559,6 @@ fn process_alive(_pid: u32) -> bool {
     true
 }
 
-/// The live holder of any database this process configured, oldest first.
-fn current_holder() -> Option<WriterHolder> {
-    let paths = HOLDER_PATHS
-        .get()
-        .and_then(|paths| paths.lock().ok().map(|paths| paths.clone()))
-        .unwrap_or_default();
-    paths
-        .iter()
-        .filter_map(|path| read_live_holder(path))
-        .min_by_key(|holder| holder.since_ms)
-}
-
 fn budget() -> Duration {
     #[cfg(test)]
     if let Some(budget) = TEST_BUDGET.with(Cell::get) {
@@ -432,8 +610,10 @@ fn backoff(count: i32) -> Duration {
 /// SQLite calls this while another connection holds a lock this statement
 /// needs; `count` is how often it already did for the same locking event.
 /// Returning `true` retries, `false` fails the statement with SQLITE_BUSY.
-fn busy_handler(count: i32) -> bool {
+/// `holder_path` is the record of this connection's own database.
+fn busy_wait(count: i32, holder_path: Option<&Path>) -> bool {
     let now = Instant::now();
+    let holder_of_this_database = || holder_path.and_then(read_live_holder);
     let started = WAIT_STARTED.with(|slot| match slot.get() {
         Some(started) if count > 0 => started,
         _ => {
@@ -442,16 +622,24 @@ fn busy_handler(count: i32) -> bool {
         }
     });
     if count == 0 {
-        let holder = current_holder().map(|holder| holder.command);
+        // A new wait: an earlier failure no error claimed is stale now.
+        LAST_FAILURE.with(|slot| slot.borrow_mut().take());
+        let holder = holder_of_this_database().map(|holder| holder.command);
         WAIT_HOLDER.with(|slot| *slot.borrow_mut() = holder);
     }
     let waited = now.saturating_duration_since(started);
     let budget = budget();
     if waited >= budget {
         WAIT_STARTED.with(|slot| slot.set(None));
-        let holder = current_holder();
+        let holder = holder_of_this_database();
         crate::phase_telemetry::add("broker_db_busy_failure", Duration::ZERO);
-        LAST_FAILURE.with(|slot| *slot.borrow_mut() = Some(BusyFailure { waited, holder }));
+        LAST_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some(BusyFailure {
+                waited,
+                holder,
+                at: Instant::now(),
+            });
+        });
         return false;
     }
     let delay = backoff(count).min(budget.saturating_sub(waited));
@@ -474,29 +662,42 @@ fn is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Extra context for a broker-database error: for a busy error, how long
-/// this thread waited and who holds the write lock; empty otherwise.
-pub(crate) fn busy_context(error: &rusqlite::Error) -> String {
-    if !is_busy(error) {
-        return String::new();
+/// Attach the wait that just failed to a busy error, when the error is
+/// created: how long this thread waited and who held the write lock of that
+/// connection's database. The failure is consumed, so a later busy error on
+/// this thread never reports it again. Other errors pass through unchanged.
+pub(crate) fn with_busy_context(error: rusqlite::Error) -> rusqlite::Error {
+    if !is_busy(&error) {
+        return error;
     }
-    let now_ms = crate::clock::epoch_ms();
-    let failure = LAST_FAILURE.with(|slot| slot.borrow().clone());
-    let (waited, holder) = match failure {
-        Some(failure) => (Some(failure.waited), failure.holder.or_else(current_holder)),
-        None => (None, current_holder()),
+    let Some(failure) = LAST_FAILURE.with(|slot| slot.borrow_mut().take()) else {
+        return error;
     };
-    let mut context = String::new();
-    if let Some(waited) = waited {
-        context.push_str(&format!(" after waiting {} s", waited.as_secs()));
+    if failure.at.elapsed() > FAILURE_FRESHNESS {
+        return error;
     }
-    match holder {
+    match error {
+        rusqlite::Error::SqliteFailure(code, message) => {
+            let base = message.unwrap_or_else(|| code.to_string());
+            rusqlite::Error::SqliteFailure(
+                code,
+                Some(format!("{base}{}", describe_failure(&failure))),
+            )
+        }
+        other => other,
+    }
+}
+
+fn describe_failure(failure: &BusyFailure) -> String {
+    let mut context = format!(" after waiting {} s", failure.waited.as_secs());
+    match &failure.holder {
         Some(holder) => {
             context.push_str("; database write lock held by ");
-            context.push_str(&holder.describe(now_ms));
+            context.push_str(&holder.describe(crate::clock::epoch_ms()));
         }
         None => context.push_str(
-            "; the write-lock holder was not recorded (it changed no row yet, or runs an older aethyme)",
+            "; the write-lock holder was not recorded (an older aethyme, or a connection \
+             outside the broker)",
         ),
     }
     context
@@ -543,7 +744,7 @@ mod tests {
         let holder = writer(&path);
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         holder.execute("INSERT INTO t VALUES (1)", []).unwrap();
-        let record = recorded_holder(&path).expect("holder recorded at the first changed row");
+        let record = recorded_holder(&path).expect("holder recorded once it holds the lock");
         assert_eq!(record.pid, std::process::id());
         assert_eq!(record.command, "gc.__trash-catchup");
 
@@ -553,11 +754,9 @@ mod tests {
         });
         let message = crate::BrokerError::from(error).to_string();
         assert!(message.contains("database is locked"), "{message}");
-        // Other tests in this process may hold records too; the oldest live
-        // one is named, and every one of them is this process.
         assert!(
             message.contains(&format!(
-                "database write lock held by pid {}",
+                "database write lock held by pid {} (`aethyme broker gc __trash-catchup`)",
                 std::process::id()
             )),
             "{message}"
@@ -623,6 +822,7 @@ mod tests {
         let path = database(&dir);
         let stale = WriterHolder {
             pid: i32::MAX as u32,
+            start: None,
             command: "gc".into(),
             since_ms: 1,
         };
@@ -637,6 +837,7 @@ mod tests {
         let record = holder_path(&path).unwrap();
         let mut holder = WriterHolder {
             pid: std::process::id(),
+            start: own_start(),
             command: "gc.__continue-artifacts".into(),
             since_ms: crate::clock::epoch_ms(),
         };
@@ -724,6 +925,140 @@ mod tests {
             None,
             "an oversized record is rejected"
         );
+    }
+
+    #[test]
+    fn a_failed_wait_is_reported_once_and_only_while_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let waiter = writer(&path);
+        let quick = Connection::open(&path).unwrap();
+        quick.busy_timeout(Duration::ZERO).unwrap();
+        let wait = || {
+            with_test_budget(Duration::from_millis(80), || {
+                waiter.execute("INSERT INTO t VALUES (1)", []).unwrap_err()
+            })
+        };
+        let quick_message = || {
+            crate::BrokerError::from(quick.execute("INSERT INTO t VALUES (2)", []).unwrap_err())
+                .to_string()
+        };
+
+        let first = crate::BrokerError::from(wait()).to_string();
+        assert!(first.contains("after waiting 0 s"), "{first}");
+        let later = quick_message();
+        assert!(later.contains("database is locked"), "{later}");
+        assert!(!later.contains("after waiting"), "consumed once: {later}");
+
+        // A failure no error claimed goes stale instead of being reported
+        // by an unrelated later error.
+        drop(wait());
+        std::thread::sleep(FAILURE_FRESHNESS + Duration::from_millis(100));
+        let stale = quick_message();
+        assert!(!stale.contains("after waiting"), "{stale}");
+        holder.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn a_wait_names_only_its_own_databases_holder() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let recorded = database(&first);
+        let unrecorded = database(&second);
+        let recorded_writer = writer(&recorded);
+        recorded_writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(recorded_holder(&recorded).is_some());
+        let plain = Connection::open(&unrecorded).unwrap();
+        plain.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let waiter = writer(&unrecorded);
+        let error = with_test_budget(Duration::from_millis(80), || {
+            waiter.execute("INSERT INTO t VALUES (1)", []).unwrap_err()
+        });
+        let message = crate::BrokerError::from(error).to_string();
+        assert!(message.contains("was not recorded"), "{message}");
+        assert!(!message.contains("held by pid"), "{message}");
+        plain.execute_batch("COMMIT").unwrap();
+        recorded_writer.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn a_record_whose_process_start_differs_is_a_reused_pid() {
+        let Some(start) = own_start() else {
+            return; // the platform cannot tell process start times apart
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let record = holder_path(&path).unwrap();
+        let mut holder = WriterHolder {
+            pid: std::process::id(),
+            start: Some(start + 1),
+            command: "gc".into(),
+            since_ms: crate::clock::epoch_ms(),
+        };
+        write_holder(&record, &holder).unwrap();
+        assert_eq!(recorded_holder(&path), None);
+        holder.start = Some(start);
+        write_holder(&record, &holder).unwrap();
+        assert_eq!(recorded_holder(&path), Some(holder));
+    }
+
+    #[test]
+    fn the_record_is_written_when_the_write_lock_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let record = holder_path(&path).unwrap();
+        let mut conn = writer(&path);
+
+        // A deferred read takes no write lock and records nothing.
+        conn.execute_batch("BEGIN DEFERRED").unwrap();
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert!(!record.exists());
+        conn.execute_batch("COMMIT").unwrap();
+
+        // An immediate transaction that only reads (or computes) before it
+        // writes is recorded from BEGIN on.
+        let tx = conn.transaction().unwrap();
+        assert!(record.exists(), "recorded at BEGIN IMMEDIATE");
+        let _: i64 = tx
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            recorded_holder(&path).map(|holder| holder.pid),
+            Some(std::process::id())
+        );
+        tx.commit().unwrap();
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn old_temporary_records_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let record = holder_path(&path).unwrap();
+        let old = dir.path().join("broker.db.writer.1.0.tmp");
+        let fresh = dir.path().join("broker.db.writer.2.0.tmp");
+        let unrelated = dir.path().join("other.1.0.tmp");
+        for file in [&old, &fresh, &unrelated] {
+            std::fs::write(file, b"{}").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(120);
+        for file in [&old, &unrelated] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        remove_temporary_leftovers(&record, "broker.db.writer");
+        assert!(!old.exists(), "a leftover older than a minute is removed");
+        assert!(fresh.exists(), "a writer may still be renaming a fresh one");
+        assert!(unrelated.exists(), "only this record's leftovers");
     }
 
     #[test]
