@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.185] - 2026-11-26
+
+### Added
+
+- Recovery archives and gate caches can live on an adopted storage root on another volume instead of the internal disk: `[placement] recovery_archives = "storage"` and `gate_caches = "storage"` in `<host state>/storage.toml` (default `host`). A root qualifies only when it is a real directory with a plain-file adoption marker, owned by the user, on a mounted local filesystem; otherwise Aethyme writes to host state and records why. The root is recorded durably before the first archive lands there, and while a recorded root is unreachable every decision that would delete because no archive was found is deferred. The storage worker migrates existing host archives in paced, resumable passes (copy, fsync, SHA-256 tree verification, then source removal; same-volume moves are a rename) and evicts unleased host gate caches once caches resolve to the root (#2042).
+
+### Changed
+
+- The storage worker reclaims caches it used to leave alone. An entry first seen by an older binary is re-classified by name on every pass, so the node compile cache is measured again; its past-day directories are removed once their UTC day is over and they have been idle an hour, never today's. Gate caches are pruned of superseded generations of local packages under the cache's exclusive lease, keeping the newest, and whole idle entries are evicted when a repository stays over its budget. On the maintainer's machine these held 108 copies of the same workspace crates and an unmeasured 7 GB node compile cache (#2041).
+- A metrics-trim resume record expires after 24 hours (#2041).
+
+### Build and release
+
+- The Homebrew tap job renders the formula with the renderer the same release run already built, instead of compiling the broker crate again; it uses the prebuilt binary only when its recorded source commit is the tag's and its checksum holds, and compiles otherwise. On v0.8.184 that compile was 191 s of the job's 214 s (#2043).
+- GitHub Actions and Cargo dependency updates (#2020, #2028).
+
+### Upgrade notes
+
+- Binaries before 0.8.185 reject a `storage.toml` with a `[placement]` table and fall back to default budgets; install the new router and engine pair everywhere before setting it (#2042).
+- With placement on a storage root, unmounting that volume defers merged-branch deletion and archive-absence decisions until it returns (#2042).
+- A gate kind's only cache entry can now be evicted after a day idle, so that gate's next run builds cold (#2041).
+
 ## [0.8.184] - 2026-11-26
 
 ### Changed
