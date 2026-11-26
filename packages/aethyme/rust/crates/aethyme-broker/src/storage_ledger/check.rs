@@ -134,6 +134,16 @@ fn registered(host_state: &Path) -> Vec<Registered> {
         .unwrap_or_default()
 }
 
+/// Every storage root `aethyme storage adopt` registered, mounted or not, in
+/// registration order (exact paths, never searched for).
+pub fn adopted_storage_roots(host_state: &Path) -> Vec<PathBuf> {
+    registered(host_state)
+        .into_iter()
+        .filter(|entry| entry.kind == RootKind::Storage)
+        .map(|entry| entry.path)
+        .collect()
+}
+
 /// The roots: host state and host cache (exact), registered worktree roots
 /// (exact configured paths), and storage roots that carry the marker.
 pub fn roots(host_state: &Path, host_cache: Option<&Path>) -> Vec<Root> {
@@ -409,10 +419,11 @@ pub fn decide(
     let stale = now.saturating_sub(summary.updated_at_ms) > duration_ms(REFRESH_EVERY);
     // A staged deletion left waiting (its stager could not start a worker,
     // or the worker that ran had already swept): one listing of the host
-    // cache root.
+    // cache root, and of each storage root (gate caches placed there stage
+    // their pruned units beside them, on the same volume).
     let staged_waiting = roots
         .iter()
-        .filter(|root| root.kind == RootKind::HostCache)
+        .filter(|root| matches!(root.kind, RootKind::HostCache | RootKind::Storage))
         .any(|root| {
             staged_deletions(&root.path)
                 .iter()
@@ -1220,6 +1231,21 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             prover.save(inputs.host_state),
         );
     }
+    // Placement (`storage.toml` `[placement]`): archives moved from host
+    // state to an adopted storage root, superseded host gate caches evicted.
+    phase = Instant::now();
+    let mut alive = || match lock.as_deref_mut() {
+        Some(lock) => lock.beat(),
+        None => true,
+    };
+    report.placement = super::placement::run(
+        inputs.host_state,
+        &mut ledger,
+        &inputs.registry,
+        inputs.pace,
+        &mut alive,
+    );
+    report.phases_ms.insert("placement".into(), elapsed(phase));
     // Again at the end: a pass runs for minutes, and what a gate staged
     // after its start would otherwise wait for the next pass.
     let phase = Instant::now();
@@ -1350,7 +1376,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
 }
 
 /// Drop a removed entry or child from the ledger.
-fn forget(ledger: &mut Ledger, candidate: &Candidate) {
+pub(crate) fn forget(ledger: &mut Ledger, candidate: &Candidate) {
     let (name, child) = match candidate.relative.split_once('/') {
         Some((name, child)) => (name, Some(child)),
         None => (candidate.relative.as_str(), None),

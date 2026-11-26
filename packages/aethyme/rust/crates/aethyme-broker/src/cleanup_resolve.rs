@@ -1347,17 +1347,87 @@ impl Broker {
         })
     }
 
+    /// Where a new recovery archive goes when no pool takes it: on the
+    /// adopted storage root `storage.toml` `[placement] recovery_archives =
+    /// "storage"` names (`<root>/recovery-archives/<repository key>`), when
+    /// it qualifies; else [`Self::recovery_archive_root`]. A missing or
+    /// unqualified root falls back to host state (counted by reason), never
+    /// fails the write.
+    pub(crate) fn placed_recovery_archive_root(&self) -> Result<PathBuf, BrokerOpError> {
+        use crate::storage_ledger::placement;
+        if let Some(host_state) = self.durable_archive_state_dir()
+            && let Some(root) =
+                placement::resolve(host_state, placement::Data::RecoveryArchives).storage_root
+        {
+            let key = self.worktree_root_plan()?.repository_key;
+            // Every writer that gets this path (the operation archive lane
+            // included) may write there next: readers must know of the root
+            // first, or an unmounted root would read as holding nothing.
+            // Unrecordable, the archive stays in host state.
+            match placement::record_archive_storage_root(host_state, &root) {
+                Ok(()) => return Ok(root.join(RECOVERY_ARCHIVE_DIRECTORY).join(key)),
+                Err(error) => {
+                    crate::phase_telemetry::add(
+                        "storage_placement_fallback_unrecorded",
+                        Duration::ZERO,
+                    );
+                    crate::warn_unrecorded::<(), _>(
+                        "record the archive storage root (archives stay in host state)",
+                        Err(error),
+                    );
+                }
+            }
+        }
+        self.recovery_archive_root()
+    }
+
+    /// This repository's archive directory on each storage root that may
+    /// hold archives (see [`crate::storage_ledger::placement`]): `(archive
+    /// directory, storage root, recorded as having received archives)`.
+    /// Empty when archives stay in the repository's own `.aethyme/`.
+    fn storage_archive_roots(&self) -> Vec<(PathBuf, PathBuf, bool)> {
+        let Some(host_state) = self.durable_archive_state_dir() else {
+            return Vec::new();
+        };
+        let roots = crate::storage_ledger::placement::archive_storage_roots(host_state);
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let Ok(key) = self.worktree_root_plan().map(|plan| plan.repository_key) else {
+            return Vec::new();
+        };
+        roots
+            .into_iter()
+            .map(|(root, recorded)| {
+                (
+                    root.join(RECOVERY_ARCHIVE_DIRECTORY).join(&key),
+                    root,
+                    recorded,
+                )
+            })
+            .collect()
+    }
+
+    /// The storage-root archive directories of this repository that exist.
+    pub(crate) fn storage_recovery_archive_dirs(&self) -> Vec<PathBuf> {
+        self.storage_archive_roots()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .collect()
+    }
+
     /// Where the retirement lane writes new recovery archives: on the pool's
     /// volume, in a broker-owned, marked, private directory beside the
     /// checkouts (`<pool>/.aethyme-recovery-archives/<repository key>`),
     /// because the host state directory may sit on a small system volume
     /// while the pool's volume has the room. Falls back to
-    /// [`Self::recovery_archive_root`] when no pool is bound or the
+    /// [`Self::placed_recovery_archive_root`] when no pool is bound or the
     /// directory's marker names another repository.
     pub(crate) fn retirement_archive_root(&self) -> Result<PathBuf, BrokerOpError> {
         match self.pool_recovery_archive_root(true) {
             Some(root) => Ok(root),
-            None => self.recovery_archive_root(),
+            None => self.placed_recovery_archive_root(),
         }
     }
 
@@ -1413,12 +1483,18 @@ impl Broker {
     }
 
     /// Every directory recovery archives of this repository may be in, the
-    /// pool-side one first (when it exists), then the host state one, so
-    /// archives written before the move stay readable and restorable.
+    /// pool-side one first (when it exists), then those on storage roots
+    /// (when they exist), then the host state one, so archives written
+    /// before a move stay readable and restorable.
     pub(crate) fn recovery_archive_roots(&self) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(pool) = self.pool_recovery_archive_root(false) {
             roots.push(pool);
+        }
+        for storage in self.storage_recovery_archive_dirs() {
+            if !roots.contains(&storage) {
+                roots.push(storage);
+            }
         }
         if let Ok(host) = self.recovery_archive_root()
             && !roots.contains(&host)
@@ -1460,6 +1536,24 @@ impl Broker {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => return None,
                 }
+            }
+        }
+        // A storage root that received archives and cannot be reached now
+        // (unmounted) may hold some: nothing can be judged absent.
+        for (path, anchor, recorded) in self.storage_archive_roots() {
+            let reachable = std::fs::symlink_metadata(&anchor)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                && crate::verification::removable_volume_unavailable_reason(&anchor).is_none();
+            if reachable {
+                if !roots.iter().any(|root| root.path == path) {
+                    roots.push(CheckedArchiveRoot { path, anchor });
+                }
+            } else if recorded {
+                crate::phase_telemetry::add(
+                    "recovery_archive_storage_root_unreachable",
+                    Duration::ZERO,
+                );
+                return None;
             }
         }
         let anchor = match self.durable_archive_state_dir() {
@@ -2069,11 +2163,12 @@ impl Broker {
             ignored_policy_sha256,
             untracked_bytes,
             // The retirement lane archives on the pool's volume; a reviewed
-            // resolve keeps the host state root its operators know.
+            // resolve keeps the host state root its operators know, unless
+            // `[placement]` puts archives on a storage root.
             archive_root: if retirement_mode {
                 self.retirement_archive_root()?
             } else {
-                self.recovery_archive_root()?
+                self.placed_recovery_archive_root()?
             },
         })
     }
@@ -2376,6 +2471,15 @@ impl Broker {
         };
         ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
         let session = self.store_ref().session(session_id)?;
+        // Readers learn of a storage root before its first archive lands.
+        if let Some(host_state) = self.durable_archive_state_dir() {
+            crate::storage_ledger::placement::note_archive_root(host_state, &plan.archive_root)
+                .map_err(|error| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: plan.archive_root.to_string_lossy().into_owned(),
+                    reason: format!("cannot record the archive storage root: {error}"),
+                })?;
+        }
         let archive_root = prepare_archive_root(&plan.archive_root).map_err(|reason| {
             BrokerOpError::RecoveryArchiveUnverified {
                 id: session_id,
@@ -2949,6 +3053,8 @@ pub(crate) struct RecoveryArchiveScan {
     pub root: PathBuf,
     /// The pool-side directory, when a pool is bound and identified.
     pub pool_root: Option<PathBuf>,
+    /// The directories on storage roots (`[placement]`) that exist.
+    pub storage_roots: Vec<PathBuf>,
     pub owned: Vec<OwnedRecoveryArchive>,
     /// Everything else, with why the broker cannot vouch for it.
     pub unowned: Vec<(PathBuf, String)>,
@@ -5017,6 +5123,10 @@ impl Broker {
         if let Some(pool) = &pool_root {
             paths.extend(archive_entries_under(pool, &mut unowned));
         }
+        let storage_roots = self.storage_recovery_archive_dirs();
+        for storage in &storage_roots {
+            paths.extend(archive_entries_under(storage, &mut unowned));
+        }
         let root_failures = unowned.len();
         drop(entries_span);
         let start = resume_after.map_or(0, |cursor| listing_resume_index(&paths, cursor));
@@ -5069,6 +5179,7 @@ impl Broker {
         Ok(RecoveryArchiveScan {
             root: host_root,
             pool_root,
+            storage_roots,
             owned,
             unowned,
             root_failures,
