@@ -732,6 +732,10 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
 /// Every release tag runs the workspace suite on macOS, with the commands of
 /// the Linux shards. It stays off pull requests and off merges to main (each
 /// merge queued a ~55 minute run nobody read) and is no required check.
+///
+/// release.yml calls it after the release builds rather than both starting on
+/// the tag push: on v0.8.185 its eight macOS jobs held the runners and the
+/// x86_64-apple-darwin release build queued 27 minutes behind them.
 #[test]
 fn macos_tests_run_the_workspace_suite_per_release() {
     let run_lines = |text: &str, job: &str| -> Vec<String> {
@@ -745,8 +749,31 @@ fn macos_tests_run_the_workspace_suite_per_release() {
     let oss = workflow("oss-ci.yml");
     assert_eq!(
         block(&macos, "on:"),
-        ["  push:", "    tags: [\"v*\"]", "  workflow_dispatch:"]
+        ["  workflow_call:", "  workflow_dispatch:"]
     );
+    // The release calls it once the builds are done, never beside them, and
+    // publication does not wait for its verdict.
+    let release = workflow("release.yml");
+    let call = block(&release, "  macos-tests:");
+    assert_eq!(
+        call,
+        [
+            "    name: macOS tests",
+            "    needs: [verify-green-main, build]",
+            "    if: ${{ !cancelled() && needs.verify-green-main.result == 'success' }}",
+            "    permissions:",
+            "      contents: read",
+            "    uses: ./.github/workflows/macos-tests.yml",
+        ]
+    );
+    for job in ["  release:", "  homebrew-tap:"] {
+        assert!(
+            !block(&release, job)
+                .iter()
+                .any(|line| line.contains("needs:") && line.contains("macos-tests")),
+            "{job} must not wait for the macOS tests"
+        );
+    }
     assert_eq!(block(&macos, "permissions:"), ["  contents: read"]);
     assert!(macos.contains("  group: macos-tests-${{ github.ref }}\n  cancel-in-progress: true"));
     assert!(!macos.contains("github.event."));

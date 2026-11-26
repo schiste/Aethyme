@@ -260,6 +260,18 @@ jobs:
           path: packages/aethyme/rust/aethyme-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
 
+  # The macOS workspace suite for the tag, after the release builds instead of
+  # beside them: started by its own tag push, its eight macOS jobs held the
+  # runners and the x86_64-apple-darwin build queued 27 minutes behind them
+  # (v0.8.185). Publication does not wait for it; it is no release gate.
+  macos-tests:
+    name: macOS tests
+    needs: [verify-green-main, build]
+    if: ${{ !cancelled() && needs.verify-green-main.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-tests.yml
+
   release:
     name: Attach to GitHub release
     needs: [build, build-windows]
