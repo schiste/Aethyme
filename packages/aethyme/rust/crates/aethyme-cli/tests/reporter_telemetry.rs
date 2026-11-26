@@ -180,6 +180,14 @@ mod interrupted {
     /// Run `broker status --json` held inside the `test_command_hold` span,
     /// wait for its heartbeat to name that span, then send `signal`.
     fn interrupt_held_command(root: &Path, signal: libc::c_int) -> serde_json::Value {
+        interrupt_held_command_with(root, signal, &[])
+    }
+
+    fn interrupt_held_command_with(
+        root: &Path,
+        signal: libc::c_int,
+        env: &[(&str, &str)],
+    ) -> serde_json::Value {
         let rows_before = metric_rows(root).len();
         let mut command = Command::new(env!("CARGO_BIN_EXE_aethyme"));
         command
@@ -191,6 +199,7 @@ mod interrupted {
             )
             .env("AETHYME_TEST_COMMAND_HOLD_MS", "120000")
             .env("AETHYME_COMMAND_HEARTBEAT_MS", "100")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -296,6 +305,26 @@ mod interrupted {
         let temp = initialised_repo();
         let row = interrupt_held_command(temp.path(), libc::SIGTERM);
         assert_interrupted_row(&row, "SIGTERM", 143);
+    }
+
+    /// A Ctrl-C also kills the foreground child, so the command can return
+    /// while its row is still being written. It must still die of the signal
+    /// and write one row, not a normal row as well (or instead).
+    #[test]
+    fn a_command_returning_after_the_signal_still_dies_of_it() {
+        let temp = initialised_repo();
+        let row = interrupt_held_command_with(
+            temp.path(),
+            libc::SIGINT,
+            &[
+                ("AETHYME_TEST_COMMAND_HOLD_RETURNS_ON_SIGNAL", "1"),
+                ("AETHYME_TEST_INTERRUPT_FLUSH_DELAY_MS", "500"),
+            ],
+        );
+        assert_eq!(row["exit"], 130, "{row}");
+        assert_eq!(row["outcome"], "interrupted", "{row}");
+        assert_eq!(row["interrupted"]["signal"], "SIGINT", "{row}");
+        assert_eq!(row["phase_counts"]["test_command_hold"], 1, "{row}");
     }
 
     #[test]

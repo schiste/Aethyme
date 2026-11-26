@@ -109,12 +109,17 @@ pub(crate) struct Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if let Some((recorder, id)) = self.open.take()
-            && let Ok(mut accumulated) = recorder.0.lock()
-        {
-            accumulated.open.remove(&id);
+        let ended = Instant::now();
+        // Registered as open: close it and add its time under one lock, in
+        // the recorder it was opened in.
+        if let Some((recorder, id)) = self.open.take() {
+            if let Ok(mut accumulated) = recorder.0.lock() {
+                accumulated.open.remove(&id);
+                accumulated.add(self.name, self.started, ended);
+            }
+            return;
         }
-        record(self.name, self.started, Instant::now());
+        record(self.name, self.started, ended);
     }
 }
 

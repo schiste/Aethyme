@@ -136,6 +136,13 @@ pub(super) fn enter(
 
 impl Drop for Scope {
     fn drop(&mut self) {
+        // A caught signal owns the end of this process: the command returning
+        // (say, because its foreground child died of the same Ctrl-C) must not
+        // write a normal row or exit normally before the watcher re-raises.
+        #[cfg(unix)]
+        if self.handlers.is_some() && unix::caught() {
+            unix::await_raise();
+        }
         #[cfg(unix)]
         drop(self.handlers.take());
         let running = RUNNING
@@ -155,6 +162,9 @@ fn remove_quietly(path: &Path) {
 }
 
 /// The test seam: hold inside the `test_command_hold` span when asked to.
+/// With [`TEST_HOLD_RETURNS_ENV`] set, a caught signal ends the hold at once,
+/// as a command returns when its child dies of the same Ctrl-C.
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub(super) fn test_hold() {
     let Some(millis) = std::env::var(TEST_HOLD_ENV)
         .ok()
@@ -162,9 +172,26 @@ pub(super) fn test_hold() {
     else {
         return;
     };
+    let returns_on_signal = std::env::var_os(TEST_HOLD_RETURNS_ENV).is_some();
     let _span = crate::phase_telemetry::span("test_command_hold");
-    std::thread::sleep(Duration::from_millis(millis));
+    let until = Instant::now() + Duration::from_millis(millis);
+    while Instant::now() < until {
+        #[cfg(unix)]
+        if returns_on_signal && unix::caught() {
+            return;
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(until.saturating_duration_since(Instant::now())),
+        );
+    }
 }
+
+/// Test seam: delays the interrupted row this many milliseconds, so the
+/// command's own return races the flush deterministically.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TEST_FLUSH_DELAY_ENV: &str = "AETHYME_TEST_INTERRUPT_FLUSH_DELAY_MS";
+/// Test seam: see [`test_hold`].
+const TEST_HOLD_RETURNS_ENV: &str = "AETHYME_TEST_COMMAND_HOLD_RETURNS_ON_SIGNAL";
 
 #[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 fn signal_name(signal: i32) -> &'static str {
@@ -267,6 +294,14 @@ fn open_elapsed_json(open: &[crate::phase_telemetry::OpenSpan]) -> serde_json::V
 /// Write the interrupted command's row. Every wait is bounded by `deadline`.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn write_interrupted_row(signal: i32, deadline: Instant) {
+    if let Some(delay) = std::env::var(TEST_FLUSH_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(
+            Duration::from_millis(delay).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
     let ended = Instant::now();
     let Some((args, started, recorder, output_before)) = ({
         let running = lock_within(&RUNNING, deadline);
@@ -428,6 +463,22 @@ mod unix {
     static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
     /// The first signal caught, `0` before any.
     static CAUGHT: AtomicI32 = AtomicI32::new(0);
+
+    /// Whether a termination signal was caught.
+    pub(super) fn caught() -> bool {
+        CAUGHT.load(Ordering::SeqCst) != 0
+    }
+
+    /// Park until the watcher re-raises the caught signal, which ends the
+    /// process. Should the watcher be gone, re-raise from here after its
+    /// budget and a margin, so the process still dies of the signal.
+    pub(super) fn await_raise() -> ! {
+        let until = Instant::now() + super::FLUSH_BUDGET + super::FLUSH_BUDGET;
+        while Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        die_of(CAUGHT.load(Ordering::SeqCst))
+    }
     static WATCHER: OnceLock<bool> = OnceLock::new();
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -598,6 +649,12 @@ mod unix {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+        die_of(signal)
+    }
+
+    /// Restore the default disposition of `signal` and raise it on this
+    /// thread, ending the process as the signal's default action does.
+    fn die_of(signal: libc::c_int) -> ! {
         // SAFETY: restoring the default disposition and unblocking `signal`
         // on this thread only; `raise` then delivers it here, and its default
         // action ends the process.

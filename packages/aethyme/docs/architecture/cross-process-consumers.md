@@ -729,7 +729,10 @@ in one step left no trace. Unix only; on other platforms nothing changes.
   signal and a parent sees the same status. The flush is bounded at 2 s
   (lock waits poll; the append lock waits at most 500 ms, then appends
   unlocked, as every command does past its wait); a second signal kills at
-  once. A signal ignored at start (`nohup`) stays ignored; a thread that
+  once. A command that returns after the signal was caught (a Ctrl-C also
+  kills its foreground child, so it can fail fast) waits for the re-raise
+  instead of writing a normal row or exiting normally: the row is written
+  once and the process still dies of the signal. A signal ignored at start (`nohup`) stays ignored; a thread that
   blocks these signals itself (`resources run` waiting with `sigwait`) still
   receives them, because the watcher blocks them too.
 - **No fallback file.** The shared append lock is held exclusively only by a
@@ -744,11 +747,15 @@ in one step left no trace. Unix only; on other platforms nothing changes.
   "session_id", "started_at_ms", "updated_at_ms", "elapsed_ms", "in_span",
   "open_spans", "open_span_elapsed_ms"}` (same meanings as above, at the time
   of writing). It is removed when the command ends, including on an
-  interrupt. A process killed by `SIGKILL` leaves its file: readers must
-  check that `pid` is alive and treat an `updated_at_ms` older than the
+  interrupt. A process killed by `SIGKILL`, or one that ends through
+  `process::exit` without the runner returning, leaves its file: every reader
+  must check that `pid` is alive and treat an `updated_at_ms` older than the
   interval as stale. No broker command lists these files yet.
 - **New span.** `test_command_hold`: only under `AETHYME_TEST_COMMAND_HOLD_MS`
-  (milliseconds), the test seam that holds a command before it runs.
+  (milliseconds), the test seam that holds a command before it runs. Two
+  further test seams: `AETHYME_TEST_COMMAND_HOLD_RETURNS_ON_SIGNAL` ends the
+  hold when a signal is caught, and `AETHYME_TEST_INTERRUPT_FLUSH_DELAY_MS`
+  delays the interrupted row (within the 2 s budget).
 
 ## Read-only Git queries answered in-process (2026-11-23)
 
