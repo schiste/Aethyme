@@ -16,6 +16,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// Bounds for the conflict report's integration-side history: the newest
+/// first-parent commits read, the commits kept per path, and the Git budget.
+/// The history is a hint, so running out of either yields a shorter list.
+const CONFLICT_HISTORY_MAX_COMMITS: usize = 2_000;
+const CONFLICT_HISTORY_PER_PATH: usize = 20;
+const CONFLICT_HISTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
@@ -2605,6 +2612,11 @@ impl Broker {
             let simulation =
                 repo.merge_tree_with_base(&commit.parents[0], &current, &commit.commit)?;
             if !simulation.conflicts.is_empty() {
+                let mut history = self.integration_commits_touching_paths(
+                    &commit.parents[0],
+                    &plan.integration_head,
+                    &simulation.conflicts,
+                );
                 let conflict_details = simulation
                     .conflicts
                     .iter()
@@ -2612,12 +2624,7 @@ impl Broker {
                         path: path.clone(),
                         originating_commit: commit.commit.clone(),
                         ownership: commit.ownership,
-                        integration_side_commits: self
-                            .integration_commits_touching_path(
-                                &commit.parents[0],
-                                &plan.integration_head,
-                                path,
-                            ),
+                        integration_side_commits: history.remove(path).unwrap_or_default(),
                         remediation: format!(
                             "rebase session {} onto integration {}, resolve {} while replaying {}, then resubmit",
                             plan.session_id, plan.integration_head, path, commit.commit
@@ -2708,27 +2715,36 @@ impl Broker {
         self.replay_submission_plan(plan).map(|_| ())
     }
 
-    fn integration_commits_touching_path(
+    /// Integration-side commits that touched each conflicting path, for the
+    /// conflict report only: best effort, bounded, never blocking `submit`.
+    fn integration_commits_touching_paths(
         &self,
         session_parent: &str,
         integration_head: &str,
-        path: &str,
-    ) -> Vec<String> {
+        paths: &[String],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let _span = crate::phase_telemetry::span("submission_conflict_history");
         let repo = self.repo_handle();
         let Ok(base) = repo.merge_base(session_parent, integration_head) else {
-            return Vec::new();
+            return Default::default();
         };
-        let Ok(commits) = repo.first_parent_commits_between_oldest(&base, integration_head) else {
-            return Vec::new();
-        };
-        commits
-            .into_iter()
-            .filter(|commit| {
-                repo.first_parent(commit)
-                    .and_then(|parent| repo.changed_between(&parent, commit))
-                    .is_ok_and(|paths| paths.iter().any(|candidate| candidate == path))
-            })
-            .collect()
+        match repo.first_parent_commits_touching_paths(
+            &base,
+            integration_head,
+            paths,
+            CONFLICT_HISTORY_MAX_COMMITS,
+            CONFLICT_HISTORY_PER_PATH,
+            CONFLICT_HISTORY_BUDGET,
+        ) {
+            Ok(found) => found,
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "submission_conflict_history_unavailable",
+                    std::time::Duration::ZERO,
+                );
+                Default::default()
+            }
+        }
     }
 
     pub(crate) fn build_submission_plan(

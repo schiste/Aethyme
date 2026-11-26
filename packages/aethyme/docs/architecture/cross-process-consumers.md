@@ -758,6 +758,24 @@ and `cat-file blob` of the selected file
   `not_a_blob`, `too_large`, `unexpected_target`. Each answered query is one
   `subprocess_git` fewer (`file_at_revision` two: `cat-file -e` and `show`).
 
+## Submit's conflict report reads integration history in one bounded log (2026-11-26)
+
+When a replayed session commit conflicts, `broker submit` lists, per
+conflicting path, the integration-side commits that touched it
+(`integration_side_commits` in the conflict details). It used to start two
+Git processes per first-parent commit per path between the merge base and
+the integration head; on a merge-heavy history with an old merge base this
+ran for over an hour with no deadline and the submission never reached its
+gates. It now reads one `git log --first-parent --diff-merges=first-parent
+--no-renames --name-only -z` over the newest 2,000 first-parent commits,
+keeps at most 20 commits per path (oldest first, as before) and stops after
+20 s; on any Git error or timeout the list is empty. A change a merge brought
+in from its side branch is attributed to the merge. Span
+`submission_conflict_history` times the read; count
+`submission_conflict_history_unavailable` records an empty list caused by an
+error or the budget. The list is a hint: an empty or shorter list never
+changes the submission verdict.
+
 ## Submit: peers' changed paths reused, verification slot into the trash (2026-11-21)
 
 - **Peer scans reuse watcher-proven answers.** A lease refresh scans each
