@@ -427,6 +427,51 @@ fn verify_plain_character_count_statuses(
     Ok(())
 }
 
+// Final-newline checks inspect the exact source bytes, so no rich-text
+// projection or additional host capability is required.
+fn verify_final_newline_statuses(
+    policy: &Value,
+    checks: &BTreeMap<&str, &Value>,
+    after: &[Item],
+) -> Result<(), &'static str> {
+    let _span = crate::phase_telemetry::span("content_gate_v2_final_newline_check");
+    for gate in policy["gates"].as_array().ok_or("invalid gates")? {
+        if gate["kind"] != "final_newline" {
+            continue;
+        }
+        let gate_id = gate["id"].as_str().ok_or("invalid gate id")?;
+        for item in after.iter().filter(|item| {
+            matches!(
+                item.media_type.as_str(),
+                "text/plain" | "text/markdown" | "text/html"
+            )
+        }) {
+            let id = format!(
+                "gate:{}:{}:{}",
+                item.entity_id.len(),
+                item.entity_id,
+                gate_id
+            );
+            let check = checks
+                .get(id.as_str())
+                .ok_or("resolved policy check is missing")?;
+            let status = check["status"].as_str().ok_or("invalid check status")?;
+            if !matches!(status, "passed" | "failed") {
+                continue;
+            }
+            let expected = if item.source.is_empty() || item.source.ends_with('\n') {
+                "passed"
+            } else {
+                "failed"
+            };
+            if status != expected {
+                return Err("final newline status differs from source");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plain_text_paragraph_count(source: &str) -> Result<u64, &'static str> {
     let mut count = 0;
     let mut inside = false;
@@ -613,6 +658,12 @@ fn policy_coverage(
         let blocking = gate["blocking"].as_bool().ok_or("invalid gate blocking")?;
         if !ids.insert(id) || (!item_gate_kind(kind) && kind != "unique_collection_metadata") {
             return Err("unsupported resolved gate");
+        }
+        if kind == "final_newline" {
+            closed(gate, &["kind", "id", "severity", "blocking"])?;
+            if !matches!(gate["severity"].as_str(), Some("warning" | "error")) {
+                return Err("invalid resolved final newline gate");
+            }
         }
         let collection = has_collection && kind == "unique_collection_metadata";
         if !collection && unsupported_item_media {
@@ -1035,6 +1086,7 @@ pub fn compare(
         if let Some(collection) = collection.as_ref() {
             verify_collection_statuses(&policy, collection, &checks)?;
         }
+        verify_final_newline_statuses(&policy, &checks, input.after)?;
         verify_plain_word_count_statuses(&policy, &checks, input.after, &mut word_counts)?;
         verify_plain_paragraph_count_statuses(
             &policy,
@@ -1178,6 +1230,113 @@ mod tests {
         fresh["verdict"]["validator"]["name"] = json!("other");
         assert!(!run(&old, &fresh, &input));
     }
+    #[test]
+    fn final_newline_status_matches_source_for_all_supported_formats() {
+        let (_, _, mut after, _) = fixture();
+        let policy = json!({"gates":[{"id":"line","kind":"final_newline"}]});
+        for media in ["text/plain", "text/markdown", "text/html"] {
+            after[0].media_type = media.into();
+            for (source, expected) in [
+                ("", "passed"),
+                ("é\n", "passed"),
+                ("é\r\n", "passed"),
+                ("é", "failed"),
+                ("é\r", "failed"),
+                ("é\u{2028}", "failed"),
+            ] {
+                after[0].source = source.into();
+                let mut check = json!({"status":expected});
+                assert!(
+                    verify_final_newline_statuses(
+                        &policy,
+                        &BTreeMap::from([("gate:7:article:line", &check)]),
+                        &after
+                    )
+                    .is_ok()
+                );
+                check["status"] = json!(if expected == "passed" {
+                    "failed"
+                } else {
+                    "passed"
+                });
+                assert_eq!(
+                    verify_final_newline_statuses(
+                        &policy,
+                        &BTreeMap::from([("gate:7:article:line", &check)]),
+                        &after
+                    ),
+                    Err("final newline status differs from source")
+                );
+                check["status"] = json!("not_checked");
+                assert!(
+                    verify_final_newline_statuses(
+                        &policy,
+                        &BTreeMap::from([("gate:7:article:line", &check)]),
+                        &after
+                    )
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_newline_policy_rejects_missing_or_unknown_fields() {
+        let (v, _, _, verdict) = fixture();
+        let mut policy: Value =
+            serde_json::from_str(v["artifacts"]["resolved_policy"].as_str().unwrap()).unwrap();
+        let change: Value =
+            serde_json::from_str(v["artifacts"]["change"].as_str().unwrap()).unwrap();
+        policy["gates"][0] =
+            json!({"kind":"final_newline","id":"words","severity":"warning","blocking":true});
+        let check = &verdict["verdict"]["checks"][0];
+        let checks = BTreeMap::from([("gate:7:article:words", check)]);
+        assert!(policy_coverage(&policy, &change, false, &checks).is_ok());
+        policy["gates"][0]["extra"] = json!(true);
+        assert!(policy_coverage(&policy, &change, false, &checks).is_err());
+        policy["gates"][0].as_object_mut().unwrap().remove("extra");
+        policy["gates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("severity");
+        assert!(policy_coverage(&policy, &change, false, &checks).is_err());
+    }
+
+    #[test]
+    fn portable_comparator_rejects_rebound_false_final_newline_pass() {
+        let (v, base, after, mut verdict) = fixture();
+        let mut input = inputs(&v, &base, &after);
+        let mut policy: Value = serde_json::from_slice(input.resolved_policy).unwrap();
+        let gate = policy["gates"][0].as_object_mut().unwrap();
+        gate.remove("min");
+        gate.remove("max");
+        gate.insert("kind".into(), json!("final_newline"));
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        input.resolved_policy = &policy_bytes;
+        let candidate = overlay(&base, input.change, &after).unwrap();
+        let hash = candidate_binding(&CandidateArtifacts {
+            change: input.change,
+            resolved_policy: input.resolved_policy,
+            host_options: input.host_options,
+            evaluator: input.evaluator_identity,
+            collection: None,
+            external_evidence: None,
+            base_revision_sha256: snapshot_digest(&base).unwrap(),
+            candidate_revision_sha256: snapshot_digest(&candidate).unwrap(),
+        })
+        .unwrap();
+        verdict["binding_sha256"] =
+            json!(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        assert_eq!(
+            compare(
+                verdict.to_string().as_bytes(),
+                verdict.to_string().as_bytes(),
+                &input
+            ),
+            Err("final newline status differs from source")
+        );
+    }
+
     #[test]
     fn plain_paragraph_counts_respect_boundaries_and_limits() {
         for (source, expected) in [
