@@ -732,6 +732,10 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
 /// Every release tag runs the workspace suite on macOS, with the commands of
 /// the Linux shards. It stays off pull requests and off merges to main (each
 /// merge queued a ~55 minute run nobody read) and is no required check.
+///
+/// release.yml calls it after the release builds rather than both starting on
+/// the tag push: on v0.8.185 its eight macOS jobs held the runners and the
+/// x86_64-apple-darwin release build queued 27 minutes behind them.
 #[test]
 fn macos_tests_run_the_workspace_suite_per_release() {
     let run_lines = |text: &str, job: &str| -> Vec<String> {
@@ -745,8 +749,31 @@ fn macos_tests_run_the_workspace_suite_per_release() {
     let oss = workflow("oss-ci.yml");
     assert_eq!(
         block(&macos, "on:"),
-        ["  push:", "    tags: [\"v*\"]", "  workflow_dispatch:"]
+        ["  workflow_call:", "  workflow_dispatch:"]
     );
+    // The release calls it once the builds are done, never beside them, and
+    // publication does not wait for its verdict.
+    let release = workflow("release.yml");
+    let call = block(&release, "  macos-tests:");
+    assert_eq!(
+        call,
+        [
+            "    name: macOS tests",
+            "    needs: [verify-green-main, build]",
+            "    if: ${{ !cancelled() && needs.verify-green-main.result == 'success' }}",
+            "    permissions:",
+            "      contents: read",
+            "    uses: ./.github/workflows/macos-tests.yml",
+        ]
+    );
+    for job in ["  release:", "  homebrew-tap:"] {
+        assert!(
+            !block(&release, job)
+                .iter()
+                .any(|line| line.contains("needs:") && line.contains("macos-tests")),
+            "{job} must not wait for the macOS tests"
+        );
+    }
     assert_eq!(block(&macos, "permissions:"), ["  contents: read"]);
     assert!(macos.contains("  group: macos-tests-${{ github.ref }}\n  cancel-in-progress: true"));
     assert!(!macos.contains("github.event."));
@@ -955,8 +982,19 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
 
 #[test]
 fn changed_workflows_have_read_only_permissions() {
-    for name in ["oss-ci.yml", "aethyme-local-tests.yml"] {
+    for name in [
+        "oss-ci.yml",
+        "aethyme-local-tests.yml",
+        "release-prepare.yml",
+    ] {
         assert_eq!(block(&workflow(name), "permissions:"), ["  contents: read"]);
+    }
+    // Release preparation renders a patch for the broker session to commit;
+    // it runs only on request and never writes back.
+    let prepare = workflow("release-prepare.yml");
+    assert_eq!(block(&prepare, "on:"), ["  workflow_dispatch:"]);
+    for write in ["git push", "git commit", "gh pr", "gh api"] {
+        assert!(!prepare.contains(write), "release-prepare.yml runs {write}");
     }
     // The contract gate reads the merged PR's body on main; still read-only.
     assert_eq!(

@@ -772,10 +772,16 @@ impl Broker {
         Ok(self.action_required_blocker(&self.store_ref().session(session_id)?))
     }
 
+    // `blockers_action_required` cost about a second per full status on the
+    // busiest repository with nothing under it, so each step has a span: the
+    // session read, then per live session the notice probe in its checkout,
+    // the idle strip marker comparison and any satisfied notice removal.
     fn action_required_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
-        Ok(self
-            .store_ref()
-            .live_sessions()?
+        let sessions = {
+            let _span = crate::phase_telemetry::span("blockers_action_required_sessions");
+            self.store_ref().live_sessions()?
+        };
+        Ok(sessions
             .iter()
             .filter_map(|session| self.action_required_blocker(session))
             .collect())
@@ -786,8 +792,10 @@ impl Broker {
             return None;
         }
         let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
+        let step = crate::phase_telemetry::span("blockers_action_required_notice_probe");
         let notice_present = notice.is_file();
         let idle_notice = notice_present && crate::preparation::is_idle_strip_notice(&notice);
+        drop(step);
         if notice_present && !idle_notice {
             return Some(Self::conflict_notice_blocker(session, &notice));
         }
@@ -795,13 +803,17 @@ impl Broker {
         // command rebuilds them. This holds whether or not the notice could
         // be written in the checkout (another notice, a tracked or unignored
         // path), and clears itself once the session is prepared again.
-        if crate::preparation::stripped_since_prepared(self.main_root(), session.id) {
+        let step = crate::phase_telemetry::span("blockers_action_required_strip_marker");
+        let stripped = crate::preparation::stripped_since_prepared(self.main_root(), session.id);
+        drop(step);
+        if stripped {
             return Some(idle_strip_blocker(
                 session.id,
                 idle_notice.then_some(notice.as_path()),
             ));
         }
         if idle_notice {
+            let _span = crate::phase_telemetry::span("blockers_action_required_notice_clear");
             crate::warn_unrecorded(
                 "clear a satisfied idle strip notice",
                 std::fs::remove_file(&notice),
@@ -1730,18 +1742,15 @@ mod tests {
     /// of every routine status while any host resource lease was
     /// quarantined; only a checkout that exists is resolved now, and the
     /// mapping is the same.
-    #[test]
-    fn resource_lease_owners_resolve_only_checkouts_that_exist() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("repository");
-        std::fs::create_dir_all(&root).unwrap();
+    fn init_repository(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
         for args in [
             &["init", "-q", "-b", "main"][..],
             &["commit", "-q", "--allow-empty", "-m", "fixture"],
         ] {
             let status = std::process::Command::new("git")
                 .args(args)
-                .current_dir(&root)
+                .current_dir(root)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -1750,6 +1759,53 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "git {args:?}");
         }
+    }
+
+    /// Routine `broker status` spent seconds in its `retention` phase and
+    /// about one in `blockers_action_required` with nothing attributed under
+    /// either: its retention is the cleanup retention summary, not the GC
+    /// plan whose `gc_plan_*` spans it was expected to carry. Each step of
+    /// both now records a span on the command's recorder.
+    #[test]
+    fn routine_status_attributes_retention_and_action_required_steps() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        init_repository(&root);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        broker.start_worktree("live checkout", None).unwrap();
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let view = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.status_current(0).unwrap()
+        };
+        assert!(view.phase_timings_ms.contains_key("retention"));
+        let (_, counts) = recorder.totals();
+        for name in [
+            "cleanup_retention_policy",
+            "cleanup_retention_inventory",
+            "cleanup_retention_closed_sessions",
+            "cleanup_retention_inode_summary",
+            "cleanup_retention_closed_worktrees",
+            "cleanup_retention_oldest_closed",
+            "cleanup_retention_gate_headroom",
+            "cleanup_retention_reconciliation",
+            "cleanup_retention_artifact_sweep",
+            "blockers_action_required",
+            "blockers_action_required_sessions",
+            "blockers_action_required_notice_probe",
+            "blockers_action_required_strip_marker",
+        ] {
+            assert!(counts.contains_key(name), "{name} missing from {counts:?}");
+        }
+    }
+
+    #[test]
+    fn resource_lease_owners_resolve_only_checkouts_that_exist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        init_repository(&root);
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
         let present = broker.start_worktree("present checkout", None).unwrap();

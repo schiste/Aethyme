@@ -43,7 +43,12 @@ jobs:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-26-intel
+          # Cross-compiled on Apple Silicon: the Intel runner took 1482 s to
+          # build what this one builds in about 820 s, and was the release's
+          # critical path. Apple clang builds the C dependencies with
+          # `-arch x86_64`; the steps that run the binaries do so under
+          # Rosetta 2 with `arch -x86_64`, so they still exercise x86_64 code.
+          - os: macos-15
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -76,8 +81,9 @@ jobs:
       - name: Add the target to the pinned toolchain
         # rust-toolchain.toml pins the channel, so inside the checkout cargo
         # runs that toolchain, not the `stable` one set up above. A target
-        # that is not the runner's host (musl) must be added to the pinned
-        # toolchain, or std is missing: "can't find crate for `core`" (v0.8.5).
+        # that is not the runner's host (musl, x86_64 macOS on Apple Silicon)
+        # must be added to the pinned toolchain, or std is missing:
+        # "can't find crate for `core`" (v0.8.5).
         run: rustup target add ${{ matrix.target }}
 
       - name: Install musl toolchain
@@ -85,6 +91,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Ensure Rosetta 2 for the x86_64 macOS binaries
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          arch -x86_64 /usr/bin/true
 
       - name: Build release binaries
         env:
@@ -111,6 +125,19 @@ jobs:
           tar -czf "target/${{ matrix.target }}/release-helpers.tar.gz" -C "$helper_stage_dir" \
             release_manifest homebrew_formula source.sha SHA256SUMS
 
+      - name: Verify macOS binary architecture
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin) expected=x86_64 ;;
+            aarch64-apple-darwin) expected=arm64 ;;
+          esac
+          for binary in aethyme aethyme-engine-cli; do
+            archs="$(lipo -archs "target/${{ matrix.target }}/release/$binary")"
+            echo "$binary: $archs"
+            test "$archs" = "$expected"
+          done
+
       - name: Verify release version contract
         if: matrix.target != 'x86_64-unknown-linux-gnu'
         env:
@@ -131,10 +158,13 @@ jobs:
       - name: Verify embedded release versions
         env:
           REF_NAME: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
+          # x86_64 macOS binaries run under Rosetta 2 on the Apple Silicon runner.
+          run_target() { if [ "$TARGET" = x86_64-apple-darwin ]; then arch -x86_64 "$@"; else "$@"; fi; }
           expected="${REF_NAME#v}"
-          router_version="$(./target/${{ matrix.target }}/release/aethyme --version | awk '{print $2}')"
-          engine_version="$(./target/${{ matrix.target }}/release/aethyme-engine-cli --version | awk '{print $2}')"
+          router_version="$(run_target ./target/${{ matrix.target }}/release/aethyme --version | awk '{print $2}')"
+          engine_version="$(run_target ./target/${{ matrix.target }}/release/aethyme-engine-cli --version | awk '{print $2}')"
           test "$router_version" = "$expected"
           test "$engine_version" = "$expected"
 
@@ -150,13 +180,17 @@ jobs:
       - name: Smoke installed archive
         env:
           REF_NAME: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
+          # x86_64 macOS binaries run under Rosetta 2 on the Apple Silicon
+          # runner; `arch -x86_64` fails rather than falling back to arm64.
+          run_target() { if [ "$TARGET" = x86_64-apple-darwin ]; then arch -x86_64 "$@"; else "$@"; fi; }
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
           tar -xzf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" -C "$smoke_root"
-          "$smoke_root/aethyme" --version
-          "$smoke_root/aethyme-engine-cli" --version
-          "$smoke_root/aethyme" broker quick-test
+          run_target "$smoke_root/aethyme" --version
+          run_target "$smoke_root/aethyme-engine-cli" --version
+          run_target "$smoke_root/aethyme" broker quick-test
           graph_repo="$smoke_root/graph-refresh"
           git init --quiet --initial-branch=main "$graph_repo"
           mkdir -p "$graph_repo/.aethyme"
@@ -165,10 +199,10 @@ jobs:
           printf 'def release_smoke():\n    return True\n' > "$graph_repo/app.py"
           git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' add -A
           git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' commit --quiet -m fixture
-          "$smoke_root/aethyme" graph status --repo "$graph_repo" --json
-          plan_sha="$("$smoke_root/aethyme" graph refresh plan --repo "$graph_repo" --json | sed -n 's/.*"plan_sha256": "\([0-9a-f]*\)".*/\1/p')"
+          run_target "$smoke_root/aethyme" graph status --repo "$graph_repo" --json
+          plan_sha="$(run_target "$smoke_root/aethyme" graph refresh plan --repo "$graph_repo" --json | sed -n 's/.*"plan_sha256": "\([0-9a-f]*\)".*/\1/p')"
           test "${#plan_sha}" = 64
-          "$smoke_root/aethyme" graph refresh execute --repo "$graph_repo" --confirm "$plan_sha"
+          run_target "$smoke_root/aethyme" graph refresh execute --repo "$graph_repo" --confirm "$plan_sha"
           test -f "$graph_repo/.aethyme/graph_store.redb"
 
       - name: Upload artifact
@@ -225,6 +259,18 @@ jobs:
           name: aethyme-x86_64-pc-windows-msvc
           path: packages/aethyme/rust/aethyme-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
+
+  # The macOS workspace suite for the tag, after the release builds instead of
+  # beside them: started by its own tag push, its eight macOS jobs held the
+  # runners and the x86_64-apple-darwin build queued 27 minutes behind them
+  # (v0.8.185). Publication does not wait for it; it is no release gate.
+  macos-tests:
+    name: macOS tests
+    needs: [verify-green-main, build]
+    if: ${{ !cancelled() && needs.verify-green-main.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-tests.yml
 
   release:
     name: Attach to GitHub release

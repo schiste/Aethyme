@@ -6524,29 +6524,6 @@ impl Broker {
         })
     }
 
-    /// The previous session's ownership boundary, when it still owns commits
-    /// at `head` that integration does not have yet. `None` leaves the new
-    /// session's baseline at `head`, as before.
-    pub(super) fn carried_ownership(
-        &self,
-        previous: &Session,
-        head: &str,
-    ) -> Option<AdoptCarriedOwnership> {
-        let (_, integration_head) = self.integration_head_snapshot().ok()?;
-        let plan = self
-            .build_submission_plan(previous, head, &integration_head)
-            .ok()?;
-        let pending_owned_commits = plan.pending_owned_commit_ids().len();
-        if pending_owned_commits == 0 {
-            return None;
-        }
-        Some(AdoptCarriedOwnership {
-            from_session: previous.id,
-            baseline: plan.recorded_baseline?,
-            pending_owned_commits,
-        })
-    }
-
     fn revalidate_reuse_base(
         &mut self,
         checkout: &GitRepo,
@@ -7274,6 +7251,7 @@ impl Broker {
         session_id: i64,
         may_create_integration: bool,
     ) -> Result<AdoptIntegrationDrift, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("adopt_drift_report");
         let session_head = checkout.head_commit()?;
         // A non-promoting repository compares against its fetched default
         // branch: integration is not maintained there, and the next step for a
@@ -7341,18 +7319,13 @@ impl Broker {
         // Only the Ahead guidance consumes submission provenance. Behind and
         // diverged checkouts need a drift warning, not a patch-id scan of the
         // repository's history while adoption holds the lifecycle claim.
-        let submission_plan = if matches!(relation, AdoptIntegrationRelation::Ahead) {
-            self.store.session(session_id).ok().and_then(|session| {
-                self.build_submission_plan(&session, &session_head, &integration_head)
-                    .ok()
+        let submittable_owned_commits = if matches!(relation, AdoptIntegrationRelation::Ahead) {
+            self.store.session(session_id).map_or(0, |session| {
+                self.submittable_owned_commits(&session, &session_head, &integration_head)
             })
         } else {
-            None
+            0
         };
-        let pending_owned_commits = submission_plan
-            .as_ref()
-            .map(|plan| plan.pending_owned_commit_ids().len());
-        let submission_plan_safe = submission_plan.as_ref().is_some_and(|plan| plan.safe);
 
         let (warning, safe_next_action) = match relation {
             AdoptIntegrationRelation::Current => (
@@ -7365,17 +7338,12 @@ impl Broker {
                 )),
                 inspect_drift,
             ),
-            AdoptIntegrationRelation::Ahead
-                if submission_plan_safe && pending_owned_commits.is_some_and(|count| count > 0) =>
-            {
-                (
-                    Some(format!(
-                        "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}; {pending} pending session-owned commit(s) are safe to submit before starting a follow-up",
-                        pending = pending_owned_commits.unwrap_or_default()
-                    )),
-                    format!("aethyme broker submit --session {session_id}"),
-                )
-            }
+            AdoptIntegrationRelation::Ahead if submittable_owned_commits > 0 => (
+                Some(format!(
+                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}; {submittable_owned_commits} pending session-owned commit(s) are safe to submit before starting a follow-up"
+                )),
+                format!("aethyme broker submit --session {session_id}"),
+            ),
             AdoptIntegrationRelation::Ahead => (
                 Some(format!(
                     "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but none are session-owned under the recorded baseline, so submit will not replay them; they predate this adoption. To submit them, re-adopt from a base that precedes them"

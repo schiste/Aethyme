@@ -3807,6 +3807,11 @@ impl Broker {
         now_ms: i64,
         audit: bool,
     ) -> Result<CleanupRetention, BrokerOpError> {
+        // Each step has its own span: this is all of `broker status`'s
+        // `retention` phase, which never reaches the GC plan and its
+        // `gc_plan_*` spans (those time `doctor`, `gc plan` and the GC
+        // service), so it reported seconds with nothing attributed.
+        let step = crate::phase_telemetry::span("cleanup_retention_policy");
         let (policy, retention_config) = match crate::load_retention_policy_report(&self.main_root)
         {
             Ok(report) => (
@@ -3824,7 +3829,9 @@ impl Broker {
                 },
             ),
         };
+        drop(step);
         let deadline = crate::git::active_git_deadline();
+        let step = crate::phase_telemetry::span("cleanup_retention_inventory");
         let (plan, deferred) = if audit {
             let plan = match deadline {
                 Some(deadline) => self.cleanup_plan_recorded_until(deadline)?,
@@ -3835,14 +3842,22 @@ impl Broker {
         } else {
             self.cleanup_plan_observed()?
         };
+        drop(step);
+        let step = crate::phase_telemetry::span("cleanup_retention_closed_sessions");
         let closed_sessions = self.store.cleaned_sessions()?;
+        drop(step);
+        let step = crate::phase_telemetry::span("cleanup_retention_inode_summary");
         let (worktree_inodes, worktree_inode_unmeasured, inode_summary_complete) =
             self.recorded_worktree_inode_summary(&closed_sessions, deadline)?;
+        drop(step);
+        let step = crate::phase_telemetry::span("cleanup_retention_closed_worktrees");
         let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
             &plan,
             &closed_sessions,
             &self.main_root,
         );
+        drop(step);
+        let step = crate::phase_telemetry::span("cleanup_retention_oldest_closed");
         let mut oldest_closed_at: Option<i64> = None;
         let mut oldest_closed_complete = true;
         for session in &closed_sessions {
@@ -3860,6 +3875,7 @@ impl Broker {
                     Some(oldest_closed_at.map_or(closed_at, |oldest| oldest.min(closed_at)));
             }
         }
+        drop(step);
         let oldest_closed_age_days = oldest_closed_at
             .map(|closed_at| now_ms.saturating_sub(closed_at).max(0) as u64 / 86_400_000)
             .unwrap_or_else(|| {
@@ -3871,7 +3887,9 @@ impl Broker {
             });
         // One reading, consumed by both the severity below and the evidence
         // line in the advice that reports it.
+        let step = crate::phase_telemetry::span("cleanup_retention_gate_headroom");
         let (gate_headroom, gate_headroom_deferred) = self.gate_headroom();
+        drop(step);
         let (host_volume_probe, host_available_bytes) = gate_headroom
             .bytes
             .map(|probe| (Some(probe.path), Some(probe.available)))
@@ -3880,7 +3898,9 @@ impl Broker {
             .inodes
             .map(|probe| (Some(probe.path), Some(probe.available)))
             .unwrap_or((None, None));
+        let step = crate::phase_telemetry::span("cleanup_retention_reconciliation");
         let reconciliation = self.reconcile_worktree_directories_until(false, deadline)?;
+        drop(step);
         let inventory_complete = deferred == 0
             && inode_summary_complete
             && oldest_closed_complete
@@ -3920,6 +3940,7 @@ impl Broker {
         // budget is not a pass -- the bytes it skipped are exactly the ones
         // that would have decided it.
         let over_retained_bytes_budget = budget_verdict.exceeded();
+        let step = crate::phase_telemetry::span("cleanup_retention_artifact_sweep");
         let (last_artifact_sweep, last_artifact_sweep_error) =
             match self.last_artifact_sweep_report() {
                 Ok(report) => (report, None),
@@ -3928,6 +3949,7 @@ impl Broker {
                     Some(error.to_string().chars().take(240).collect::<String>()),
                 ),
             };
+        drop(step);
         Ok(CleanupRetention {
             inventory_complete,
             inventory_deferred_sessions: deferred,
@@ -4023,7 +4045,7 @@ impl Broker {
             })
             .unwrap_or_default();
         let gate_storage = self.storage_context().gate_storage_locations();
-        if uses_managed_cache && let Some(cache) = gate_storage.cache_dir() {
+        if uses_managed_cache && let Some(cache) = gate_storage.gate_cache_dir() {
             probes.insert(cache);
         }
         if uses_host_resource_db && let Ok(database) = gate_storage.resource_db_path() {
@@ -5451,6 +5473,8 @@ impl Broker {
                 let archived_plan = archive_guard.plan();
                 let archive_path = archive_guard.archive_path();
                 let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
+                let replan_span =
+                    crate::phase_telemetry::span("recovery_archive_apply_replan_under_claim");
                 let current = if archive_guard.is_retirement() {
                     self.cleanup_resolve_retirement_revalidation_plan(
                         session_id,
@@ -5461,6 +5485,7 @@ impl Broker {
                 } else {
                     self.cleanup_resolve_revalidation_plan(session_id)?
                 };
+                drop(replan_span);
                 if current.digest != archived_plan.digest
                     || current.target_origin != session.origin
                     || archived_plan.target_origin != session.origin
@@ -5504,6 +5529,8 @@ impl Broker {
                         }
                     }
                 }
+                let _verify_span =
+                    crate::phase_telemetry::span("recovery_archive_apply_verify_under_claim");
                 crate::cleanup_resolve::verify_recovery_archive_for_plan(
                     self.repo_handle(),
                     archive_path,

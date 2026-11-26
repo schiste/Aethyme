@@ -95,6 +95,62 @@ pub(crate) fn raise_for_trash_deleter() -> DeleterPriority {
     platform::raise_for_trash_deleter()
 }
 
+/// The macOS process-scope disk policy the trash deleter drops to while
+/// foreground work (a dependency install, a gate) writes to a volume it
+/// deletes on: `IOPOL_THROTTLE`, under which XNU delays its I/O whenever
+/// ordinary-priority I/O hit the same disk recently.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const TRASH_DELETER_IOPOL_THROTTLE: libc::c_int = 3;
+
+/// Which disk policy the trash deleter should switch to, if any.
+///
+/// The deleter raises itself to `IOPOL_IMPORTANT` so it is not starved by a
+/// busy disk, and that also lets it starve the foreground install beside it
+/// (a 30-minute offline install used ~6 s of CPU while the catch-up removed
+/// 17.7 GB on its volume). It yields back to the throttled tier while
+/// foreground work runs on its volume and returns to `important` once that
+/// work ends. A process whose policy was not `important` when the lap began
+/// (the throttled worker, an operator's foreground drain on Linux) is never
+/// switched: raising it would undo its own policy.
+///
+/// `Some(true)` means drop to the throttle, `Some(false)` means return to
+/// `important`, `None` means leave the policy as it is.
+pub(crate) fn trash_deleter_io_switch(
+    base_policy: &str,
+    yielding_now: bool,
+    foreground_active: bool,
+) -> Option<bool> {
+    (base_policy == "important" && yielding_now != foreground_active).then_some(foreground_active)
+}
+
+/// Apply [`trash_deleter_io_switch`]'s answer: the throttle when `yielding`,
+/// `important` otherwise. Whether the platform accepted it; always `false`
+/// off macOS, where the deleter keeps its inherited idle class.
+pub(crate) fn set_trash_deleter_io_yield(yielding: bool) -> bool {
+    platform::set_process_io_policy(if yielding {
+        TRASH_DELETER_IOPOL_THROTTLE
+    } else {
+        TRASH_DELETER_IOPOL_IMPORTANT
+    })
+}
+
+/// Set the storage worker's recovery archive migration to an ordinary
+/// process's disk policy (`ordinary`: leave the macOS background band, then
+/// `IOPOL_IMPORTANT`) or back to `IOPOL_THROTTLE`. Process scope, like the
+/// trash deleter: XNU throttles a thread whenever its process is throttled,
+/// so the copy threads follow the process. Whether the platform accepted
+/// it; always `false` off macOS, where the worker keeps its idle class.
+pub(crate) fn set_storage_migration_io(ordinary: bool) -> bool {
+    if ordinary {
+        platform::leave_darwin_background();
+    }
+    platform::set_process_io_policy(if ordinary {
+        TRASH_DELETER_IOPOL_IMPORTANT
+    } else {
+        TRASH_DELETER_IOPOL_THROTTLE
+    })
+}
+
 /// Apply the retirement lane's priority through the three setters (the
 /// platform calls, or recorders in tests): leave the background band, set
 /// the process-scope disk policy to `IOPOL_IMPORTANT` (the policy an
@@ -228,6 +284,19 @@ mod platform {
         ) -> libc::c_int;
     }
 
+    pub(super) fn set_process_io_policy(policy: libc::c_int) -> bool {
+        // SAFETY: integer-only wrapper changing only this process's policy.
+        unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, policy) == 0 }
+    }
+
+    pub(super) fn leave_darwin_background() -> bool {
+        // SAFETY: integer-only syscall wrapper; `who = 0` is this process.
+        let result = unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, super::TRASH_DELETER_DARWIN_BG)
+        };
+        result == 0
+    }
+
     pub(super) fn lower_current_process() -> BackgroundPriority {
         // SAFETY: plain syscall wrappers with integer arguments; `who = 0`
         // names the calling process and no memory is passed.
@@ -268,6 +337,15 @@ mod platform {
 
     /// Linux keeps the inherited class (the throttle measured was macOS's).
     pub(super) fn raise_child_before_exec() {}
+
+    /// Linux keeps the inherited idle class; nothing to switch.
+    pub(super) fn set_process_io_policy(_policy: libc::c_int) -> bool {
+        false
+    }
+
+    pub(super) fn leave_darwin_background() -> bool {
+        false
+    }
 
     pub(super) fn current_io_policy() -> &'static str {
         // SAFETY: `ioprio_get` takes two integers and touches no memory.
@@ -338,6 +416,14 @@ mod platform {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn raise_child_before_exec() {}
 
+    pub(super) fn set_process_io_policy(_policy: libc::c_int) -> bool {
+        false
+    }
+
+    pub(super) fn leave_darwin_background() -> bool {
+        false
+    }
+
     /// No qualified call on this platform (Windows included): the worker runs
     /// at normal priority and relies on the rate limit and host lock.
     pub(super) fn lower_current_process() -> BackgroundPriority {
@@ -380,6 +466,26 @@ mod tests {
         let refused = raise_for_trash_deleter_with(|_| false, |_, _| false, |_| false);
         assert_eq!(refused.io_policy, "unchanged");
         assert!(!current_io_policy().is_empty());
+    }
+
+    /// The deleter drops to the throttle while foreground work runs on its
+    /// volume and returns to `important` after; a process that was never
+    /// raised is left alone in both directions.
+    #[test]
+    fn the_trash_deleter_yields_its_disk_only_from_important() {
+        assert_eq!(
+            trash_deleter_io_switch("important", false, true),
+            Some(true)
+        );
+        assert_eq!(
+            trash_deleter_io_switch("important", true, false),
+            Some(false)
+        );
+        assert_eq!(trash_deleter_io_switch("important", true, true), None);
+        assert_eq!(trash_deleter_io_switch("important", false, false), None);
+        assert_eq!(trash_deleter_io_switch("throttle", false, true), None);
+        assert_eq!(trash_deleter_io_switch("idle", false, true), None);
+        assert_eq!(trash_deleter_io_switch("unknown", true, false), None);
     }
 
     /// Only a Git read is known read-only; a write, a deletion, an unknown

@@ -27,11 +27,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod archive_floor;
+pub mod artifact_age;
 pub mod check;
 pub mod cli;
 pub mod evict;
+pub mod gate_prune;
 pub mod host_temp;
 pub mod landing;
+pub mod placement;
 #[cfg(test)]
 mod tests;
 
@@ -49,6 +53,8 @@ const LEDGER_SCHEMA: u32 = 2;
 const GIB: u64 = 1024 * 1024 * 1024;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
+/// The default of `[budget] artifact_max_age_hours`.
+pub const DEFAULT_ARTIFACT_MAX_AGE_HOURS: u64 = 24;
 /// Directory entries counted for a class that is not walked.
 const COUNT_LIMIT: u64 = 100_000;
 /// How often a walk refreshes the worker's heartbeat.
@@ -118,10 +124,24 @@ pub enum Policy {
         idle: Duration,
         expire: Option<Duration>,
     },
+    /// Children named for a UTC day (`d<days since the epoch>`, the Node.js
+    /// compile cache): a past day's child goes once unchanged for
+    /// `past_day_idle`, whatever the budget; today's (or a later day's) is
+    /// never removed. Other children are kept as [`Policy::LruChildren`]
+    /// with `idle` and `expire`.
+    DailyChildren {
+        idle: Duration,
+        expire: Duration,
+        past_day_idle: Duration,
+    },
     /// The whole entry goes once nothing in it changed for `age`.
     ExpireEntry { age: Duration },
-    /// Over budget, every entry but the most recently used one per gate
-    /// kind goes; an entry with a live lease is never touched.
+    /// Over budget, superseded workspace build units are pruned out of each
+    /// entry first ([`gate_prune`]); then every entry but the most recently
+    /// used one per gate kind goes, then, least recently used first, the
+    /// other kinds' entries idle for a day (any idle time under pressure),
+    /// never the repository's most recently used entry. An entry with a live
+    /// lease is never touched.
     GateCache,
     /// Over budget, oldest first, only archives proven landed and past their
     /// recorded minimum retention; never by age alone.
@@ -221,7 +241,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | landing::CACHE_FILE
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
-                | check::GATE_BUDGETS_FILE => Class::Coordination,
+                | check::GATE_BUDGETS_FILE
+                | placement::ARCHIVE_STORAGE_ROOTS_FILE
+                | placement::ARCHIVE_STORAGE_ROOTS_LOCK_FILE
+                | placement::MIGRATION_STATE_FILE => Class::Coordination,
                 _ => Class::Unclassified,
             }
         }
@@ -258,6 +281,10 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | "task-caches" => Class::ToolCaches,
                 "qualification-retained" => Class::QualificationRetained,
                 "preparation-cache" | "preparation-cache-isolated" => Class::PreparationCache,
+                // Placed here by `storage.toml` `[placement]`, in the same
+                // layout as in host state and the host cache.
+                placement::RECOVERY_ARCHIVE_DIRECTORY => Class::RecoveryArchives,
+                placement::GATE_CACHE_DIRECTORY => Class::GateCache,
                 "worktrees" | "checkout-preserved" => Class::Worktrees,
                 STORAGE_ROOT_MARKER => Class::Coordination,
                 _ => Class::Unclassified,
@@ -299,17 +326,25 @@ pub fn policy(class: Class) -> Policy {
 /// once the day is over.
 pub const NODE_COMPILE_CACHE_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// How long a past day's Node.js compile cache directory must be unchanged
+/// before it goes. No new command is pointed at a past day's directory; this
+/// covers a process started before midnight that writes its entries when it
+/// exits.
+pub const NODE_COMPILE_CACHE_PAST_DAY_IDLE: Duration = HOUR;
+
 /// How the top-level entry `name` of `class` is enforced: its class's
-/// policy, except that the Node.js compile cache's daily directories also
-/// expire by age, whatever the tool-cache budget.
+/// policy, except that the Node.js compile cache's daily directories go once
+/// their day is over (and unchanged for an hour), whatever the tool-cache
+/// budget, and today's directory never goes.
 pub fn entry_policy(class: Class, name: &str) -> Policy {
     match policy(class) {
         Policy::LruChildren { idle, .. }
             if class == Class::ToolCaches && name == crate::node_compile_cache::CACHE_DIRECTORY =>
         {
-            Policy::LruChildren {
+            Policy::DailyChildren {
                 idle,
-                expire: Some(NODE_COMPILE_CACHE_EXPIRY),
+                expire: NODE_COMPILE_CACHE_EXPIRY,
+                past_day_idle: NODE_COMPILE_CACHE_PAST_DAY_IDLE,
             }
         }
         policy => policy,
@@ -332,8 +367,20 @@ pub struct Budgets {
     pub host_cache_total_bytes: u64,
     pub storage_total_bytes: u64,
     /// Below this free space on a volume, eviction runs unpaced and advice
-    /// warns.
+    /// warns (recovery archives excepted: see
+    /// `recovery_archive_free_floor_percent`).
     pub free_floor_bytes: u64,
+    /// The recovery archive floor of a volume is the larger of
+    /// `free_floor_bytes` and this share (percent) of the volume's size,
+    /// capped at `recovery_archive_free_floor_cap_bytes`. While the
+    /// volume's free space is below it, the oldest recovery archives on it
+    /// that may go (landed, past their promised retention, not kept) are
+    /// removed, paced and within a time budget, until free space is back at
+    /// the floor. `0` leaves `free_floor_bytes` alone.
+    pub recovery_archive_free_floor_percent: u64,
+    /// The most the share may add: with the defaults a 1 TB disk (931 GiB)
+    /// gets a 20 GiB floor, not 93 GiB. `0` leaves `free_floor_bytes` alone.
+    pub recovery_archive_free_floor_cap_bytes: u64,
     /// Below this, commands that write to that volume refuse once a bounded
     /// reclaim did not free enough.
     pub hard_minimum_bytes: u64,
@@ -355,6 +402,14 @@ pub struct Budgets {
     pub host_temp_advice_entries: u64,
     /// ... or a sizeable one sits on a volume with less free space than this.
     pub host_temp_free_floor_bytes: u64,
+    /// The host-wide artifact max age, in hours (`0` turns it off): build
+    /// output and caches Aethyme can prove rebuildable and unused are
+    /// removed once unused this long, whatever the budgets
+    /// ([`artifact_age`]): gate cache entries and superseded local build
+    /// units, Cargo targets in session scratch directories and in the main
+    /// checkouts of registered repositories, empty leftover worktree roots,
+    /// and (by the idle strip) the Cargo targets of sessions idle this long.
+    pub artifact_max_age_hours: u64,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -375,6 +430,8 @@ impl Default for Budgets {
             host_cache_total_bytes: 12 * GIB,
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
+            recovery_archive_free_floor_percent: 10,
+            recovery_archive_free_floor_cap_bytes: 20 * GIB,
             hard_minimum_bytes: 2 * GIB,
             // Archive-then-delete keeps idle work only in its archive, so
             // archives are kept a quarter (was 30 days).
@@ -383,6 +440,7 @@ impl Default for Budgets {
             host_temp_advice_bytes: 8 * GIB,
             host_temp_advice_entries: 5_000,
             host_temp_free_floor_bytes: 10 * GIB,
+            artifact_max_age_hours: DEFAULT_ARTIFACT_MAX_AGE_HOURS,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
@@ -393,6 +451,10 @@ impl Default for Budgets {
 struct BudgetFile {
     #[serde(default)]
     budget: Budgets,
+    /// Read by [`placement::Placement::load`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    placement: Option<toml::Value>,
 }
 
 impl Budgets {
@@ -412,6 +474,12 @@ impl Budgets {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         (budgets, error)
+    }
+
+    /// The artifact max age, `None` when `artifact_max_age_hours` is 0.
+    pub fn artifact_max_age(&self) -> Option<Duration> {
+        (self.artifact_max_age_hours > 0)
+            .then(|| Duration::from_secs(self.artifact_max_age_hours.saturating_mul(60 * 60)))
     }
 
     /// A repository's gate cache budget: its configured one, else the
@@ -434,6 +502,20 @@ impl Budgets {
             Class::PreparationCache => Some(self.preparation_cache_bytes),
             _ => None,
         }
+    }
+
+    /// The recovery archive floor of a volume of `total_bytes` (`0` when
+    /// its size is unknown): the larger of `free_floor_bytes` and
+    /// `recovery_archive_free_floor_percent` of it, the share capped at
+    /// `recovery_archive_free_floor_cap_bytes`.
+    pub fn recovery_archive_floor(&self, total_bytes: u64) -> u64 {
+        let share = u128::from(total_bytes)
+            * u128::from(self.recovery_archive_free_floor_percent.min(100))
+            / 100;
+        let share = u64::try_from(share)
+            .unwrap_or(u64::MAX)
+            .min(self.recovery_archive_free_floor_cap_bytes);
+        self.free_floor_bytes.max(share)
     }
 
     /// The total for one kind of root (worktrees excluded).
@@ -627,6 +709,26 @@ pub struct PassReport {
     /// counted as unlanded.
     #[serde(default)]
     pub unproven_archives: Vec<String>,
+    /// Why `storage.toml` could not be read: this pass ran on default
+    /// budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_error: Option<String>,
+    /// The recovery archive floor, per volume holding archives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_floor: Vec<archive_floor::FloorReport>,
+    /// Where archives and gate caches went and what moved, when
+    /// `storage.toml` `[placement]` places either off the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<placement::PlacementReport>,
+    /// What pruning superseded workspace build units out of over-budget gate
+    /// caches did this pass; `None` when no gate cache was over budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_cache_prune: Option<gate_prune::GatePruneReport>,
+    /// What the artifact max age removed outside the ledger's classes this
+    /// pass (session scratch and main-checkout Cargo targets, leftover
+    /// worktree roots); `None` when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_age: Option<artifact_age::ArtifactAgeReport>,
 }
 
 /// The persisted ledger.
@@ -947,6 +1049,9 @@ pub struct RecoveryArchiveUsage {
     pub pool: ArchiveLocationUsage,
     /// Archives in host state (written before the move; still restorable).
     pub host_state: ArchiveLocationUsage,
+    /// Archives on adopted storage roots (`storage.toml` `[placement]`).
+    #[serde(default)]
+    pub storage: ArchiveLocationUsage,
     /// `[cleanup] recovery_archive_bound_gib` in bytes (`0`: off).
     pub bound_bytes: u64,
     pub over_bound: bool,
@@ -965,6 +1070,19 @@ pub struct RecoveryArchiveUsage {
     pub evicted_bytes_total: u64,
     /// The measurement stopped at its deadline (a lower bound).
     pub partial: bool,
+    /// Every archive found is in the total, measured by this pass or counted
+    /// with the size an earlier pass measured (so it can be true of a
+    /// `partial` pass). A record from before this field reads as not known.
+    #[serde(default)]
+    pub total_known: bool,
+    /// `total_known` is false for one reason alone: a pool seen before is
+    /// absent.
+    #[serde(default)]
+    pub only_pool_absent: bool,
+    /// Removals made some and stopped on their budget with archives past
+    /// their retention age left to try.
+    #[serde(default)]
+    pub eviction_unfinished: bool,
     pub observed_at_ms: i64,
 }
 
@@ -1016,6 +1134,38 @@ pub struct MeasuredArchiveSize {
     pub bytes: u64,
 }
 
+/// An archive the broker cannot vouch for, in [`ArchiveBoundState`]: its
+/// content may change, so it is walked again whenever a pass reaches it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnownedArchiveSize {
+    /// What the last completed walk found, if any: counted in the total of
+    /// a pass that could not walk it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// When that walk completed; `0` once a later walk failed. Past
+    /// [`UNOWNED_SIZE_FRESH_MS`] the bytes still count, but the total is
+    /// not known.
+    #[serde(default)]
+    pub measured_at_ms: i64,
+    /// When a walk was last tried: the one tried longest ago goes first, so
+    /// one that is always too large cannot hold back the others.
+    #[serde(default)]
+    pub tried_at_ms: i64,
+}
+
+/// How long the size of an archive the broker cannot vouch for stands in for
+/// a new walk: it may have grown since.
+pub const UNOWNED_SIZE_FRESH_MS: i64 = 24 * 60 * 60 * 1_000;
+
+impl UnownedArchiveSize {
+    /// Whether the size is recent enough for a known total.
+    pub fn fresh(&self, now_ms: i64) -> bool {
+        self.bytes.is_some()
+            && now_ms >= self.measured_at_ms
+            && now_ms - self.measured_at_ms < UNOWNED_SIZE_FRESH_MS
+    }
+}
+
 fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
     use sha2::Digest as _;
     // Beside the usage record, with an extension the usage reader skips.
@@ -1036,6 +1186,9 @@ pub struct ArchiveBoundState {
     /// owns are kept; a failed walk is never recorded.
     #[serde(default)]
     pub sizes: BTreeMap<String, MeasuredArchiveSize>,
+    /// Archives the broker could not vouch for when last listed.
+    #[serde(default)]
+    pub unowned_sizes: BTreeMap<String, UnownedArchiveSize>,
     /// Archives whose size walk ran out of budget, with when: measured
     /// after the others next run, with what budget is left.
     #[serde(default)]
@@ -1049,6 +1202,11 @@ pub struct ArchiveBoundState {
     /// resumes after it. `None` once a listing reaches every archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_cursor: Option<String>,
+    /// The pool-side archive directory last seen: while it is absent (an
+    /// unmounted volume) and sizes under it are recorded, they are kept and
+    /// the total is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_root: Option<String>,
 }
 
 /// `repository`'s [`ArchiveBoundState`] (empty when none was recorded or
@@ -1058,6 +1216,22 @@ pub fn archive_bound_state(host_state: &Path, repository: &str) -> ArchiveBoundS
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// Archive staging directories (`.partial`) the bound passes last listed, with
+/// the size each was last measured at: being written, or left unfinished. Reads
+/// the recorded states only.
+pub fn unfinished_archive_staging(host_state: &Path) -> BTreeMap<PathBuf, Option<u64>> {
+    recovery_archive_usage(host_state)
+        .keys()
+        .flat_map(|repository| archive_bound_state(host_state, repository).unowned_sizes)
+        .map(|(path, size)| (PathBuf::from(path), size.bytes))
+        .filter(|(path, _)| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(is_partial_archive_name)
+        })
+        .collect()
 }
 
 /// Record `repository`'s [`ArchiveBoundState`], written atomically.
@@ -1359,9 +1533,13 @@ pub fn archive_deletable(
 const EARLIEST_MANIFEST_MS: u64 = 1_500_000_000_000;
 const MANIFEST_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Add top-level entries that appeared under the roots and drop those that
-/// disappeared.
+/// Add top-level entries that appeared under the roots, drop those that
+/// disappeared, and classify known entries again: an entry first seen by a
+/// binary that did not know its name (an older one) was recorded as
+/// unclassified, which is never measured, so it is measured afresh as what
+/// it is.
 pub fn discover(ledger: &mut Ledger) {
+    reclassify(ledger);
     let mut seen = Vec::new();
     for root in &ledger.roots {
         let Some(device) = device_of(&root.path) else {
@@ -1399,6 +1577,31 @@ pub fn discover(ledger: &mut Ledger) {
         seen.iter()
             .any(|(root, name)| *root == item.root && *name == item.name)
     });
+}
+
+/// Give every known item the class [`classify`] gives its name now; an item
+/// whose class changed is reset to unmeasured (counter
+/// `storage_ledger_reclassified`). Returns how many changed.
+pub fn reclassify(ledger: &mut Ledger) -> usize {
+    let mut changed = 0;
+    for item in &mut ledger.items {
+        let class = classify(item.root_kind, &item.name);
+        if class == item.class {
+            continue;
+        }
+        crate::phase_telemetry::add("storage_ledger_reclassified", Duration::ZERO);
+        changed += 1;
+        item.class = class;
+        item.bytes = 0;
+        item.measured = false;
+        item.entries = 0;
+        item.oldest_ms = 0;
+        item.newest_ms = 0;
+        item.measured_at_ms = 0;
+        item.children.clear();
+        item.walk = None;
+    }
+    changed
 }
 
 /// Measure (or count) one item until `deadline`; `true` when it finished.
@@ -1465,23 +1668,8 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
         let name = walk.current.take().unwrap_or_default();
         if child_level {
             let child_path = path.join(&name);
-            let ctime = fs::symlink_metadata(&child_path).map_or(0, |metadata| ctime_ms(&metadata));
-            let meta = if item.class == Class::RecoveryArchives {
-                archive_meta(&child_path)
-            } else {
-                ArchiveMeta::default()
-            };
-            let kept = item.class == Class::RecoveryArchives && keep_marker(&child_path).exists();
-            walk.done.push(Child {
-                name,
-                bytes: walk.usage.bytes,
-                newest_ms: walk.usage.newest_ms,
-                ctime_ms: ctime,
-                created_ms: meta.created_ms,
-                min_retention_ms: meta.min_retention_ms,
-                session_id: meta.session_id,
-                kept,
-            });
+            walk.done
+                .push(child_record(item.class, &child_path, name, &walk.usage));
         } else {
             item.bytes = walk.usage.bytes;
             item.entries = walk.usage.entries;
@@ -1494,26 +1682,81 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
         }
     }
     if child_level {
-        item.bytes = walk.done.iter().map(|child| child.bytes).sum();
-        item.entries = walk.done.len() as u64;
-        item.newest_ms = walk
-            .done
-            .iter()
-            .map(|child| child.newest_ms)
-            .max()
-            .unwrap_or(0);
-        item.oldest_ms = walk
-            .done
-            .iter()
-            .map(|child| child.newest_ms)
-            .filter(|ms| *ms > 0)
-            .min()
-            .unwrap_or(0);
         item.children = walk.done;
+        set_child_totals(item);
     }
     item.measured = true;
     item.measured_at_ms = now_ms();
     true
+}
+
+/// One child's record once its walk finished with `usage`.
+fn child_record(class: Class, child_path: &Path, name: String, usage: &Usage) -> Child {
+    let ctime = fs::symlink_metadata(child_path).map_or(0, |metadata| ctime_ms(&metadata));
+    let meta = if class == Class::RecoveryArchives {
+        archive_meta(child_path)
+    } else {
+        ArchiveMeta::default()
+    };
+    let kept = class == Class::RecoveryArchives && keep_marker(child_path).exists();
+    Child {
+        name,
+        bytes: usage.bytes,
+        newest_ms: usage.newest_ms,
+        ctime_ms: ctime,
+        created_ms: meta.created_ms,
+        min_retention_ms: meta.min_retention_ms,
+        session_id: meta.session_id,
+        kept,
+    }
+}
+
+/// An item evicted child by child: its totals from its children.
+pub(crate) fn set_child_totals(item: &mut Item) {
+    item.bytes = item.children.iter().map(|child| child.bytes).sum();
+    item.entries = item.children.len() as u64;
+    item.newest_ms = item
+        .children
+        .iter()
+        .map(|child| child.newest_ms)
+        .max()
+        .unwrap_or(0);
+    item.oldest_ms = item
+        .children
+        .iter()
+        .map(|child| child.newest_ms)
+        .filter(|ms| *ms > 0)
+        .min()
+        .unwrap_or(0);
+}
+
+/// Measure one child of `item` now, whole (no deadline): what a full walk
+/// of the item would record for it. `None` when it is missing or is a link.
+pub(crate) fn measure_child(item: &Item, name: &str, beat: &mut dyn FnMut()) -> Option<Child> {
+    let child_path = item.path().join(name);
+    let top = fs::symlink_metadata(item.path()).ok()?;
+    let child = fs::symlink_metadata(&child_path).ok()?;
+    if child.file_type().is_symlink() || !child.is_dir() {
+        return None;
+    }
+    let mut pending = vec![child_path.clone()];
+    let mut usage = Usage::default();
+    // A far deadline: the walk always finishes.
+    let deadline = Instant::now() + DAY;
+    walk_until(
+        &mut pending,
+        &mut usage,
+        device(&top),
+        deadline,
+        BEAT_EVERY,
+        beat,
+    );
+    Some(child_record(
+        item.class,
+        &child_path,
+        name.to_string(),
+        &usage,
+    ))
 }
 
 /// Measure entries round robin until `budget` elapses: dirty (noted by a
@@ -1562,13 +1805,21 @@ pub fn measure_some(
     (measured, resumable)
 }
 
-/// Record over-budget time for each class.
+/// Record over-budget time for each class. The gate cache is over budget
+/// while any repository's gate caches are over that repository's budget.
 pub fn update_over_budget_clock(ledger: &mut Ledger, budgets: &Budgets, now: u64) {
     let totals = ledger.class_bytes();
+    let gate_over = evict::gate_cache_by_repository(ledger)
+        .iter()
+        .any(|(repository, bytes)| *bytes > budgets.gate_budget(repository));
     for class in totals.keys().copied().collect::<Vec<_>>() {
-        let over = budgets
-            .class_bytes(class)
-            .is_some_and(|budget| totals.get(&class).copied().unwrap_or(0) > budget);
+        let over = if class == Class::GateCache {
+            gate_over
+        } else {
+            budgets
+                .class_bytes(class)
+                .is_some_and(|budget| totals.get(&class).copied().unwrap_or(0) > budget)
+        };
         let telemetry = ledger.telemetry.entry(class).or_default();
         match (over, telemetry.over_budget_since_ms) {
             (true, None) => telemetry.over_budget_since_ms = Some(now),

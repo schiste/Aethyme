@@ -2318,7 +2318,7 @@ const SUPPORTED_FILESYSTEMS: &[&str] = &["ext4", "xfs", "btrfs"];
 
 /// The filesystem type holding `path`, and whether it is local.
 #[cfg(target_os = "macos")]
-fn filesystem_of(path: &Path) -> (String, bool) {
+pub(crate) fn filesystem_of(path: &Path) -> (String, bool) {
     use std::os::unix::ffi::OsStrExt;
 
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -2338,7 +2338,7 @@ fn filesystem_of(path: &Path) -> (String, bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn filesystem_of(path: &Path) -> (String, bool) {
+pub(crate) fn filesystem_of(path: &Path) -> (String, bool) {
     use std::os::unix::ffi::OsStrExt;
 
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -2367,7 +2367,7 @@ fn filesystem_of(path: &Path) -> (String, bool) {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn filesystem_of(_path: &Path) -> (String, bool) {
+pub(crate) fn filesystem_of(_path: &Path) -> (String, bool) {
     ("unknown".into(), false)
 }
 

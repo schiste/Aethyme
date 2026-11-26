@@ -2,8 +2,10 @@
 //!
 //! Deletion sites, and why each removal is safe:
 //! - `gate_cache` (`<host cache>/gates/<repository>/<key>`): a cargo target a
-//!   gate rebuilds; regenerable. Removed only while holding the entry's
-//!   exclusive gate cache lease, so a gate never loses it mid-run.
+//!   gate rebuilds; regenerable. Superseded workspace build units are pruned
+//!   out of it first ([`super::gate_prune`]); a whole entry is removed only
+//!   while holding the entry's exclusive gate cache lease, so a gate never
+//!   loses it mid-run.
 //! - `recovery_archives` (`<host state>/recovery-archives/<repository>/<id>`):
 //!   only for size, only when every commit it records is contained in the
 //!   repository's default branch and it holds no patch, untracked or ignored
@@ -12,7 +14,9 @@
 //!   never removed here, only reported by id.
 //! - `symbol_index`, `graph_stores`, `tool_caches`, `qualification_retained`:
 //!   indexes and caches rebuilt on demand; a child used within the class's
-//!   idle time is kept, and recency is re-read just before removal.
+//!   idle time is kept, and recency is re-read just before removal. The
+//!   Node.js compile cache's past days go an hour after their last change;
+//!   today's directory is never removed.
 //! - `release_artifacts`, `rollout_artifacts`, `quick_test_pools`: leftovers
 //!   of release and test runs with Aethyme's exact generated names, removed
 //!   whole once nothing in them changed for their age.
@@ -29,7 +33,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::landing::Refusal;
-use super::{Budgets, Child, Class, Item, Ledger, Policy, RootKind, policy};
+use super::{Budgets, Child, Class, Item, Ledger, Policy, RootKind};
 
 /// Why something is proposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +78,7 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
+pub(super) fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
     Candidate {
         class: item.class,
         root_kind: item.root_kind,
@@ -94,6 +98,91 @@ fn last_used(child: &Child) -> Option<u64> {
     [child.newest_ms, child.ctime_ms]
         .into_iter()
         .find(|ms| *ms > 0)
+}
+
+/// How the children of an entry evicted child by child are judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChildRule {
+    pub(super) idle: Duration,
+    pub(super) expire: Option<Duration>,
+    /// Day-named children ([`Policy::DailyChildren`]): a past day's goes once
+    /// unchanged this long; today's never goes.
+    pub(super) past_day_idle: Option<Duration>,
+}
+
+impl ChildRule {
+    /// The rule of an entry's policy, if it is evicted child by child.
+    pub(super) fn of(policy: Policy) -> Option<Self> {
+        match policy {
+            Policy::LruChildren { idle, expire } => Some(Self {
+                idle,
+                expire,
+                past_day_idle: None,
+            }),
+            Policy::DailyChildren {
+                idle,
+                expire,
+                past_day_idle,
+            } => Some(Self {
+                idle,
+                expire: Some(expire),
+                past_day_idle: Some(past_day_idle),
+            }),
+            _ => None,
+        }
+    }
+
+    /// How long `child` must be unchanged before it may go, or why it may
+    /// never go now.
+    pub(super) fn idle_for(&self, child: &str, now: u64) -> Result<Duration, &'static str> {
+        match self.past_day_idle.map(|past_day_idle| {
+            (
+                past_day_idle,
+                crate::node_compile_cache::past_day(child, now),
+            )
+        }) {
+            Some((_, Some(false))) => Err("today's directory, still in use"),
+            Some((past_day_idle, Some(true))) => Ok(past_day_idle),
+            _ => Ok(self.idle),
+        }
+    }
+}
+
+/// What the plan does with one child of an entry evicted child by child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChildFate {
+    Keep,
+    /// Goes whatever the budget.
+    Expired,
+    /// Goes while its class is over budget, least recently used first.
+    Idle {
+        used: u64,
+    },
+}
+
+/// The fate of `child` under `rule` at `now`. Unknown recency is not
+/// "oldest": such a child is kept. A past day's child goes once unchanged
+/// for its idle time and is never budget-evicted before; today's is kept.
+pub(super) fn child_fate(child: &Child, rule: ChildRule, now: u64) -> ChildFate {
+    let Some(used) = last_used(child) else {
+        return ChildFate::Keep;
+    };
+    let age = now.saturating_sub(used);
+    if rule.past_day_idle.is_some()
+        && crate::node_compile_cache::past_day(&child.name, now).is_some()
+    {
+        return match rule.idle_for(&child.name, now) {
+            Ok(idle) if age >= duration_ms(idle) => ChildFate::Expired,
+            _ => ChildFate::Keep,
+        };
+    }
+    if rule.expire.is_some_and(|expire| age > duration_ms(expire)) {
+        ChildFate::Expired
+    } else if age >= duration_ms(rule.idle) {
+        ChildFate::Idle { used }
+    } else {
+        ChildFate::Keep
+    }
 }
 
 /// Gate cache bytes per repository, from the ledger's children.
@@ -146,18 +235,18 @@ pub fn plan(
                     });
                 }
             }
-            Policy::LruChildren { idle, expire } => {
+            policy @ (Policy::LruChildren { .. } | Policy::DailyChildren { .. }) => {
+                let Some(rule) = ChildRule::of(policy) else {
+                    continue;
+                };
                 let mut idle_children: Vec<(&Child, u64)> = Vec::new();
                 for child in &item.children {
-                    // Unknown recency is not "oldest": such a child is kept.
-                    let Some(used) = last_used(child) else {
-                        continue;
-                    };
-                    let age = now.saturating_sub(used);
-                    if expire.is_some_and(|expire| age > duration_ms(expire)) {
-                        expired.push(child_candidate(item, child, Reason::Expired));
-                    } else if age >= duration_ms(idle) {
-                        idle_children.push((child, used));
+                    match child_fate(child, rule, now) {
+                        ChildFate::Keep => {}
+                        ChildFate::Expired => {
+                            expired.push(child_candidate(item, child, Reason::Expired));
+                        }
+                        ChildFate::Idle { used } => idle_children.push((child, used)),
                     }
                 }
                 let budget = if pressing {
@@ -174,13 +263,23 @@ pub fn plan(
                     );
                 }
             }
-            Policy::GateCache => over.extend(plan_gate_cache(item, budgets, pressing)),
+            Policy::GateCache => {
+                // Entries unused for the artifact max age go whatever the
+                // budget; the rest are judged for budget.
+                expired.extend(
+                    item.children
+                        .iter()
+                        .filter(|child| gate_entry_expired(child, budgets, now))
+                        .map(|child| child_candidate(item, child, Reason::Expired)),
+                );
+                over.extend(plan_gate_cache(item, budgets, pressing, now));
+            }
             Policy::RecoveryArchives => {
-                let budget = if pressing {
-                    0
-                } else {
-                    budgets.recovery_archives_bytes
-                };
+                // Pressure does not empty this budget: below a volume's
+                // floor, the archive floor removes the oldest removable
+                // archives only until free space is back at it, paced
+                // (`archive_floor`), instead of every landed one at once.
+                let budget = budgets.recovery_archives_bytes;
                 let over_budget = class_bytes.get(&item.class).copied().unwrap_or(0) > budget;
                 // Oldest by manifest creation; one without it is kept.
                 let mut children: Vec<(&Child, u64)> = item
@@ -219,10 +318,33 @@ pub fn plan(
     expired
 }
 
-/// Over budget, all but the most recently used entry per gate kind.
-fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool) -> Vec<Candidate> {
+/// Whether a gate cache entry (`<repository>/<key>`) was unused for the
+/// artifact max age: its newest change (every gate rebuilds the workspace
+/// members it tests into it, #391) is that old. Unknown recency, or the
+/// max age off, is not expired.
+pub fn gate_entry_expired(child: &Child, budgets: &Budgets, now: u64) -> bool {
+    budgets.artifact_max_age().is_some_and(|max_age| {
+        last_used(child).is_some_and(|used| now.saturating_sub(used) >= duration_ms(max_age))
+    })
+}
+
+/// How long the most recently used entry of a gate kind must be unused
+/// before it goes for budget (outside pressure): its next gate rebuilds from
+/// nothing, so an entry in daily use is kept.
+pub const GATE_CACHE_LAST_ENTRY_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Over budget, all but the most recently used entry per gate kind, least
+/// recently used first; then, still least recently used first, the most
+/// recently used entries of the other kinds unused for
+/// [`GATE_CACHE_LAST_ENTRY_IDLE`] (any time under pressure). The
+/// repository's most recently used entry, and one of unknown recency, are
+/// always kept. The pass stops removing once the repository is within budget.
+fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool, now: u64) -> Vec<Candidate> {
     let mut by_repository: BTreeMap<&str, Vec<&Child>> = BTreeMap::new();
     for child in &item.children {
+        if gate_entry_expired(child, budgets, now) {
+            continue;
+        }
         if let Some((repository, _)) = child.name.split_once('/') {
             by_repository.entry(repository).or_default().push(child);
         }
@@ -256,6 +378,27 @@ fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool) -> Vec<Candid
             evict
                 .into_iter()
                 .map(|child| child_candidate(item, child, Reason::OverBudget)),
+        );
+        // Last resort: whole entries of other kinds, never the most
+        // recently used one of the repository.
+        let newest = children
+            .iter()
+            .max_by_key(|child| last_used(child).unwrap_or(u64::MAX))
+            .map(|child| child.name.as_str());
+        let mut last: Vec<(&Child, u64)> = children
+            .iter()
+            .filter(|child| {
+                keep.contains(child.name.as_str()) && Some(child.name.as_str()) != newest
+            })
+            .filter_map(|child| last_used(child).map(|used| (*child, used)))
+            .filter(|(_, used)| {
+                pressing || now.saturating_sub(*used) >= duration_ms(GATE_CACHE_LAST_ENTRY_IDLE)
+            })
+            .collect();
+        last.sort_by_key(|(_, used)| *used);
+        candidates.extend(
+            last.into_iter()
+                .map(|(child, _)| child_candidate(item, child, Reason::OverBudget)),
         );
     }
     candidates
@@ -433,9 +576,18 @@ pub fn refuse(
         return Some("a symbolic link, or not a plain path inside its root".into());
     }
     let path = candidate.path();
-    match policy(candidate.class) {
+    let (entry, child) = candidate
+        .relative
+        .split_once('/')
+        .unwrap_or((candidate.relative.as_str(), ""));
+    match super::entry_policy(candidate.class, entry) {
         Policy::ReportOnly(why) => return Some(why.into()),
-        Policy::LruChildren { idle, .. } => {
+        policy @ (Policy::LruChildren { .. } | Policy::DailyChildren { .. }) => {
+            let idle = match ChildRule::of(policy).map(|rule| rule.idle_for(child, now)) {
+                Some(Ok(idle)) => idle,
+                Some(Err(why)) => return Some(why.into()),
+                None => return Some("not evicted child by child".into()),
+            };
             let changed = recent_change(&path);
             if changed > candidate.newest_ms || now.saturating_sub(changed) < duration_ms(idle) {
                 return Some("used since it was measured".into());
@@ -459,6 +611,11 @@ pub fn refuse(
                     return Some("a live lease holds it".into());
                 }
                 Some(_) => {}
+            }
+            // Expired by the artifact max age: a gate that wrote into it
+            // since it was measured used it.
+            if candidate.reason == Reason::Expired && recent_change(&path) > candidate.newest_ms {
+                return Some("used since it was measured".into());
             }
         }
         Policy::RecoveryArchives if candidate.reason == Reason::Expired => {
@@ -549,6 +706,20 @@ pub fn remove_protected(
     let (Some(_), Some(repository), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
         return Err("not a gate cache entry".into());
     };
+    with_gate_cache_lease(registry, repository, key, || {
+        remove(candidate, beat, deadline).map_err(|error| error.to_string())
+    })?
+}
+
+/// Run `work` while holding the gate cache `<repository>/<key>`'s exclusive
+/// lease (`managed_cache_lease_name`), released on every path. `Err` when
+/// the registry cannot be read or a gate holds the lease: `work` did not run.
+pub fn with_gate_cache_lease<T>(
+    registry: &Path,
+    repository: &str,
+    key: &str,
+    work: impl FnOnce() -> T,
+) -> Result<T, String> {
     // `open` would create a missing registry: a lease there proves nothing.
     if !registry.is_file() {
         return Err("the lease registry cannot be read".into());
@@ -577,16 +748,16 @@ pub fn remove_protected(
     let grant = coordinator
         .acquire(&request)
         .map_err(|error| format!("a gate holds it ({error})"))?;
-    let removed = remove(candidate, beat, deadline).map_err(|error| error.to_string());
+    let done = work();
     crate::warn_unrecorded(
-        "release the gate cache lease storage eviction took",
+        "release the gate cache lease the storage worker took",
         coordinator.release(
             &grant.lease.lease_id,
             grant.lease.generation,
             &grant.ownership_token,
         ),
     );
-    removed
+    Ok(done)
 }
 
 /// Remove a candidate: renamed aside first (so a half-removed tree is never
@@ -615,6 +786,16 @@ pub fn delete_tree(
     beat: &mut dyn FnMut(),
     deadline: Option<Instant>,
 ) -> std::io::Result<bool> {
+    delete_tree_measured(path, beat, deadline).map(|(done, _)| done)
+}
+
+/// [`delete_tree`], also returning the allocated bytes of what it removed.
+pub fn delete_tree_measured(
+    path: &Path,
+    beat: &mut dyn FnMut(),
+    deadline: Option<Instant>,
+) -> std::io::Result<(bool, u64)> {
+    let mut removed_bytes = 0_u64;
     let mut last_beat = Instant::now();
     let mut stack = vec![(path.to_path_buf(), false)];
     while let Some((next, visited)) = stack.pop() {
@@ -626,6 +807,7 @@ pub fn delete_tree(
         if metadata.is_dir() {
             if visited {
                 fs::remove_dir(&next)?;
+                removed_bytes = removed_bytes.saturating_add(super::allocated(&metadata));
             } else {
                 stack.push((next.clone(), true));
                 for entry in fs::read_dir(&next)?.flatten() {
@@ -635,16 +817,17 @@ pub fn delete_tree(
         } else {
             // A file or a link: the link itself goes, never its target.
             fs::remove_file(&next)?;
+            removed_bytes = removed_bytes.saturating_add(super::allocated(&metadata));
         }
         if last_beat.elapsed() >= super::BEAT_EVERY {
             beat();
             last_beat = Instant::now();
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) && !stack.is_empty() {
-            return Ok(false);
+            return Ok((false, removed_bytes));
         }
     }
-    Ok(true)
+    Ok((true, removed_bytes))
 }
 
 /// Leftovers of removals interrupted after the rename.

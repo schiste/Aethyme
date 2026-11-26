@@ -908,7 +908,9 @@ pub struct AdoptCarriedOwnership {
     pub from_session: i64,
     /// The ownership boundary the new session starts from.
     pub baseline: String,
-    /// Commits after `baseline` that submit will replay.
+    /// Commits after `baseline` that stay session-owned: those integration
+    /// holds pending, or, when reachability from the default branch took every
+    /// one of those out, the ones integration only matches by patch.
     pub pending_owned_commits: usize,
 }
 
@@ -3964,6 +3966,7 @@ pub(crate) use leases::{
 };
 #[cfg(test)]
 pub(crate) use leases::{
+    BEFORE_ACTIVITY_PROBE, DEADLINE_AT_LATE_PROBE, EARLY_LOOK_UNREADABLE,
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
@@ -3977,7 +3980,7 @@ pub(crate) use retire::{
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]
 pub(crate) use scratch::scratch_instruction;
-pub(crate) use tombstone::{is_checkout_tombstone, restore_command};
+pub(crate) use tombstone::{is_checkout_tombstone, may_be_retired_checkout, restore_command};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

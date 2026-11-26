@@ -53,6 +53,7 @@ fn pass(host_state: &Path, roots: Vec<Root>, budgets: Budgets) -> super::Ledger 
             measure_budget: Duration::from_secs(60),
             pace: Duration::ZERO,
             registry,
+            budget_error: None,
         },
         None,
     )
@@ -236,8 +237,11 @@ fn gate_entry(cache: &Path, key: &str, days: u64) {
     age(&path, days);
 }
 
+/// Over budget, older entries of a kind go, then the other kinds' entries
+/// idle for a day; the repository's most recently used entry and every
+/// leased one stay.
 #[test]
-fn an_over_budget_gate_cache_keeps_one_entry_per_kind_and_every_leased_one() {
+fn an_over_budget_gate_cache_keeps_its_newest_entry_and_every_leased_one() {
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path().join("state");
     let cache = dir.path().join("cache");
@@ -251,6 +255,7 @@ fn an_over_budget_gate_cache_keeps_one_entry_per_kind_and_every_leased_one() {
     let _held = lease(&registry, "gate-run", "rust-workspace-v1");
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
         ..Budgets::default()
     };
     pass(
@@ -264,10 +269,561 @@ fn an_over_budget_gate_cache_keeps_one_entry_per_kind_and_every_leased_one() {
     assert_eq!(
         super::read_names(&cache.join("gates/example-0123")),
         vec![
-            "lint-v1".to_string(),
             "rust-workspace-v1".to_string(),
             "rust-workspace-v3".to_string()
         ]
+    );
+}
+
+fn gate_child(name: &str, used_ms: u64) -> super::Child {
+    super::Child {
+        name: name.into(),
+        bytes: 1024,
+        newest_ms: used_ms,
+        ctime_ms: 0,
+        created_ms: None,
+        min_retention_ms: None,
+        session_id: None,
+        kept: false,
+    }
+}
+
+fn gate_ledger(children: Vec<super::Child>) -> super::Ledger {
+    let now = super::now_ms();
+    super::Ledger {
+        items: vec![super::Item {
+            root: PathBuf::from("/host-cache"),
+            root_kind: RootKind::HostCache,
+            name: "gates".into(),
+            class: Class::GateCache,
+            device: 0,
+            bytes: children.iter().map(|child| child.bytes).sum(),
+            measured: true,
+            entries: children.len() as u64,
+            oldest_ms: 0,
+            newest_ms: now,
+            measured_at_ms: now,
+            children,
+            walk: None,
+        }],
+        ..super::Ledger::default()
+    }
+}
+
+/// The last-resort order: older entries of a kind first, then other kinds'
+/// newest entries once idle for a day (any idle time under pressure), never
+/// the repository's most recently used entry; a repository within budget
+/// loses nothing.
+#[test]
+fn whole_gate_cache_entries_go_least_recently_used_after_older_generations() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v3", now - 3 * DAY_MS),
+        gate_child("repo/rust-workspace-v2", now - 5 * DAY_MS),
+        gate_child("repo/rust-contract-v1", now - 2 * hour),
+        gate_child("repo/lint-v1", now - 2 * DAY_MS),
+        gate_child("small/rust-workspace-v1", now - 9 * DAY_MS),
+    ]);
+    let budgets = Budgets {
+        gate_cache_bytes_per_repository: 2048,
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    let planned = |aggressive: &std::collections::BTreeSet<RootKind>| -> Vec<String> {
+        evict::plan(&ledger, &budgets, now, aggressive)
+            .into_iter()
+            .map(|candidate| candidate.relative)
+            .collect()
+    };
+    assert_eq!(
+        planned(&Default::default()),
+        vec![
+            "gates/repo/rust-workspace-v2",
+            "gates/repo/rust-workspace-v3",
+            "gates/repo/lint-v1",
+        ]
+    );
+    // Recently used last entries of a kind are kept outside pressure only.
+    let recent = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v3", now - 3 * hour),
+        gate_child("repo/rust-contract-v1", now - 2 * hour),
+    ]);
+    let tight = Budgets {
+        gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    assert!(evict::plan(&recent, &tight, now, &Default::default()).is_empty());
+    let pressing: std::collections::BTreeSet<RootKind> = [RootKind::HostCache].into();
+    let under_pressure: Vec<String> = evict::plan(&recent, &tight, now, &pressing)
+        .into_iter()
+        .map(|candidate| candidate.relative)
+        .collect();
+    assert_eq!(under_pressure, vec!["gates/repo/rust-workspace-v3"]);
+}
+
+/// Only repositories over their budget (every one under pressure) are
+/// pruned, their entries largest first.
+#[test]
+fn gate_cache_entries_to_prune_are_the_over_budget_repositories_largest_first() {
+    let now = super::now_ms();
+    let mut ledger = gate_ledger(vec![
+        gate_child("over/a-v1", now),
+        gate_child("over/b-v1", now),
+        gate_child("under/a-v1", now),
+    ]);
+    ledger.items[0].children[1].bytes = 4096;
+    let budgets = Budgets {
+        gate_cache_bytes_per_repository: 2048,
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    let names = |ledger: &super::Ledger,
+                 aggressive: &std::collections::BTreeSet<RootKind>|
+     -> Vec<String> {
+        super::gate_prune::entries_to_prune(ledger, &budgets, aggressive)
+            .into_iter()
+            .map(|(index, name)| {
+                assert_eq!(index, 0);
+                name
+            })
+            .collect()
+    };
+    assert_eq!(
+        names(&ledger, &Default::default()),
+        vec!["over/b-v1", "over/a-v1"]
+    );
+    let pressing: std::collections::BTreeSet<RootKind> = [RootKind::HostCache].into();
+    assert_eq!(
+        names(&ledger, &pressing),
+        vec!["over/b-v1", "over/a-v1", "under/a-v1"]
+    );
+    ledger.items[0].measured = false;
+    assert!(
+        names(&ledger, &pressing).is_empty(),
+        "an unmeasured cache is not judged"
+    );
+}
+
+/// A file with explicit modification and access times.
+fn timed_file(path: &Path, content: &[u8], modified: SystemTime, accessed: SystemTime) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_modified(modified)
+                .set_accessed(accessed),
+        )
+        .unwrap();
+}
+
+/// One cargo library unit built `built_days_ago` (and last read then), with
+/// a `bytes`-long rlib and a dep-info file naming `source`.
+fn cargo_unit(
+    profile: &Path,
+    package: &str,
+    hash: &str,
+    built_days_ago: u64,
+    bytes: usize,
+    source: &str,
+) {
+    let when = SystemTime::now() - Duration::from_millis(built_days_ago * DAY_MS);
+    let crate_name = package.replace('-', "_");
+    let fingerprint = profile
+        .join(".fingerprint")
+        .join(format!("{package}-{hash}"));
+    for name in [
+        format!("lib-{crate_name}"),
+        format!("lib-{crate_name}.json"),
+    ] {
+        timed_file(&fingerprint.join(name), b"fingerprint", when, when);
+    }
+    let deps = profile.join("deps");
+    timed_file(
+        &deps.join(format!("lib{crate_name}-{hash}.rlib")),
+        &vec![7u8; bytes],
+        when,
+        when,
+    );
+    timed_file(
+        &deps.join(format!("{crate_name}-{hash}.d")),
+        format!(
+            "{}: {source}\n",
+            deps.join(format!("lib{crate_name}-{hash}.rlib")).display()
+        )
+        .as_bytes(),
+        when,
+        when,
+    );
+}
+
+const OLD_HASH: &str = "aaaaaaaaaaaaaaaa";
+const NEW_HASH: &str = "bbbbbbbbbbbbbbbb";
+const OLD_DEP_HASH: &str = "cccccccccccccccc";
+const NEW_DEP_HASH: &str = "dddddddddddddddd";
+
+/// A gate cache entry holding a superseded and a current generation of a
+/// workspace crate and of a registry dependency.
+fn superseded_gate_entry(cache: &Path) -> PathBuf {
+    let entry = cache.join("gates/example-0123/rust-workspace-v1");
+    let profile = entry.join("debug");
+    let local = "crates/work/src/lib.rs";
+    let registry = "/home/u/.cargo/registry/src/index.crates.io-1/dep-1.0.0/src/lib.rs";
+    cargo_unit(&profile, "work-crate", OLD_HASH, 10, 64 * 1024, local);
+    cargo_unit(&profile, "work-crate", NEW_HASH, 1, 64 * 1024, local);
+    cargo_unit(
+        &profile,
+        "registry-dep",
+        OLD_DEP_HASH,
+        10,
+        64 * 1024,
+        registry,
+    );
+    cargo_unit(
+        &profile,
+        "registry-dep",
+        NEW_DEP_HASH,
+        1,
+        64 * 1024,
+        registry,
+    );
+    entry
+}
+
+/// An over-budget gate cache loses its superseded workspace units, never a
+/// registry dependency's nor the current generation, and the entry itself
+/// (the repository's only one) stays; a gate holding the lease keeps it all.
+#[test]
+fn an_over_budget_gate_cache_is_pruned_of_superseded_workspace_units_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let registry = empty_registry(&host_state);
+    let entry = superseded_gate_entry(&cache);
+    let profile = entry.join("debug");
+    let budgets = Budgets {
+        gate_cache_bytes_per_repository: 1,
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    let roots = || {
+        vec![
+            root(&host_state, RootKind::HostState),
+            root(&cache, RootKind::HostCache),
+        ]
+    };
+
+    // A gate holds the entry: nothing is pruned.
+    let held = lease(&registry, "gate-run", "rust-workspace-v1");
+    let ledger = pass(&host_state, roots(), budgets.clone());
+    let report = ledger.last_pass.unwrap().gate_cache_prune.unwrap();
+    assert_eq!(report.entries, 0);
+    assert_eq!(
+        report.leased,
+        vec!["gates/example-0123/rust-workspace-v1".to_string()]
+    );
+    assert!(
+        profile
+            .join(format!(".fingerprint/work-crate-{OLD_HASH}"))
+            .exists()
+    );
+    crate::HostResourceCoordinator::open(&registry)
+        .unwrap()
+        .release(
+            &held.lease.lease_id,
+            held.lease.generation,
+            &held.ownership_token,
+        )
+        .unwrap();
+
+    let ledger = pass(&host_state, roots(), budgets);
+    let report = ledger.last_pass.unwrap().gate_cache_prune.unwrap();
+    assert_eq!(report.entries, 1);
+    assert_eq!(report.units, 1);
+    assert_eq!(report.not_local, 1);
+    assert_eq!(report.stop, "done");
+    assert!(report.leased.is_empty());
+    for gone in [
+        format!(".fingerprint/work-crate-{OLD_HASH}"),
+        format!("deps/libwork_crate-{OLD_HASH}.rlib"),
+        format!("deps/work_crate-{OLD_HASH}.d"),
+    ] {
+        assert!(!profile.join(&gone).exists(), "{gone} must be pruned");
+    }
+    for kept in [
+        format!(".fingerprint/work-crate-{NEW_HASH}"),
+        format!("deps/libwork_crate-{NEW_HASH}.rlib"),
+        format!(".fingerprint/registry-dep-{OLD_DEP_HASH}"),
+        format!("deps/libregistry_dep-{OLD_DEP_HASH}.rlib"),
+    ] {
+        assert!(profile.join(&kept).exists(), "{kept} must be kept");
+    }
+    // The next gate counts a unit cargo rebuilds with a pruned hash.
+    assert_eq!(
+        fs::read_to_string(entry.join(crate::gates::PRUNED_UNITS_MARKER)).unwrap(),
+        format!("debug/.fingerprint/work-crate-{OLD_HASH}")
+    );
+    // Nothing staged is left beside the cache, and the lease is released.
+    assert!(
+        super::read_names(&cache)
+            .iter()
+            .all(|name| !name.starts_with(".aethyme-storage-evicting-"))
+    );
+    assert!(evict::leased_gate_caches(&registry).unwrap().is_empty());
+    // Status shows the per-repository budget and what the prune did.
+    let status = super::cli::status_value(&host_state);
+    let gate = &status["classes"]["gate_cache"];
+    assert_eq!(
+        gate["budget_bytes"],
+        serde_json::json!(4 * 1024 * 1024 * 1024u64)
+    );
+    assert_eq!(
+        gate["repositories"]["example-0123"]["budget_bytes"],
+        serde_json::json!(4 * 1024 * 1024 * 1024u64)
+    );
+    assert_eq!(gate["last_prune"]["units"], serde_json::json!(1));
+}
+
+/// A gate cache entry unused for the artifact max age goes whatever the
+/// budget, the repository's newest included; one used within it stays.
+#[test]
+fn gate_cache_entries_unused_for_the_max_age_expire_whatever_the_budget() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v1", now - 30 * hour),
+        gate_child("repo/lint-v1", now - 2 * hour),
+        gate_child("idle/rust-workspace-v1", now - 25 * hour),
+    ]);
+    let planned = |budgets: &Budgets| -> Vec<(String, Reason)> {
+        evict::plan(&ledger, budgets, now, &Default::default())
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect()
+    };
+    assert_eq!(
+        planned(&Budgets::default()),
+        vec![
+            ("gates/repo/rust-workspace-v1".to_string(), Reason::Expired),
+            ("gates/idle/rust-workspace-v1".to_string(), Reason::Expired),
+        ]
+    );
+    let off = Budgets {
+        artifact_max_age_hours: 0,
+        ..Budgets::default()
+    };
+    assert!(planned(&off).is_empty(), "under budget, nothing goes");
+    assert!(evict::gate_entry_expired(
+        &gate_child("r/k", now - 24 * hour),
+        &Budgets::default(),
+        now
+    ));
+    assert!(!evict::gate_entry_expired(
+        &gate_child("r/k", now - 24 * hour + 1),
+        &Budgets::default(),
+        now
+    ));
+    assert!(
+        !evict::gate_entry_expired(&gate_child("r/k", 0), &Budgets::default(), now),
+        "unknown recency is kept"
+    );
+}
+
+/// Gate caches placed on an adopted storage root (`[placement]`) expire by
+/// the max age like the host cache's, and are pruned each pass too.
+#[test]
+fn gate_caches_on_a_storage_root_follow_the_max_age() {
+    let now = super::now_ms();
+    let hour = 60 * 60 * 1000;
+    let mut ledger = gate_ledger(vec![
+        gate_child("repo/rust-workspace-v1", now - 30 * hour),
+        gate_child("repo/lint-v1", now - 2 * hour),
+    ]);
+    ledger.items[0].root = PathBuf::from("/storage-root");
+    ledger.items[0].root_kind = RootKind::Storage;
+    assert_eq!(
+        classify(RootKind::Storage, "gates"),
+        Class::GateCache,
+        "placement's layout"
+    );
+    let planned: Vec<(String, Reason)> =
+        evict::plan(&ledger, &Budgets::default(), now, &Default::default())
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect();
+    assert_eq!(
+        planned,
+        vec![("gates/repo/rust-workspace-v1".to_string(), Reason::Expired)]
+    );
+    let pruned: Vec<String> =
+        super::gate_prune::entries_to_prune(&ledger, &Budgets::default(), &Default::default())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    assert_eq!(pruned, vec!["repo/lint-v1"]);
+}
+
+/// With the max age on, every gate cache entry used within it is pruned
+/// each pass (no pile-up), whatever the budget; an expired one is left to
+/// go whole.
+#[test]
+fn with_the_max_age_on_every_gate_cache_entry_is_pruned_each_pass() {
+    let now = super::now_ms();
+    let ledger = gate_ledger(vec![
+        gate_child("over/a-v1", now),
+        gate_child("under/a-v1", now),
+        gate_child("old/a-v1", now - 2 * DAY_MS),
+    ]);
+    let names: Vec<String> =
+        super::gate_prune::entries_to_prune(&ledger, &Budgets::default(), &Default::default())
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    assert_eq!(names, vec!["over/a-v1", "under/a-v1"]);
+}
+
+/// Expired by the max age, an entry a gate wrote into since it was
+/// measured is refused at removal.
+#[test]
+fn an_expired_gate_cache_entry_used_since_it_was_measured_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    gate_entry(&cache, "rust-workspace-v1", 2);
+    let entry = cache.join("gates/example-0123/rust-workspace-v1");
+    let candidate = Candidate {
+        class: Class::GateCache,
+        root_kind: RootKind::HostCache,
+        root: cache.clone(),
+        relative: "gates/example-0123/rust-workspace-v1".into(),
+        bytes: 1,
+        newest_ms: super::now_ms() - 2 * DAY_MS + 1_000,
+        reason: Reason::Expired,
+        expires_ms: None,
+        allow_unlanded: false,
+    };
+    let leases = std::collections::BTreeSet::new();
+    assert_eq!(
+        evict::refuse(&candidate, Some(&leases), super::now_ms()),
+        None
+    );
+    file(&entry.join(".rustc_info.json"), 16);
+    assert_eq!(
+        evict::refuse(&candidate, Some(&leases), super::now_ms()).as_deref(),
+        Some("used since it was measured")
+    );
+}
+
+/// Finding (c) of #2041: under disk pressure, gate cache entries go one at
+/// a time while free space is re-read, and removal stops once the volume
+/// is back above its floor, instead of cutting the repository to one entry.
+#[test]
+fn pressure_eviction_stops_once_free_space_is_back_above_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let registry = empty_registry(&host_state);
+    for (key, days) in [
+        ("rust-workspace-v1", 9),
+        ("rust-workspace-v2", 5),
+        ("rust-workspace-v3", 1),
+    ] {
+        gate_entry(&cache, key, days);
+    }
+    let gib = 1024 * 1024 * 1024_u64;
+    let entries = cache.join("gates/example-0123");
+    let mut free = |_: &Path| {
+        let present = super::read_names(&entries).len();
+        Some(if present >= 3 {
+            (gib, 100 * gib)
+        } else {
+            (100 * gib, 100 * gib)
+        })
+    };
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        check::run_pass(
+            PassInputs {
+                host_state: &host_state,
+                roots: vec![
+                    root(&host_state, RootKind::HostState),
+                    root(&cache, RootKind::HostCache),
+                ],
+                budgets: Budgets {
+                    artifact_max_age_hours: 0,
+                    ..Budgets::default()
+                },
+                free: &mut free,
+                measure_budget: Duration::from_secs(60),
+                pace: Duration::ZERO,
+                registry,
+                budget_error: None,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        super::read_names(&entries),
+        vec![
+            "rust-workspace-v2".to_string(),
+            "rust-workspace-v3".to_string()
+        ],
+        "one removal brought free space back"
+    );
+    let (_, counts) = recorder.totals();
+    assert_eq!(counts.get("storage_eviction_pressure_relieved"), Some(&1));
+}
+
+/// `storage_node_compile_cache_day_evicted` counts day directories only.
+#[test]
+fn only_node_compile_cache_days_count_as_evicted_days() {
+    let now = super::now_ms();
+    let today = now / DAY_MS;
+    assert!(check::is_node_compile_cache_day(
+        &format!("node-compile-cache/d{}", today - 3),
+        now
+    ));
+    assert!(!check::is_node_compile_cache_day(
+        "node-compile-cache/v22.1.0",
+        now
+    ));
+    assert!(!check::is_node_compile_cache_day("cargo/registry", now));
+    assert!(!check::is_node_compile_cache_day("node-compile-cache", now));
+
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let node = cache.join("node-compile-cache");
+    for child in [format!("d{}", today - 20), "v22.1.0".to_string()] {
+        file(&node.join(&child).join("entry"), 4096);
+        age(&node.join(&child), 20);
+    }
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        pass(
+            &host_state,
+            vec![
+                root(&host_state, RootKind::HostState),
+                root(&cache, RootKind::HostCache),
+            ],
+            Budgets::default(),
+        );
+    }
+    assert!(super::read_names(&node).is_empty(), "both expired");
+    let (_, counts) = recorder.totals();
+    assert_eq!(
+        counts.get("storage_node_compile_cache_day_evicted"),
+        Some(&1)
     );
 }
 
@@ -451,6 +1007,276 @@ fn archives_go_only_when_landed_and_past_their_promised_retention() {
         Budgets::default(),
     );
     assert!(ledger.last_pass.unwrap().evicted.is_empty());
+}
+
+fn pass_with_free(
+    host_state: &Path,
+    budgets: Budgets,
+    reading: Option<(u64, u64)>,
+) -> super::Ledger {
+    let registry = host_state.join("host-resources.db");
+    let mut free = |_: &Path| reading;
+    check::run_pass(
+        PassInputs {
+            host_state,
+            roots: vec![root(host_state, RootKind::HostState)],
+            budgets,
+            free: &mut free,
+            measure_budget: Duration::from_secs(60),
+            pace: Duration::ZERO,
+            registry,
+            budget_error: None,
+        },
+        None,
+    )
+    .unwrap()
+}
+
+/// Below the archive floor, the oldest removable archives go until the
+/// projected free space is back at it; unlanded, young and kept ones stay
+/// whatever the floor; an unreadable volume skips it.
+#[test]
+fn the_archive_floor_removes_the_oldest_removable_archives_until_met() {
+    use super::archive_floor::FloorStop;
+    let setup = || {
+        let dir = tempfile::tempdir().unwrap();
+        let host_state = dir.path().join("state");
+        let repository = dir.path().join("repository");
+        fs::create_dir_all(&host_state).unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        fs::write(repository.join("a"), "a").unwrap();
+        git(&repository, &["add", "a"]);
+        git(&repository, &["commit", "-q", "-m", "a"]);
+        let landed = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", &landed],
+        );
+        git(&repository, &["checkout", "-q", "-b", "work"]);
+        fs::write(repository.join("b"), "b").unwrap();
+        git(&repository, &["add", "b"]);
+        git(&repository, &["commit", "-q", "-m", "b"]);
+        let unlanded = git(&repository, &["rev-parse", "HEAD"]);
+        archive(&host_state, "older-unlanded", &repository, &unlanded, 90);
+        archive(&host_state, "old-landed", &repository, &landed, 40);
+        archive(&host_state, "kept-landed", &repository, &landed, 35);
+        fs::write(
+            host_state.join("recovery-archives/example-0123/kept-landed.aethyme-keep"),
+            "",
+        )
+        .unwrap();
+        archive(&host_state, "mid-landed", &repository, &landed, 30);
+        archive(&host_state, "young-landed", &repository, &landed, 3);
+        empty_registry(&host_state);
+        (dir, host_state)
+    };
+    // Within every budget; only the floor can remove anything.
+    let floor = 1_000_000_000;
+    let budgets = Budgets {
+        free_floor_bytes: floor,
+        recovery_archive_free_floor_percent: 0,
+        ..Budgets::default()
+    };
+    let present = |host_state: &Path, id: &str| {
+        host_state
+            .join("recovery-archives/example-0123")
+            .join(id)
+            .exists()
+    };
+
+    // One byte short: the oldest removable archive alone goes.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 1, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(
+        report.evicted,
+        vec!["recovery_archives:recovery-archives/example-0123/old-landed".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(report.archive_floor.len(), 1, "{report:?}");
+    assert_eq!(report.archive_floor[0].pruned, 1);
+    assert_eq!(report.archive_floor[0].floor_bytes, floor);
+    assert_eq!(report.archive_floor[0].stop, FloorStop::FloorMet);
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|line| line.contains("older-unlanded (archive floor)")),
+        "{report:?}"
+    );
+    for id in [
+        "older-unlanded",
+        "kept-landed",
+        "mid-landed",
+        "young-landed",
+    ] {
+        assert!(present(&host_state, id), "{id}");
+    }
+
+    // Short by more than the two landed archives hold (about 66 KB each),
+    // within reach of what no rule kept in advance: every removable archive
+    // goes, the protected ones stay.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 300_000, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(report.archive_floor[0].pruned, 2, "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::ProtectedOnly);
+    assert!(!present(&host_state, "old-landed") && !present(&host_state, "mid-landed"));
+    for id in ["older-unlanded", "kept-landed", "young-landed"] {
+        assert!(present(&host_state, id), "{id}");
+    }
+
+    // Far short: the same archives go, and the stop says the archives could
+    // never close the shortfall.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((0, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(report.archive_floor[0].pruned, 2, "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::CannotClose);
+
+    // A keep marker written after the landing proof, just before removal,
+    // keeps the archive; the next one goes in its place.
+    let (_dir, host_state) = setup();
+    check::BEFORE_ARCHIVE_REMOVAL_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|path: &Path| {
+            if path.ends_with("old-landed") {
+                fs::write(super::keep_marker(path), "").unwrap();
+            }
+        }));
+    });
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 1, 0)));
+    check::BEFORE_ARCHIVE_REMOVAL_FOR_TEST.with(|hook| *hook.borrow_mut() = None);
+    let report = ledger.last_pass.unwrap();
+    assert!(present(&host_state, "old-landed"), "{report:?}");
+    assert!(!present(&host_state, "mid-landed"), "{report:?}");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|line| line.contains("old-landed (archive floor): kept by the owner's marker")),
+        "{report:?}"
+    );
+
+    // At the floor, or with the volume unreadable: nothing goes.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::FloorMet);
+    let ledger = pass_with_free(&host_state, budgets, None);
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::Unsupported);
+    assert_eq!(report.archive_floor[0].free_before_bytes, None);
+}
+
+/// One deadline covers every volume of a pass: once it passed, no volume
+/// gets a fresh budget, and each reports the deadline with nothing removed.
+#[test]
+fn the_archive_floor_deadline_is_one_per_pass_across_volumes() {
+    use super::archive_floor::FloorStop;
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let repository = dir.path().join("repository");
+    fs::create_dir_all(&host_state).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init", "-q", "-b", "main"]);
+    fs::write(repository.join("a"), "a").unwrap();
+    git(&repository, &["add", "a"]);
+    git(&repository, &["commit", "-q", "-m", "a"]);
+    let landed = git(&repository, &["rev-parse", "HEAD"]);
+    git(
+        &repository,
+        &["update-ref", "refs/remotes/origin/main", &landed],
+    );
+    archive(&host_state, "old-landed", &repository, &landed, 40);
+    archive(&host_state, "mid-landed", &repository, &landed, 30);
+    empty_registry(&host_state);
+    let floor = 1_000_000_000;
+    let budgets = Budgets {
+        free_floor_bytes: floor,
+        recovery_archive_free_floor_percent: 0,
+        ..Budgets::default()
+    };
+    // Measured by a pass at the floor (nothing removed).
+    let mut ledger = pass_with_free(&host_state, budgets.clone(), Some((floor, 0)));
+    // The same archives seen on a second volume.
+    let mut second = ledger
+        .items
+        .iter()
+        .find(|item| item.class == Class::RecoveryArchives)
+        .expect("archives measured")
+        .clone();
+    second.device = second.device.wrapping_add(1);
+    ledger.items.push(second);
+    let mut free = |_: &Path| Some((floor - 100_000, 0));
+    let mut report = super::PassReport::default();
+    let reports = check::archive_floor_pass(
+        &mut ledger,
+        &budgets,
+        &mut free,
+        &host_state.join("host-resources.db"),
+        Duration::ZERO,
+        Instant::now(),
+        None,
+        None,
+        &mut report,
+    );
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    for volume in &reports {
+        assert_eq!(volume.stop, FloorStop::Deadline, "{reports:?}");
+        assert_eq!(volume.pruned, 0);
+    }
+    assert!(report.evicted.is_empty());
+    for id in ["old-landed", "mid-landed"] {
+        assert!(
+            host_state
+                .join("recovery-archives/example-0123")
+                .join(id)
+                .exists()
+        );
+    }
+}
+
+/// An unreadable `storage.toml` is recorded in the pass report and advised.
+#[test]
+fn an_invalid_budget_file_is_reported_and_advised() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    fs::write(
+        host_state.join(super::BUDGET_FILE),
+        "[budget]\nno_such_key = 1\n",
+    )
+    .unwrap();
+    let (budgets, error) = Budgets::load(host_state);
+    assert_eq!(budgets, Budgets::default());
+    let error = error.expect("rejected");
+    let advice = super::cli::status_advice(host_state);
+    assert!(
+        advice
+            .iter()
+            .any(|entry| entry.id == "storage.budget-config-invalid"
+                && entry.evidence == vec![error.clone()]),
+        "{advice:?}"
+    );
+    let registry = host_state.join("host-resources.db");
+    let mut free = |_: &Path| Some((u64::MAX / 2, u64::MAX / 2));
+    let ledger = check::run_pass(
+        PassInputs {
+            host_state,
+            roots: vec![root(host_state, RootKind::HostState)],
+            budgets,
+            free: &mut free,
+            measure_budget: Duration::from_secs(60),
+            pace: Duration::ZERO,
+            registry,
+            budget_error: Some(error.clone()),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(ledger.last_pass.unwrap().budget_error, Some(error));
 }
 
 // Must-fix 3: no walk of report-only classes; walks resume within deadlines
@@ -823,6 +1649,7 @@ fn a_worker_that_lost_its_lock_removes_nothing_more() {
             measure_budget: Duration::from_secs(60),
             pace: Duration::ZERO,
             registry,
+            budget_error: None,
         },
         Some(&mut lock),
     )
@@ -1790,15 +2617,18 @@ fn an_archive_repeating_one_commit_is_probed_once() {
     assert_eq!(prover.stats().duplicate_commits, 1);
 }
 
-/// The Node.js compile cache's daily directories expire by age even while
-/// tool caches are under budget; other tool caches still go only when over.
+/// The Node.js compile cache's past days go an hour after their last change
+/// even while tool caches are under budget, today's never (not even under
+/// pressure); other tool caches still go only when over.
 #[test]
-fn old_node_compile_cache_days_expire_while_tool_caches_are_under_budget() {
+fn past_node_compile_cache_days_go_after_an_hour_and_today_never() {
     let now = super::now_ms();
-    let child = |name: &str, age_days: u64| super::Child {
+    let today = now / DAY_MS;
+    let hour = 60 * 60 * 1000;
+    let child = |name: &str, age_ms: u64| super::Child {
         name: name.into(),
         bytes: 1024,
-        newest_ms: now - age_days * DAY_MS,
+        newest_ms: now - age_ms,
         ctime_ms: 0,
         created_ms: None,
         min_retention_ms: None,
@@ -1820,24 +2650,162 @@ fn old_node_compile_cache_days_expire_while_tool_caches_are_under_budget() {
         children,
         walk: None,
     };
+    let long_ago = format!("d{}", today - 20);
+    let yesterday = format!("d{}", today - 1);
+    let earlier = format!("d{}", today - 2);
+    let today_name = format!("d{today}");
     let ledger = super::Ledger {
         items: vec![
             item(
                 "node-compile-cache",
-                vec![child("d20400", 20), child("d20418", 1)],
+                vec![
+                    child(&long_ago, 20 * DAY_MS),
+                    child(&yesterday, 2 * hour),
+                    // A process started before midnight wrote here lately.
+                    child(&earlier, 10 * 60 * 1000),
+                    // Today's, however old its content looks.
+                    child(&today_name, 30 * DAY_MS),
+                    // Not a day's name: the tool-cache rules.
+                    child("v22.1.0", 20 * DAY_MS),
+                ],
             ),
-            item("cargo", vec![child("registry", 20)]),
+            item("cargo", vec![child("registry", 20 * DAY_MS)]),
         ],
         ..super::Ledger::default()
     };
-    let plan = evict::plan(&ledger, &Budgets::default(), now, &Default::default());
-    let planned: Vec<(&str, Reason)> = plan
-        .iter()
-        .map(|candidate| (candidate.relative.as_str(), candidate.reason))
-        .collect();
+    let planned = |aggressive: &std::collections::BTreeSet<RootKind>| -> Vec<(String, Reason)> {
+        evict::plan(&ledger, &Budgets::default(), now, aggressive)
+            .into_iter()
+            .map(|candidate| (candidate.relative, candidate.reason))
+            .collect()
+    };
     assert_eq!(
-        planned,
-        vec![("node-compile-cache/d20400", Reason::Expired)],
-        "{plan:?}"
+        planned(&Default::default()),
+        vec![
+            (format!("node-compile-cache/{long_ago}"), Reason::Expired),
+            ("node-compile-cache/v22.1.0".to_string(), Reason::Expired),
+            (format!("node-compile-cache/{yesterday}"), Reason::Expired),
+        ]
+    );
+    let pressing: std::collections::BTreeSet<RootKind> = [RootKind::HostCache].into();
+    assert!(
+        planned(&pressing)
+            .iter()
+            .all(|(relative, _)| !relative.ends_with(&today_name) && !relative.ends_with(&earlier)),
+        "today's directory and a past day written lately stay under pressure"
+    );
+    // Removal re-checks: today's directory is refused whatever the plan said.
+    let dir = tempfile::tempdir().unwrap();
+    let todays = dir.path().join("node-compile-cache").join(&today_name);
+    file(&todays.join("entry"), 16);
+    age(&todays, 30);
+    let candidate = Candidate {
+        class: Class::ToolCaches,
+        root_kind: RootKind::HostCache,
+        root: dir.path().to_path_buf(),
+        relative: format!("node-compile-cache/{today_name}"),
+        bytes: 16,
+        newest_ms: now,
+        reason: Reason::Expired,
+        expires_ms: None,
+        allow_unlanded: false,
+    };
+    assert_eq!(
+        evict::refuse(&candidate, None, now).as_deref(),
+        Some("today's directory, still in use")
+    );
+}
+
+/// A compile cache entry an older binary recorded as unclassified (it did
+/// not know the name) is classified again, measured and its past days
+/// removed; today's stays.
+#[test]
+fn an_entry_recorded_as_unclassified_is_measured_once_its_name_is_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let today = super::now_ms() / DAY_MS;
+    let node = cache.join("node-compile-cache");
+    file(&node.join(format!("d{today}/v24/entry")), 4096);
+    let roots = || {
+        vec![
+            root(&host_state, RootKind::HostState),
+            root(&cache, RootKind::HostCache),
+        ]
+    };
+    pass(&host_state, roots(), Budgets::default());
+    // What an older binary left: the entry unclassified, counted, never walked.
+    let mut ledger = super::Ledger::load(&host_state);
+    let item = ledger
+        .items
+        .iter_mut()
+        .find(|item| item.name == "node-compile-cache")
+        .unwrap();
+    item.class = Class::Unclassified;
+    item.measured = false;
+    item.children.clear();
+    ledger.save(&host_state).unwrap();
+    let past = node.join(format!("d{}", today - 3));
+    file(&past.join("v24/entry"), 64 * 1024);
+    age(&past, 3);
+
+    let ledger = pass(&host_state, roots(), Budgets::default());
+
+    assert!(!past.exists(), "a past day is removed once measured");
+    assert!(node.join(format!("d{today}/v24/entry")).exists());
+    let item = ledger
+        .items
+        .iter()
+        .find(|item| item.name == "node-compile-cache")
+        .unwrap();
+    assert_eq!(item.class, Class::ToolCaches);
+    assert!(item.measured);
+}
+
+/// Archive staging the bound pass listed is shown with what it measured;
+/// archives are not.
+#[test]
+fn unfinished_archive_staging_is_listed_and_counted() {
+    let host = tempfile::tempdir().unwrap();
+    let repository = "/example/repository";
+    super::record_recovery_archive_usage(
+        host.path(),
+        repository,
+        super::RecoveryArchiveUsage::default(),
+    )
+    .unwrap();
+    let sized = |bytes| super::UnownedArchiveSize {
+        bytes,
+        ..Default::default()
+    };
+    let state = super::ArchiveBoundState {
+        unowned_sizes: [
+            (
+                "/archives/1.retirement-v6.partial".to_string(),
+                sized(Some(7)),
+            ),
+            (
+                "/archives/2.retirement-v6-next.partial".to_string(),
+                sized(None),
+            ),
+            ("/archives/3-unowned".to_string(), sized(Some(100))),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    super::record_archive_bound_state(host.path(), repository, &state).unwrap();
+
+    let status = super::cli::status_value(host.path());
+    assert_eq!(
+        status["classes"]["recovery_archives_by_location"]["unfinished_staging"],
+        serde_json::json!({"directories": 2, "bytes": 7, "unmeasured": 1})
+    );
+    assert_eq!(
+        super::cli::archives_value(host.path())["unfinished_staging"],
+        serde_json::json!([
+            {"path": "/archives/1.retirement-v6.partial", "bytes": 7},
+            {"path": "/archives/2.retirement-v6-next.partial", "bytes": null},
+        ])
     );
 }

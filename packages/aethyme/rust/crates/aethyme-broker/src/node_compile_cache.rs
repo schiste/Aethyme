@@ -24,9 +24,13 @@
 //!
 //! Node.js never removes stale entries, so the directory gets a new
 //! subdirectory each day and the storage ledger classifies
-//! `node-compile-cache` as a tool cache: its daily children are evicted least
-//! recently used first, under the tool-cache budget, once idle for its idle
-//! time. Deleting one is always safe; the next run recompiles.
+//! `node-compile-cache` as a tool cache whose daily children go once their
+//! UTC day is over and they have not changed for an hour, whatever the
+//! tool-cache budget ([`past_day`]); today's directory is never removed.
+//! Nothing records which process uses a directory, but no command is pointed
+//! at a past day's: only a process started before midnight still writes
+//! there, when it exits. Deleting one is always safe; the next run
+//! recompiles (Node.js recreates a missing directory).
 //!
 //! The variable is set only when the caller's environment does not already
 //! name one (a declared step environment still wins, being applied later),
@@ -190,6 +194,18 @@ fn cache_directory(host_cache: &Path, now: SystemTime) -> PathBuf {
     host_cache.join(CACHE_DIRECTORY).join(format!("d{days}"))
 }
 
+/// Whether the cache directory child `name` (`d<days since the epoch>`) is
+/// for a UTC day before the one `now_ms` falls in: `Some(false)` for today's
+/// or a later day's, `None` when `name` is not a day directory's name.
+pub(crate) fn past_day(name: &str, now_ms: u64) -> Option<bool> {
+    let digits = name.strip_prefix('d')?;
+    if digits.is_empty() || digits.len() > 12 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let day: u64 = digits.parse().ok()?;
+    Some(day < now_ms / (SECONDS_PER_DAY * 1_000))
+}
+
 #[cfg(unix)]
 fn create_private_directory(directory: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -254,6 +270,30 @@ mod tests {
             PathBuf::from(next),
             host.path().join(CACHE_DIRECTORY).join("d20416")
         );
+    }
+
+    #[test]
+    fn only_a_past_days_directory_is_a_past_day() {
+        let now = 20_783 * SECONDS_PER_DAY * 1_000 + 5_000;
+        assert_eq!(past_day("d20782", now), Some(true));
+        assert_eq!(past_day("d1", now), Some(true));
+        assert_eq!(past_day("d20783", now), Some(false), "today's");
+        assert_eq!(past_day("d20784", now), Some(false), "a later day's");
+        // The directory this module creates for `now` is today's.
+        let today = cache_directory(Path::new("/cache"), UNIX_EPOCH + Duration::from_millis(now));
+        let name = today.file_name().unwrap().to_str().unwrap();
+        assert_eq!(past_day(name, now), Some(false));
+        for other in [
+            "d",
+            "x20782",
+            "d-1",
+            "d20782x",
+            "d+5",
+            "v22.1.0",
+            "d9999999999999",
+        ] {
+            assert_eq!(past_day(other, now), None, "{other}");
+        }
     }
 
     #[test]

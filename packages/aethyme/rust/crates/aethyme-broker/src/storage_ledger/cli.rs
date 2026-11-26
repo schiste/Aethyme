@@ -154,6 +154,13 @@ pub fn status_value(host_state: &Path) -> Value {
     let summary = Summary::load(host_state);
     let (budgets, budget_error) = Budgets::load(host_state);
     let class_bytes = ledger.class_bytes();
+    // The gate cache's budget is per repository: its class budget is the sum
+    // of the budgets of the repositories it holds, each shown with its bytes.
+    let gate_repositories = super::evict::gate_cache_by_repository(&ledger);
+    let gate_budget: u64 = gate_repositories
+        .keys()
+        .map(|repository| budgets.gate_budget(repository))
+        .fold(0, u64::saturating_add);
     let mut classes: BTreeMap<Class, Value> = BTreeMap::new();
     for class in class_bytes.keys() {
         let items: Vec<&super::Item> = ledger
@@ -177,13 +184,18 @@ pub fn status_value(host_state: &Path) -> Value {
             _ => None,
         };
         let telemetry = ledger.telemetry.get(class).cloned().unwrap_or_default();
+        let budget_bytes = match class {
+            Class::GateCache if !gate_repositories.is_empty() => Some(gate_budget),
+            _ => budgets.class_bytes(*class),
+        };
         classes.insert(
             *class,
             json!({
                 "bytes": class_bytes.get(class),
                 "entries": items.iter().map(|item| item.entries).sum::<u64>(),
                 "oldest_ms": oldest,
-                "budget_bytes": budgets.class_bytes(*class),
+                "oldest_age_ms": oldest.map(|ms| super::now_ms().saturating_sub(ms)),
+                "budget_bytes": budget_bytes,
                 "reclaimable_bytes": reclaimable,
                 "why_not": why_not,
                 "unmeasured": items.iter().filter(|item| item.measured_at_ms == 0).count(),
@@ -192,6 +204,32 @@ pub fn status_value(host_state: &Path) -> Value {
                 "over_budget_since_ms": telemetry.over_budget_since_ms,
                 "over_budget_ms_total": telemetry.over_budget_ms_total,
             }),
+        );
+    }
+    if let Some(gate) = classes.get_mut(&Class::GateCache)
+        && let Some(object) = gate.as_object_mut()
+    {
+        object.insert(
+            "repositories".into(),
+            gate_repositories
+                .iter()
+                .map(|(repository, bytes)| {
+                    (
+                        repository.clone(),
+                        json!({"bytes": bytes, "budget_bytes": budgets.gate_budget(repository)}),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>()
+                .into(),
+        );
+        object.insert(
+            "last_prune".into(),
+            json!(
+                ledger
+                    .last_pass
+                    .as_ref()
+                    .and_then(|pass| pass.gate_cache_prune.clone())
+            ),
         );
     }
     let unclassified: Vec<Value> = ledger
@@ -225,6 +263,7 @@ pub fn status_value(host_state: &Path) -> Value {
     let checkouts = super::checkout_counts(host_state);
     let scratch = super::session_scratch_usage(host_state);
     let archive_usage = super::recovery_archive_usage(host_state);
+    let staging = super::unfinished_archive_staging(host_state);
     let mut classes = serde_json::to_value(&classes).unwrap_or_else(|_| json!({}));
     // Recovery archives by location: the pool's volume (new archives) and
     // host state (older ones), as the retirement lane last measured them.
@@ -242,12 +281,18 @@ pub fn status_value(host_state: &Path) -> Value {
             json!({
                 "pool": sum(|usage| &usage.pool),
                 "host_state": sum(|usage| &usage.host_state),
+                "storage": sum(|usage| &usage.storage),
                 "over_bound": archive_usage.values().filter(|usage| usage.over_bound).count(),
                 "unique_kept_over_bound": archive_usage.values().map(|usage| usage.unique_kept_over_bound).sum::<usize>(),
                 "evicted_total": archive_usage.values().map(|usage| usage.evicted_total).sum::<usize>(),
                 "evicted_bytes_total": archive_usage.values().map(|usage| usage.evicted_bytes_total).sum::<u64>(),
                 "partial": archive_usage.values().any(|usage| usage.partial),
                 "repositories": archive_usage,
+                "unfinished_staging": {
+                    "directories": staging.len(),
+                    "bytes": staging.values().flatten().sum::<u64>(),
+                    "unmeasured": staging.values().filter(|bytes| bytes.is_none()).count(),
+                },
                 "why_not": "measured by checkout retirement; over [cleanup] recovery_archive_bound_gib only fully landed archives are removed",
             }),
         );
@@ -308,10 +353,88 @@ pub fn status_value(host_state: &Path) -> Value {
         // Host temp folders: not Aethyme's roots; read by the worker, never
         // deleted (`storage.host-temp-large`).
         "host_temp": super::host_temp::Reading::load(host_state),
+        "artifact_max_age": artifact_max_age_status(&ledger, &budgets, super::now_ms()),
         "budgets": budgets,
         "budget_error": budget_error,
+        // `storage.toml` `[placement]`: where archives and gate caches go.
+        "placement": super::placement::status(host_state),
         "last_pass": ledger.last_pass,
         "phases_ms": {"read": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)},
+    })
+}
+
+/// Compliance with the artifact max age, per class it applies to: the age
+/// of the least recently used artifact still there (`oldest_age_ms`) against
+/// the max age (`within`: `null` when unknown or the max age is off).
+/// Gate cache entries and the Node.js compile cache come from the ledger;
+/// gate cache units and the classes outside the ledger from the last pass.
+pub fn artifact_max_age_status(ledger: &Ledger, budgets: &Budgets, now: u64) -> Value {
+    let max_age_ms = budgets.artifact_max_age().map(super::evict::duration_ms);
+    let within = |age: Option<u64>| -> Value {
+        match (age, max_age_ms) {
+            (Some(age), Some(max)) => json!(age <= max),
+            _ => Value::Null,
+        }
+    };
+    let oldest_child = |class: Class, name: Option<&str>| -> Option<u64> {
+        ledger
+            .items
+            .iter()
+            .filter(|item| item.class == class && item.measured)
+            .filter(|item| name.is_none_or(|name| item.name == name))
+            .flat_map(|item| item.children.iter())
+            .map(|child| child.newest_ms.max(child.ctime_ms))
+            .filter(|ms| *ms > 0)
+            .min()
+            .map(|ms| now.saturating_sub(ms))
+    };
+    let mut classes = serde_json::Map::new();
+    let gate = oldest_child(Class::GateCache, None);
+    classes.insert(
+        "gate_cache".into(),
+        json!({"oldest_age_ms": gate, "within": within(gate)}),
+    );
+    let node = oldest_child(
+        Class::ToolCaches,
+        Some(crate::node_compile_cache::CACHE_DIRECTORY),
+    );
+    classes.insert(
+        "node_compile_cache".into(),
+        json!({
+            "oldest_age_ms": node,
+            // Today's directory is kept whatever its age; past days go an
+            // hour after their last change.
+            "rule": "past UTC days go an hour after their last change; today's stays",
+        }),
+    );
+    let last = ledger.last_pass.as_ref();
+    if let Some(prune) = last.and_then(|pass| pass.gate_cache_prune.as_ref()) {
+        classes.insert(
+            "gate_cache_units".into(),
+            json!({
+                "pruned_for_pile_up": prune.units,
+                "pruned_bytes": prune.bytes,
+                "kept_in_use": prune.in_use,
+                "kept_not_local": prune.not_local,
+                "stop": prune.stop,
+            }),
+        );
+    }
+    let age = last.and_then(|pass| pass.artifact_age.as_ref());
+    if let Some(age) = age {
+        for (class, outcome) in &age.classes {
+            let mut value = json!(outcome);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("within".into(), within(outcome.oldest_kept_age_ms));
+            }
+            classes.insert(class.clone(), value);
+        }
+    }
+    json!({
+        "max_age_hours": budgets.artifact_max_age_hours,
+        "max_age_ms": max_age_ms,
+        "classes": classes,
+        "stop": age.map(|age| age.stop.clone()),
     })
 }
 
@@ -327,6 +450,47 @@ fn status(json_output: bool) -> u8 {
     }
     if value["updated_at_ms"].as_u64().unwrap_or(0) == 0 {
         println!("storage: not measured yet (the worker starts with the next broker command)");
+    }
+    if let Some(error) = value["budget_error"].as_str() {
+        println!("Warning: {error}; default storage budgets in use");
+    }
+    match value["artifact_max_age"]["max_age_hours"].as_u64() {
+        Some(0) | None => println!("artifact max age: off"),
+        Some(hours) => {
+            let over: Vec<&str> = value["artifact_max_age"]["classes"]
+                .as_object()
+                .map(|classes| {
+                    classes
+                        .iter()
+                        .filter(|(_, entry)| entry["within"] == json!(false))
+                        .map(|(class, _)| class.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if over.is_empty() {
+                println!("artifact max age: {hours}h, every class within it");
+            } else {
+                println!(
+                    "artifact max age: {hours}h; older artifacts still in: {}",
+                    over.join(", ")
+                );
+            }
+        }
+    }
+    for data in ["recovery_archives", "gate_caches"] {
+        let placement = &value["placement"][data];
+        if placement["configured"] == "storage" || !placement["fallback"].is_null() {
+            println!(
+                "placement: {data} configured {}, placed {}{}",
+                placement["configured"].as_str().unwrap_or("?"),
+                placement["placed"].as_str().unwrap_or("?"),
+                placement["fallback"]
+                    .as_str()
+                    .map_or_else(String::new, |why| format!(
+                        " (Warning: fell back to the host: {why})"
+                    )),
+            );
+        }
     }
     // Roots and one total first.
     let total: u64 = value["classes"]
@@ -395,6 +559,14 @@ fn status(json_output: bool) -> u8 {
                     .unwrap_or_default()
             );
         }
+    }
+    let staging = &value["classes"]["recovery_archives_by_location"]["unfinished_staging"];
+    if staging["directories"].as_u64().unwrap_or(0) > 0 {
+        println!(
+            "unfinished archive staging: {} director(ies), {} measured (see `aethyme storage archives`)",
+            staging["directories"],
+            human(staging["bytes"].as_u64().unwrap_or(0))
+        );
     }
     if let Some(over) = value["over_budget"].as_array() {
         for entry in over {
@@ -567,11 +739,34 @@ pub(super) fn unlanded_archive_evidence(archives: &[String]) -> Vec<String> {
     evidence
 }
 
+/// `storage.budget-config-invalid`: `storage.toml` cannot be read, so the
+/// worker runs on default budgets (an older binary on the host rejects keys
+/// it does not know in the same way).
+fn budget_config_invalid_advice(error: String) -> crate::StatusAdvice {
+    crate::StatusAdvice {
+        id: "storage.budget-config-invalid",
+        severity: crate::StatusAdviceSeverity::Warning,
+        reason: "the host's storage.toml cannot be read; the storage worker runs on default budgets until it is fixed",
+        summary: "storage.toml is invalid: default storage budgets in use".into(),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![error],
+        commands: vec!["aethyme storage status".into()],
+    }
+}
+
 /// `broker status` advice: over budget, below floor, unclassified. Class
 /// names and sizes only; archive ids are paths inside Aethyme's own root.
 pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
     let summary = Summary::load(host_state);
     let mut advice = Vec::new();
+    if let (_, Some(error)) = Budgets::load(host_state) {
+        crate::phase_telemetry::add(
+            "storage_budget_config_invalid_advised",
+            std::time::Duration::ZERO,
+        );
+        advice.push(budget_config_invalid_advice(error));
+    }
     if !summary.over_budget.is_empty() {
         let mut evidence: Vec<String> = summary
             .over_budget
@@ -874,8 +1069,29 @@ pub(super) fn command_temp_backlog_advice(
 
 /// The directory of archive `id` (`<pool>/<archive>`, optionally prefixed
 /// with `recovery-archives/`), checked to be a plain path inside the host
-/// state's archive root.
+/// state's archive root or, for an archive placed or moved there, an
+/// adopted storage root's (`storage.toml` `[placement]`).
 pub fn archive_path(host_state: &Path, id: &str) -> Result<std::path::PathBuf, String> {
+    let mut bases = vec![host_state.to_path_buf()];
+    bases.extend(
+        super::placement::archive_storage_roots(host_state)
+            .into_iter()
+            .map(|(root, _)| root),
+    );
+    let mut first_error = None;
+    for base in &bases {
+        match archive_path_in(base, id) {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| format!("no archive {id}")))
+}
+
+/// [`archive_path`] in one base directory (host state or a storage root).
+fn archive_path_in(host_state: &Path, id: &str) -> Result<std::path::PathBuf, String> {
     let id = id.strip_prefix("recovery-archives/").unwrap_or(id);
     let parts: Vec<&str> = id.split('/').collect();
     let plain = |part: &str| {
@@ -1005,10 +1221,15 @@ pub fn archives_value(host_state: &Path) -> Value {
             }));
         }
     }
+    let staging: Vec<Value> = super::unfinished_archive_staging(host_state)
+        .into_iter()
+        .map(|(path, bytes)| json!({"path": path.to_string_lossy(), "bytes": bytes}))
+        .collect();
     json!({
         "schema": "aethyme.storage-archives/v1",
         "unlanded_archive_days": budgets.unlanded_archive_days,
         "archives": rows,
+        "unfinished_staging": staging,
     })
 }
 
@@ -1023,7 +1244,12 @@ fn archives(json_output: bool) -> u8 {
         return crate::exit_status::SUCCESS;
     }
     let rows = value["archives"].as_array().cloned().unwrap_or_default();
-    println!("{} recovery archive(s)", rows.len());
+    let staging = value["unfinished_staging"].as_array();
+    if rows.is_empty() && staging.is_some_and(|staging| !staging.is_empty()) {
+        println!("no finished recovery archive");
+    } else {
+        println!("{} recovery archive(s)", rows.len());
+    }
     for row in rows {
         println!(
             "  {}  {}  {}  created {}  expires {}{}",
@@ -1041,6 +1267,15 @@ fn archives(json_output: bool) -> u8 {
                 .as_u64()
                 .map_or_else(|| "never".to_string(), |ms| ms.to_string()),
             if row["kept"] == true { "  kept" } else { "" }
+        );
+    }
+    for entry in staging.into_iter().flatten() {
+        println!(
+            "  unfinished staging  {}  {}  (copies of an attempt that did not finish; never expired)",
+            entry["path"].as_str().unwrap_or("?"),
+            entry["bytes"]
+                .as_u64()
+                .map_or_else(|| "size unknown".to_string(), human)
         );
     }
     crate::exit_status::SUCCESS

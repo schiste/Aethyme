@@ -388,8 +388,65 @@ Budgets default to: recovery archives 4 GiB, gate cache 4 GiB per repository
 graph stores 2 GiB, qualification retained 1 GiB, tool caches 8 GiB, host state
 total 16 GiB, host cache total 12 GiB, storage roots total 48 GiB, free-space
 floor 10 GiB and hard minimum 2 GiB per volume. `<host state>/storage.toml`
-`[budget]` overrides them. `gc plan` reads a gate cache entry's size from the
+`[budget]` overrides them. Recovery archives have a free-space floor of their
+own: the larger of `free_floor_bytes` and `recovery_archive_free_floor_percent`
+(default 10) of the volume's size, the share capped at
+`recovery_archive_free_floor_cap_bytes` (default 20 GiB), so a 1 TB disk gets a
+20 GiB floor, not 93 GiB. Below it, the worker removes the oldest
+archives on that volume that may go (landed, past their promised retention,
+not kept), across repositories and paced, until free space is back at the
+floor; archives holding unlanded or uncommitted work are never removed for it.
+A `storage.toml` the worker cannot read leaves it on default budgets and is
+advised as `storage.budget-config-invalid` in `broker status`. `gc plan` reads a gate cache entry's size from the
 ledger when the worker measured it within the hour instead of walking it.
+
+Placement: recovery archives and managed gate caches can live on an adopted
+storage root on another volume instead of host state and the host cache.
+`<host state>/storage.toml`:
+
+```toml
+[placement]
+recovery_archives = "storage"   # "host" (default) or "storage"
+gate_caches = "storage"         # "host" (default) or "storage"
+storage_root = "/path/to/root"  # optional; needed when several roots are adopted
+```
+
+Only an adopted root qualifies (`aethyme storage adopt <dir>`): a real
+directory, not a symbolic link, carrying the adoption marker, both owned by
+this user, on a mounted, local file system. When it does not (unmounted,
+unadopted, ambiguous, a link, another owner, a network file system, or an
+unreadable `[placement]`), archives and gate caches go to host state and the
+host cache as before; the reason shows in `storage status` (`placement`) and
+is counted, and no cleanup fails for it. On the root, the layout mirrors host
+state: `<root>/recovery-archives/<repository key>/<archive>` and
+`<root>/gates/<repository key>/<cache key>`, so the worker inventories,
+expires, floors and lists them as before and archive ids do not change. The
+retirement lane still prefers the pool's own archive directory; a reviewed
+`cleanup resolve` and a repository with no pool write to the placed root.
+Every reader (restore, `storage archives`, `keep-archive`, landing proofs,
+expiry, the archive floor and bound, `gc plan`, merged-branch cleanup) finds
+archives in host state, the pool and every storage root that received archives
+or was adopted; while a root that received archives is unreachable, decisions
+that delete when no archive is found are deferred.
+
+While `recovery_archives = "storage"` resolves to a root, each worker pass
+moves host state archives there (at most 60 s and 500 archives per pass,
+resuming from a recorded cursor): never one being written (partial names),
+without a manifest, or while its repository's lifecycle lock is held or
+awaited (a restore, retirement or bound pass). Same volume: one rename.
+Another volume: copied to a `.partial` staging directory, every file and
+directory synced, both trees compared (type, size and SHA-256 of every file),
+renamed into place, then the host copy is removed; keep and dismissal markers
+move with it. A crash leaves the host copy intact or two identical copies,
+which the next pass reconciles. While `gate_caches = "storage"` resolves to
+a root, gates build there and the worker evicts the host cache's gate caches
+(never moved), each under its exclusive lease, so a running gate keeps its
+cache. `storage status --json` adds `placement` (configured and placed
+location per kind, `fallback`, `storage_root`, `archive_storage_roots`,
+`migration` totals and cursor) and `recovery_archives_by_location.storage`;
+the pass report adds `placement`. An older binary rejects a `storage.toml`
+with a `[placement]` table and runs on default budgets, so add it only once
+every binary on the host is at least this version.
 
 Host temp folders (the per-user temp folder on macOS and `/tmp`) are not
 Aethyme's roots: they are read, never deleted. After its pass, at most every
@@ -408,6 +465,38 @@ these keys only once every Aethyme binary on the host is at least this
 version. Known limit: the one-level listing calls `lstat` on each entry, and
 a dead network or automount mount inside a temp folder can block that call
 with no timeout.
+
+Artifact max age: `[budget] artifact_max_age_hours` (default 24, `0` off) is
+one host-wide age past which rebuildable build output and caches Aethyme can
+prove unused are removed, whatever the budgets. Each worker pass removes gate
+cache entries unused for it (their newest change; every gate rebuilds the
+workspace members it tests into its entry), under the entry's exclusive gate
+cache lease, the repository's newest entry included; and, in every entry still
+in use, prunes the superseded generations of local packages (by their dep-info:
+no registry or git dependency) whose last recorded access or change is older
+than the max age, so a busy entry never piles up generations. In session
+scratch directories and in the main checkouts of registered repositories
+(directories named `target` up to three levels deep, only when Git says they
+hold no tracked file and are ignored), a Cargo target (it carries Cargo's
+`CACHEDIR.TAG`) unused for the max age is removed whole, and one used within
+it is pruned like a gate cache entry, in both cases only while the worker holds
+every profile's `.cargo-lock` (a running build keeps it). Empty leftover
+worktree roots in Aethyme's `worktrees` containers (no registered repository
+uses them, nothing in them but Aethyme's markers and empty directories, nothing
+changed for the max age; quick-test pools included) are removed. The idle
+strip removes the Cargo targets of open sessions with no activity for the max
+age, declared as preparation outputs or not (Cargo rebuilds them); other
+regenerable directories still go only as declared outputs, after `[cleanup]
+idle_strip_after_hours`. Recovery archives, preparation caches (rotated by
+the preparation cache), tracked paths and anything without a rebuild proof
+are never removed by age. `storage status --json` gives every class an
+`oldest_age_ms` and adds `artifact_max_age` (`max_age_hours`, `max_age_ms`,
+`stop`, and per class `oldest_age_ms` or `oldest_kept_age_ms` with `within`:
+whether the least recently used artifact still there is within the max age;
+for the classes outside the ledger also `found`, `removed_for_age`,
+`removed_for_age_bytes`, `pruned_for_pile_up`, `pruned_for_pile_up_bytes`,
+`kept_in_use`, `kept_unproven`); the human output says which classes still
+hold older artifacts.
 
 ## Broker Commands
 
@@ -1096,7 +1185,11 @@ why. `package_store.output_share` reports the output-sharing pass: its
 (`files_scanned`, `files_already_shared`, `files_cloned_from_pool`,
 `bytes_cloned_from_pool`, `files_added_to_pool`, `bytes_added_to_pool`,
 `files_left_alone`, `files_failed`, `pool_entries_rejected` for entries
-whose bytes did not match their name, `stale_temporaries_removed`),
+whose bytes did not match their name, `stale_temporaries_removed`,
+`files_skipped_bytecode` and `bytes_skipped_bytecode` for Python bytecode,
+`pool_entries_hashed`, `pool_bytes_hashed`, `pool_entries_verified_by_record`
+and `pool_bytes_verified_by_record` for entries read or recognized as already
+hashed, `verification_record_ignored`, `verification_record_write_failed`),
 `unique_bytes_before` and
 `unique_bytes_after` (bytes the walked outputs own alone, from APFS private
 sizes or Linux FIEMAP shared-extent flags; `unique_bytes_method` is

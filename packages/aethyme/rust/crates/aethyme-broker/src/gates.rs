@@ -38,6 +38,7 @@ use crate::store::BrokerStore;
 use crate::types::{GateEnvironment, GateFailureClass, GateStatus, NewGateResult};
 
 pub(crate) mod bounded_log;
+mod vitest_summary;
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;
@@ -808,6 +809,11 @@ pub struct GateRunOutcome {
     /// Serialized only when true. See [`GateRunOutcome::is_host_fault`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub host_fault: bool,
+    /// A completed vitest failure whose log also contains environment text.
+    /// The stored row is never reused, and a rerun may differ. Serialized only
+    /// when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub environment_text_test_failure: bool,
 }
 
 impl GateRunOutcome {
@@ -1080,6 +1086,36 @@ impl GateStorageLocations {
             Self::Defaults => crate::host_state::default_host_cache_dir(),
             Self::Captured { host_cache_dir, .. } => host_cache_dir.clone(),
         }
+    }
+
+    /// The directory managed gate caches go under (`<dir>/gates/<repository
+    /// key>/<cache key>`): the host cache, or the adopted storage root
+    /// `<host state>/storage.toml` `[placement] gate_caches = "storage"`
+    /// names, while it qualifies. A missing or unqualified root falls back to
+    /// the host cache (counted by reason). A cache left in the other location
+    /// is never reused: it is only a cache, and the storage worker evicts the
+    /// host one once it is unleased.
+    pub(crate) fn gate_cache_dir(&self) -> Option<PathBuf> {
+        let host_cache = self.cache_dir()?;
+        let host_state = match self {
+            Self::Defaults => crate::host_state::default_host_state_dir(),
+            Self::Captured {
+                host_resource_db_path,
+                ..
+            } => host_resource_db_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        if let Some(host_state) = host_state {
+            use crate::storage_ledger::placement;
+            if let Some(root) =
+                placement::resolve(&host_state, placement::Data::GateCaches).storage_root
+            {
+                return Some(root);
+            }
+        }
+        Some(host_cache)
     }
 }
 
@@ -2991,13 +3027,26 @@ impl GateResourceRuntime {
         // it first instead of waiting for its turn.
         if let Some(host_state) = self.resource_db_path.parent() {
             let prefix = managed_cache_lease_name("", "");
+            // Placed on an adopted storage root (`[placement]`), the cache
+            // is that root's `gates` entry, not the host cache's.
+            let kind = {
+                use crate::storage_ledger::placement;
+                if placement::resolve(host_state, placement::Data::GateCaches)
+                    .on_storage()
+                    .is_some()
+                {
+                    crate::storage_ledger::RootKind::Storage
+                } else {
+                    crate::storage_ledger::RootKind::HostCache
+                }
+            };
             for allocation in &self.grant.lease.allocations {
                 if let Some(rest) = allocation.value.strip_prefix(prefix.trim_end_matches(':'))
                     && let Some((repository, key)) = rest.trim_start_matches(':').split_once(':')
                 {
                     crate::storage_ledger::note_written(
                         host_state,
-                        crate::storage_ledger::RootKind::HostCache,
+                        kind,
                         &format!("gates/{repository}/{key}"),
                     );
                 }
@@ -3221,12 +3270,14 @@ fn prepare_managed_gate_cache(
     if policy.is_none() {
         return Ok(None);
     }
-    let root = storage.cache_dir().ok_or_else(|| {
+    let root = storage.gate_cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
-    // Pruned units are handed to the storage worker, which removes the
-    // host cache root's `.aethyme-storage-evicting-*` leftovers in the
-    // background on every pass; with the worker off, they go inline.
+    // Pruned units are staged beside the cache, under `root` (the host
+    // cache, or the storage root `[placement]` names: the same volume as
+    // the units), and handed to the storage worker, which removes every
+    // root's `.aethyme-storage-evicting-*` leftovers in the background on
+    // every pass; with the worker off, they go inline.
     let deferred_to = storage
         .resource_db_path()
         .ok()
@@ -3307,9 +3358,60 @@ fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error
     )
 }
 
-/// The pruned-units record inside a managed cache: which units the last
-/// prune staged, read by the next gate to count rebuilds.
-const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+/// The pruned-units record inside a managed cache: which units prunes
+/// staged (the gate's own, or the storage worker's between gates), read
+/// after the next gate's build to count the units it rebuilt.
+pub(crate) const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+
+/// After a gate's build: count the units the pruned-units record names that
+/// cargo rebuilt with the very hash a prune removed (the prune misjudged
+/// them as unused), then remove the record. Read after the build, not
+/// before it: a prune the storage worker made between gates has had no
+/// build yet when the next gate starts, so counting then always found
+/// nothing. Returns how many were rebuilt (`None`: no record).
+pub(crate) fn count_units_rebuilt_after_prune(directory: &Path) -> Option<u64> {
+    let marker = directory.join(PRUNED_UNITS_MARKER);
+    let text = std::fs::read_to_string(&marker).ok()?;
+    let staged: Vec<String> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let rebuilt = crate::cargo_target_prune::rebuilt_units(directory, &staged);
+    crate::phase_telemetry::attach(
+        "managed_cache_prune",
+        serde_json::json!({"rebuilt_after_previous_prune": rebuilt}),
+    );
+    for _ in 0..rebuilt {
+        crate::phase_telemetry::add(
+            "managed_cache_prune_rebuilt_unit",
+            std::time::Duration::ZERO,
+        );
+    }
+    crate::warn_unrecorded(
+        "remove the pruned-units record",
+        std::fs::remove_file(&marker),
+    );
+    Some(rebuilt)
+}
+
+/// Add `staged` to the pruned-units record of the cache at `directory`
+/// (one unit per line), keeping what an earlier prune recorded and no build
+/// has counted yet.
+pub(crate) fn append_pruned_units(directory: &Path, staged: &[String]) {
+    let marker = directory.join(PRUNED_UNITS_MARKER);
+    let mut lines: Vec<String> = std::fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.extend(staged.iter().cloned());
+    crate::warn_unrecorded(
+        "record the pruned units",
+        std::fs::write(&marker, lines.join("\n")),
+    );
+}
 
 /// How long a gate may spend moving superseded units out of its managed
 /// cache before it runs its command.
@@ -3328,7 +3430,18 @@ fn prepare_managed_gate_cache_in(
         return Ok(None);
     };
     std::fs::create_dir_all(root)?;
-    crate::host_state::protect_host_state_path(root, true)?;
+    // The host cache is private; an adopted storage root is the owner's
+    // directory (it holds other data), so only its `gates` is made private.
+    if root
+        .join(crate::storage_ledger::STORAGE_ROOT_MARKER)
+        .is_file()
+    {
+        let gates = root.join("gates");
+        std::fs::create_dir_all(&gates)?;
+        crate::host_state::protect_host_state_path(&gates, true)?;
+    } else {
+        crate::host_state::protect_host_state_path(root, true)?;
+    }
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);
@@ -3340,27 +3453,8 @@ fn prepare_managed_gate_cache_in(
         Err(error) => return Err(error),
     };
     let bytes_before = usage_before.bytes;
-    // Units the previous prune staged that cargo has since rebuilt with the
-    // same hash: the prune misjudged them as unused.
-    let marker = directory.join(PRUNED_UNITS_MARKER);
-    if let Ok(text) = std::fs::read_to_string(&marker) {
-        let staged: Vec<String> = text.lines().map(str::to_string).collect();
-        let rebuilt = crate::cargo_target_prune::rebuilt_units(&directory, &staged);
-        crate::phase_telemetry::attach(
-            "managed_cache_prune",
-            serde_json::json!({"rebuilt_after_previous_prune": rebuilt}),
-        );
-        for _ in 0..rebuilt {
-            crate::phase_telemetry::add(
-                "managed_cache_prune_rebuilt_unit",
-                std::time::Duration::ZERO,
-            );
-        }
-        crate::warn_unrecorded(
-            "remove the pruned-units record",
-            std::fs::remove_file(&marker),
-        );
-    }
+    // Rebuilt units are counted after the build
+    // (`count_units_rebuilt_after_prune`), whoever pruned.
     // Over its ceiling, first move superseded build units (earlier
     // generations of a unit nothing has read since its successor was built)
     // out of the tree, down to three quarters of the ceiling, so the next
@@ -3411,10 +3505,7 @@ fn prepare_managed_gate_cache_in(
                 "gate {gate_name} pruned {} superseded build units ({} bytes) from managed cache {}",
                 pruned.units, pruned.bytes, policy.key
             ));
-            crate::warn_unrecorded(
-                "record the pruned units",
-                std::fs::write(&marker, pruned.staged.join("\n")),
-            );
+            append_pruned_units(&directory, &pruned.staged);
         }
         if staging.exists()
             && let Some(host_state) = deferred_to
@@ -3513,7 +3604,8 @@ fn gate_storage_probes(
             path: checkout.root().to_path_buf(),
         },
     ];
-    if let (Some(cache_key), Some(cache_root)) = (gate.managed_cache.as_ref(), storage.cache_dir())
+    if let (Some(cache_key), Some(cache_root)) =
+        (gate.managed_cache.as_ref(), storage.gate_cache_dir())
     {
         let repository = git_origin_fingerprint(checkout);
         probes.push(GateStorageProbe {
@@ -3593,7 +3685,7 @@ fn gate_storage_admission_refusal(
     gate: &Gate,
     storage: GateStorageLocations,
 ) -> Option<String> {
-    if gate.managed_cache.is_some() && storage.cache_dir().is_none() {
+    if gate.managed_cache.is_some() && storage.gate_cache_dir().is_none() {
         return Some(
             "the broker's captured host cache directory is unavailable for this managed cache"
                 .into(),
@@ -4336,6 +4428,7 @@ where
                 // whose verdict is reused, so the cache hit reports none.
                 environment: GateEnvironment::default(),
                 host_fault: false,
+                environment_text_test_failure: false,
             });
             if failed {
                 break;
@@ -4870,6 +4963,7 @@ where
                     // The managed cache could not be prepared: the command
                     // never ran.
                     host_fault: true,
+                    environment_text_test_failure: false,
                 });
                 break;
             }
@@ -4978,6 +5072,11 @@ where
                 .flatten();
             cache.provenance.bytes_after = usage_after.map(|usage| usage.bytes);
             cache.provenance.inodes_after = usage_after.map(|usage| usage.inodes);
+            // What this build rebuilt of what a prune removed; a writer still
+            // running leaves the record for the next gate.
+            if writers_quiescent {
+                count_units_rebuilt_after_prune(&cache.directory);
+            }
         }
         let release_error = match resource_runtime.as_mut() {
             Some(runtime) => runtime.finish(writers_quiescent),
@@ -5050,8 +5149,12 @@ where
                 );
             }
         }
-        let (mut gate_status, mut failure_class, exit_code) =
-            classify_gate_result(&gate.command, &log_path, status);
+        let GateClassification {
+            status: mut gate_status,
+            mut failure_class,
+            exit_code,
+            environment_text_test_failure,
+        } = classify_gate_run(&gate.command, &log_path, status);
         if progress.early_verification_cancelled() == Some(true)
             || (early_verification && timed_out)
         {
@@ -5078,6 +5181,9 @@ where
                 );
             }
         }
+        // Cancellation and host starvation above outrank the summary.
+        let environment_text_test_failure =
+            environment_text_test_failure && gate_status == GateStatus::Fail;
         // Classification reads the log in place, so the rename waits until
         // after it. A failing log then moves aside: the generic name is keyed
         // on (gate, tree, worker), so a re-run against an unchanged tree lands
@@ -5101,14 +5207,17 @@ where
         let reusable_profile = cache_provenance
             .as_ref()
             .filter(|_| !early_verification || gate_status == GateStatus::Pass);
-        let cache_bypass_reason = (!early_verification
-            && should_bypass_timeout_text_test_failure_cache(
-                gate.cache,
-                gate_status,
-                failure_class,
-                &log_path,
-            ))
-        .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+        let cache_bypass_reason = test_failure_cache_bypass_reason(
+            environment_text_test_failure,
+            early_verification,
+            gate.cache,
+            gate_status,
+            failure_class,
+            &log_path,
+        );
+        if environment_text_test_failure {
+            crate::phase_telemetry::add("gate_environment_text_test_failure", Duration::ZERO);
+        }
         let run_id = store.record_gate_result_with_execution_profile_and_cache_bypass(
             &NewGateResult {
                 gate_name: gate.name.clone(),
@@ -5150,6 +5259,7 @@ where
             log_path: Some(log_path.to_string_lossy().into_owned()),
             environment,
             host_fault,
+            environment_text_test_failure,
         });
         if failed {
             break;
@@ -5244,6 +5354,7 @@ fn record_gate_preflight_resource_failure(
         log_path: Some(log_path.to_string_lossy().into_owned()),
         environment: GateEnvironment::default(),
         host_fault: true,
+        environment_text_test_failure: false,
     })
 }
 
@@ -5302,6 +5413,7 @@ fn gate_storage_resource_failure(
         log_path: None,
         environment: GateEnvironment::default(),
         host_fault: true,
+        environment_text_test_failure: false,
     })
 }
 
@@ -5341,6 +5453,48 @@ fn starved_after_start(
 
 fn short_tree_hash(tree_hash: &str) -> &str {
     &tree_hash[..12.min(tree_hash.len())]
+}
+
+struct GateClassification {
+    status: GateStatus,
+    failure_class: Option<GateFailureClass>,
+    exit_code: Option<i64>,
+    /// Decided once, here, so recording never depends on reading the log again.
+    environment_text_test_failure: bool,
+}
+
+/// Classify a run, and settle environment text in the log of a vitest run.
+///
+/// Only an ordinary exit 1, the code vitest fails with, that would be an
+/// environment error is looked at, so every other fault keeps its class.
+fn classify_gate_run(
+    command: &str,
+    log_path: &Path,
+    status: Result<GateCommandOutcome, std::io::Error>,
+) -> GateClassification {
+    let ordinary_failure = status.as_ref().is_ok_and(|outcome| {
+        outcome.exit_code == Some(1)
+            && !outcome.timed_out
+            && outcome.resource_error.is_none()
+            && outcome.capture_error.is_none()
+    });
+    let (status, failure_class, exit_code) = classify_gate_result(command, log_path, status);
+    let environment_text_test_failure =
+        ordinary_failure && failure_class == Some(GateFailureClass::Environment) && {
+            let _span = crate::phase_telemetry::span("gate_vitest_summary_parse");
+            vitest_summary::complete_failure(log_path)
+        };
+    let (status, failure_class) = if environment_text_test_failure {
+        (GateStatus::Fail, Some(GateFailureClass::TestFailure))
+    } else {
+        (status, failure_class)
+    };
+    GateClassification {
+        status,
+        failure_class,
+        exit_code,
+        environment_text_test_failure,
+    }
 }
 
 fn classify_gate_result(
@@ -5493,6 +5647,35 @@ fn cached_failure_class(status: GateStatus) -> Option<GateFailureClass> {
 
 const TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON: &str =
     "test output contained timeout text; rerun instead of reusing this failure";
+
+const ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON: &str =
+    "test failure log contained environment error text; rerun instead of reusing this failure";
+
+/// Why this completed test failure must not satisfy a later cache lookup.
+///
+/// With environment text in the log the tests did fail, but an environment
+/// problem may be why, so the row is cleared whatever the gate's cache
+/// setting: advisory readers of uncleared failures do not know that setting.
+fn test_failure_cache_bypass_reason(
+    environment_text_test_failure: bool,
+    early_verification: bool,
+    cache_enabled: bool,
+    status: GateStatus,
+    failure_class: Option<GateFailureClass>,
+    log_path: &Path,
+) -> Option<&'static str> {
+    if environment_text_test_failure {
+        return Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+    }
+    (!early_verification
+        && should_bypass_timeout_text_test_failure_cache(
+            cache_enabled,
+            status,
+            failure_class,
+            log_path,
+        ))
+    .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+}
 
 fn should_bypass_timeout_text_test_failure_cache(
     cache_enabled: bool,
@@ -5718,18 +5901,23 @@ fn is_environment_error(exit_code: i32, log_path: &Path) -> bool {
     has_environment_error_diagnostic(log_path)
 }
 
+const ENVIRONMENT_ERROR_PATTERNS: &[&str] = &[
+    ": command not found",
+    "command not found",
+    "not found on path",
+    "executable file not found",
+    "permission denied",
+    "cannot execute",
+];
+
 fn has_environment_error_diagnostic(log_path: &Path) -> bool {
-    log_contains_any(
-        log_path,
-        &[
-            ": command not found",
-            "command not found",
-            "not found on path",
-            "executable file not found",
-            "permission denied",
-            "cannot execute",
-        ],
-    )
+    log_contains_any(log_path, ENVIRONMENT_ERROR_PATTERNS)
+}
+
+fn contains_environment_error(lowercase: &str) -> bool {
+    ENVIRONMENT_ERROR_PATTERNS
+        .iter()
+        .any(|pattern| lowercase.contains(pattern))
 }
 
 fn log_contains_any(log_path: &Path, patterns: &[&str]) -> bool {
@@ -6148,6 +6336,8 @@ fn run_gate_command(
     context: GateCommandContext<'_>,
     artifact_use: &mut GateArtifactUseGuard,
 ) -> Result<GateCommandOutcome, std::io::Error> {
+    // Unattended bulk deleters on this volume yield the disk while it runs.
+    let _foreground_io = crate::foreground_io::ForegroundIoMark::enter("gate", context.cwd);
     run_gate_command_inner(command, &context, artifact_use)
 }
 
@@ -10431,6 +10621,364 @@ mod tests {
         );
     }
 
+    const FAILED_VITEST_WITH_ENVIRONMENT_TEXT: &str = " RUN  v4.1.11 /work/app\n\nstderr | a.test.ts\nEACCES: permission denied\n\n⎯⎯⎯ Failed Tests 1 ⎯⎯⎯\n\nAssertionError: expected 1 to be 2\n⎯⎯⎯[1/1]⎯\n\n Test Files  1 failed | 2 passed (3)\n      Tests  1 failed | 8 passed (9)\n   Start at  10:11:12\n   Duration  1.00s\n";
+
+    fn classified(log: &Path, outcome: GateCommandOutcome) -> GateClassification {
+        classify_gate_run("pnpm test", log, Ok(outcome))
+    }
+
+    #[test]
+    fn completed_vitest_failure_outranks_environment_text_for_exit_1_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+        let environment = Some(GateFailureClass::Environment);
+        for (code, status, class, flagged) in [
+            (
+                Some(1),
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                true,
+            ),
+            (Some(2), GateStatus::Error, environment, false),
+            (Some(125), GateStatus::Error, environment, false),
+            (Some(126), GateStatus::Error, environment, false),
+            (Some(127), GateStatus::Error, environment, false),
+            (Some(130), GateStatus::Error, environment, false),
+            (
+                Some(124),
+                GateStatus::Error,
+                Some(GateFailureClass::Timeout),
+                false,
+            ),
+            // Never a verdict from a run that exited zero or was killed.
+            (Some(0), GateStatus::Pass, None, false),
+            (None, GateStatus::Cancelled, None, false),
+        ] {
+            let actual = classified(&log, command_outcome(code, false));
+            assert_eq!(
+                (
+                    actual.status,
+                    actual.failure_class,
+                    actual.exit_code,
+                    actual.environment_text_test_failure,
+                ),
+                (status, class, code.map(i64::from), flagged),
+                "exit {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_vitest_summary_keeps_the_environment_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (from, to) in [
+            ("(9)", "(10)"),
+            ("1 failed | 8 passed (9)", "9 passed (9)"),
+            ("   Duration  1.00s\n", ""),
+            (
+                "AssertionError: expected 1 to be 2",
+                "sh: pg_ctl: command not found",
+            ),
+        ] {
+            assert!(FAILED_VITEST_WITH_ENVIRONMENT_TEXT.contains(from));
+            std::fs::write(&log, FAILED_VITEST_WITH_ENVIRONMENT_TEXT.replace(from, to)).unwrap();
+            let actual = classified(&log, command_outcome(Some(1), false));
+            assert_eq!(actual.status, GateStatus::Error, "{from:?}");
+            assert_eq!(
+                actual.failure_class,
+                Some(GateFailureClass::Environment),
+                "{from:?}"
+            );
+            assert!(!actual.environment_text_test_failure, "{from:?}");
+        }
+        // Without environment text it is an ordinary, unflagged test failure.
+        std::fs::write(
+            &log,
+            FAILED_VITEST_WITH_ENVIRONMENT_TEXT.replace("permission denied", "refused"),
+        )
+        .unwrap();
+        let actual = classified(&log, command_outcome(Some(1), false));
+        assert_eq!(actual.failure_class, Some(GateFailureClass::TestFailure));
+        assert!(!actual.environment_text_test_failure);
+    }
+
+    #[test]
+    fn vitest_failure_never_overrides_explicit_infrastructure_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (kind, expected) in [
+            ("timeout", GateFailureClass::Timeout),
+            ("capture", GateFailureClass::Environment),
+            ("resource", GateFailureClass::ResourceContention),
+            ("storage", GateFailureClass::ResourceContention),
+            ("database", GateFailureClass::ResourceContention),
+        ] {
+            let extra = match kind {
+                "storage" => "No space left on device\n",
+                "database" => "database is locked\n",
+                _ => "",
+            };
+            std::fs::write(
+                &log,
+                format!("{extra}{FAILED_VITEST_WITH_ENVIRONMENT_TEXT}"),
+            )
+            .unwrap();
+            let mut outcome = command_outcome(Some(1), kind == "timeout");
+            if kind == "capture" {
+                outcome.capture_error = Some("incomplete pipe".into());
+            }
+            if kind == "resource" {
+                outcome.resource_error = Some("lease lost".into());
+            }
+            let actual = classified(&log, outcome);
+            assert_eq!(actual.status, GateStatus::Error, "{kind}");
+            assert_eq!(actual.failure_class, Some(expected), "{kind}");
+            assert!(!actual.environment_text_test_failure, "{kind}");
+        }
+    }
+
+    #[test]
+    fn environment_text_has_its_own_bypass_that_reads_no_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        let reason = |environment_text, early, cache| {
+            test_failure_cache_bypass_reason(
+                environment_text,
+                early,
+                cache,
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                &log,
+            )
+        };
+        assert!(!log.exists());
+        for early in [false, true] {
+            for cache in [false, true] {
+                assert_eq!(
+                    reason(true, early, cache),
+                    Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+                );
+            }
+        }
+        std::fs::write(&log, "Test timed out in 5000ms\n").unwrap();
+        assert_eq!(
+            reason(true, false, true),
+            Some(ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+        );
+        assert_eq!(
+            reason(false, false, true),
+            Some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+        );
+        assert_eq!(reason(false, true, true), None);
+        assert_eq!(reason(false, false, false), None);
+        std::fs::write(&log, "permission denied\n").unwrap();
+        assert_eq!(reason(false, false, true), None);
+    }
+
+    /// The same failure without environment text is the control.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclassified_failure_is_counted_and_never_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        // The gate's own logs must not change the tree between the two runs.
+        std::fs::create_dir_all(checkout_root.join(".git/info")).unwrap();
+        std::fs::write(checkout_root.join(".git/info/exclude"), ".aethyme/\n").unwrap();
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        struct Quiet {
+            early: bool,
+        }
+        impl GateProgressSink for Quiet {
+            fn early_verification_cancelled(&self) -> Option<bool> {
+                self.early.then_some(false)
+            }
+            fn report(&self, _line: &str) {}
+        }
+        for (name, environment_text, cache, early) in [
+            ("reclassified", true, true, false),
+            ("reclassified-uncached", true, false, false),
+            ("reclassified-early", true, true, true),
+            ("ordinary", false, true, false),
+        ] {
+            let output = if environment_text {
+                FAILED_VITEST_WITH_ENVIRONMENT_TEXT.to_string()
+            } else {
+                FAILED_VITEST_WITH_ENVIRONMENT_TEXT.replace("permission denied", "refused")
+            };
+            let source = root.path().join(format!("{name}.txt"));
+            std::fs::write(&source, output).unwrap();
+            let mut store = BrokerStore::open(&root.path().join(format!("{name}.db"))).unwrap();
+            let gate = synthetic_gate(name, cache, &format!("cat '{}'; exit 1", source.display()));
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let mut run = || {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                run_selections_with_profile_capture(
+                    &mut store,
+                    &checkout_root,
+                    &checkout,
+                    vec![Selection {
+                        gate: &gate,
+                        triggered_by: None,
+                        owner_paths: Vec::new(),
+                    }],
+                    None,
+                    CachePolicy::Use,
+                    GateRuntimeContext {
+                        fresh_checkout: false,
+                        slot_handoff: None,
+                        progress: &Quiet { early },
+                        admission_host: &SequencedAdmissionHost::new(vec![None]),
+                        deadline: None,
+                        comparison_base: None,
+                        storage: GateStorageLocations::default(),
+                    },
+                    |_, _| None,
+                    |_, _, _, _| None,
+                    |_, _| profile.clone(),
+                )
+                .unwrap()
+                .remove(0)
+            };
+            let first = run();
+            let second = run();
+            assert_eq!(first.status, GateStatus::Fail, "{name}");
+            assert_eq!(
+                first.failure_class,
+                Some(GateFailureClass::TestFailure),
+                "{name}"
+            );
+            assert!(!first.is_host_fault(), "{name} is rejected, not deferred");
+            assert_eq!(
+                first.environment_text_test_failure, environment_text,
+                "{name}"
+            );
+            // Serialized only when true.
+            assert_eq!(
+                serde_json::to_value(&first)
+                    .unwrap()
+                    .get("environment_text_test_failure")
+                    .is_some(),
+                environment_text,
+                "{name}"
+            );
+            assert_eq!(second.status, GateStatus::Fail, "{name}");
+            assert_eq!(second.cached, !environment_text, "{name}");
+            let expected = environment_text.then_some(2);
+            let (_, counts) = recorder.totals();
+            for counter in [
+                "gate_environment_text_test_failure",
+                "gate_vitest_summary_parse",
+            ] {
+                assert_eq!(counts.get(counter).copied(), expected, "{name}: {counts:?}");
+            }
+            // Every stored row is cleared with the reason, or none is.
+            let database =
+                rusqlite::Connection::open(root.path().join(format!("{name}.db"))).unwrap();
+            let cleared: Vec<Option<String>> = database
+                .prepare("SELECT cleared_reason FROM gate_results ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let reason = environment_text
+                .then(|| ENVIRONMENT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON.to_string());
+            assert!(!cleared.is_empty(), "{name}");
+            assert!(cleared.iter().all(|stored| *stored == reason), "{name}");
+            // Every store lookup, whatever identity it binds.
+            assert_eq!(
+                store
+                    .cached_gate_result(&gate.name, &first.tree_hash)
+                    .unwrap()
+                    .is_some(),
+                !environment_text,
+                "{name}"
+            );
+            assert_eq!(
+                store
+                    .cached_gate_result_for_definition(
+                        &gate.name,
+                        &first.tree_hash,
+                        &gate.definition_hash,
+                    )
+                    .unwrap()
+                    .is_some(),
+                !environment_text,
+                "{name}"
+            );
+        }
+    }
+
+    /// An early verification cancelled between the command's exit and its
+    /// classification stays cancelled, whatever the log says.
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_outranks_a_completed_vitest_failure() {
+        /// Cancelled once the process named in the file has been reaped.
+        struct CancelledAfterExit(PathBuf);
+        impl GateProgressSink for CancelledAfterExit {
+            fn early_verification_cancelled(&self) -> Option<bool> {
+                let pid = std::fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok());
+                // SAFETY: signal zero only probes the process.
+                Some(pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0))
+            }
+            fn report(&self, _line: &str) {}
+        }
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let mut store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let source = root.path().join("output.txt");
+        std::fs::write(&source, FAILED_VITEST_WITH_ENVIRONMENT_TEXT).unwrap();
+        let pid = root.path().join("pid");
+        let gate = synthetic_gate(
+            "cancelled",
+            true,
+            &format!(
+                "echo $$ > '{}'; cat '{}'; exit 1",
+                pid.display(),
+                source.display()
+            ),
+        );
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        let outcomes = run_selections_with_profile_capture(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                fresh_checkout: false,
+                slot_handoff: None,
+                progress: &CancelledAfterExit(pid),
+                admission_host: &SequencedAdmissionHost::new(vec![None]),
+                deadline: None,
+                comparison_base: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+            |_, _| profile.clone(),
+        )
+        .unwrap();
+        assert_eq!(outcomes[0].exit_code, Some(1), "the command finished");
+        assert_eq!(outcomes[0].status, GateStatus::Cancelled);
+        assert_eq!(outcomes[0].failure_class, None);
+        assert!(!outcomes[0].environment_text_test_failure);
+    }
+
     const FAILED_TAP: &str = "TAP version 13\n# Subtest: computes a value\nnot ok 1 - computes a value\n  ---\n  error: assertion failed\n  ...\n1..1\n# tests 1\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n";
 
     #[test]
@@ -10885,10 +11433,10 @@ end = 55999
         }
     }
 
-    /// The gate after a prune counts the units cargo rebuilt with a pruned
+    /// A gate counts, after its build, the units cargo rebuilt with a pruned
     /// hash, so a misjudged access time shows up in the metrics.
     #[test]
-    fn the_gate_after_a_prune_counts_units_rebuilt_with_a_pruned_hash() {
+    fn the_build_after_a_prune_counts_units_rebuilt_with_a_pruned_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let directory = tmp.path().join("gates/repository/cargo");
         let profile = directory.join("debug");
@@ -10897,28 +11445,26 @@ end = 55999
             key: "cargo".into(),
             max_bytes: 1_000,
         };
-        let prepare = || {
-            prepare_managed_gate_cache_in(
-                Some(&policy),
-                "repository",
-                &StderrGateProgressSink,
-                "test",
-                tmp.path(),
-                None,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        prepare();
-        // Cargo rebuilds the pruned generation.
+        prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // This gate's build rebuilds the pruned generation.
         std::fs::create_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
 
         let recorder = crate::phase_telemetry::Recorder::default();
-        {
+        let rebuilt = {
             let _installed = crate::phase_telemetry::install(recorder.clone());
-            prepare();
-        }
+            count_units_rebuilt_after_prune(&directory)
+        };
 
+        assert_eq!(rebuilt, Some(1));
         let (_, counts) = recorder.totals();
         assert_eq!(
             counts.get("managed_cache_prune_rebuilt_unit"),
@@ -10930,6 +11476,58 @@ end = 55999
             1
         );
         assert!(!directory.join(PRUNED_UNITS_MARKER).exists());
+        assert_eq!(count_units_rebuilt_after_prune(&directory), None);
+    }
+
+    /// Finding (a) of #2041: a prune the storage worker recorded between
+    /// gates survives the next gate's preparation (nothing was built since
+    /// it), and that gate's build is what gets counted.
+    #[test]
+    fn a_worker_prune_record_is_counted_after_the_next_build_not_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("gates/repository/cargo");
+        let profile = directory.join("debug");
+        write_unit_generations(&profile);
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: u64::MAX,
+        };
+        // What the worker staged (it renamed the unit away).
+        std::fs::remove_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/work-aaaaaaaaaaaaaaaa".into()],
+        );
+        prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            directory.join(PRUNED_UNITS_MARKER).exists(),
+            "the record waits for a build"
+        );
+        // The gate's build rebuilds it.
+        std::fs::create_dir_all(profile.join(".fingerprint/work-aaaaaaaaaaaaaaaa")).unwrap();
+        assert_eq!(count_units_rebuilt_after_prune(&directory), Some(1));
+        // A later prune adds to a record no build has counted yet.
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/a-1111111111111111".into()],
+        );
+        append_pruned_units(
+            &directory,
+            &["debug/.fingerprint/b-2222222222222222".into()],
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(PRUNED_UNITS_MARKER)).unwrap(),
+            "debug/.fingerprint/a-1111111111111111\ndebug/.fingerprint/b-2222222222222222"
+        );
     }
 
     #[test]

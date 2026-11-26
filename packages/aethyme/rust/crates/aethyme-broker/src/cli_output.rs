@@ -39,6 +39,13 @@ pub(crate) fn snapshot() -> OutputSnapshot {
     INVOCATION_OUTPUT.with(Cell::get)
 }
 
+/// Bytes printed through [`out!`] by every thread of this process so far.
+/// Another thread (the interrupted-command flush) can read it, unlike the
+/// per-invocation snapshot.
+pub(crate) fn process_emitted_bytes() -> u64 {
+    EMITTED.load(Ordering::Relaxed)
+}
+
 pub(crate) fn emitted_since(snapshot: OutputSnapshot) -> bool {
     emitted_bytes_since(snapshot) > 0
 }

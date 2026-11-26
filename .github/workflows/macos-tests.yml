@@ -3,6 +3,14 @@ name: macOS tests
 # The Rust workspace suite on macOS, the primary user platform, once per
 # release (every `v*` tag) and on request (`workflow_dispatch` on any ref).
 #
+# A release runs it from release.yml (`workflow_call`), after the release
+# builds, not from its own tag push (since 2026-11-26): on v0.8.185 both
+# workflows started on the tag together, these eight macOS jobs took the
+# runners, and the x86_64-apple-darwin release build queued 27 minutes
+# (15:27:02 to 15:54:41) behind them. Called from release.yml, the run is the
+# tag's own commit and ref, and its verdict shows on the release run as
+# "macOS tests / macOS tests".
+#
 # Not on merges to main (since 2026-11-16): every merge queued a ~55 minute
 # macOS run, the queue backed up past an hour, and nothing read the verdict
 # before the next merge. Main runs Linux only; the other platforms run when a
@@ -29,8 +37,7 @@ name: macOS tests
 # `run:` block here — every step is a fixed command.
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -81,14 +88,14 @@ jobs:
         id: nextest_install
         continue-on-error: true
         timeout-minutes: 3
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.146
 
       - name: Retry cargo-nextest installation
         if: steps.nextest_install.outcome == 'failure'
         timeout-minutes: 3
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.146
 

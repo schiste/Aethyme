@@ -58,6 +58,15 @@
 //! session gets one note naming what was removed and how to prepare again.
 //! A session is stripped once per stretch of inactivity: it is armed again
 //! only by new activity (its `last_activity_at` changes).
+//!
+//! Once the session has had no activity for the host's artifact max age
+//! (`[budget] artifact_max_age_hours` in the host's `storage.toml`, default
+//! 24, `0` off), its Cargo `target` directories go too, declared or not
+//! ([`rebuilt_on_demand`]): Cargo rebuilds a target on the next build, so no
+//! preparation step is needed. Every proof above still applies. A session
+//! idle-stripped earlier is examined once more when it reaches the max age
+//! ([`IDLE_STRIP_MAX_AGE_DONE_KEY`]). When only such targets were removed,
+//! preparation is not marked stale and no notice is left.
 
 use super::strip::{CheckoutStripReport, StripTarget};
 use super::*;
@@ -77,6 +86,9 @@ pub(crate) const IDLE_STRIP_RULES_KEY: &str = "checkout_strip.idle_done_rules";
 /// remove from an open session widens. 2: environment roots whose
 /// interpreter a step declares, and pnpm workspace members with their root.
 pub(crate) const IDLE_STRIP_RULES: u32 = 2;
+/// Meta key: open sessions the idle strip handled once idle for the artifact
+/// max age (JSON: session id to the `last_activity_at` it saw).
+pub(crate) const IDLE_STRIP_MAX_AGE_DONE_KEY: &str = "checkout_strip.idle_max_age_done";
 /// Remembered sessions at most; the lowest ids go first.
 const IDLE_STRIP_DONE_MAX: usize = 16_384;
 /// Open sessions the idle strip lists per run, at most (each costs a few
@@ -155,6 +167,25 @@ pub(crate) enum Coverage {
     /// A workspace member's `node_modules` while the top-level
     /// `node_modules` is a declared output.
     WorkspaceMember,
+}
+
+/// Whether `candidate`, which no step declares, may still go from a session
+/// idle for the artifact max age (`past_max_age`): a Cargo target, which
+/// Cargo rebuilds on the next build.
+pub(crate) fn rebuilt_on_demand(
+    candidate: &super::strip::StripCandidate,
+    past_max_age: bool,
+) -> bool {
+    past_max_age && candidate.kind == super::strip::StripKind::CargoTarget
+}
+
+/// The host's artifact max age in milliseconds, `None` when it is off or
+/// the host state directory is unknown.
+fn artifact_max_age_ms(host_state: Option<&Path>) -> Option<i64> {
+    let (budgets, _) = crate::storage_ledger::Budgets::load(host_state?);
+    budgets
+        .artifact_max_age()
+        .map(|age| i64::try_from(age.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn normalised_outputs(outputs: &[String]) -> Vec<String> {
@@ -278,8 +309,9 @@ fn note_idle_refusal(report: &mut IdleStripReport, code: &'static str) {
 
 /// One idle checkout's outcome.
 enum IdleStrip {
-    /// These relative paths moved into the trash (none: nothing to strip).
-    Done(Vec<String>),
+    /// These relative paths moved into the trash (none: nothing to strip),
+    /// and of those, the ones Cargo rebuilds on demand ([`rebuilt_on_demand`]).
+    Done(Vec<String>, Vec<String>),
     Refused(&'static str),
 }
 
@@ -509,11 +541,18 @@ pub(crate) fn recent_file_activity(
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|modified| modified >= since)
     };
+    let index_head_decides = || {
+        crate::worktree_status_activity::note_index_head_decides(
+            crate::worktree_status_activity::IDLE_STRIP_LOOK,
+        );
+    };
     if let Some(admin) = git_admin_dir(worktree) {
         if newer(&admin.join("index")) {
+            index_head_decides();
             return Some("git_index");
         }
         if newer(&admin.join("HEAD")) {
+            index_head_decides();
             return Some("git_head");
         }
     }
@@ -604,10 +643,24 @@ impl Broker {
         };
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let idle_hours = idle_after_ms / 3_600_000;
+        let max_age_ms = artifact_max_age_ms(self.storage_context().host_state_dir.as_deref());
+        let handled_max_age: BTreeMap<i64, i64> = if max_age_ms.is_some() {
+            self.meta_json(IDLE_STRIP_MAX_AGE_DONE_KEY)
+        } else {
+            BTreeMap::new()
+        };
         let mut newly_handled = BTreeMap::new();
+        let mut newly_handled_max_age = BTreeMap::new();
         let mut listed = 0_usize;
         for session in &idle {
-            if handled.get(&session.id) == Some(&session.last_activity_at) {
+            let past_max_age = max_age_ms
+                .is_some_and(|age| now_ms.saturating_sub(session.last_activity_at) >= age);
+            let handled_now = if past_max_age {
+                handled_max_age.get(&session.id) == Some(&session.last_activity_at)
+            } else {
+                handled.get(&session.id) == Some(&session.last_activity_at)
+            };
+            if handled_now {
                 report.skipped_handled += 1;
                 continue;
             }
@@ -626,11 +679,15 @@ impl Broker {
                 run,
                 checkout_deadline,
                 &venv_markers,
+                past_max_age,
                 &mut report,
             ) {
-                IdleStrip::Done(stripped) => {
+                IdleStrip::Done(stripped, on_demand) => {
                     if transient_before == super::strip::transient_refusals(&report.strip) {
                         newly_handled.insert(session.id, session.last_activity_at);
+                        if past_max_age {
+                            newly_handled_max_age.insert(session.id, session.last_activity_at);
+                        }
                     }
                     if stripped.is_empty() {
                         crate::phase_telemetry::add(
@@ -646,6 +703,15 @@ impl Broker {
                         "checkout_idle_strip_stripped_checkout",
                         Duration::ZERO,
                     );
+                    if stripped.len() == on_demand.len() {
+                        // Only Cargo targets: Cargo rebuilds them, so the
+                        // preparation stays fresh and no notice is needed.
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_max_age_targets_only",
+                            Duration::ZERO,
+                        );
+                        continue;
+                    }
                     crate::warn_unrecorded(
                         "mark an idle-stripped session's preparation stale",
                         crate::preparation::mark_stripped(self.main_root(), session.id, &stripped)
@@ -688,6 +754,9 @@ impl Broker {
                     note_idle_refusal(&mut report, code);
                     if code == "not_owned" || code == "preparation_not_configured" {
                         newly_handled.insert(session.id, session.last_activity_at);
+                        if past_max_age {
+                            newly_handled_max_age.insert(session.id, session.last_activity_at);
+                        }
                     }
                     if code == "process_use_unknown" {
                         report.strip.process_use_unavailable = true;
@@ -710,6 +779,20 @@ impl Broker {
                     }
                 }),
             );
+            if !newly_handled_max_age.is_empty() {
+                crate::warn_unrecorded(
+                    "remember sessions idle-stripped at the artifact max age",
+                    self.update_meta_json(
+                        IDLE_STRIP_MAX_AGE_DONE_KEY,
+                        |stored: &mut BTreeMap<i64, i64>| {
+                            stored.extend(newly_handled_max_age.iter().map(|(id, at)| (*id, *at)));
+                            while stored.len() > IDLE_STRIP_DONE_MAX {
+                                stored.pop_first();
+                            }
+                        },
+                    ),
+                );
+            }
             if memo_outdated {
                 crate::warn_unrecorded(
                     "record the idle strip's coverage rules",
@@ -723,6 +806,7 @@ impl Broker {
             "checkout_idle_strip",
             serde_json::json!({
                 "idle_after_hours": idle_hours,
+                "artifact_max_age_hours": max_age_ms.map(|age| age / 3_600_000),
                 "idle_sessions": idle.len(),
                 "backlog": report.idle_backlog,
                 "skipped_handled": report.skipped_handled,
@@ -753,6 +837,7 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         deadline: Instant,
         venv_markers: &[String],
+        past_max_age: bool,
         report: &mut IdleStripReport,
     ) -> IdleStrip {
         use IdleStrip::Refused;
@@ -837,6 +922,7 @@ impl Broker {
         let mut primary = Vec::new();
         let mut members = Vec::new();
         let mut not_declared = Vec::new();
+        let mut on_demand = Vec::new();
         for candidate in candidates {
             match idle_coverage(&declared_outputs, &candidate) {
                 Some(Coverage::Exact) => primary.push(candidate),
@@ -860,6 +946,14 @@ impl Broker {
                         Duration::ZERO,
                     );
                 }
+                None if rebuilt_on_demand(&candidate, past_max_age) => {
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_covered_cargo_target_max_age",
+                        Duration::ZERO,
+                    );
+                    on_demand.push(candidate.relative.clone());
+                    primary.push(candidate);
+                }
                 None => not_declared.push(candidate),
             }
         }
@@ -880,7 +974,7 @@ impl Broker {
         }
         if candidates.is_empty() && members.is_empty() {
             tally_kinds(report, &all_candidates, &[], &BTreeMap::new());
-            return IdleStrip::Done(Vec::new());
+            return IdleStrip::Done(Vec::new(), Vec::new());
         }
         // A complete open-file observation (shared by the run): any process
         // with its working directory or an open file inside keeps it.
@@ -1026,7 +1120,11 @@ impl Broker {
             }
         }
         tally_kinds(report, &all_candidates, &stripped, &sizes);
-        IdleStrip::Done(stripped)
+        let on_demand = on_demand
+            .into_iter()
+            .filter(|relative| stripped.contains(relative))
+            .collect();
+        IdleStrip::Done(stripped, on_demand)
     }
 }
 
@@ -1127,6 +1225,36 @@ mod tests {
         let note = idle_strip_note(7, &["node_modules".into(), "backend/.venv".into()], 4);
         assert!(note.contains("node_modules, backend/.venv"));
         assert!(note.contains("aethyme broker submit prepare --session 7"));
+    }
+
+    /// Past the artifact max age, an undeclared Cargo target goes too (Cargo
+    /// rebuilds it); nothing else undeclared does, and nothing before.
+    #[test]
+    fn past_the_max_age_only_cargo_targets_are_rebuilt_on_demand() {
+        use super::super::strip::{StripCandidate, StripKind};
+        let candidate = |relative: &str, kind| StripCandidate {
+            relative: relative.into(),
+            kind,
+        };
+        let target = candidate("target", StripKind::CargoTarget);
+        assert!(rebuilt_on_demand(&target, true));
+        assert!(!rebuilt_on_demand(&target, false));
+        for kind in [
+            StripKind::NodeModules,
+            StripKind::Venv,
+            StripKind::PnpmStore,
+        ] {
+            assert!(!rebuilt_on_demand(&candidate("x", kind), true), "{kind:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(artifact_max_age_ms(Some(dir.path())), Some(24 * 3_600_000));
+        std::fs::write(
+            dir.path().join(crate::storage_ledger::BUDGET_FILE),
+            "[budget]\nartifact_max_age_hours = 0\n",
+        )
+        .unwrap();
+        assert_eq!(artifact_max_age_ms(Some(dir.path())), None);
+        assert_eq!(artifact_max_age_ms(None), None);
     }
 
     /// Coverage for an open session: exact outputs; a Python environment

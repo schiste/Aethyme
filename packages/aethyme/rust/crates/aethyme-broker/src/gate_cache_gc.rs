@@ -50,19 +50,15 @@ pub(crate) fn location_in(
 ) -> Option<GateCacheLocation> {
     let repo = GitRepo::discover(main_root).ok()?;
     let repository_key = crate::gates::repository_key(&repo).0;
-    let (cache, registry) = match storage {
-        crate::gates::GateStorageLocations::Defaults => (
-            crate::host_state::default_host_cache_dir()?,
-            crate::default_host_resource_db_path().ok(),
-        ),
+    // Where gates write now (the host cache, or a storage root by
+    // `[placement]`); a host cache left behind is the storage worker's.
+    let cache = storage.gate_cache_dir()?;
+    let registry = match storage {
+        crate::gates::GateStorageLocations::Defaults => crate::default_host_resource_db_path().ok(),
         crate::gates::GateStorageLocations::Captured {
-            host_cache_dir: Some(cache),
             host_resource_db_path,
-        } => (cache.clone(), host_resource_db_path.clone()),
-        crate::gates::GateStorageLocations::Captured {
-            host_cache_dir: None,
             ..
-        } => return None,
+        } => host_resource_db_path.clone(),
     };
     Some(GateCacheLocation {
         root: cache.join("gates").join(&repository_key),

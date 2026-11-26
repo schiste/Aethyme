@@ -4,6 +4,356 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.185] - 2026-11-26
+
+### Added
+
+- Recovery archives and gate caches can live on an adopted storage root on another volume instead of the internal disk: `[placement] recovery_archives = "storage"` and `gate_caches = "storage"` in `<host state>/storage.toml` (default `host`). A root qualifies only when it is a real directory with a plain-file adoption marker, owned by the user, on a mounted local filesystem; otherwise Aethyme writes to host state and records why. The root is recorded durably before the first archive lands there, and while a recorded root is unreachable every decision that would delete because no archive was found is deferred. The storage worker migrates existing host archives in paced, resumable passes (copy, fsync, SHA-256 tree verification, then source removal; same-volume moves are a rename) and evicts unleased host gate caches once caches resolve to the root (#2042).
+
+### Changed
+
+- The storage worker reclaims caches it used to leave alone. An entry first seen by an older binary is re-classified by name on every pass, so the node compile cache is measured again; its past-day directories are removed once their UTC day is over and they have been idle an hour, never today's. Gate caches are pruned of superseded generations of local packages under the cache's exclusive lease, keeping the newest, and whole idle entries are evicted when a repository stays over its budget. On the maintainer's machine these held 108 copies of the same workspace crates and an unmeasured 7 GB node compile cache (#2041).
+- A metrics-trim resume record expires after 24 hours (#2041).
+
+### Build and release
+
+- The Homebrew tap job renders the formula with the renderer the same release run already built, instead of compiling the broker crate again; it uses the prebuilt binary only when its recorded source commit is the tag's and its checksum holds, and compiles otherwise. On v0.8.184 that compile was 191 s of the job's 214 s (#2043).
+- GitHub Actions and Cargo dependency updates (#2020, #2028).
+
+### Upgrade notes
+
+- Binaries before 0.8.185 reject a `storage.toml` with a `[placement]` table and fall back to default budgets; install the new router and engine pair everywhere before setting it (#2042).
+- With placement on a storage root, unmounting that volume defers merged-branch deletion and archive-absence decisions until it returns (#2042).
+- A gate kind's only cache entry can now be evicted after a day idle, so that gate's next run builds cold (#2041).
+
+## [0.8.184] - 2026-11-26
+
+### Changed
+
+- The unattended metrics trim now finishes on busy repositories. In 0.8.183 its first run on the busiest repository staged 177 MB of a 508 MB log within its 50-second budget (3.5 MB/s inside the CPU-starved background worker) and gave up, and every retry restarted from the first byte. Rows in the broker's own shape whose leading `ts` is inside retention are now kept without being parsed; a row about to be removed is still fully validated, by a checker that accepts and rejects exactly what the previous JSON parse did (UTF-8, surrogates, number range, nesting, last duplicate `ts`) without building a tree. A trim that runs out of budget keeps its staged file and resumes from the same line on the next worker run, after proving the log is the same file (device, inode and content fingerprints); anything else restarts it (#2038).
+- The host storage worker keeps a free-space floor on every volume that holds recovery archives: the larger of `free_floor_bytes` (10 GiB) and the smaller of 10% of the volume and 20 GiB. Below it, the oldest archives across repositories are removed, paced (200 ms each, one 60-second budget per pass), and only archives proven landed, past their minimum retention and without a keep marker; the keep marker is re-read immediately before each removal. Below 10 GiB free the worker no longer removes every landed archive at once and unpaced, and the per-class archive budget no longer removes an archive marked to keep (#2039).
+
+### Added
+
+- `storage.toml` `[budget]` keys `recovery_archive_free_floor_percent` (default 10) and `recovery_archive_free_floor_cap_bytes` (default 20 GiB); pass-report fields `archive_floor[]` and `budget_error`; spans `storage_archive_floor`, `_probe`, `_prune`; counters `storage_archive_floor_pruned`, `_kept`, `_interrupted`, `_remove_failed`, `_stop_{floor_met,protected_only,cannot_close,deadline,unsupported}`, `storage_budget_config_invalid`; `broker status` advice `storage.budget-config-invalid` (#2039).
+- `command_metrics_trim` attachment fields `resumed_from_bytes` and `resume_recorded`; counters `command_metrics_trim_resumed` and `command_metrics_trim_claimed_elsewhere` (#2038).
+
+### Build and release
+
+- The x86_64 macOS release binaries are cross-compiled on the Apple Silicon runner instead of the Intel runner. On v0.8.183 the Intel build took 1,482 s against 823 s for the arm64 build and was the critical path of the 31-minute release-binaries workflow. The binary-running release steps run the x86_64 binaries under Rosetta 2 with `arch -x86_64`, and a `lipo` check proves each macOS archive holds the architecture it ships for (#2037).
+
+### Upgrade notes
+
+- Binaries before 0.8.184 reject a `storage.toml` that sets the new floor keys and fall back to default budgets; 0.8.184 reports such a fallback as `budget_error` and in `broker status` (#2039).
+- `command_metrics_trim.bytes_scanned` is now the absolute offset reached; this attempt's work is `bytes_scanned - resumed_from_bytes` (#2038).
+- A recent metrics row damaged after its leading `ts` is still kept but is no longer counted as a malformed-line blocker by `gc plan` (#2038).
+- A host-state root over `host_state_total_bytes` no longer removes recovery archives unless their class is over `recovery_archives_bytes`; the free-space floor covers disk pressure (#2039).
+
+## [0.8.183] - 2026-11-26
+
+### Changed
+
+- The background checkout retirement worker now keeps `.aethyme/logs/command-metrics.jsonl` within `command_metrics_days` (default 30) on its own. Before, only a reviewed `gc plan` / `gc apply` trimmed it, and on the busiest repository it had grown to about 500 MB and 622,000 rows going back three months. The trim runs at most once a day (30 minutes after a run that did not finish) and within the worker run's deadline. It filters old rows before taking the append lock and holds the lock only for rows appended meanwhile, with the same row rule and replace-and-verify safeguards as the reviewed trim, so no row inside retention, malformed line or half-written last line is lost (#2033).
+- Checkout retirement no longer keeps a clean closed checkout because of an ignored directory that holds no files. The plan archived such a directory as zero files and found nothing to preserve, but the re-check before the move refused it as unknown ignored content, so the checkout was kept as "changed" on every run. The re-check now releases it only when a walk under the lifecycle claim, bounded by one shared entry budget and the re-check's deadline and never following a link, finds nothing but directories; any file, link, special node or unreadable entry still keeps the checkout. On the busiest repository 983 of 1,511 retirement judgements in a day were kept as "changed" (#2034).
+- A checkout kept because a stash was made on its branch is remembered with the keep back-off and forgotten as soon as the stash is gone (#2034).
+
+### Added
+
+- Keep codes `changed_session`, `changed_head`, `changed_policy_unavailable`, `changed_uncommitted`, `changed_operation`, `changed_stash`, `changed_ignored`, `changed_unclean_other`, `changed_unclean_unknown` and `changed_after_archive`, each counted as `checkout_retirement_kept_<code>`, replacing the single `changed`; counter `proof_empty_ignored_directory_released`; spans `checkout_retirement_phase_recheck` and `proof_empty_ignored_directory_walk` (#2034).
+- Spans `command_metrics_trim`, `_stage` and `_publish`, attachment `command_metrics_trim` (outcome, rows expired, kept and removed, bytes before and after, elapsed) and its outcome counters (#2033).
+
+### Build and release
+
+- A new dispatch-only workflow, `release-prepare.yml`, renders a release's generated agent-instruction files on GitHub (Linux, read-only token, warm shared Rust cache) and uploads them as a patch of exactly five files. Release preparation no longer compiles the CLI on the maintainer's machine or waits for free memory there; on 2026-11-26 that local build held a release for hours on an overloaded host. The output is identical to a macOS render: it depends only on tracked files and the compiled-in version (#2035).
+
+### Upgrade notes
+
+- `checkout_retirement_kept_changed` is no longer written; read the per-cause codes above (#2034).
+- The unattended metrics trim does not run where the filesystem has no inode numbers (Windows); the reviewed `gc apply` still trims there (#2033).
+
+## [0.8.182] - 2026-11-26
+
+### Added
+
+- `broker status` now says where its `retention` phase goes: spans `cleanup_retention_policy`, `_inventory`, `_closed_sessions`, `_inode_summary`, `_closed_worktrees`, `_oldest_closed`, `_gate_headroom`, `_reconciliation` and `_artifact_sweep`. On the busiest repository that phase took about 2.8 s per full status view on 0.8.181 with nothing attributed under it (#2031).
+- `blockers_action_required` (about 1 s per full status view there) is split into `blockers_action_required_sessions` and, per live session, `_notice_probe`, `_strip_marker` and `_notice_clear` (#2031).
+
+### Fixed
+
+- The architecture notes said the `gc_plan_*` spans added in 0.8.181 time the `retention` phase of `status`; they time that of `doctor` (#2031).
+
+## [0.8.181] - 2026-11-26
+
+### Changed
+
+- The health and cleanup inventory behind `status` no longer starts Git for a closed session's directory that Git certainly cannot open: one with no `.git` or `HEAD` in it or any parent, or whose `.git` pointer names a directory that does not exist. Git's answer for both is an error, so the same ownership check that followed that error runs as before, and cleanup and retention keep, remove and report exactly what they did. On the busiest repository, 39 full `status` views in an hour started 15,366 such probes (about 394 each, 61 s); 483 of its 1,290 checkout directories have no `.git` entry (#2029).
+
+### Added
+
+- Counters `worktree_common_dir_no_git_entry` and `worktree_common_dir_dangling_pointer`, and spans `gc_plan_retention_policy`, `_cleanup_inventory`, `_store_reads`, `_gate_logs`, `_command_metrics`, `_worktree_blockers`, `_artifact_candidates`, `_orphan_roots`, `_recovery_archives`, `_gate_cache`, `_environment_cache`, `_worktree_reconciliation`, `_cleanup_reports` and `gc_health_journal`, which split the `retention` phase of `status` (#2029).
+
+### Upgrade notes
+
+- For such directories, cleanup's keep and unavailable reasons read "is not inside a git repository" instead of Git's own error text (#2029).
+
+## [0.8.180] - 2026-11-26
+
+### Changed
+
+- The background lane that closes abandoned sessions now looks first at reasons that are cheap to read and keep a session anyway: a held explicit claim, an active merge-queue entry, a running gate or an unresolved command. These are read only in holder states where the full judgement would reach the same check. Before, they were read after the activity probe, the work class, the remote safety check, the process listing and the open-file check. On Aethyme's own repository 48 cleanup passes made 1,142 such judgements in 2,613 s and closed none; 713 kept for a held claim, 186 for the merge queue. The early look only keeps: every check before a close still runs, unchanged, under the claim, and any read error falls through to the full judgement (#2026).
+
+### Added
+
+- Span `session_close_early_look`, counters `session_close_early_kept` and `session_close_early_look_unreadable`, attachment `session_close_early_kept_by_reason` (#2026).
+
+### Upgrade notes
+
+- A session kept by the early look may report that reason instead of an earlier one such as recent activity, and counts as deferred work, so the retirement request stays armed. Its stale-work class and closing-soon time stay as last recorded until a full judgement runs (#2026).
+
+### Known issues
+
+- Sessions kept for an active build-output producer still pay the full judgement: the only check takes the producer's reclaim lock.
+- The remote safety check asks the remote once per session, about 0.9 s each.
+
+## [0.8.179] - 2026-11-25
+
+### Changed
+
+- The step of `submit prepare` that shares dependency files between checkouts no longer hashes or pools Python bytecode. Bytecode usually carries its checkout's path and its source's time, so it rarely matches another checkout; each examined prepare added about 25 MB of it to the pool. In a sample of the pool, 988 of 1,036 entries were bytecode (#2024).
+- A pool entry verified in the last day is not read again while its device, inode, size, modification time and change time are unchanged. Together these should remove about 367 of 685 MB read per pass (estimated from bytes; not timed). The step took 1,293 s over 40 prepares on 0.8.177 on the busiest repository (median 20.8 s, p90 82 s) (#2024).
+
+### Added
+
+- Spans `prepare_output_share_sweep`, `_sample`, `_sizing`, `_hash`, `_verify`, `_add`, `_replace` and `_record`, and counters for skipped bytecode and for pool entries hashed or recognised (#2024).
+
+### Upgrade notes
+
+- `unique_bytes_after` now includes bytecode that is no longer pooled (about 25 MB per checkout there). Bytecode already in the pool stays until the store rotates.
+
+### Known issues
+
+- The first prepare after the upgrade, and one about once a day, still hashes every reused pool entry.
+- Damage on disk that changes no metadata of a pool entry is found within a day instead of by the next prepare.
+
+## [0.8.178] - 2026-11-25
+
+### Fixed
+
+- `start --adopt` after a closed session no longer hashes the patches of every commit the branch has beyond a stale local integration branch. In a repository that lands only by pull request that branch does not move; on the busiest repository it was about 21,000 commits behind, and the scan took 160 to 272 s in three 0.8.176 runs, all while holding the lifecycle lock (18 such runs since 0.8.157 held it for 4,716 s). The same scan, reproduced by hand, took 200 s of CPU. Only the session's own undelivered commits are judged now, and only commits sharing a changed-path set with a candidate are hashed (#2022).
+- The scan for renamed files in the same command runs one listing instead of one Git process per owned commit (#2022).
+
+### Changed
+
+- Commits reachable from `origin/HEAD` no longer count as owned and pending when a session is re-adopted. Work landed by squash or rebase stays with the session, as before. A session with nothing pending but commits that integration holds only by patch match keeps its boundary when other owned commits were left out this way (#2022).
+
+### Added
+
+- Spans `adopt_carried_ownership`, `adopt_drift_report`, `adopt_ownership_candidates` and `session_renamed_targets`; counters `adopt_carried_ownership_error` and `adopt_carried_default_unreadable`; attachment `adopt_ownership` (#2022).
+
+### Known issues
+
+- A commit that integration already holds by one patch match can still be left out of a re-adopted session when nothing was left out by reachability, as before.
+- `finish` still builds the full plan against the local integration branch in one check.
+- One step still walks commit headers in proportion to how far integration is behind.
+
+## [0.8.177] - 2026-11-25
+
+### Fixed
+
+- A background measurement of the shared preparation cache that reaches its 30-minute deadline makes that store wait 6 hours, then 24 hours after each further deadline without a completed walk in between. Before, it was walked again after 10 minutes, doubling. On the busiest repository since 0.8.160, 11 such walks took 19,803 s for no answer; the answers used saved at most about 750 s. The wait is one record per cache root, bound to the store's identity: a new, coalesced or rewritten request does not shorten it; another store identity, a completed walk of the store or a rotation of it by `submit prepare` ends it. What decides a budget and the other interruptions' back-off are unchanged, and `prepare` keeps its own bounded inventory during the wait (#2018).
+
+### Added
+
+- Counters `preparation_cache_measurement_deadline_wait_set` and `_deadline_wait_restored`, duration `preparation_cache_measurement_walk_cpu`, object `preparation_cache_measurement_progress`, request field `unanswered_deadlines` (omitted when zero) (#2018).
+
+### Known issues
+
+- An oversized store whose walk reaches the deadline is noticed later than before (#2018).
+- A remount that renumbers the device reads as another store and allows one walk (#2018).
+
+## [0.8.176] - 2026-11-25
+
+### Fixed
+
+- A recovery archive no longer takes an ignored file twice when Git lists both a directory and the files in it. Before, the copy failed with "File exists" on the second one, after copying what came before it: on one repository 6 of 23 kept checkouts, one after a 312 s copy, and the retirement lane retired nothing in 53 runs (1,955 s) (#2016).
+- An unfinished archive of an earlier state of a checkout no longer always blocks that checkout (9 of the 23). It is removed only when its record names this session, checkout path and branch, its commits are in what the plan archives, none of its prerequisite refs exists, and it holds only the record, the current patches and files the checkout still starts with byte for byte. Anything established to be otherwise keeps it, and the archive uses one alternate staging name; with both kept the apply refuses and says what an owner can do. A failure to judge removes nothing and opens no alternate (#2016).
+- A truncated manifest in unfinished staging no longer stops the release of prerequisite refs in its archive root when its retirement record is sound (#2016).
+
+### Changed
+
+- A plan whose file lists are not unique and sorted is refused before anything is copied (#2016).
+- Reports name a blocking ignored directory once, without its files (#2016).
+
+### Added
+
+- `storage status` (`recovery_archives_by_location.unfinished_staging`) and `storage archives` list unfinished staging, from sizes already recorded (#2016).
+- Counters `recovery_archive_ignored_duplicates_dropped`, `recovery_archive_plan_file_list_refused`, `recovery_archive_stale_partial_removed`, `_kept`, `_undecided`; span `recovery_archive_apply_stale_partial` (#2016).
+
+### Upgrade notes
+
+- `storage` JSON output only gains fields.
+
+### Known issues
+
+- Kept unfinished staging is never expired, at most two per session; staging with a Git bundle is always kept (#2016).
+- A staged copy that can never be read refuses every attempt on its checkout (#2016).
+
+## [0.8.175] - 2026-11-25
+
+### Fixed
+
+- The checkout retirement lane no longer redoes, every slice, a plan or archive that did not fit its 5-minute slice. One cut after at least 4 minutes, or a plan that leaves under 90 s for its archive, is remembered as `out_of_time` with the existing back-off (1, 6, 24 h); a shorter cut gets one whole slice next (`cut_short`). After the back-off the lane gives that checkout 20 minutes from its plan, at most once per lane run. Before, another repository's lane spent 5,872 s in 5 runs and retired nothing, while the busiest repository's lane waited for the volume they share (#2014).
+- The deadline for installing an archive's prerequisite refs is taken at each install, not before the copy, so a long archive no longer fails on a 10-minute Git limit that began before it (#2014).
+- A volume turn lock that cannot be opened ends the lane with `error` instead of reading as held (#2014).
+
+### Changed
+
+- A judgement past its slice observes open files again before the move, for at most 30 s, under the lifecycle claim; an incomplete observation refuses the move (#2014).
+- The retirement lane's recorded time is set only by a run that ran a slice. An `out_of_time` checkout is tried by the worker only when no lane ran a slice for 2 hours, and is not withheld from the other cleanup lanes (#2014).
+
+### Added
+
+- Spans `checkout_retirement_volume_turn_wait`, `checkout_retirement_volume_turn_held` and `recovery_archive_apply_*`; counter `checkout_retirement_long_judgement`; keeps `out_of_time`, `cut_short`, `volume_turn_error` (#2014).
+
+### Upgrade notes
+
+- An older binary that rewrites the kept-checkout record drops the `out_of_time` flag, which only shortens the next attempt.
+
+### Known issues
+
+- One slow checkout can hold a volume's turn for about 25 minutes, once per lane run (5-minute slices before), and critical memory pressure is not read during it (#2014).
+- An incomplete archive whose checkout changed since still blocks that checkout's retirement (not new).
+
+## [0.8.174] - 2026-11-25
+
+### Fixed
+
+- The recovery-archive size check honours its 30-minute interval when it cannot list every archive within its budget but every archive's size is known and the total is within the bound. Before, such a check was due again at the next run: on the busiest repository 22 of 26 recorded checks used their whole 20 s listing budget, with archives at about a third of the bound (#2012).
+
+### Changed
+
+- Listing gets at most three quarters of the check's budget and size walks the rest; archives with no usable size are listed first, and the listing share is taken after the directory entries are read (#2012).
+- Archives the broker does not vouch for keep their last measured size for at most 24 h. A carried size counts in the total and the bound, and never towards removing an archive (#2012).
+- An archive directory that cannot be listed, or a pool that is absent while archives are recorded in it, makes the total unknown, and recorded sizes there are kept. An absent pool alone waits for the interval (#2012).
+- A check that removed an expired archive and ran out of budget with more left is due again at once (#2012).
+
+### Added
+
+- Recorded usage fields `total_known`, `only_pool_absent`, `eviction_unfinished`; pass fields `walk_fell_back`, `size_unknown`, `size_stale`, `listed_first`, `root_failures`, `pool_absent`, `total_known`, `total_from_earlier_sizes`, `eviction_unfinished`; counters `recovery_archive_bound_total_from_earlier_sizes`, `recovery_archive_bound_total_unknown`, `checkout_retirement_archive_bound_not_due_partial` (#2012).
+
+### Upgrade notes
+
+- Each repository runs at least one extra check after the upgrade.
+
+### Known issues
+
+- A check that does not list every archive judges only the listed ones for age expiry, so expiry can take several intervals to cover all of them (#2012).
+
+## [0.8.173] - 2026-11-25
+
+### Changed
+
+- The merged-pull-request close lane takes its first changed-file activity probe (one Git status, at most 2 s) just before the operation claim instead of before the holder check and the landing proof. A close still requires it; the holder is judged again with its time, the index, `HEAD` and hook are read fresh around it, and the look under the claim is unchanged. A pass out of time before the probe keeps the session. On the busiest repository's 0.8.172 runs, 151 such first looks took 280 s in 26 runs and 37 reached the look under the claim. The net gain is unknown: the proof's clean check and the look under the claim may cost more. It is judged per run on `worktree_status_activity`, `landed_proof_worktree_clean` and `session_close_checkout_activity` together, and the change is reverted without a net drop (#2010).
+
+### Upgrade notes
+
+- `worktree_activity_look` `merged_pull_request_first` counts only looks taken; sessions the lane declines before its probe are in `worktree_activity_look_avoided` (#2010).
+
+## [0.8.172] - 2026-11-25
+
+### Changed
+
+- The automatic session-close lanes ask cheap keeps before the changed-file activity probe (one Git status, at most 2 s). Every lane first asks whether activity already known from the session row, last merge, hook, index or `HEAD` is recent; the landed lane also asks for an unmerged pull request, the cleanup policy and no session commits; the no-work lane for its holder, unresolved operations and explicit claims. Every check is still asked where it was, and the index, `HEAD` and hook are read fresh around the probe. In nine 0.8.171 passes over a minute on the busiest repository the probe's looks took about 440 s, nearly all in looks that timed out. The avoidable share there is estimated at about 13% of the timed-out looks, and some skipped probes may be paid by a later lane, so the gain is read after release (#2008).
+
+### Added
+
+- Attachments `worktree_activity_look_avoided` and `session_no_work_kept_other_by_reason`, and span `session_close_before_probe` (#2008).
+
+### Upgrade notes
+
+- Kept-reason counts can shift, because a cheaper reason may be reported first. `worktree_activity_look` `_first` entries no longer count avoided looks, so compare total `worktree_status_activity` across versions instead (#2008).
+
+## [0.8.171] - 2026-11-25
+
+### Fixed
+
+- `start --reuse` no longer recreates a retired checkout from its branch when its recovery archive may exist but cannot be reached (an unmounted volume, an unreadable directory, record or manifest, an incomplete pool binding). Before, the tombstone was removed first and unreadable places were skipped, so the checkout came back without its uncommitted work and without the pointer to the archive. The archive is now looked up before the tombstone is touched; when it cannot be told, the command refuses, leaves the tombstone, and gives a next step for that cause. An archive proven gone still falls back to the branch. Later failures put the tombstone back. An empty directory left by a killed restore is handled as retired (#2005).
+- An unreadable record of archived sessions is no longer overwritten. The next archived retirement keeps its text and restarts the record with the entries that can be read (#2005).
+- The merged-branch lane keeps a branch when an archive root or record cannot be resolved or checked. Before, such a root read as holding no archive (#2003).
+
+### Changed
+
+- The merged-branch lane lists the recovery archives once per slice instead of once per session; the re-check under the lifecycle claim before each delete still reads them afresh. `merged_branches_restorable_state` took 5.4 to 20.3 s in 13 of 14 recorded 0.8.169 passes on the busiest repository; which part of it was slow is inferred, and the new spans measure it (#2003).
+
+### Added
+
+- Spans and counts `merged_branches_archive_record`, `_tombstone`, `_archive_listing`, `_archive_listing_fresh`, `_archive_roots`, `_archive_entries`, `_archive_roots_unknown` (#2003); span `checkout_restore_archive_lookup` and counts `checkout_restore_refused_archive_unknown`, `checkout_restore_tombstone_lost`, `checkout_retirement_tombstone_kept_archive_unknown`, `checkout_retirement_archive_record_restarted`, `checkout_retirement_archive_record_preserve_refused` (#2005).
+- Attachments that split the changed-files activity probe by lane and look: `worktree_activity_look`, `worktree_activity_look_timed_out`, `worktree_activity_probe_newest`, `worktree_activity_index_head_decides`, `worktree_activity_probe_changed_verdict`, `worktree_activity_capped_probe_changed_verdict`, `worktree_activity_probe_answer_differs`, `worktree_activity_after_first_look_timed_out`, `landed_proof_worktree_clean_by_probe` (#2006).
+
+### Upgrade notes
+
+- `start --reuse` can now refuse where it used to recreate a checkout; the message says what to do (#2005).
+
+### Known issues
+
+- After a damaged record of archived sessions, a session closed before the restart can stay refused when no tombstone names its archive and the damaged text cannot answer for it; its archive is then restored by hand (#2005).
+
+## [0.8.170] - 2026-11-24
+
+### Fixed
+
+- A gate that ends with a complete, consistent Vitest failure summary is reported as a test failure even when its log contains environment wording such as "permission denied". Before, that wording anywhere in the log made it an environment failure: on the busiest repository 69 runs of one gate in 14 days (21.4 h) got that label, 66 of them with a complete summary of failing tests, and in the traced log a passing test had printed the words. The rule is strict: exit code 1 only, the failed block must be present, and environment wording outside every test run or inside a failed block keeps the environment label, as does any partial or ambiguous log. Such a gate still blocks, its result is never reused for the same tree, and text output says a rerun may differ (#2001).
+
+### Upgrade notes
+
+- `submit` exits with the verification-failure code instead of the environment code for these failures, and `insights` counts fewer environment failures. Native controller repair requests are unchanged (#2001).
+
+### Added
+
+- Gate outcome field `environment_text_test_failure` (only when true), counter `gate_environment_text_test_failure` and span `gate_vitest_summary_parse` (#2001).
+
+## [0.8.169] - 2026-11-24
+
+### Fixed
+
+- The background lane that deletes merged local branches of cleaned sessions reads the sessions of every local branch in one scan. Before, it searched the `sessions` table, which has no index on `branch`, once per local branch. In the first five 0.8.168 slices on the busiest repository (1,386 branches, 10,034 sessions) the lane took 44 to 753 s, and its 20 s budget counted that listing, so it judged nothing and its cursor did not move. The budget now counts from the start of judging. Branches with a session not cleaned no longer take places in the 200-branch window (about 170 of them did). Restorable state and ancestry are read only when no earlier fact keeps the branch. Everything re-read under the lifecycle claim before a delete is unchanged (#1999).
+
+### Changed
+
+- `kept_by_reason.session_not_cleaned` in the `merged_branches` summary and attachment counts every such local branch, not only those of the slice's window (#1999).
+
+### Added
+
+- Spans `merged_branches_list_branches`, `merged_branches_list_checkouts`, `merged_branches_list_sessions`, `merged_branches_restorable_state` and `merged_branches_ancestry` (#1999).
+
+### Known issues
+
+- Each deletion still searches the sessions table once while holding the lifecycle claim (at most 4 s per slice), so a slow pass may delete only a few branches.
+
+## [0.8.168] - 2026-11-24
+
+### Changed
+
+- Background retirement of landed and merged-PR sessions asks the preparation record whether a preparation is running, instead of the full preparation status, which hashes every declared input, resolves runtimes and looks up outputs with no deadline. In one sample (the first 30 `gc` rows of 0.8.166 in one repository) 73 full checks took 505 s. That is an unsplit upper bound: the same span covers the abandonment and no-work lanes, so no gain is claimed until it is measured. Abandonment, no-work, `finish`, hooks, `submit prepare`, cleanup and removal are unchanged (#1997).
+- These lanes can now close a session whose declared input is missing, symlinked, not a regular file, unreadable or changing, whose runtime cannot be resolved, or whose output is symlinked or unreadable. A merged-PR session in that state may close at the merged-PR window. In-progress records not proved ended, an unreadable or invalid declaration, and unreadable, mismatched or unexpected records keep the session where the check runs (#1997).
+- The record is read without a declaration too. An in-progress record with no declaration and no host lease counts as ended once its start predates the current boot by more than 10 minutes; a record kept for unverified cleanup counts as ended too. An unknown boot time or a start time of zero or less keeps the session (#1997).
+
+### Added
+
+- Spans `preparation_record_check`, `session_close_*`, `landed_proof_recheck`, `landed_close_head_and_activity`, `landed_merged_pr_evidence_recheck` and `landed_close_last_look`; counter `preparation_pre_boot_without_lease`; attachment `phase_distinct_counts` with the distinct sessions examined per command (#1997).
+
+### Known issues
+
+- The check runs for a merged-PR close, or a landed close whose holder has a task lease or has moved on. A landed close of a legacy holder does not ask, as before, and a merged-PR session kept as unknown can be retried that way past the landed window.
+- A forward clock step of more than 10 minutes, or another host or container sharing the repository state, can make a running lease-less preparation without a declaration look ended.
+
+## [0.8.167] - 2026-11-24
+
+### Added
+
+- Every preparation run records how long each configured step took. The command-metrics line of `broker submit prepare` and `broker advance` carries a `preparation_steps` attachment, one entry per `[[steps]]` entry in configuration order: `index`, `name`, `cache` (`repository_shared` or `worktree_local`), `mode` (`online`, `offline` or `skipped`), `duration_ms` and `outcome` (`ok`, `failed`, `timed_out`, `error`, `unknown` or `skipped`). Before, only successful runs listed step durations, so a failed or refused preparation could not be attributed to a step. On the busiest repository preparation is the largest single cost (median 270–365 s); its steps measured 174 s, 81 s and 40 s at the median. The attachment is rewritten after every step, steps after a failure are `skipped`, and a cache hit lists every step as `skipped` with 0 ms. `outcome` describes the step's command; the ownership audit result is reported by the guarded exec as before. Refusals before the first step attach nothing (#1994).
+- The preparation record `.aethyme/run/preparation/session-<id>.json` gains an optional `steps` list with the same entries. The schema stays version 1: older binaries ignore the field, and records without it read as before (#1994).
+
 ## [0.8.166] - 2026-11-24
 
 ### Fixed

@@ -805,6 +805,10 @@ cache = "repository_shared"
     std::fs::write(store.join("old-artifact"), "bytes over budget").unwrap();
     std::fs::write(temp.path().join("pnpm-lock.yaml"), "v2\n").unwrap();
     std::fs::remove_dir_all(temp.path().join("node_modules")).unwrap();
+    // A background measurement of this store waits after a deadline, and so
+    // does one under another cache root.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let deadline_waits = seed_deadline_waits(temp.path(), &store);
     // The first run measured the store, so a repository that never shares
     // the cache would not measure again within the hour: forget that check.
     forget_shared_cache_budget_checks(temp.path());
@@ -872,6 +876,13 @@ cache = "repository_shared"
     assert_eq!(inventory["outcome"], "over_budget", "{rotated}");
     assert!(!store.join("old-artifact").exists());
     assert!(temp.path().join("node_modules").is_dir());
+    // The rotated store's wait is over; the other root's is not.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let [(ended, _), (kept, record)] = &deadline_waits;
+        assert_eq!(read_meta(temp.path(), ended), "null");
+        assert_eq!(&read_meta(temp.path(), kept), record);
+    }
 
     // Within the hour after a check, the next preparation skips the
     // inventory even though the store is over budget again.
@@ -893,6 +904,75 @@ cache = "repository_shared"
         "{skipped}"
     );
     assert!(store.join("old-artifact").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_meta(repo: &Path, key: &str) -> String {
+    rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
+        .unwrap()
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// Record a measurement wait of `store` under its own cache root and under
+/// another one; returns each metadata key with the record written there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_deadline_waits(repo: &Path, store: &Path) -> [(String, String); 2] {
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    let stamp: String = db
+        .query_row(
+            "SELECT key FROM meta WHERE key LIKE 'preparation.shared_cache_budget_checked_at_ms.%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let root_key = stamp.rsplit('.').next().unwrap();
+    [root_key, "000000000000"].map(|root_key| {
+        let key = format!("preparation.shared_cache_measurement.deadline_wait.{root_key}");
+        let record = serde_json::json!({
+            "repository": store.file_name().unwrap().to_str().unwrap(),
+            "cache_root_key": root_key,
+            "store_identity": store_identity_digest(store),
+            "consecutive": 1,
+            "until_ms": 1,
+        })
+        .to_string();
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            [&key, &record],
+        )
+        .unwrap();
+        (key, record)
+    })
+}
+
+/// The digest the broker names a store directory with: of its device, inode
+/// and filesystem identifier.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn store_identity_digest(store: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(store).unwrap();
+    let path = std::ffi::CString::new(store.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the path is NUL-terminated and stat is writable storage.
+    assert_eq!(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+    // SAFETY: the successful call initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    let fsid = std::ptr::addr_of!(stat.f_fsid).cast::<u8>();
+    // SAFETY: fsid points to the live f_fsid field, read for its exact size.
+    let bytes = unsafe { std::slice::from_raw_parts(fsid, std::mem::size_of_val(&stat.f_fsid)) };
+    let filesystem_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let identity = format!(
+        r#"{{"device":{},"inode":{},"filesystem_id":"{filesystem_id}"}}"#,
+        metadata.dev(),
+        metadata.ino()
+    );
+    format!("{:x}", Sha256::digest(identity.as_bytes()))[..32].to_string()
 }
 
 /// Remove the record of when each shared-cache budget check last ran.

@@ -414,6 +414,84 @@ fn release_workflow_smokes_the_installed_archive_contract() {
     }
 }
 
+/// The Intel macOS runner took 1482 s to build the release pair and was the
+/// release's critical path, so x86_64 macOS is cross-compiled on the same
+/// Apple Silicon runner as aarch64. The archive must still be proven to be
+/// x86_64 and to run as x86_64 (under Rosetta 2), not merely to build.
+#[test]
+fn release_workflow_cross_compiles_intel_macos_on_apple_silicon() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+
+    let arm_runner = "          - os: macos-15\n            target: aarch64-apple-darwin\n";
+    assert!(workflow.contains(arm_runner), "aarch64 macOS runner moved");
+    let intel_entry = workflow
+        .split("          - os: ")
+        .find(|entry| entry.contains("target: x86_64-apple-darwin"))
+        .expect("release matrix must build x86_64-apple-darwin");
+    assert!(
+        intel_entry.starts_with("macos-15\n"),
+        "x86_64-apple-darwin must build on the Apple Silicon runner: {intel_entry}"
+    );
+    for intel_runner in ["macos-26-intel", "macos-15-intel", "macos-13"] {
+        assert!(
+            !workflow.contains(intel_runner),
+            "release workflow names the Intel runner {intel_runner}"
+        );
+    }
+
+    let add_target = workflow_step_block(&workflow, "Add the target to the pinned toolchain");
+    assert!(add_target.contains("run: rustup target add ${{ matrix.target }}"));
+    assert!(
+        !add_target.contains("if:"),
+        "the cross target must be added to the pinned toolchain on every runner"
+    );
+
+    let rosetta = workflow_step_block(&workflow, "Ensure Rosetta 2 for the x86_64 macOS binaries");
+    assert!(rosetta.contains("if: matrix.target == 'x86_64-apple-darwin'"));
+    assert!(rosetta.contains("softwareupdate --install-rosetta --agree-to-license"));
+    assert!(
+        workflow.find("- name: Ensure Rosetta 2").unwrap()
+            < workflow
+                .find("- name: Verify release version contract")
+                .unwrap()
+    );
+
+    let architecture = workflow_step_script(&workflow, "Verify macOS binary architecture");
+    assert!(architecture.contains("x86_64-apple-darwin) expected=x86_64 ;;"));
+    assert!(architecture.contains("aarch64-apple-darwin) expected=arm64 ;;"));
+    assert!(architecture.contains("lipo -archs"));
+    assert!(architecture.contains("test \"$archs\" = \"$expected\""));
+
+    let run_target = "run_target() { if [ \"$TARGET\" = x86_64-apple-darwin ]; then arch -x86_64 \"$@\"; else \"$@\"; fi; }";
+    for step in [
+        "Verify embedded release versions",
+        "Smoke installed archive",
+    ] {
+        assert!(
+            workflow_step_block(&workflow, step).contains("TARGET: ${{ matrix.target }}"),
+            "{step} must know the target it runs"
+        );
+        let script = workflow_step_script(&workflow, step);
+        assert!(
+            script.contains(run_target),
+            "{step} must run x86_64 under Rosetta"
+        );
+        for line in script.lines().filter(|line| {
+            line.contains("/aethyme ")
+                || line.contains("/aethyme\" ")
+                || line.contains("aethyme-engine-cli")
+        }) {
+            if line.contains("run_target") || line.trim_start().starts_with("tar ") {
+                continue;
+            }
+            panic!("{step} runs a release binary without run_target: {line}");
+        }
+    }
+}
+
 #[test]
 fn release_targets_exercises_native_linux_arm64_runtime_contract() {
     let workflow = std::fs::read_to_string(
@@ -831,7 +909,17 @@ fn homebrew_tap_workflow_publishes_from_the_signed_manifest() {
     let publish = tap.find("Publish and verify formula").unwrap();
     assert!(verify < render && render < publish);
     assert!(tap.contains("release.yml@refs/tags/${TAG}"));
-    assert!(tap.contains("--source-sha \"$(git rev-parse \"refs/tags/${TAG}^{commit}\")\""));
+    assert!(tap.contains("source_sha=\"$(git rev-parse \"refs/tags/${TAG}^{commit}\")\""));
+    assert!(tap.contains("--source-sha \"$source_sha\""));
+    // A publication reuses the release run's renderer only when it was built
+    // from the tag's commit and its checksum holds; anything else compiles.
+    let fetch = tap
+        .find("Fetch the release run's formula renderer")
+        .unwrap();
+    assert!(fetch < verify);
+    assert!(tap.contains("name: release-helpers-${{ github.sha }}"));
+    assert!(tap.contains("[ \"$(cat \"$helper_dir/source.sha\")\" = \"$source_sha\" ]"));
+    assert!(tap.contains("sha256sum --check --quiet SHA256SUMS"));
 
     // Only a publication sees the tap token; a rehearsal passes --dry-run
     // with the read-only job token.

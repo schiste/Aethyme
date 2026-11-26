@@ -784,6 +784,7 @@ fn gate_observation_from_event(event: &crate::Event) -> Option<(GateRunOutcome, 
             log_path: None,
             environment: crate::GateEnvironment::default(),
             host_fault: false,
+            environment_text_test_failure: false,
         },
         event.ts,
     ))
@@ -1474,6 +1475,7 @@ mod tests {
             log_path: Some("/private/log/GATE-LOG-SECRET".into()),
             environment: crate::GateEnvironment::default(),
             host_fault: false,
+            environment_text_test_failure: false,
         }
     }
 
@@ -1651,6 +1653,7 @@ mod tests {
             log_path: None,
             environment: crate::GateEnvironment::default(),
             host_fault: false,
+            environment_text_test_failure: false,
         };
         let gates = vec![
             ReportGateObservation {

@@ -424,6 +424,8 @@ fn trusted_native_failed_checks(observation: &serde_json::Value) -> Vec<FailedCh
         || failed.iter().any(|gate| {
             gate["status"] != "fail"
                 || gate["host_fault"] == true
+                // A rerun may differ, so no repair is requested for it.
+                || gate["environment_text_test_failure"] == true
                 || !matches!(
                     gate["failure_class"].as_str(),
                     Some("test_failure" | "build_failure" | "cached_prior_fail")

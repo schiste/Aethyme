@@ -1136,7 +1136,7 @@ const TAGGED_CACHE_ENTRY_LIMIT: usize = 20_000;
 
 /// Whether `directory` holds a regular `CACHEDIR.TAG` that begins with the
 /// standard signature: the tool that wrote the cache declared it regenerable.
-fn has_cache_directory_tag(directory: &Path) -> bool {
+pub(crate) fn has_cache_directory_tag(directory: &Path) -> bool {
     use std::io::Read;
     let tag = directory.join("CACHEDIR.TAG");
     let Ok(metadata) = std::fs::symlink_metadata(&tag) else {
@@ -1662,6 +1662,28 @@ pub struct AutoRemovedCheckout {
     pub ownership_reproof: Option<String>,
 }
 
+/// `blockers` without a path inside another listed directory: Git lists a
+/// directory holding only files ignored by a pattern, and each of them. Only
+/// for reports: a remembered keep's fingerprint needs every listed path.
+fn outermost_blockers(blockers: &[String]) -> Vec<&str> {
+    blockers
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            !blockers.iter().any(|listed| {
+                listed.ends_with('/') && listed != path && path.starts_with(listed.as_str())
+            })
+        })
+        .collect()
+}
+
+fn serialize_outermost_blockers<S: serde::Serializer>(
+    blockers: &[String],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&outermost_blockers(blockers), serializer)
+}
+
 /// One candidate auto-cleanup kept, and why.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AutoKeptCheckout {
@@ -1675,7 +1697,12 @@ pub struct AutoKeptCheckout {
     /// Ignored paths, relative to the checkout, that keep it (code
     /// `ignored_content`). Each is a root Git listed as ignored that no
     /// built-in witness or `[cleanup] regenerable` glob recognises.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Serialized without a path inside a listed directory.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_outermost_blockers"
+    )]
     pub ignored_blockers: Vec<String>,
     /// Set to `device_renumber` when the device-renumber ownership re-proof
     /// was tried for this checkout and refused (code
@@ -4330,6 +4357,57 @@ pub(crate) fn unclean_reason(
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    unclean_reason_with(
+        worktree,
+        branch,
+        main_root,
+        policy,
+        UnknownIgnoredDirectories::Keep,
+    )
+}
+
+/// [`unclean_reason`] for the checkout retirement lane's re-check under the
+/// lifecycle claim: an ignored directory nothing catalogues as regenerable
+/// that holds no file at all (only directories, or nothing) does not keep
+/// the checkout. The lane's plan archives such a directory file by file
+/// (`ArchiveIgnoredDirectoriesScope`), which is zero files, so it already
+/// called the checkout "nothing to preserve"; without this the re-check
+/// refused every run what the plan had just approved. The directory is
+/// walked again here, under the claim, so a file written into it after the
+/// plan still keeps the checkout.
+pub(crate) fn unclean_reason_for_retirement(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+    policy: &AutoCleanupPolicy,
+) -> Result<Option<String>, String> {
+    unclean_reason_with(
+        worktree,
+        branch,
+        main_root,
+        policy,
+        UnknownIgnoredDirectories::ReleaseWhenEmpty,
+    )
+}
+
+/// How proof 3 treats an ignored directory nothing catalogues as
+/// regenerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownIgnoredDirectories {
+    /// It keeps the checkout, whatever it holds.
+    Keep,
+    /// It keeps the checkout unless its whole subtree holds no file, link
+    /// or special node ([`ignored_directory_holds_no_files`]).
+    ReleaseWhenEmpty,
+}
+
+fn unclean_reason_with(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+    policy: &AutoCleanupPolicy,
+    unknown_directories: UnknownIgnoredDirectories,
+) -> Result<Option<String>, String> {
     let _span = crate::phase_telemetry::span("proof_unclean_check");
     let strict = policy.strict;
     let listing = match run_proof_git(
@@ -4369,7 +4447,7 @@ pub(crate) fn unclean_reason(
     if let Some(reason) = in_progress_or_stash_reason(worktree, branch, main_root)? {
         return Ok(Some(reason));
     }
-    ignored_reason_from_status(worktree, &records, policy)
+    ignored_reason_from_status(worktree, &records, policy, unknown_directories)
 }
 
 /// The ignored-content verdict ([`ignored_content_reason`]) over the `!!`
@@ -4379,6 +4457,7 @@ fn ignored_reason_from_status(
     worktree: &Path,
     records: &[(&str, &str)],
     policy: &AutoCleanupPolicy,
+    unknown_directories: UnknownIgnoredDirectories,
 ) -> Result<Option<String>, String> {
     let _span = crate::phase_telemetry::span("proof_ignored_check");
     let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
@@ -4406,6 +4485,14 @@ fn ignored_reason_from_status(
         ));
     }
     let mut released_by_file_pattern = false;
+    let mut released_empty_directories = 0_usize;
+    // One budget for every walk of this re-check, which runs under the
+    // repository-wide lifecycle claim: never more than its entries in all,
+    // never past the listing's deadline.
+    let mut walk_budget = EmptyDirectoryWalkBudget::new(
+        EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+        crate::git::active_git_deadline().map_or(deadline, |active| active.min(deadline)),
+    );
     for relative in ignored {
         ensure_ignored_content_before(deadline)?;
         if relative.len() > PROOF_IGNORED_PATH_BYTES {
@@ -4425,6 +4512,17 @@ fn ignored_reason_from_status(
                     ),
                     IgnoredEntryRule::Other => {}
                 }
+                if unknown_directories == UnknownIgnoredDirectories::ReleaseWhenEmpty
+                    && matches!(classification, RecoveryIgnoredClassification::Preserve(_))
+                    && {
+                        let _walk =
+                            crate::phase_telemetry::span("proof_empty_ignored_directory_walk");
+                        ignored_directory_holds_no_files(worktree, relative, &mut walk_budget)
+                    }
+                {
+                    released_empty_directories += 1;
+                    return Ok(());
+                }
                 ignored_verdict(relative, classification)
             },
         );
@@ -4438,7 +4536,90 @@ fn ignored_reason_from_status(
     if released_by_file_pattern {
         crate::phase_telemetry::add("cleanup_checkout_released_by_file_pattern", Duration::ZERO);
     }
+    for _ in 0..released_empty_directories {
+        crate::phase_telemetry::add("proof_empty_ignored_directory_released", Duration::ZERO);
+    }
     Ok(None)
+}
+
+/// Entries (directories and their entries) all of one re-check's
+/// [`ignored_directory_holds_no_files`] walks read together before they stop
+/// and call the directory being walked not empty.
+const EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT: usize = 4_096;
+/// Directory levels one walk descends before it calls the directory not
+/// empty.
+const EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT: usize = 128;
+
+/// What the empty-directory walks of one re-check may still spend: entries
+/// shared across every ignored root, and a deadline.
+#[derive(Debug)]
+pub(crate) struct EmptyDirectoryWalkBudget {
+    entries_left: usize,
+    deadline: Instant,
+}
+
+impl EmptyDirectoryWalkBudget {
+    pub(crate) fn new(entries: usize, deadline: Instant) -> Self {
+        Self {
+            entries_left: entries,
+            deadline,
+        }
+    }
+
+    /// Spend one entry; `false` once the entries or the time are gone.
+    fn spend(&mut self) -> bool {
+        if self.entries_left == 0 || Instant::now() >= self.deadline {
+            return false;
+        }
+        self.entries_left -= 1;
+        true
+    }
+}
+
+/// Whether the ignored path `relative` of `worktree` is a real directory
+/// (never a link) whose whole subtree holds only directories: no regular
+/// file, link or special node. Never follows a link, and spends `budget`
+/// for every directory it opens and every entry it reads; any entry it
+/// cannot read, a subtree deeper than its depth limit, and a budget that
+/// runs out answer `false` (the directory keeps the checkout). An empty
+/// directory holds no work: the recovery archive of such a directory is
+/// zero files.
+pub(crate) fn ignored_directory_holds_no_files(
+    worktree: &Path,
+    relative: &str,
+    budget: &mut EmptyDirectoryWalkBudget,
+) -> bool {
+    let root = worktree.join(relative.trim_end_matches('/'));
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let mut pending = vec![(root, 0_usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT || !budget.spend() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            if !budget.spend() {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return false;
+            }
+            pending.push((entry.path(), depth + 1));
+        }
+    }
+    true
 }
 
 /// Proof 3 without the ignored-path listing: no uncommitted or untracked
@@ -4683,20 +4864,24 @@ fn in_progress_or_stash_reason(
     }
 
     if let Some(branch) = branch {
-        let stashes = git(main_root, &["stash", "list", "--format=%gs"])?;
-        let made_here = [format!("WIP on {branch}:"), format!("On {branch}:")];
-        if let Some(entry) = stashes
-            .lines()
-            .find(|line| made_here.iter().any(|prefix| line.starts_with(prefix)))
-        {
-            return Ok(Some(format!(
-                "a stash was made on {branch}: {}",
-                entry.trim()
-            )));
-        }
+        return stash_made_on_branch(main_root, branch);
     }
 
     Ok(None)
+}
+
+/// A stash made on `branch` (one `git stash list` in `main_root`), as the
+/// keep reason proof 3 gives for it.
+pub(crate) fn stash_made_on_branch(
+    main_root: &Path,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let stashes = git(main_root, &["stash", "list", "--format=%gs"])?;
+    let made_here = [format!("WIP on {branch}:"), format!("On {branch}:")];
+    Ok(stashes
+        .lines()
+        .find(|line| made_here.iter().any(|prefix| line.starts_with(prefix)))
+        .map(|entry| format!("a stash was made on {branch}: {}", entry.trim())))
 }
 
 /// Shared ignored-content verdict for automatic and finish-time cleanup.
@@ -5248,8 +5433,8 @@ fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
         if !Path::new(worktree).is_dir() {
             continue;
         }
-        for blocker in &entry.blockers {
-            *counts.entry(blocker.as_str()).or_default() += 1;
+        for blocker in outermost_blockers(&entry.blockers) {
+            *counts.entry(blocker).or_default() += 1;
         }
     }
     let mut rows = counts
@@ -8163,6 +8348,7 @@ impl Broker {
                 landed_judged_in_pass += 1;
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+                crate::phase_telemetry::add_distinct("landed_sessions_examined", session.id);
                 let started = Instant::now();
                 #[cfg(test)]
                 let forced_budget_exhausted =
@@ -8604,6 +8790,7 @@ impl Broker {
             };
             summary.landed_examined += 1;
             crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+            crate::phase_telemetry::add_distinct("landed_sessions_examined", session.id);
             crate::phase_telemetry::add("landed_likely_examined", Duration::ZERO);
             let started = Instant::now();
             // A spawned session whose every pull request merged takes the
@@ -11241,6 +11428,192 @@ mod tests {
         }
     }
 
+    /// Only a real directory whose subtree holds nothing but directories is
+    /// empty: a file, a link (to a directory too) or a link as the root is
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_directory_holds_no_files_only_when_its_subtree_is_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("empty/nested/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("bare")).unwrap();
+        std::fs::create_dir_all(root.join("with_file/nested")).unwrap();
+        std::fs::write(root.join("with_file/nested/data.txt"), "work\n").unwrap();
+        std::fs::create_dir_all(root.join("with_link")).unwrap();
+        std::os::unix::fs::symlink(root.join("bare"), root.join("with_link/to_bare")).unwrap();
+        std::os::unix::fs::symlink(root.join("bare"), root.join("linked_root")).unwrap();
+        std::fs::write(root.join("plain.log"), "log\n").unwrap();
+
+        let walk = |relative: &str| {
+            super::ignored_directory_holds_no_files(
+                root,
+                relative,
+                &mut super::EmptyDirectoryWalkBudget::new(
+                    super::EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+                    Instant::now() + Duration::from_secs(600),
+                ),
+            )
+        };
+        assert!(walk("empty/"));
+        assert!(walk("bare"));
+        assert!(!walk("with_file/"));
+        assert!(!walk("with_link/"));
+        assert!(!walk("linked_root"));
+        assert!(!walk("plain.log"));
+        assert!(!walk("missing/"));
+    }
+
+    /// A FIFO in the directory keeps it: a special node is not a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_inside_an_ignored_directory_keeps_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("holder/nested")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("holder/nested/pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut budget = super::EmptyDirectoryWalkBudget::new(
+            super::EMPTY_IGNORED_DIRECTORY_ENTRY_LIMIT,
+            Instant::now() + Duration::from_secs(600),
+        );
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "holder/",
+            &mut budget
+        ));
+    }
+
+    /// Past the entry budget, past the depth limit or past the deadline,
+    /// the walk answers "not empty" (keep).
+    #[cfg(unix)]
+    #[test]
+    fn an_exhausted_walk_keeps_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["a", "b", "c", "d"] {
+            std::fs::create_dir_all(root.join("wide").join(name)).unwrap();
+        }
+        let later = Instant::now() + Duration::from_secs(600);
+        // The root, its four entries and the four entries' directories: 9.
+        assert!(super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(9, later)
+        ));
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(8, later)
+        ));
+
+        let mut deep = root.join("deep");
+        for _ in 0..=super::EMPTY_IGNORED_DIRECTORY_DEPTH_LIMIT + 1 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "deep",
+            &mut super::EmptyDirectoryWalkBudget::new(usize::MAX, later)
+        ));
+
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "wide",
+            &mut super::EmptyDirectoryWalkBudget::new(usize::MAX, Instant::now())
+        ));
+    }
+
+    /// One budget is shared by every root of a re-check: what one walk
+    /// spent is gone for the next.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_budget_is_shared_across_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("first/x")).unwrap();
+        std::fs::create_dir_all(root.join("second/y")).unwrap();
+        // Each root alone costs 3: itself, its entry, that entry's directory.
+        let mut budget =
+            super::EmptyDirectoryWalkBudget::new(5, Instant::now() + Duration::from_secs(600));
+        assert!(super::ignored_directory_holds_no_files(
+            root,
+            "first",
+            &mut budget
+        ));
+        assert!(!super::ignored_directory_holds_no_files(
+            root,
+            "second",
+            &mut budget
+        ));
+    }
+
+    /// The retirement re-check releases an ignored directory nothing
+    /// catalogues as regenerable only while it holds no file; every other
+    /// caller of proof 3 still keeps the checkout for it.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_retirement_recheck_releases_an_empty_unknown_ignored_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Proof test"]);
+        git(&["config", "user.email", "proof@example.invalid"]);
+        std::fs::write(root.join(".gitignore"), "scratch-area/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join("scratch-area/nested")).unwrap();
+        let policy = AutoCleanupPolicy::default();
+
+        let kept = super::unclean_reason(root, None, root, &policy).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "{kept:?}"
+        );
+        assert_eq!(
+            super::unclean_reason_for_retirement(root, None, root, &policy),
+            Ok(None)
+        );
+
+        let strict = AutoCleanupPolicy {
+            strict: true,
+            ..AutoCleanupPolicy::default()
+        };
+        let kept = super::unclean_reason_for_retirement(root, None, root, &strict).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "strict mode never releases: {kept:?}"
+        );
+
+        std::fs::write(root.join("scratch-area/nested/notes.txt"), "work\n").unwrap();
+        let kept = super::unclean_reason_for_retirement(root, None, root, &policy).unwrap();
+        assert!(
+            kept.as_deref().is_some_and(
+                |reason| reason.starts_with("ignored content requires explicit cleanup")
+            ),
+            "{kept:?}"
+        );
+    }
+
     /// A stopped listing takes its whole process group with it: a child the
     /// listing started (as a submodule `git status` would be) is not left
     /// running.
@@ -11353,6 +11726,46 @@ mod tests {
             "{reason}"
         );
         assert!(root.join("opaque/nested/user-data.json").exists());
+    }
+
+    /// Git lists a directory holding only pattern-ignored files and each of
+    /// them: the directory is reported once and a sibling still is, while the
+    /// fingerprint of a remembered keep covers the nested paths.
+    #[test]
+    fn a_blocking_directory_is_not_reported_again_for_its_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        touch(root, "logs/a.log");
+        touch(root, "logs/deep/b.log");
+        touch(root, "logs-standalone.log");
+
+        let blockers =
+            super::ignored_content_blockers(root, &AutoCleanupPolicy::default(), 16).unwrap();
+
+        let ignored_blockers = blockers
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let fingerprint = super::keep_memo_fingerprint(root, &ignored_blockers);
+        for nested in ["logs/deep", "logs/deep/b.log"] {
+            assert!(
+                fingerprint
+                    .iter()
+                    .any(|part| part.starts_with(&format!("{nested}="))),
+                "{nested}: {fingerprint:?}"
+            );
+        }
+        let kept = super::AutoKeptCheckout {
+            ignored_blockers,
+            ..Default::default()
+        };
+        let reported = serde_json::to_value(&kept).unwrap();
+        let mut reported =
+            serde_json::from_value::<Vec<String>>(reported["ignored_blockers"].clone()).unwrap();
+        reported.sort();
+        assert_eq!(reported, ["logs-standalone.log", "logs/"]);
     }
 
     #[cfg(unix)]
@@ -14535,7 +14948,7 @@ mod tests {
             "the admin directory can have a name independent of the checkout"
         );
         assert!(
-            crate::broker::checked_worktree_activity_ms(broker.main_root(), &current)
+            crate::broker::checked_worktree_activity(broker.main_root(), &current)
                 .unwrap()
                 .is_some()
         );

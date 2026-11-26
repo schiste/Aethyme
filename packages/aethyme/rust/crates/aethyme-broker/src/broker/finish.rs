@@ -1609,7 +1609,22 @@ impl Broker {
         if canonical_path.parent() != Some(parent.as_path()) {
             return Ok(false);
         }
-        let actual = match GitRepo::worktree_common_dir(&canonical_path) {
+        // A status in the busiest repository asked Git this about 394 times,
+        // mostly for pool directories with no `.git` at all (retired and
+        // stripped checkouts) or with a pointer to a removed Git directory.
+        // Git cannot find a checkout in either, so its answer is an error,
+        // and the error branch below is taken without starting it. Only an
+        // open Git deadline allows this, so a timeout still reads as one.
+        let probed = match GitRepo::checkout_discovery_certainly_fails(&canonical_path) {
+            Some(failure) => {
+                crate::phase_telemetry::add(failure.counter(), std::time::Duration::ZERO);
+                Err(GitError::NotARepository {
+                    path: canonical_path.clone(),
+                })
+            }
+            None => GitRepo::worktree_common_dir(&canonical_path),
+        };
+        let actual = match probed {
             Ok(common_dir) => common_dir,
             Err(inspection_error) => {
                 // The pointer is independent evidence only if it names this
