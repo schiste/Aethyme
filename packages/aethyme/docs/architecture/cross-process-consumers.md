@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-11-17
+Last Updated: 2026-11-26
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -725,6 +725,65 @@ of `command-metrics.jsonl` see these changes:
 
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
+
+## Leases read as what they are: path overlaps inform, reads are never refused (2026-11-26)
+
+"Lease" names three things, and agents read advisory path overlaps as blocks.
+Rendered text now keeps one vocabulary per kind (one builder module,
+`aethyme-broker/src/lease_wording.rs`); internal names and JSON fields are
+unchanged unless listed here.
+
+- **Reads and the finite task lease.** `status` (every form), `agents`,
+  `status readiness`, `status doctor` (and `doctor plan`), `resources
+  list|pressure|plan|explain`, `console` (status/list), `advisories list`,
+  `exposures plan`, `checkpoint plan`, `worktree-root` (status), `gc storage`
+  (plan), `trust status`, `merge-chain --dry-run` and `integration reconcile`
+  without `--apply` are no longer refused for a non-holder with "has a finite
+  task lease; this command is not covered by its child-lifetime protocol",
+  and no longer downgrade the holder's lease either. The commands already
+  classed as observation-only (`prepare status`, `leases` listing, `plan`,
+  `explain`, `export`, and the rest) are unchanged. Count
+  `task_lease_read_allowed` records each read that the old check would have
+  refused; span `task_lease_read_check` times that check, which reuses the
+  holder binding the session guard's snapshot read and reads the process
+  table only when the binding is a finite task lease. State-changing commands still refuse, now with "is held by another
+  agent process (session holder with a finite task lease, not a path lease)".
+- **Status advice for conflicting path pairs.** `advice[].id` and compact
+  `advice.categories[].id` change from `lease.overlap-conflict` to
+  `paths.merge-conflict-risk`, and the severity from `warning` to `info`: a
+  path lease never refuses an edit, a claim or a submit. `reason` stays
+  `overlap_conflict`; consumers that keyed on the old id should key on
+  `reason`. No in-repository consumer parsed the id outside its own test.
+- **Rendered path-overlap lines.** Hook coordination, `advanced exec` / `git`
+  / `gh`, `submit`, `leases claim`, `leases` and `leases request-release` say
+  "session N is also editing X (informational: path leases never block your
+  edits or submit; coordinate only if you change the same lines)" in place of
+  "holds", "conflict on" and "would conflict". The hook renders the
+  `pre_edit.action` value `wait` for an earlier overlapping session as
+  `Before editing: coordinate.` (the JSON value stays `wait`).
+  `request-release` no longer suggests `leases wait`. A multi-path `leases
+  claim` failure names each failed path and its error inline.
+- **Host resources.** `HostResourceError::Conflict` no longer renders as
+  "host resource bundle unavailable: …". It is named by `conflicts[].kind`:
+  "build/cache slot" (`capacity`, `exclusive_key`), "port" (`tcp_port`),
+  "managed storage" (codes starting `managed_storage`), else "host
+  resource". Only `resource_contention` on build/cache slots reads "build/cache
+  slot busy (host resource, not a path lease): …; waiting is normal; retry
+  shortly"; everything else reads "<noun> unavailable (host resource, not a
+  path lease): …". `code` and `conflicts[]` are unchanged.
+- **Hook repeats.** The prompt/tool hook re-injects coordination lines only
+  when the overlapping paths or declared scopes (every row, by a digest kept in
+  the hook's own state file, not in the status document) or the pre-edit
+  decision (action, instruction and peer) change; a peer's liveness or task
+  label alone no longer does. Only the ordinary-overlap instruction renders
+  `wait` as "coordinate"; a peer whose ownership changed still reads `wait`. Count
+  `hook_coordination_repeat_suppressed` records each suppressed repeat.
+- **Generated guidance.** The broker protocol block says path leases only
+  inform and never block edits or submit (it stays within
+  `GENERATED_POLICY_MAX_TOKENS`); `references/broker.md` and the skill card
+  explain the three kinds in one paragraph. None of them
+  say another explicit lease can refuse a claim (the broker has not refused
+  claims on another session's lease since that rule was removed).
 
 ## Interrupted commands write their row; running commands keep a heartbeat (2026-11-26)
 

@@ -391,8 +391,8 @@ Use `aethyme broker status --json` in your worktree to inspect the session on
 demand. Add `--session <id>` from another checkout. Reuse its revision with
 `--since-revision <token>` for changes only. Treat deferred checks as unknown.
 Use `aethyme broker status --full --json` for exact session or lease-path
-evidence. Check overlapping work before duplicating it. Overlaps with an
-active session's explicit lease are advisory. Reconcile before merging and
+evidence. Check overlapping work before duplicating it. Path leases only
+inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
@@ -431,8 +431,8 @@ Use `aethyme broker status --json` in your worktree to inspect the session on
 demand. Add `--session <id>` from another checkout. Reuse its revision with
 `--since-revision <token>` for changes only. Treat deferred checks as unknown.
 Use `aethyme broker status --full --json` for exact session or lease-path
-evidence. Check overlapping work before duplicating it. Overlaps with an
-active session's explicit lease are advisory. Reconcile before merging and
+evidence. Check overlapping work before duplicating it. Path leases only
+inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
@@ -736,9 +736,14 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   Leases record planned or observed path overlap; they do not lock files
-   across isolated worktrees. A lease or warning alone is not a reason to
-   wait or switch tasks: continue on independent work in your own worktree.
+   Three things are called leases. Path leases record which session edits
+   which paths; they never block your edits, a claim or submit, so an overlap
+   is information. Build/cache slots (host resources) can make a command
+   wait; waiting is normal and it retries. The session holder (task lease)
+   refuses another agent process's state-changing commands for that session,
+   never reads such as `broker status`. Path leases do not lock files across
+   isolated worktrees. A lease or warning alone is not a reason to wait or
+   switch tasks: continue on independent work in your own worktree.
    Before contacting a holder, inspect their task and claimed paths in
    `aethyme broker status --full --json`; an explicit lease may record intent without
    any edit. Every overlap the broker reports, warning or refusal, carries that
@@ -755,9 +760,8 @@ blocked.
    waiting or messaging. Coordinate only when edits overlap or interact, or
    your work depends on unmerged work. If needed, contact the holder with the
    exact path and dependency using `aethyme broker advanced note send --to-session <id>`;
-   a lease alone is not a reason to request release. A refused claim means the
-   broker did not grant that claim; it does not block unrelated work in your
-   checkout. A sibling session's PR or branch is not automatically your
+   a lease alone is not a reason to request release. A claim is never refused
+   by another session's path lease. A sibling session's PR or branch is not automatically your
    upstream. Sync against the configured upstream when required; do not import
    or restack onto another session's branch without separate authorization.
    When you edit a file another live session is changing, the broker tells you
@@ -778,11 +782,9 @@ blocked.
    changed files, but explicit leases are clearer for planned shared edits.
    `leases release` removes an explicit claim; implicit rows describe the
    current diff and remain until that diff is refreshed or cleared.
-   Outside `verify-only`, another active explicit lease can refuse a claim;
-   that refusal applies to the claim only. In `verify-only`, another session's
-   lease does not refuse a claim. Other overlaps return a warning naming the
-   holder and `note send` command; warnings do not pause work in your own
-   worktree.
+   Another session's lease never refuses a claim: every overlap returns an
+   informational warning naming that session and the `note send` command;
+   warnings do not pause work in your own worktree.
 
    Status and blocker listings are repository-wide; stale leases remain in the
    lease/liveness views but do not become global path-lease blockers. These
@@ -800,10 +802,9 @@ blocked.
    dependency state; use the read-only lease plan to recheck scope before a
    later retry.
 
-   A claim is refused only by another explicit lease whose holder is actively
-   working, and never in a `verify-only` repository; every other overlap comes
-   back as a warning naming the holder, with the `note send` command to
-   coordinate.
+   A path claim is never refused by another session's lease; every overlap
+   comes back as an informational warning naming that session, with the
+   `note send` command to coordinate.
 
    Cleanup and archive inventories are deletion proofs: path enumeration must
    preserve every path or fail closed. Do not use a parser that silently drops
@@ -1952,7 +1953,7 @@ mod tests {
                 "`--since-revision <token>` for changes only. Treat deferred checks as unknown.",
                 "changes and changes to repository warning counts at prompt and tool boundaries.",
                 "`aethyme broker status --full --json` for exact session or lease-path",
-                "active session's explicit lease are advisory. Reconcile before merging",
+                "inform: they never block edits or submit. Reconcile before merging and",
                 "resolve blockers and refusals.",
             ] {
                 assert!(

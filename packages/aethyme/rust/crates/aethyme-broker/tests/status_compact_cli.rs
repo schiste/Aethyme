@@ -164,9 +164,9 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     let categories = compact["advice"]["categories"].as_array().unwrap();
     let overlap = categories
         .iter()
-        .find(|category| category["id"] == "lease.overlap-conflict")
-        .expect("overlap warning category retained");
-    assert_eq!(overlap["severity"], "warning");
+        .find(|category| category["id"] == "paths.merge-conflict-risk")
+        .expect("overlap information category retained");
+    assert_eq!(overlap["severity"], "info");
     assert_eq!(overlap["count"], 3);
     assert_eq!(overlap["duplicate_count"], 2);
     assert_eq!(overlap["summary_variants_omitted"], true);

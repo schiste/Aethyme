@@ -623,10 +623,12 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         out!("  execution receipt: {receipt_id}");
         for lease in &report.warned_leases {
             out!(
-                "  lease overlap: session {} holds {}: {}",
-                lease.session_id,
-                lease.path,
-                lease.reason.as_deref().unwrap_or("")
+                "  path overlap: {}",
+                crate::lease_wording::session_path_overlap(
+                    lease.session_id,
+                    &lease.path,
+                    lease.reason.as_deref()
+                )
             );
             if let Some(changes) = &lease.other_changes {
                 out!("{}", crate::overlap_diff::render(changes, "    "));

@@ -213,11 +213,12 @@ fn render_lease_coverage(report: &crate::leases::LeaseCoverageReport) {
 pub(super) fn render_lease_overlaps(overlaps: &[crate::LeaseBlocker]) {
     for overlap in overlaps {
         out!(
-            "  note: session {} also holds {} [{}]: {}",
-            overlap.session_id,
-            overlap.path,
-            overlap.kind.as_str(),
-            overlap.reason.as_deref().unwrap_or("")
+            "  note: {}",
+            crate::lease_wording::path_overlap(
+                &format!("session {} [{}]", overlap.session_id, overlap.kind.as_str()),
+                &overlap.path,
+                overlap.reason.as_deref()
+            )
         );
         if let Some(changes) = &overlap.other_changes {
             out!("{}", crate::overlap_diff::render(changes, "    "));
@@ -488,6 +489,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 // if any path could not be claimed. Never imply atomicity.
                 let mut results = Vec::with_capacity(paths.len());
                 let mut failures = 0usize;
+                let mut failure_reasons = Vec::new();
                 for path in paths {
                     let is_directory = std::path::Path::new(&session_info.worktree_path)
                         .join(path)
@@ -502,6 +504,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         })),
                         Err(error) => {
                             failures += 1;
+                            failure_reasons.push(format!("{path}: {error}"));
                             results.push(serde_json::json!({
                                 "requested_path": path,
                                 "error": error.to_string(),
@@ -518,7 +521,8 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 out!("{}", serde_json::to_string_pretty(&result)?);
                 if failures > 0 {
                     return Err(UsageError::Message(format!(
-                        "{failures} lease claim(s) failed; inspect individual results above"
+                        "{failures} lease claim(s) failed: {}",
+                        failure_reasons.join("; ")
                     )));
                 }
                 return Ok(());
@@ -559,16 +563,21 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 }
                 for warning in &report.warnings {
                     out!(
-                        "  note: session {} ({}) also holds {} [{}]: {}",
-                        warning.session_id,
-                        warning
-                            .holder_context
-                            .as_deref()
-                            .or(warning.holder_status.as_deref())
-                            .unwrap_or("unknown"),
-                        warning.path,
-                        warning.kind.as_str(),
-                        warning.reason.as_deref().unwrap_or("")
+                        "  note: {}",
+                        crate::lease_wording::path_overlap(
+                            &format!(
+                                "session {} ({}) [{}]",
+                                warning.session_id,
+                                warning
+                                    .holder_context
+                                    .as_deref()
+                                    .or(warning.holder_status.as_deref())
+                                    .unwrap_or("unknown"),
+                                warning.kind.as_str()
+                            ),
+                            &warning.path,
+                            warning.reason.as_deref()
+                        )
                     );
                     if let Some(changes) = &warning.other_changes {
                         out!("{}", crate::overlap_diff::render(changes, "    "));
@@ -732,9 +741,8 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         request.state.as_str()
                     );
                 }
-                out!("These requests are advisory; they do not block edits in separate worktrees.");
                 out!(
-                    "Before following up or waiting, inspect the holder's task and relevant worktree diff. Use `leases wait` only when this exact path is needed."
+                    "These requests are informational: path leases never block your edits or submit, so there is nothing to wait for. Coordinate with the holder only if you change the same lines."
                 );
             }
         }

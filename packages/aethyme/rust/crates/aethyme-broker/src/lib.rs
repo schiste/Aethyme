@@ -137,6 +137,7 @@ mod issue_set;
 mod issue_set_apply;
 mod issue_set_github;
 mod lease_export;
+mod lease_wording;
 mod leases;
 pub mod local_acceptance;
 pub mod local_authority;

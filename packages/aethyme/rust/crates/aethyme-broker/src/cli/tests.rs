@@ -266,6 +266,48 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
 }
 
 #[test]
+fn reads_are_never_task_lease_work() {
+    fn classify(public_args: &[&str]) -> super::TaskLeaseCommandClass {
+        let resolution = super::surface::resolve(&strings(public_args));
+        assert!(resolution.refusal.is_none(), "{public_args:?}");
+        let subcommand = resolution.args.first().expect("resolved command");
+        let parsed = super::parse(&resolution.args[1..]).expect("normalized command parses");
+        super::task_lease_command_class(subcommand, &parsed)
+    }
+    use super::TaskLeaseCommandClass::{OtherWork, SessionRead};
+    let reads: [&[&str]; 14] = [
+        &["status", "--full", "--json"],
+        &["status", "--refresh"],
+        &["status", "readiness"],
+        &["status", "doctor"],
+        &["status", "doctor", "plan"],
+        &["advanced", "agents"],
+        &["advanced", "agents", "--json"],
+        &["advanced", "resources", "list"],
+        &["advanced", "resources", "pressure"],
+        &["advanced", "resources", "plan", "request.json"],
+        &["advanced", "console", "status"],
+        &["advanced", "advisories", "list"],
+        &["advanced", "exposures", "plan"],
+        &["advanced", "trust", "status"],
+    ];
+    for args in reads {
+        assert_eq!(classify(args), SessionRead, "{args:?}");
+    }
+    let writes: [&[&str]; 6] = [
+        &["advanced", "resources", "release", "lease-1"],
+        &["advanced", "resources", "reconcile"],
+        &["advanced", "advisories", "ack", "a1"],
+        &["advanced", "exposures", "apply"],
+        &["advanced", "trust"],
+        &["status", "doctor", "apply"],
+    ];
+    for args in writes {
+        assert_eq!(classify(args), OtherWork, "{args:?}");
+    }
+}
+
+#[test]
 fn closed_session_admission_exceptions_are_narrowly_scoped() {
     fn reaches_handler(public_args: &[&str]) -> bool {
         let public_args = public_args
@@ -505,6 +547,128 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
     assert_eq!(
         after_event_id, before_event_id,
         "a repeat finish on a closed session must not heartbeat or downgrade its holder"
+    );
+}
+
+/// A read from someone other than the finite task lease's holder used to be
+/// refused ("not covered by its child-lifetime protocol"), which agents read
+/// as being blocked. It must succeed and leave the holder binding untouched.
+#[cfg(unix)]
+#[test]
+fn a_read_from_a_non_holder_of_a_finite_task_lease_succeeds() {
+    const CHILD_ENV: &str = "AETHYME_TASK_LEASE_READ_TEST_CHILD";
+    if std::env::var(CHILD_ENV).is_ok() {
+        let args = vec!["agents".to_owned(), "--json".to_owned()];
+        if let Err(error) = super::run_inner(&args, &super::CompatibilityMode::Normal) {
+            panic!("a read from a non-holder must not be refused: {error:?}");
+        }
+        return;
+    }
+
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .env("GIT_AUTHOR_NAME", "task lease read test")
+            .env("GIT_AUTHOR_EMAIL", "task-lease-read@example.invalid")
+            .env("GIT_COMMITTER_NAME", "task lease read test")
+            .env("GIT_COMMITTER_EMAIL", "task-lease-read@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repository.path().join("tracked.txt"), "fixture\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-qm", "fixture"]);
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repository.path()).unwrap();
+    let session = broker
+        .start_worktree("task lease read fixture", None)
+        .unwrap();
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            if let Err(error) = self.0.kill() {
+                eprintln!("holder fixture cleanup: {error}");
+            }
+            if let Err(error) = self.0.wait() {
+                eprintln!("holder fixture wait: {error}");
+            }
+        }
+    }
+    let holder_process = OwnedChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the owned sibling holder process"),
+    );
+    let holder_pid = i64::from(holder_process.0.id());
+    let process_table = crate::session_holder::ProcessTable::snapshot()
+        .expect("the parent process table is readable");
+    let holder = process_table
+        .process(holder_pid)
+        .expect("the owned sibling appears in its process table");
+    broker
+        .store()
+        .append_event(
+            crate::events::SESSION_HOLDER_BOUND,
+            Some(session.id),
+            Some(&crate::events::session_holder_task_lease_bound_payload(
+                &holder,
+                "task_lease_enabled",
+                None,
+            )),
+        )
+        .unwrap();
+    let before_event_id = broker
+        .store()
+        .latest_session_holder_event(session.id)
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("a_read_from_a_non_holder_of_a_finite_task_lease_succeeds")
+        .arg("--nocapture")
+        .current_dir(&session.worktree_path)
+        .env(CHILD_ENV, "1");
+    broker
+        .configure_storage_context_for_child(&mut child)
+        .expect("bind the child CLI to fixture-owned storage");
+    child.env(
+        crate::session_holder::AGENT_PID_ENV,
+        std::process::id().to_string(),
+    );
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "non-holder read child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after_event_id = broker
+        .store()
+        .latest_session_holder_event(session.id)
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(
+        after_event_id, before_event_id,
+        "a read must neither renew nor downgrade the holder's finite task lease"
     );
 }
 
