@@ -888,6 +888,9 @@ pub struct PassInputs<'a> {
     pub pace: Duration,
     /// The lease registry for gate caches.
     pub registry: PathBuf,
+    /// Why `storage.toml` could not be read, when the pass runs on default
+    /// budgets because of it.
+    pub budget_error: Option<String>,
 }
 
 /// This pass's landing decisions: the shared prover's counts since `before`.
@@ -911,8 +914,14 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     let started = Instant::now();
     let mut report = PassReport {
         started_at_ms: now_ms(),
+        budget_error: inputs.budget_error.clone(),
         ..PassReport::default()
     };
+    if report.budget_error.is_some() {
+        // Default budgets in place of the owner's: an older binary on the
+        // host, or a file with a key or value this binary rejects.
+        crate::phase_telemetry::add("storage_budget_config_invalid", Duration::ZERO);
+    }
     let mut lock = lock;
     let mut beat = || {
         if let Some(lock) = lock.as_deref_mut() {
@@ -1087,6 +1096,14 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             report.skipped.push(format!("{}: {why}", candidate.label()));
             continue;
         }
+        // An archive's keep marker, read last, after the landing proof and
+        // just before the rename.
+        if candidate.class == Class::RecoveryArchives && kept_at_removal(&candidate.path()) {
+            report
+                .skipped
+                .push(format!("{}: kept by the owner's marker", candidate.label()));
+            continue;
+        }
         let mut beat = || {
             if let Some(lock) = lock.as_deref_mut() {
                 lock.beat();
@@ -1139,6 +1156,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         &mut *inputs.free,
         &inputs.registry,
         inputs.pace,
+        Instant::now() + ARCHIVE_FLOOR_BUDGET,
         lock.as_deref_mut(),
         leases.as_ref(),
         &mut report,
@@ -1305,22 +1323,49 @@ fn forget(ledger: &mut Ledger, candidate: &Candidate) {
     }
 }
 
-/// The longest the archive floor may remove archives in one pass.
-const ARCHIVE_FLOOR_BUDGET: Duration = Duration::from_secs(60);
+/// The longest the archive floor may remove archives in one pass, across
+/// every volume.
+pub(super) const ARCHIVE_FLOOR_BUDGET: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs on an archive's path once every check before its
+    /// removal passed, just before the last keep marker read.
+    pub(super) static BEFORE_ARCHIVE_REMOVAL_FOR_TEST: std::cell::RefCell<Option<RemovalHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) type RemovalHook = Box<dyn Fn(&Path)>;
+
+/// Whether the owner's keep marker is beside the archive at `path`, read
+/// last, after the landing proof and just before the rename: a marker
+/// written while the proof ran keeps the archive.
+fn kept_at_removal(path: &Path) -> bool {
+    #[cfg(test)]
+    BEFORE_ARCHIVE_REMOVAL_FOR_TEST.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
+    super::keep_marker(path).exists()
+}
 
 /// Apply the recovery archive floor (see [`super::archive_floor`]) to every
 /// volume holding measured archives: while its free space is below the
 /// floor, remove the oldest archives on it that no rule keeps, whichever
-/// repository they belong to, each re-checked just before removal (keep
-/// marker, landing, promised retention), paced, until the projected free
-/// space is back at the floor or [`ARCHIVE_FLOOR_BUDGET`] ran out.
+/// repository they belong to, each re-checked just before removal (landing
+/// and promised retention, then the keep marker last), paced, until the
+/// projected free space is back at the floor or `deadline` (one for the
+/// whole pass, every volume included) passed.
 #[allow(clippy::too_many_arguments)]
-fn archive_floor_pass(
+pub(super) fn archive_floor_pass(
     ledger: &mut Ledger,
     budgets: &Budgets,
     free: &mut dyn FnMut(&Path) -> Option<(u64, u64)>,
     registry: &Path,
     pace: Duration,
+    deadline: Instant,
     mut lock: Option<&mut WorkerLock>,
     leases: Option<&BTreeSet<(String, String)>>,
     report: &mut PassReport,
@@ -1342,44 +1387,44 @@ fn archive_floor_pass(
         let probe = crate::phase_telemetry::span("storage_archive_floor_probe");
         let reading = free(&probe_root);
         drop(probe);
+        let free_before = reading.map(|(available, _)| available);
         let floor = reading.map_or(0, |(_, total)| budgets.recovery_archive_floor(total));
-        let mut progress = FloorProgress::new(reading.map(|(available, _)| available), floor);
+        let mut entries: Vec<(Candidate, FloorArchive)> = Vec::new();
+        for item in ledger
+            .items
+            .iter()
+            .filter(|&item| holds_archives(item) && item.device == device)
+        {
+            for child in &item.children {
+                let retention = child
+                    .min_retention_ms
+                    .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
+                let protected = child.kept
+                    || super::is_partial_archive_name(&child.name)
+                    || child
+                        .created_ms
+                        .is_none_or(|created| now < created.saturating_add(retention));
+                entries.push((
+                    evict::child_candidate(item, child, Reason::OverBudget),
+                    FloorArchive {
+                        created_ms: child.created_ms.unwrap_or(0),
+                        bytes: child.bytes,
+                        protected,
+                    },
+                ));
+            }
+        }
+        let archives: Vec<FloorArchive> = entries.iter().map(|(_, archive)| *archive).collect();
+        let mut progress = FloorProgress::for_archives(&archives, free_before, floor);
         let mut floor_report = FloorReport {
             device,
             floor_bytes: floor,
-            free_before_bytes: reading.map(|(available, _)| available),
+            free_before_bytes: free_before,
             ..FloorReport::default()
         };
         let mut out_of_time = false;
         if progress.short() {
             let _prune = crate::phase_telemetry::span("storage_archive_floor_prune");
-            let mut entries: Vec<(Candidate, FloorArchive)> = Vec::new();
-            for item in ledger
-                .items
-                .iter()
-                .filter(|&item| holds_archives(item) && item.device == device)
-            {
-                for child in &item.children {
-                    let retention = child
-                        .min_retention_ms
-                        .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
-                    let protected = child.kept
-                        || super::is_partial_archive_name(&child.name)
-                        || child
-                            .created_ms
-                            .is_none_or(|created| now < created.saturating_add(retention));
-                    entries.push((
-                        evict::child_candidate(item, child, Reason::OverBudget),
-                        FloorArchive {
-                            created_ms: child.created_ms.unwrap_or(0),
-                            bytes: child.bytes,
-                            protected,
-                        },
-                    ));
-                }
-            }
-            let archives: Vec<FloorArchive> = entries.iter().map(|(_, archive)| *archive).collect();
-            let deadline = Instant::now() + ARCHIVE_FLOOR_BUDGET;
             for index in floor_order(&archives) {
                 if !progress.short() {
                     break;
@@ -1393,13 +1438,12 @@ fn archive_floor_pass(
                     break;
                 }
                 let candidate = &entries[index].0;
-                // Re-read just before removal: the keep marker, then landing
-                // and promised retention.
-                let refusal = if super::keep_marker(&candidate.path()).exists() {
-                    Some("kept by the owner's marker".to_string())
-                } else {
-                    evict::refuse(candidate, leases, now)
-                };
+                // Landing and promised retention first, then the keep
+                // marker, read last just before the rename.
+                let refusal = evict::refuse(candidate, leases, now).or_else(|| {
+                    kept_at_removal(&candidate.path())
+                        .then(|| "kept by the owner's marker".to_string())
+                });
                 if let Some(why) = refusal {
                     crate::phase_telemetry::add("storage_archive_floor_kept", Duration::ZERO);
                     report
@@ -1415,7 +1459,7 @@ fn archive_floor_pass(
                 // Renamed aside first: a removal the deadline stops leaves
                 // only a remainder the next pass sweeps.
                 match evict::remove_protected(candidate, registry, &mut beat, Some(deadline)) {
-                    Ok(_) => {
+                    Ok(true) => {
                         crate::phase_telemetry::add("storage_archive_floor_pruned", Duration::ZERO);
                         progress.record(candidate.bytes);
                         floor_report.pruned += 1;
@@ -1429,9 +1473,32 @@ fn archive_floor_pass(
                         telemetry.bytes_reclaimed += candidate.bytes;
                         forget(ledger, candidate);
                     }
-                    Err(error) => report
-                        .skipped
-                        .push(format!("{} (archive floor): {error}", candidate.label())),
+                    Ok(false) => {
+                        // Gone from its place, not yet from the disk: not
+                        // counted as freed.
+                        crate::phase_telemetry::add(
+                            "storage_archive_floor_interrupted",
+                            Duration::ZERO,
+                        );
+                        floor_report.interrupted += 1;
+                        report.skipped.push(format!(
+                            "{} (archive floor): removal interrupted at the deadline; \
+                             the next pass sweeps the remainder",
+                            candidate.label()
+                        ));
+                        forget(ledger, candidate);
+                        out_of_time = true;
+                        break;
+                    }
+                    Err(error) => {
+                        crate::phase_telemetry::add(
+                            "storage_archive_floor_remove_failed",
+                            Duration::ZERO,
+                        );
+                        report
+                            .skipped
+                            .push(format!("{} (archive floor): {error}", candidate.label()));
+                    }
                 }
                 // Unattended deletion is paced, even below the floor.
                 if !pace.is_zero() {
@@ -1440,7 +1507,7 @@ fn archive_floor_pass(
             }
         }
         floor_report.stop = progress.stop(out_of_time);
-        floor_report.free_after_bytes = if floor_report.pruned > 0 {
+        floor_report.free_after_bytes = if floor_report.pruned + floor_report.interrupted > 0 {
             let probe = crate::phase_telemetry::span("storage_archive_floor_probe");
             let after = free(&probe_root).map(|(available, _)| available);
             drop(probe);
@@ -1462,6 +1529,7 @@ fn archive_floor_pass(
                     "free_after_bytes": volume.free_after_bytes,
                     "pruned": volume.pruned,
                     "pruned_bytes": volume.pruned_bytes,
+                    "interrupted": volume.interrupted,
                     "stop": volume.stop.as_str(),
                 }))
                 .collect::<Vec<_>>(),
@@ -1482,7 +1550,7 @@ pub fn run_worker_pass() -> Result<Ledger, String> {
     let host_cache = crate::host_state::default_host_cache_dir();
     lower_priority();
     let mut lock = WorkerLock::acquire(&host_state)?;
-    let (budgets, _) = Budgets::load(&host_state);
+    let (budgets, budget_error) = Budgets::load(&host_state);
     let inputs = PassInputs {
         host_state: &host_state,
         roots: roots(&host_state, host_cache.as_deref()),
@@ -1491,6 +1559,7 @@ pub fn run_worker_pass() -> Result<Ledger, String> {
         measure_budget: MEASURE_BUDGET,
         pace: PACE,
         registry: host_state.join("host-resources.db"),
+        budget_error,
     };
     let ledger = run_pass(inputs, Some(&mut lock)).map_err(|error| error.to_string())?;
     // Host temp folders are read, never evicted: a separate bounded reading

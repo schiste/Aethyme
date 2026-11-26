@@ -390,10 +390,14 @@ total 16 GiB, host cache total 12 GiB, storage roots total 48 GiB, free-space
 floor 10 GiB and hard minimum 2 GiB per volume. `<host state>/storage.toml`
 `[budget]` overrides them. Recovery archives have a free-space floor of their
 own: the larger of `free_floor_bytes` and `recovery_archive_free_floor_percent`
-(default 10) of the volume's size. Below it, the worker removes the oldest
+(default 10) of the volume's size, the share capped at
+`recovery_archive_free_floor_cap_bytes` (default 20 GiB), so a 1 TB disk gets a
+20 GiB floor, not 93 GiB. Below it, the worker removes the oldest
 archives on that volume that may go (landed, past their promised retention,
 not kept), across repositories and paced, until free space is back at the
-floor; archives holding unlanded or uncommitted work are never removed for it. `gc plan` reads a gate cache entry's size from the
+floor; archives holding unlanded or uncommitted work are never removed for it.
+A `storage.toml` the worker cannot read leaves it on default budgets and is
+advised as `storage.budget-config-invalid` in `broker status`. `gc plan` reads a gate cache entry's size from the
 ledger when the worker measured it within the hour instead of walking it.
 
 Host temp folders (the per-user temp folder on macOS and `/tmp`) are not

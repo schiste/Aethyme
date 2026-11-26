@@ -7,7 +7,10 @@
 //! volume. With several repositories, archives within every bound can still
 //! fill the disk host state lives on. The floor is the larger of
 //! `[budget] free_floor_bytes` and `recovery_archive_free_floor_percent` of
-//! the volume's size. While the volume's free space is below it, the worker
+//! the volume's size, the share capped at
+//! `recovery_archive_free_floor_cap_bytes`: with the defaults (10 GiB, 10%,
+//! 20 GiB) a 1 TB disk (931 GiB) gets 20 GiB, not 93 GiB, and a 100 GB disk
+//! 10 GiB. While the volume's free space is below it, the worker
 //! removes the oldest removable archives on that volume, whichever
 //! repository they belong to, until the free space it projects (the
 //! reading plus what it removed) is back at the floor.
@@ -17,7 +20,15 @@
 //! creation time, still being written, or not proven landed (commits not in
 //! the default branch, or any patch, untracked or ignored file), the last
 //! proven only when the archive is reached. Removals are paced like every
-//! unattended deletion, even under pressure, and stop at a time budget.
+//! unattended deletion, even under pressure, and stop at a time budget
+//! shared by every volume in the pass.
+//!
+//! A floor the archives cannot meet is made visible: when the bytes every
+//! archive not already kept by a rule holds (an upper bound, landing not yet
+//! proven) could not close a quarter of the shortfall, the archives that can
+//! go still go, and the stop is `cannot_close` rather than `protected_only`
+//! (on APFS, free space excludes purgeable space, so a floor can be out of
+//! reach of anything Aethyme removes).
 //!
 //! This module holds the selection rules; `check::run_pass` applies them.
 
@@ -32,6 +43,9 @@ pub enum FloorStop {
     FloorMet,
     /// Below the floor, but every archive left is one a rule keeps.
     ProtectedOnly,
+    /// Below the floor, and even every archive no rule kept in advance
+    /// could not have closed a quarter of the shortfall.
+    CannotClose,
     /// Below the floor when the time budget ran out (or the worker lock
     /// was lost); the next pass continues.
     Deadline,
@@ -44,6 +58,7 @@ impl FloorStop {
         match self {
             Self::FloorMet => "floor_met",
             Self::ProtectedOnly => "protected_only",
+            Self::CannotClose => "cannot_close",
             Self::Deadline => "deadline",
             Self::Unsupported => "unsupported",
         }
@@ -54,6 +69,7 @@ impl FloorStop {
         match self {
             Self::FloorMet => "storage_archive_floor_stop_floor_met",
             Self::ProtectedOnly => "storage_archive_floor_stop_protected_only",
+            Self::CannotClose => "storage_archive_floor_stop_cannot_close",
             Self::Deadline => "storage_archive_floor_stop_deadline",
             Self::Unsupported => "storage_archive_floor_stop_unsupported",
         }
@@ -74,12 +90,14 @@ pub struct FloorArchive {
 }
 
 /// Progress towards the floor on one volume: the free space read before
-/// any removal (`None` when it cannot be read) plus the bytes removed since.
+/// any removal (`None` when it cannot be read) plus the bytes removed since,
+/// and the bytes of the archives no rule kept in advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorProgress {
     free_before: Option<u64>,
     floor: u64,
     freed: u64,
+    removable: u64,
 }
 
 impl FloorProgress {
@@ -88,7 +106,28 @@ impl FloorProgress {
             free_before,
             floor,
             freed: 0,
+            removable: 0,
         }
+    }
+
+    /// The progress on `archives`, counting what they could free at most.
+    pub fn for_archives(archives: &[FloorArchive], free_before: Option<u64>, floor: u64) -> Self {
+        Self {
+            removable: archives
+                .iter()
+                .filter(|archive| !archive.protected)
+                .fold(0, |sum: u64, archive| sum.saturating_add(archive.bytes)),
+            ..Self::new(free_before, floor)
+        }
+    }
+
+    /// Whether every archive no rule keeps in advance could not close a
+    /// quarter of the shortfall the volume started with.
+    pub fn cannot_close(&self) -> bool {
+        self.free_before.is_some_and(|free| {
+            let shortfall = self.floor.saturating_sub(free);
+            shortfall > 0 && self.removable.saturating_mul(4) < shortfall
+        })
     }
 
     /// Whether the projected free space is still below the floor. An
@@ -109,6 +148,8 @@ impl FloorProgress {
             FloorStop::Unsupported
         } else if !self.short() {
             FloorStop::FloorMet
+        } else if self.cannot_close() {
+            FloorStop::CannotClose
         } else if out_of_time {
             FloorStop::Deadline
         } else {
@@ -131,7 +172,7 @@ pub fn floor_order(archives: &[FloorArchive]) -> Vec<usize> {
 /// size, and why it stops: oldest first, protected ones never, and no more
 /// once the projected free space reaches the floor.
 pub fn select(archives: &[FloorArchive], free: Option<u64>, floor: u64) -> (Vec<usize>, FloorStop) {
-    let mut progress = FloorProgress::new(free, floor);
+    let mut progress = FloorProgress::for_archives(archives, free, floor);
     let mut chosen = Vec::new();
     for index in floor_order(archives) {
         if !progress.short() {
@@ -152,9 +193,14 @@ pub struct FloorReport {
     /// Free space before and after the removals; `None` when unreadable.
     pub free_before_bytes: Option<u64>,
     pub free_after_bytes: Option<u64>,
-    /// Archives removed for the floor, and their measured bytes.
+    /// Archives removed for the floor, and their measured bytes (complete
+    /// removals only).
     pub pruned: usize,
     pub pruned_bytes: u64,
+    /// Removals the deadline interrupted after the rename: gone from their
+    /// place, the remainder swept by the next pass; not counted as freed.
+    #[serde(default)]
+    pub interrupted: usize,
     pub stop: FloorStop,
 }
 
@@ -198,8 +244,10 @@ mod tests {
                 ..archive(3, 5 * GIB)
             },
         ];
+        // 8 free of 10: the one unprotected archive could close the 2 GiB
+        // shortfall's quarter, but not all of it.
         assert_eq!(
-            select(&archives, Some(GIB), 10 * GIB),
+            select(&archives, Some(8 * GIB), 10 * GIB),
             (vec![1], FloorStop::ProtectedOnly)
         );
         let all_protected = [FloorArchive {
@@ -208,7 +256,7 @@ mod tests {
         }];
         assert_eq!(
             select(&all_protected, Some(GIB), 10 * GIB),
-            (vec![], FloorStop::ProtectedOnly)
+            (vec![], FloorStop::CannotClose)
         );
     }
 
@@ -256,11 +304,40 @@ mod tests {
 
     #[test]
     fn a_stop_on_time_is_a_deadline_only_while_short() {
-        let mut progress = FloorProgress::new(Some(GIB), 2 * GIB);
+        let mut progress = FloorProgress::for_archives(&[archive(1, GIB)], Some(GIB), 2 * GIB);
         assert_eq!(progress.stop(true), FloorStop::Deadline);
         assert_eq!(progress.stop(false), FloorStop::ProtectedOnly);
         progress.record(GIB);
         assert_eq!(progress.stop(true), FloorStop::FloorMet);
+    }
+
+    /// Even every unprotected archive could not close a quarter of the
+    /// shortfall: they still go, and the stop says the floor is out of reach.
+    #[test]
+    fn a_floor_out_of_reach_is_reported_as_cannot_close() {
+        let archives = [
+            archive(1, GIB),
+            FloorArchive {
+                protected: true,
+                ..archive(2, 50 * GIB)
+            },
+        ];
+        // Shortfall 10 GiB; 1 GiB removable is under a quarter.
+        assert_eq!(
+            select(&archives, Some(0), 10 * GIB),
+            (vec![0], FloorStop::CannotClose)
+        );
+        // 3 GiB removable closes over a quarter: protected_only.
+        let archives = [archive(1, 3 * GIB)];
+        assert_eq!(
+            select(&archives, Some(0), 10 * GIB),
+            (vec![0], FloorStop::ProtectedOnly)
+        );
+        let progress = FloorProgress::for_archives(&archives, Some(0), 10 * GIB);
+        assert!(!progress.cannot_close());
+        assert_eq!(progress.stop(true), FloorStop::Deadline);
+        let hopeless = FloorProgress::for_archives(&archives, Some(0), 100 * GIB);
+        assert_eq!(hopeless.stop(true), FloorStop::CannotClose);
     }
 
     #[test]
@@ -268,7 +345,15 @@ mod tests {
         let budgets = super::super::Budgets::default();
         assert_eq!(budgets.recovery_archive_floor(0), 10 * GIB);
         assert_eq!(budgets.recovery_archive_floor(50 * GIB), 10 * GIB);
-        assert_eq!(budgets.recovery_archive_floor(500 * GIB), 50 * GIB);
+        assert_eq!(budgets.recovery_archive_floor(150 * GIB), 15 * GIB);
+        // The share is capped: 20 GiB for a 1 TB disk, not 93 GiB.
+        assert_eq!(budgets.recovery_archive_floor(1_000_000_000_000), 20 * GIB);
+        assert_eq!(budgets.recovery_archive_floor(500 * GIB), 20 * GIB);
+        let uncapped = super::super::Budgets {
+            recovery_archive_free_floor_cap_bytes: u64::MAX,
+            ..budgets.clone()
+        };
+        assert_eq!(uncapped.recovery_archive_floor(500 * GIB), 50 * GIB);
         let fixed_only = super::super::Budgets {
             recovery_archive_free_floor_percent: 0,
             ..budgets.clone()
@@ -281,9 +366,6 @@ mod tests {
         };
         assert_eq!(off.recovery_archive_floor(500 * GIB), 0);
         assert!(!FloorProgress::new(Some(0), 0).short());
-        assert_eq!(
-            super::super::Budgets::default().recovery_archive_floor(u64::MAX),
-            u64::MAX / 10
-        );
+        assert_eq!(uncapped.recovery_archive_floor(u64::MAX), u64::MAX / 10);
     }
 }

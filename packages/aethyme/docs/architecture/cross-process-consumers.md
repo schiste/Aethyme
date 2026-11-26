@@ -339,37 +339,63 @@ time), `storage_host_temp_partial` (a root left partial by the deadline) and
 Recovery archive free-space floor (2026-11-26): each worker pass, after the
 other evictions, applies a floor to every volume holding measured recovery
 archives (host state): the larger of `[budget] free_floor_bytes` (10 GiB) and
-new `[budget] recovery_archive_free_floor_percent` (default 10, `0` leaves the
-fixed floor alone) of the volume's size. While the volume's free space
-(`statvfs`) is below it, the oldest archives on that volume, whichever
-repository they belong to, are removed until the projected free space (the
-reading plus the measured bytes removed) is back at the floor. Never removed
-for the floor: an archive with its owner's keep marker, within its promised
-minimum retention, without a creation time, still being written, or not
-proven landed (re-checked just before removal, as for the budget). Removals
-are paced by the worker's pace even under pressure, share a 60-second budget
-per pass, and are renamed aside first (a removal the budget stops leaves a
-remainder the next pass sweeps). Pressure no longer empties the recovery
-archive budget or removes every landed archive unpaced: below the floor the
-archive floor alone answers it. The pass report (`storage run --json`,
-`storage status --json` `last_pass`) adds `archive_floor[]` (`device`,
-`floor_bytes`, `free_before_bytes`, `free_after_bytes`, `pruned`,
-`pruned_bytes`, `stop` one of `floor_met`, `protected_only`, `deadline`,
-`unsupported`) and the phase `archive_floor`; floor removals are listed in
-`evicted`, and archives kept for the floor in `skipped` with `(archive
-floor)`. Command metrics: span `storage_archive_floor` (the whole step),
-`storage_archive_floor_probe` (each free-space reading) and
-`storage_archive_floor_prune` (removals on a volume below the floor);
-counters `storage_archive_floor_pruned` (one per archive removed),
-`storage_archive_floor_kept` (one per archive a rule kept when reached) and
-one of `storage_archive_floor_stop_floor_met`, `_stop_protected_only`,
-`_stop_deadline` (the budget ran out, or the worker lock was lost) or
-`_stop_unsupported` (free space unreadable: the floor is skipped) per volume;
-attachment `storage_archive_floor` (`volumes[]` with the report's fields
-except `device`). An older binary on the same host rejects a `storage.toml`
-that sets `recovery_archive_free_floor_percent` and runs with default
-budgets, so set it only once every binary on the host is at least this
-version.
+new `[budget] recovery_archive_free_floor_percent` (default 10) of the
+volume's size, that share capped at new
+`recovery_archive_free_floor_cap_bytes` (default 20 GiB; either at `0` leaves
+the fixed floor alone). A 1 TB disk (931 GiB) gets 20 GiB, not 93 GiB; a
+100 GB disk gets 10 GiB. While the volume's free space (`statvfs`
+`f_bavail`, which on APFS excludes purgeable space) is below it, the oldest
+archives on that volume, whichever repository they belong to, are removed
+until the projected free space (the reading plus the measured bytes of
+completed removals) is back at the floor. Never removed for the floor: an
+archive with its owner's keep marker, within its promised minimum retention,
+without a creation time, still being written, or not proven landed. Landing
+and retention are re-checked just before removal, then the keep marker is
+read last, immediately before the rename (the budget and age-expiry
+removals now read the marker at that point too, so a kept archive is no
+longer removed for the class budget either). Removals are paced by the
+worker's pace even under pressure, share one 60-second deadline for the
+whole pass (every volume included), and are renamed aside first; a removal
+the deadline interrupts after the rename is not counted as freed (field
+`interrupted`; the next pass sweeps the remainder) and ends the step with
+`deadline`. Behaviour changes: pressure (a volume below `free_floor_bytes`)
+no longer empties the recovery archive budget or removes every landed
+archive at once and unpaced; and a root over its total (`host state` over
+`host_state_total_bytes`) no longer removes recovery archives unless their
+class is over `recovery_archives_bytes`: below the floor the archive floor
+alone answers. When even every archive no rule kept in advance (an upper
+bound: landing is proven only when an archive is reached) could not close a
+quarter of the shortfall, the archives that can go still go and the stop is
+`cannot_close`, so a floor out of reach is visible rather than silently
+pruning every removable archive on each pass. The pass report (`storage run
+--json`, `storage status --json` `last_pass`) adds `archive_floor[]`
+(`device`, `floor_bytes`, `free_before_bytes`, `free_after_bytes`, `pruned`,
+`pruned_bytes`, `interrupted`, `stop` one of `floor_met`, `protected_only`,
+`cannot_close`, `deadline`, `unsupported`) and the phase `archive_floor`;
+completed floor removals are listed in `evicted`, archives a rule kept when
+reached in `skipped` with `(archive floor)`. Command metrics: span
+`storage_archive_floor` (the whole step), `storage_archive_floor_probe`
+(each free-space reading) and `storage_archive_floor_prune` (removals on a
+volume below the floor); counters `storage_archive_floor_pruned` (one per
+completed removal), `storage_archive_floor_interrupted` (one per removal the
+deadline stopped after the rename), `storage_archive_floor_kept` (one per
+archive refused when reached: not proven landed, within its retention, or
+its keep marker found at the last read), `storage_archive_floor_remove_failed`
+(one per removal that failed) and, per volume, one of
+`storage_archive_floor_stop_floor_met`, `_stop_protected_only`,
+`_stop_cannot_close`, `_stop_deadline` (the pass deadline passed, a removal
+was interrupted, or the worker lock was lost) or `_stop_unsupported` (free
+space unreadable: the floor is skipped); attachment `storage_archive_floor`
+(`volumes[]` with the report's fields except `device`). A `storage.toml` this
+binary cannot read (a bad value, or a key it does not know) makes the
+worker run on default budgets as before, now recorded: pass report field
+`budget_error`, counter `storage_budget_config_invalid` (one per such pass),
+a `Warning:` line in `storage status`, and `broker status` advice
+`storage.budget-config-invalid` (warning, with the parse error as evidence;
+counter `storage_budget_config_invalid_advised`). An older binary on the
+same host rejects a `storage.toml` that sets either new key and runs with
+default budgets, so set them only once every binary on the host is at least
+this version.
 
 Recovery archive landing proofs (2026-11-23): whether an archive's commits
 are in its repository's default branch is answered by one prover per process

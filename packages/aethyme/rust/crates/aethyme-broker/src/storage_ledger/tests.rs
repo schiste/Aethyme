@@ -53,6 +53,7 @@ fn pass(host_state: &Path, roots: Vec<Root>, budgets: Budgets) -> super::Ledger 
             measure_budget: Duration::from_secs(60),
             pace: Duration::ZERO,
             registry,
+            budget_error: None,
         },
         None,
     )
@@ -469,6 +470,7 @@ fn pass_with_free(
             measure_budget: Duration::from_secs(60),
             pace: Duration::ZERO,
             registry,
+            budget_error: None,
         },
         None,
     )
@@ -557,9 +559,11 @@ fn the_archive_floor_removes_the_oldest_removable_archives_until_met() {
         assert!(present(&host_state, id), "{id}");
     }
 
-    // Far short: every removable archive goes, the protected ones stay.
+    // Short by more than the two landed archives hold (about 66 KB each),
+    // within reach of what no rule kept in advance: every removable archive
+    // goes, the protected ones stay.
     let (_dir, host_state) = setup();
-    let ledger = pass_with_free(&host_state, budgets.clone(), Some((0, 0)));
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 300_000, 0)));
     let report = ledger.last_pass.unwrap();
     assert_eq!(report.archive_floor[0].pruned, 2, "{report:?}");
     assert_eq!(report.archive_floor[0].stop, FloorStop::ProtectedOnly);
@@ -567,6 +571,37 @@ fn the_archive_floor_removes_the_oldest_removable_archives_until_met() {
     for id in ["older-unlanded", "kept-landed", "young-landed"] {
         assert!(present(&host_state, id), "{id}");
     }
+
+    // Far short: the same archives go, and the stop says the archives could
+    // never close the shortfall.
+    let (_dir, host_state) = setup();
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((0, 0)));
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(report.archive_floor[0].pruned, 2, "{report:?}");
+    assert_eq!(report.archive_floor[0].stop, FloorStop::CannotClose);
+
+    // A keep marker written after the landing proof, just before removal,
+    // keeps the archive; the next one goes in its place.
+    let (_dir, host_state) = setup();
+    check::BEFORE_ARCHIVE_REMOVAL_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|path: &Path| {
+            if path.ends_with("old-landed") {
+                fs::write(super::keep_marker(path), "").unwrap();
+            }
+        }));
+    });
+    let ledger = pass_with_free(&host_state, budgets.clone(), Some((floor - 1, 0)));
+    check::BEFORE_ARCHIVE_REMOVAL_FOR_TEST.with(|hook| *hook.borrow_mut() = None);
+    let report = ledger.last_pass.unwrap();
+    assert!(present(&host_state, "old-landed"), "{report:?}");
+    assert!(!present(&host_state, "mid-landed"), "{report:?}");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|line| line.contains("old-landed (archive floor): kept by the owner's marker")),
+        "{report:?}"
+    );
 
     // At the floor, or with the volume unreadable: nothing goes.
     let (_dir, host_state) = setup();
@@ -579,6 +614,114 @@ fn the_archive_floor_removes_the_oldest_removable_archives_until_met() {
     assert!(report.evicted.is_empty(), "{report:?}");
     assert_eq!(report.archive_floor[0].stop, FloorStop::Unsupported);
     assert_eq!(report.archive_floor[0].free_before_bytes, None);
+}
+
+/// One deadline covers every volume of a pass: once it passed, no volume
+/// gets a fresh budget, and each reports the deadline with nothing removed.
+#[test]
+fn the_archive_floor_deadline_is_one_per_pass_across_volumes() {
+    use super::archive_floor::FloorStop;
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let repository = dir.path().join("repository");
+    fs::create_dir_all(&host_state).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init", "-q", "-b", "main"]);
+    fs::write(repository.join("a"), "a").unwrap();
+    git(&repository, &["add", "a"]);
+    git(&repository, &["commit", "-q", "-m", "a"]);
+    let landed = git(&repository, &["rev-parse", "HEAD"]);
+    git(
+        &repository,
+        &["update-ref", "refs/remotes/origin/main", &landed],
+    );
+    archive(&host_state, "old-landed", &repository, &landed, 40);
+    archive(&host_state, "mid-landed", &repository, &landed, 30);
+    empty_registry(&host_state);
+    let floor = 1_000_000_000;
+    let budgets = Budgets {
+        free_floor_bytes: floor,
+        recovery_archive_free_floor_percent: 0,
+        ..Budgets::default()
+    };
+    // Measured by a pass at the floor (nothing removed).
+    let mut ledger = pass_with_free(&host_state, budgets.clone(), Some((floor, 0)));
+    // The same archives seen on a second volume.
+    let mut second = ledger
+        .items
+        .iter()
+        .find(|item| item.class == Class::RecoveryArchives)
+        .expect("archives measured")
+        .clone();
+    second.device = second.device.wrapping_add(1);
+    ledger.items.push(second);
+    let mut free = |_: &Path| Some((floor - 100_000, 0));
+    let mut report = super::PassReport::default();
+    let reports = check::archive_floor_pass(
+        &mut ledger,
+        &budgets,
+        &mut free,
+        &host_state.join("host-resources.db"),
+        Duration::ZERO,
+        Instant::now(),
+        None,
+        None,
+        &mut report,
+    );
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    for volume in &reports {
+        assert_eq!(volume.stop, FloorStop::Deadline, "{reports:?}");
+        assert_eq!(volume.pruned, 0);
+    }
+    assert!(report.evicted.is_empty());
+    for id in ["old-landed", "mid-landed"] {
+        assert!(
+            host_state
+                .join("recovery-archives/example-0123")
+                .join(id)
+                .exists()
+        );
+    }
+}
+
+/// An unreadable `storage.toml` is recorded in the pass report and advised.
+#[test]
+fn an_invalid_budget_file_is_reported_and_advised() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    fs::write(
+        host_state.join(super::BUDGET_FILE),
+        "[budget]\nno_such_key = 1\n",
+    )
+    .unwrap();
+    let (budgets, error) = Budgets::load(host_state);
+    assert_eq!(budgets, Budgets::default());
+    let error = error.expect("rejected");
+    let advice = super::cli::status_advice(host_state);
+    assert!(
+        advice
+            .iter()
+            .any(|entry| entry.id == "storage.budget-config-invalid"
+                && entry.evidence == vec![error.clone()]),
+        "{advice:?}"
+    );
+    let registry = host_state.join("host-resources.db");
+    let mut free = |_: &Path| Some((u64::MAX / 2, u64::MAX / 2));
+    let ledger = check::run_pass(
+        PassInputs {
+            host_state,
+            roots: vec![root(host_state, RootKind::HostState)],
+            budgets,
+            free: &mut free,
+            measure_budget: Duration::from_secs(60),
+            pace: Duration::ZERO,
+            registry,
+            budget_error: Some(error.clone()),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(ledger.last_pass.unwrap().budget_error, Some(error));
 }
 
 // Must-fix 3: no walk of report-only classes; walks resume within deadlines
@@ -951,6 +1094,7 @@ fn a_worker_that_lost_its_lock_removes_nothing_more() {
             measure_budget: Duration::from_secs(60),
             pace: Duration::ZERO,
             registry,
+            budget_error: None,
         },
         Some(&mut lock),
     )
