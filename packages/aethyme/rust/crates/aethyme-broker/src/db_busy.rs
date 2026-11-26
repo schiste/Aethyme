@@ -228,17 +228,40 @@ fn install_holder_hooks(conn: &Connection, path: PathBuf) {
     conn.rollback_hook(Some(move || state.disarm()));
 }
 
+/// Largest holder record read back; a real one is under 200 bytes.
+const MAX_HOLDER_RECORD_BYTES: u64 = 4096;
+
+/// Distinguishes this process's temporary record files.
+static HOLDER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write the record to a fresh private file beside it and rename that into
+/// place. Nothing at the record's name is ever opened for writing, so a
+/// symlink planted there is replaced, not followed.
 fn write_holder(path: &Path, holder: &WriterHolder) -> std::io::Result<()> {
     use std::io::Write as _;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("holder record path has no name"))?;
+    let sequence = HOLDER_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_file_name(format!("{name}.{}.{sequence}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    let mut file = options.open(path)?;
-    file.write_all(serde_json::to_string(holder)?.as_bytes())
+    let written = options.open(&temporary).and_then(|mut file| {
+        file.write_all(serde_json::to_string(holder)?.as_bytes())?;
+        std::fs::rename(&temporary, path)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// The recorded write-lock holder of `db_path`, if its record names a live
@@ -275,9 +298,53 @@ pub(crate) fn long_held_write_lock(db_path: &Path) -> Option<LongHeldWriteLock> 
 }
 
 fn read_live_holder(path: &Path) -> Option<WriterHolder> {
-    let bytes = std::fs::read(path).ok()?;
-    let holder: WriterHolder = serde_json::from_slice(&bytes).ok()?;
+    let holder = parse_holder(&read_holder_bytes(path)?)?;
     process_alive(holder.pid).then_some(holder)
+}
+
+/// The record's bytes, only from a private regular file this user owns, not
+/// through a symlink, and at most [`MAX_HOLDER_RECORD_BYTES`].
+fn read_holder_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid || metadata.mode() & 0o022 != 0 || metadata.nlink() != 1 {
+            return None;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_HOLDER_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_HOLDER_RECORD_BYTES).then_some(bytes)
+}
+
+/// A record is accepted only when every field is one this module writes:
+/// its command must already be a clean label, so nothing read from the file
+/// (escape sequences, control characters, paths) reaches an error or status.
+fn parse_holder(bytes: &[u8]) -> Option<WriterHolder> {
+    let holder: WriterHolder = serde_json::from_slice(bytes).ok()?;
+    let valid = holder.pid > 0
+        && holder.since_ms > 0
+        && !holder.command.is_empty()
+        && holder.command.len() <= MAX_COMMAND_LABEL
+        && sanitize_label(&holder.command) == holder.command;
+    valid.then_some(holder)
 }
 
 #[cfg(unix)]
@@ -576,6 +643,74 @@ mod tests {
                 .contains("(`aethyme broker gc __continue-artifacts`) for 42 s"),
             "{}",
             lock.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_holder_path_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let record = holder_path(&path).unwrap();
+        let target = dir.path().join("victim");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &record).unwrap();
+        assert_eq!(
+            recorded_holder(&path),
+            None,
+            "a symlinked record is not read"
+        );
+
+        let conn = writer(&path);
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        let metadata = std::fs::symlink_metadata(&record).unwrap();
+        assert!(metadata.file_type().is_file(), "the link was replaced");
+        assert_eq!(
+            recorded_holder(&path).map(|holder| holder.pid),
+            Some(std::process::id())
+        );
+        conn.execute_batch("COMMIT").unwrap();
+        assert!(!record.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_record_with_escape_sequences_or_control_characters_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database(&dir);
+        let record = holder_path(&path).unwrap();
+        // JSON escapes: ESC sequences and a newline decode into the field.
+        for command in [
+            r"\u001b[31mgc\u001b[0m",
+            r"gc\nforged line",
+            "../../etc",
+            "",
+        ] {
+            let json = format!(
+                "{{\"pid\":{},\"command\":\"{command}\",\"since_ms\":1}}",
+                std::process::id()
+            );
+            let _ = std::fs::remove_file(&record);
+            std::fs::write(&record, json).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert_eq!(recorded_holder(&path), None, "{command:?}");
+        }
+        let oversized = format!(
+            "{{\"pid\":{},\"command\":\"gc\",\"since_ms\":1,\"pad\":\"{}\"}}",
+            std::process::id(),
+            "x".repeat(8192)
+        );
+        std::fs::write(&record, oversized).unwrap();
+        assert_eq!(
+            recorded_holder(&path),
+            None,
+            "an oversized record is rejected"
         );
     }
 

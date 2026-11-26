@@ -6451,8 +6451,16 @@ across a child process, a sleep or a network call.
   (mode 0600; JSON `pid`, `command`, `since_ms`) and removes it when the
   transaction commits or rolls back, or the connection closes. `command` is
   the command's metric surface (`gc.__trash-catchup`), never a path, id or
-  task text. A record naming a dead process is ignored. The window between
-  `BEGIN IMMEDIATE` and the first changed row is not recorded.
+  task text. The record is written to a fresh private file
+  (`O_CREAT|O_EXCL|O_NOFOLLOW`, `<database>.writer.<pid>.<n>.tmp`) renamed
+  into place, so a symlink planted at its name is replaced, never followed.
+  A reader accepts only a regular file it owns, not group- or
+  world-writable, with one link, opened without following links, of at most
+  4 KiB, whose `command` is already a clean label (ASCII letters, digits,
+  `.`, `_`, `-`; at most 96 characters); anything else, and a record naming
+  a dead process, is ignored. The window between `BEGIN IMMEDIATE` and the
+  first changed row is not recorded. The record is not part of SQLite's
+  sidecar checks, which probe files as SQLite journals.
 - **Named errors.** A wait that runs out of budget fails as before
   (`database is locked`), with `after waiting <n> s; database write lock held
   by pid <pid> (`aethyme broker <command>`) for <n> s` appended, or a note
