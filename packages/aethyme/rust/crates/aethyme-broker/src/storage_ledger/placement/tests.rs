@@ -47,13 +47,25 @@ impl Fixture {
     }
 
     fn migrate_until(&self, deadline: Instant, alive: &mut dyn FnMut() -> bool) -> PlacementReport {
+        self.migrate_in_lanes(MigrationDeadlines::fixed(deadline), alive, &mut || {
+            MigrationLane::Throttled
+        })
+    }
+
+    fn migrate_in_lanes(
+        &self,
+        deadlines: MigrationDeadlines,
+        alive: &mut dyn FnMut() -> bool,
+        lane: &mut dyn FnMut() -> MigrationLane,
+    ) -> PlacementReport {
         let mut report = PlacementReport::default();
         migrate_archives(
             &self.host_state,
             &self.storage,
-            deadline,
+            deadlines,
             Duration::ZERO,
             alive,
+            lane,
             &mut report,
         );
         report
@@ -65,6 +77,7 @@ impl Drop for Fixture {
         set_local_for_test(None);
         CRASH_FOR_TEST.with(|cell| cell.set(None));
         FORCE_COPY_FOR_TEST.with(|cell| cell.set(false));
+        FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(0));
     }
 }
 
@@ -584,4 +597,312 @@ fn the_root_is_recorded_even_with_no_host_archives() {
     // Recording again changes nothing.
     record_archive_storage_root(&fixture.host_state, &fixture.storage).unwrap();
     assert_eq!(recorded_archive_storage_roots(&fixture.host_state).len(), 1);
+}
+
+/// An archive of many small files in nested directories, as most are.
+fn many_file_archive(path: &Path, repository: &Path, files: usize) {
+    archive(path, repository);
+    for index in 0..files {
+        let directory = path.join(format!("untracked/group-{}", index % 7));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("file-{index}.txt")),
+            format!("contents of file {index}\n").repeat(index % 13 + 1),
+        )
+        .unwrap();
+    }
+}
+
+/// The lane is ordinary only with no foreground work and no critical memory
+/// pressure; only a process that began throttled is ever switched, and only
+/// when the lane asks for the other policy.
+#[test]
+fn the_migration_lane_and_its_disk_policy_follow_foreground_work() {
+    assert_eq!(migration_lane(false, false, false), MigrationLane::Ordinary);
+    for (foreground, memory, below_floor) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        assert_eq!(
+            migration_lane(foreground, memory, below_floor),
+            MigrationLane::Throttled,
+            "{foreground} {memory} {below_floor}"
+        );
+    }
+
+    // The throttled worker raises itself for the ordinary lane, drops back
+    // when foreground work appears, and otherwise leaves its policy alone.
+    assert_eq!(
+        migration_io_switch("throttle", false, MigrationLane::Ordinary),
+        Some(true)
+    );
+    assert_eq!(
+        migration_io_switch("throttle", true, MigrationLane::Throttled),
+        Some(false)
+    );
+    assert_eq!(
+        migration_io_switch("throttle", true, MigrationLane::Ordinary),
+        None
+    );
+    assert_eq!(
+        migration_io_switch("throttle", false, MigrationLane::Throttled),
+        None
+    );
+    // Any other starting policy is the process's own: never switched.
+    for base in ["idle", "important", "default", "unknown"] {
+        for raised in [false, true] {
+            for lane in [MigrationLane::Ordinary, MigrationLane::Throttled] {
+                assert_eq!(migration_io_switch(base, raised, lane), None, "{base}");
+            }
+        }
+    }
+    // The ordinary lane moves more per pass and does not pause.
+    assert!(MigrationLane::Ordinary.cap() > MigrationLane::Throttled.cap());
+    assert_eq!(
+        MigrationLane::Ordinary.pace(Duration::from_millis(200)),
+        Duration::ZERO
+    );
+    assert_eq!(
+        MigrationLane::Throttled.pace(Duration::from_millis(200)),
+        Duration::from_millis(200)
+    );
+}
+
+/// Past the throttled budget the ordinary lane keeps moving archives; once
+/// foreground work drops the lane to throttled, the pass stops and says so,
+/// and the next pass resumes after the last archive moved.
+#[test]
+fn the_ordinary_lane_continues_past_the_throttled_budget_until_foreground_work() {
+    let fixture = Fixture::new();
+    let repository = fixture.storage.with_file_name("gone-repository");
+    for id in ["key/1-a", "key/2-b", "key/3-c"] {
+        archive(&fixture.host_archive(id), &repository);
+    }
+    let started = Instant::now();
+    let deadlines = MigrationDeadlines {
+        throttled: started,
+        ordinary: started + Duration::from_secs(60),
+    };
+
+    // Ordinary for the first two archives, then foreground work appears.
+    let mut reads = 0;
+    let report = fixture.migrate_in_lanes(deadlines, &mut || true, &mut || {
+        reads += 1;
+        if reads <= 2 {
+            MigrationLane::Ordinary
+        } else {
+            MigrationLane::Throttled
+        }
+    });
+    assert_eq!(report.archives_migrated, 2, "{report:?}");
+    assert_eq!(report.archives_migrated_ordinary, 2, "{report:?}");
+    assert_eq!(report.migration_stop.as_deref(), Some("throttled"));
+    assert_eq!(report.migration_lane_changes, 1);
+    assert_eq!(report.moved, ["key/1-a", "key/2-b"]);
+    assert_eq!(report.archives_left, 1);
+    assert_eq!(
+        MigrationState::load(&fixture.host_state).cursor.as_deref(),
+        Some("key/2-b")
+    );
+
+    let report = fixture.migrate_in_lanes(deadlines, &mut || true, &mut || MigrationLane::Ordinary);
+    assert_eq!(report.archives_migrated, 1, "{report:?}");
+    assert_eq!(report.migration_stop.as_deref(), Some("done"));
+    for id in ["key/1-a", "key/2-b", "key/3-c"] {
+        assert!(fixture.stored_archive(id).join("manifest.json").is_file());
+        assert!(!fixture.host_archive(id).exists());
+    }
+}
+
+/// A parallel copy across volumes reproduces every file, directory and link;
+/// one out of time leaves the source intact and no staging copy, and the
+/// next attempt moves it whole.
+#[test]
+fn a_parallel_copy_out_of_time_leaves_the_source_and_moves_whole_later() {
+    let fixture = Fixture::new();
+    FORCE_COPY_FOR_TEST.with(|cell| cell.set(true));
+    let repository = fixture.storage.with_file_name("gone-repository");
+    many_file_archive(&fixture.host_archive("key/1-a"), &repository, 200);
+    let before = entries(&fixture.host_archive("key/1-a"));
+    let destination_root = fixture.storage.join(RECOVERY_ARCHIVE_DIRECTORY);
+    fs::create_dir_all(&destination_root).unwrap();
+
+    let outcome = migrate_one(
+        &fixture.host_state,
+        &destination_root,
+        "key/1-a",
+        Instant::now(),
+        &mut || {},
+    );
+    assert_eq!(outcome, Moved::OutOfTime);
+    assert_eq!(entries(&fixture.host_archive("key/1-a")), before);
+    assert!(!fixture.stored_archive("key/1-a").exists());
+    assert!(
+        !destination_root
+            .join("key")
+            .join(format!("{MIGRATING_PREFIX}1-a.partial"))
+            .exists(),
+        "an unfinished copy is removed"
+    );
+
+    let report = fixture.migrate();
+    assert_eq!(report.archives_migrated, 1, "{report:?}");
+    assert_eq!(report.files_migrated, 203, "{report:?}");
+    assert!(!fixture.host_archive("key/1-a").exists());
+    assert_eq!(entries(&fixture.stored_archive("key/1-a")), before);
+}
+
+/// The copy is made from one read of each source file: a source that
+/// changes after it was listed is caught by listing it again.
+#[test]
+fn a_source_changed_after_its_copy_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    many_file_archive(&source, dir.path(), 20);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let copied = copy_tree(&source, &dir.path().join("copy"), deadline)
+        .unwrap()
+        .unwrap();
+    assert_eq!(copied.files, 23);
+    assert_eq!(
+        tree_entries(&dir.path().join("copy"), deadline)
+            .unwrap()
+            .unwrap(),
+        copied.entries
+    );
+    assert_eq!(
+        source_unchanged(&source, &copied, deadline).unwrap(),
+        Some(true)
+    );
+
+    // Same size, new contents: within the racy window, read again even
+    // when the file system's timestamp tick hides the change.
+    fs::write(
+        source.join("untracked/deep/notes.txt"),
+        "WORK IN PROGRESS\n",
+    )
+    .unwrap();
+    assert_eq!(
+        source_unchanged(&source, &copied, deadline).unwrap(),
+        Some(false)
+    );
+    // A file added.
+    let copied = copy_tree(&source, &dir.path().join("again"), deadline)
+        .unwrap()
+        .unwrap();
+    fs::write(source.join("late.txt"), "late\n").unwrap();
+    assert_eq!(
+        source_unchanged(&source, &copied, deadline).unwrap(),
+        Some(false)
+    );
+}
+
+/// Moved archives are accounted in the ledger exactly as a full measurement
+/// would find them, with nothing noted for the next pass to walk again.
+#[test]
+fn moved_archives_are_accounted_without_measuring_the_roots_again() {
+    let fixture = Fixture::new();
+    FORCE_COPY_FOR_TEST.with(|cell| cell.set(true));
+    let repository = fixture.storage.with_file_name("gone-repository");
+    for id in ["key/1-a", "key/2-b"] {
+        many_file_archive(&fixture.host_archive(id), &repository, 30);
+    }
+    fs::create_dir_all(fixture.storage.join(RECOVERY_ARCHIVE_DIRECTORY)).unwrap();
+    let measure = |ledger: &mut Ledger| {
+        for item in &mut ledger.items {
+            item.walk = None;
+            assert!(super::super::measure_item(
+                item,
+                Instant::now() + Duration::from_secs(60),
+                &mut || {}
+            ));
+        }
+    };
+    let mut ledger = Ledger {
+        roots: vec![
+            super::super::Root::new(&fixture.host_state, RootKind::HostState),
+            super::super::Root::new(&fixture.storage, RootKind::Storage),
+        ],
+        ..Ledger::default()
+    };
+    super::super::discover(&mut ledger);
+    measure(&mut ledger);
+
+    let report = fixture.migrate();
+    assert_eq!(report.moved, ["key/1-a", "key/2-b"]);
+    let dirty = fixture.host_state.join(super::super::DIRTY_DIRECTORY);
+    let _ = fs::remove_dir_all(&dirty);
+    account_moved_archives(
+        &mut ledger,
+        &fixture.host_state,
+        &fixture.storage,
+        &report.moved,
+        &mut || {},
+    );
+    assert!(
+        super::super::read_names(&dirty).is_empty(),
+        "nothing is noted for measuring"
+    );
+
+    let mut fresh = ledger.clone();
+    measure(&mut fresh);
+    let archives = |ledger: &Ledger, root: &Path| {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.root == root && item.name == RECOVERY_ARCHIVE_DIRECTORY)
+            .unwrap();
+        let mut children: Vec<(String, u64)> = item
+            .children
+            .iter()
+            .map(|child| (child.name.clone(), child.bytes))
+            .collect();
+        children.sort();
+        (children, item.bytes)
+    };
+    assert_eq!(
+        archives(&ledger, fixture.storage.as_path()),
+        archives(&fresh, fixture.storage.as_path())
+    );
+    assert_eq!(
+        archives(&ledger, fixture.host_state.as_path()),
+        archives(&fresh, fixture.host_state.as_path())
+    );
+    assert_eq!(archives(&ledger, fixture.storage.as_path()).0.len(), 2);
+    assert!(archives(&ledger, fixture.host_state.as_path()).0.is_empty());
+}
+
+/// A copy placed but never flushed (the pass stopped, or its flush failed)
+/// is identical in the page cache only: the source stays until a flush of
+/// the placed copy succeeds, on that pass or a later one.
+#[test]
+fn a_placed_copy_is_flushed_before_its_source_is_removed() {
+    let fixture = Fixture::new();
+    FORCE_COPY_FOR_TEST.with(|cell| cell.set(true));
+    let repository = fixture.storage.with_file_name("gone-repository");
+    archive(&fixture.host_archive("key/1-a"), &repository);
+    let before = entries(&fixture.host_archive("key/1-a"));
+
+    // Placed, then the flush fails: the copy stays, the source too.
+    FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(1));
+    let report = fixture.migrate();
+    assert_eq!(report.archives_failed, 1, "{report:?}");
+    assert_eq!(entries(&fixture.stored_archive("key/1-a")), before);
+    assert_eq!(entries(&fixture.host_archive("key/1-a")), before);
+
+    // The next pass finds them identical, but its flush fails too: the
+    // source is not removed.
+    FLUSH_FAILURES_FOR_TEST.with(|cell| cell.set(1));
+    let report = fixture.migrate();
+    assert_eq!(report.archives_migrated, 0, "{report:?}");
+    assert_eq!(report.archives_failed, 1, "{report:?}");
+    assert_eq!(entries(&fixture.host_archive("key/1-a")), before);
+
+    // Once a flush succeeds, the source goes.
+    let report = fixture.migrate();
+    assert_eq!(report.archives_migrated, 1, "{report:?}");
+    assert!(!fixture.host_archive("key/1-a").exists());
+    assert_eq!(entries(&fixture.stored_archive("key/1-a")), before);
 }

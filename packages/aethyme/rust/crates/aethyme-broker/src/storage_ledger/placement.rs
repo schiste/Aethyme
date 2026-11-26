@@ -31,18 +31,29 @@
 //!
 //! Migration ([`migrate_archives`]): while recovery archives are placed on a
 //! storage root, each storage worker pass moves archives already in host
-//! state there, oldest name first from a persisted cursor, within
-//! [`MIGRATION_BUDGET`]. Never a partial archive (being written), never one
-//! without a manifest, and never while its repository's lifecycle lock is
-//! held or awaited (a restore or retirement in progress). Same volume: one
-//! rename. Another volume: copied into a `.partial` staging directory beside
-//! the destination, every file and directory synced, both trees compared
-//! entry by entry (type, size, SHA-256), renamed into place, and only then is
-//! the source renamed aside and deleted. A crash leaves either the source
-//! intact (the staging is removed on the next attempt) or two identical
-//! copies (the next attempt proves them identical and removes the source).
-//! Keep and dismissal markers are copied before the archive and removed from
-//! the source after it.
+//! state there, oldest name first from a persisted cursor. Never a partial
+//! archive (being written), never one without a manifest, and never while
+//! its repository's lifecycle lock is held or awaited (a restore or
+//! retirement in progress). Same volume: one rename. Another volume: copied
+//! into a `.partial` staging directory beside the destination, the files by
+//! [`COPY_THREADS`] threads, each file hashed (SHA-256) as it is read and
+//! handed to the device (`fsync`) once written, every directory too; then
+//! the copy is read back and compared entry by entry (type, size, SHA-256)
+//! with what was read, the source is listed again to prove it did not change
+//! while copied, the copy is renamed into place, and one device flush
+//! (macOS `F_FULLFSYNC`, which empties the device's whole write cache) makes
+//! all of it durable. Only then is the source renamed aside and deleted. A
+//! crash leaves either the source intact (the staging is removed on the next
+//! attempt) or two identical copies (the next attempt proves them identical
+//! and removes the source). Keep and dismissal markers are copied before the
+//! archive and removed from the source after it.
+//!
+//! The pace follows foreground work ([`migration_lane`]): while no
+//! foreground run (a dependency install, a gate) writes to either volume and
+//! memory is not critical, the migration runs at an ordinary process's disk
+//! priority, unpaced, for up to [`MIGRATION_BACKLOG_BUDGET`] per pass; as
+//! soon as one does, it drops back to the throttled disk policy, the pace and
+//! [`MIGRATION_BUDGET`] from the start of the pass.
 //!
 //! Gate caches are a cache: a host gate cache is never moved or reused once
 //! the placement is on a storage root; the worker evicts it
@@ -72,13 +83,28 @@ pub const ARCHIVE_STORAGE_ROOTS_FILE: &str = "storage-archive-roots.json";
 pub const ARCHIVE_STORAGE_ROOTS_LOCK_FILE: &str = "storage-archive-roots.lock";
 /// The migration's cursor and counters (`<host state>/storage-placement.json`).
 pub const MIGRATION_STATE_FILE: &str = "storage-placement.json";
-/// The longest one pass spends moving archives.
+/// The longest one pass spends moving archives while foreground work runs
+/// (the throttled lane).
 pub const MIGRATION_BUDGET: Duration = Duration::from_secs(60);
+/// The longest one pass spends moving archives while no foreground work
+/// runs (the ordinary lane): long enough to move a backlog of thousands of
+/// archives in one pass instead of 60 s every pass.
+pub const MIGRATION_BACKLOG_BUDGET: Duration = Duration::from_secs(20 * 60);
 /// A copy that started within the budget may run this much past it: a copy
 /// stopped half way is thrown away, so one large archive would never move.
 pub const MIGRATION_GRACE: Duration = Duration::from_secs(120);
-/// The most archives one pass moves.
+/// The most archives one pass moves in the throttled lane.
 pub const MIGRATIONS_PER_PASS: usize = 500;
+/// The most archives one pass moves in the ordinary lane.
+pub const MIGRATIONS_PER_ORDINARY_PASS: usize = 10_000;
+/// Threads copying, or hashing, one archive's files: archives are mostly
+/// small files, where each file's open, write and sync latency, not
+/// bandwidth, bounds a single thread.
+pub const COPY_THREADS: usize = 4;
+/// How often the lane (foreground work, memory pressure) is read again.
+const LANE_RESAMPLE: Duration = Duration::from_secs(1);
+/// The read buffer of one copy or hash thread.
+const COPY_BUFFER: usize = 1 << 17;
 /// The longest one pass spends evicting superseded host gate caches.
 pub const GATE_EVICTION_BUDGET: Duration = Duration::from_secs(30);
 /// Staging directory of a copy across volumes: `<prefix><archive>.partial`,
@@ -476,16 +502,32 @@ pub struct PlacementReport {
     pub storage_root: Option<PathBuf>,
     pub archives_migrated: u64,
     pub bytes_migrated: u64,
+    /// Files copied across volumes this pass (0 for renames).
+    #[serde(default)]
+    pub files_migrated: u64,
     /// Not moved this pass, for a reason a later pass may lift (partial,
     /// incomplete, its repository's lifecycle lock busy).
     pub archives_skipped: u64,
     pub archives_failed: u64,
     /// Archives still in host state once the pass stopped.
     pub archives_left: u64,
-    /// Why the migration stopped: `done`, `deadline`, `per_pass_cap` or
-    /// `lock_lost`.
+    /// Why the migration stopped: `done`, `deadline`, `throttled` (past
+    /// the throttled lane's budget while foreground work or memory pressure
+    /// holds it there), `per_pass_cap` or `lock_lost`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_stop: Option<String>,
+    /// How long the migration ran this pass.
+    #[serde(default)]
+    pub migration_elapsed_ms: u64,
+    /// Archives moved while in the ordinary lane (no foreground work).
+    #[serde(default)]
+    pub archives_migrated_ordinary: u64,
+    /// Times the lane changed (ordinary to throttled or back) this pass.
+    #[serde(default)]
+    pub migration_lane_changes: u64,
+    /// The ids moved this pass, for the ledger (not persisted).
+    #[serde(skip)]
+    pub moved: Vec<String>,
     pub host_gate_caches_evicted: u64,
     pub host_gate_cache_bytes_evicted: u64,
     /// The first reasons archives were skipped or failed, and host gate
@@ -533,11 +575,112 @@ impl MigrationState {
     }
 }
 
+/// How hard the migration may use the disks right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationLane {
+    /// No foreground work on either volume and memory not critical: an
+    /// ordinary process's disk priority, unpaced, the backlog budget.
+    Ordinary,
+    /// Foreground work, critical memory pressure or a destination volume
+    /// below its free floor: the worker's throttled disk policy, paced,
+    /// [`MIGRATION_BUDGET`].
+    Throttled,
+}
+
+impl MigrationLane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Throttled => "throttled",
+        }
+    }
+
+    /// The most archives one pass moves in this lane.
+    fn cap(self) -> usize {
+        match self {
+            Self::Ordinary => MIGRATIONS_PER_ORDINARY_PASS,
+            Self::Throttled => MIGRATIONS_PER_PASS,
+        }
+    }
+
+    /// The pause after each archive: none in the ordinary lane, where the
+    /// lane itself is read again between archives.
+    fn pace(self, pace: Duration) -> Duration {
+        match self {
+            Self::Ordinary => Duration::ZERO,
+            Self::Throttled => pace,
+        }
+    }
+}
+
+/// The lane for what the host does now: ordinary only while no foreground
+/// run writes to the source or destination volume, memory is not critical
+/// and the destination volume is not below its free floor (filling a volume
+/// short of space at full speed competes with whatever else needs it).
+pub fn migration_lane(
+    foreground_active: bool,
+    memory_critical: bool,
+    destination_below_floor: bool,
+) -> MigrationLane {
+    if foreground_active || memory_critical || destination_below_floor {
+        MigrationLane::Throttled
+    } else {
+        MigrationLane::Ordinary
+    }
+}
+
+/// Which process disk policy the migration should switch to, if any:
+/// `Some(true)` raise to an ordinary process's, `Some(false)` drop back to
+/// the throttle, `None` leave it. Only a process that was throttled when the
+/// migration began (the detached worker on macOS) is ever switched: any
+/// other policy (an operator's `storage run` on Linux, an unknown platform)
+/// is its own and stays.
+pub fn migration_io_switch(
+    base_policy: &str,
+    raised_now: bool,
+    lane: MigrationLane,
+) -> Option<bool> {
+    let raise = lane == MigrationLane::Ordinary;
+    (base_policy == "throttle" && raised_now != raise).then_some(raise)
+}
+
+/// When a pass stops migrating, by lane, both from the start of the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationDeadlines {
+    pub throttled: Instant,
+    pub ordinary: Instant,
+}
+
+impl MigrationDeadlines {
+    /// From `started`: [`MIGRATION_BUDGET`] and [`MIGRATION_BACKLOG_BUDGET`].
+    pub fn starting(started: Instant) -> Self {
+        Self {
+            throttled: started + MIGRATION_BUDGET,
+            ordinary: started + MIGRATION_BACKLOG_BUDGET,
+        }
+    }
+
+    /// One deadline whatever the lane.
+    pub fn fixed(deadline: Instant) -> Self {
+        Self {
+            throttled: deadline,
+            ordinary: deadline,
+        }
+    }
+
+    fn of(self, lane: MigrationLane) -> Instant {
+        match lane {
+            MigrationLane::Ordinary => self.ordinary,
+            MigrationLane::Throttled => self.throttled,
+        }
+    }
+}
+
 /// How one archive's move ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Moved {
-    /// Moved; the bytes copied (0 for a rename).
-    Done(u64),
+    /// Moved; the bytes and files copied (0 for a rename).
+    Done(u64, u64),
     /// Left in place for now.
     Skipped(&'static str),
     /// Left in place; something is wrong with it or its destination.
@@ -555,6 +698,9 @@ thread_local! {
     /// Tests: copy even when source and destination share a volume.
     pub(crate) static FORCE_COPY_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Tests: fail this many device flushes.
+    pub(crate) static FLUSH_FAILURES_FOR_TEST: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn crashed_for_test(point: &'static str) -> bool {
@@ -659,11 +805,111 @@ enum Entry {
     Link(PathBuf),
 }
 
-/// Every entry under `root` by relative path, never following a link;
-/// `Ok(None)` when `deadline` passed first.
-fn tree_entries(root: &Path, deadline: Instant) -> io::Result<Option<BTreeMap<PathBuf, Entry>>> {
-    use sha2::Digest as _;
-    let mut entries = BTreeMap::new();
+/// How a file looked when listed: a write, truncation, replacement or mode
+/// change between two listings changes it (the status-change time moves on
+/// every one of them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    bytes: u64,
+    modified_ns: i128,
+    changed_ns: i128,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn stamp(metadata: &fs::Metadata) -> Stamp {
+    use std::os::unix::fs::MetadataExt;
+    Stamp {
+        bytes: metadata.size(),
+        modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+            + i128::from(metadata.mtime_nsec()),
+        changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
+            + i128::from(metadata.ctime_nsec()),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn stamp(metadata: &fs::Metadata) -> Stamp {
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos() as i128);
+    Stamp {
+        bytes: metadata.len(),
+        modified_ns,
+        changed_ns: 0,
+        inode: 0,
+    }
+}
+
+/// One file of a listed tree.
+#[derive(Debug, Clone)]
+struct Listed {
+    relative: PathBuf,
+    stamp: Stamp,
+}
+
+/// What a listing records of one entry, to prove a tree unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Shape {
+    Directory,
+    File(Stamp),
+    Link(PathBuf),
+}
+
+/// A tree's entries, never following a link: directories parents first.
+#[derive(Debug, Default)]
+struct Listing {
+    /// The wall clock when the listing began, in nanoseconds.
+    listed_at_ns: i128,
+    directories: Vec<(PathBuf, fs::Permissions)>,
+    links: Vec<(PathBuf, PathBuf)>,
+    files: Vec<Listed>,
+}
+
+impl Listing {
+    fn shape(&self) -> BTreeMap<PathBuf, Shape> {
+        let mut shape = BTreeMap::new();
+        for (relative, _) in &self.directories {
+            shape.insert(relative.clone(), Shape::Directory);
+        }
+        for (relative, target) in &self.links {
+            shape.insert(relative.clone(), Shape::Link(target.clone()));
+        }
+        for file in &self.files {
+            shape.insert(file.relative.clone(), Shape::File(file.stamp));
+        }
+        shape
+    }
+
+    /// The compared entries, with each file's size and digest from `digests`
+    /// (in `files` order).
+    fn entries(&self, digests: Vec<(u64, [u8; 32])>) -> BTreeMap<PathBuf, Entry> {
+        let mut entries = BTreeMap::new();
+        for (relative, _) in &self.directories {
+            entries.insert(relative.clone(), Entry::Directory);
+        }
+        for (relative, target) in &self.links {
+            entries.insert(relative.clone(), Entry::Link(target.clone()));
+        }
+        for (file, (bytes, sha256)) in self.files.iter().zip(digests) {
+            entries.insert(file.relative.clone(), Entry::File { bytes, sha256 });
+        }
+        entries
+    }
+}
+
+/// List every entry under `root`, never following a link; `Ok(None)` when
+/// `deadline` passed first.
+fn list_tree(root: &Path, deadline: Instant) -> io::Result<Option<Listing>> {
+    let mut listing = Listing {
+        listed_at_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as i128),
+        ..Listing::default()
+    };
     let mut pending = vec![PathBuf::new()];
     while let Some(relative) = pending.pop() {
         if Instant::now() >= deadline {
@@ -671,83 +917,299 @@ fn tree_entries(root: &Path, deadline: Instant) -> io::Result<Option<BTreeMap<Pa
         }
         let path = root.join(&relative);
         let metadata = fs::symlink_metadata(&path)?;
-        let entry = if metadata.file_type().is_symlink() {
-            Entry::Link(fs::read_link(&path)?)
+        if metadata.file_type().is_symlink() {
+            listing.links.push((relative, fs::read_link(&path)?));
         } else if metadata.is_dir() {
             for child in fs::read_dir(&path)? {
                 pending.push(relative.join(child?.file_name()));
             }
-            Entry::Directory
+            listing.directories.push((relative, metadata.permissions()));
         } else if metadata.is_file() {
-            let mut file = fs::File::open(&path)?;
-            let mut hasher = sha2::Sha256::new();
-            let mut buffer = vec![0_u8; 1 << 16];
-            let mut bytes = 0_u64;
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                bytes += read as u64;
-                hasher.update(&buffer[..read]);
-            }
-            Entry::File {
-                bytes,
-                sha256: hasher.finalize().into(),
-            }
+            listing.files.push(Listed {
+                relative,
+                stamp: stamp(&metadata),
+            });
         } else {
             return Err(io::Error::other(format!(
                 "{} is not a file, directory or link",
                 path.display()
             )));
-        };
-        entries.insert(relative, entry);
+        }
     }
-    Ok(Some(entries))
+    Ok(Some(listing))
+}
+
+/// Run `work` on every file of `files` with up to [`COPY_THREADS`] threads,
+/// each with its own read buffer; the results in `files` order, the first
+/// error, or `Ok(None)` when `deadline` passed first. The command's
+/// telemetry recorder is handed to every thread.
+fn for_each_file<R: Send>(
+    files: &[Listed],
+    deadline: Instant,
+    work: &(dyn Fn(&Listed, &mut [u8]) -> io::Result<R> + Sync),
+) -> io::Result<Option<Vec<R>>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    if files.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let recorder = crate::phase_telemetry::active();
+    let threads = COPY_THREADS.clamp(1, files.len());
+    type Part<T> = io::Result<Option<Vec<(usize, T)>>>;
+    let parts: Vec<Part<R>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let recorder = recorder.clone();
+                let (next, stop) = (&next, &stop);
+                scope.spawn(move || -> Part<R> {
+                    let _installed = recorder.map(crate::phase_telemetry::install);
+                    let mut buffer = vec![0_u8; COPY_BUFFER];
+                    let mut done = Vec::new();
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return Ok(Some(done));
+                        }
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(file) = files.get(index) else {
+                            return Ok(Some(done));
+                        };
+                        if Instant::now() >= deadline {
+                            stop.store(true, Ordering::Relaxed);
+                            return Ok(None);
+                        }
+                        match work(file, &mut buffer[..]) {
+                            Ok(result) => done.push((index, result)),
+                            Err(error) => {
+                                stop.store(true, Ordering::Relaxed);
+                                return Err(error);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("a copy thread panicked")))
+            })
+            .collect()
+    });
+    let mut results = Vec::with_capacity(files.len());
+    let mut out_of_time = false;
+    for part in parts {
+        match part? {
+            Some(done) => results.extend(done),
+            None => out_of_time = true,
+        }
+    }
+    if out_of_time || results.len() != files.len() {
+        return Ok(None);
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(Some(
+        results.into_iter().map(|(_, result)| result).collect(),
+    ))
+}
+
+/// A file's size and SHA-256, read once.
+fn hash_file(path: &Path, buffer: &mut [u8]) -> io::Result<(u64, [u8; 32])> {
+    use sha2::Digest as _;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((bytes, hasher.finalize().into()))
+}
+
+/// Every entry under `root` by relative path, never following a link, files
+/// hashed by [`COPY_THREADS`] threads; `Ok(None)` when `deadline` passed
+/// first.
+fn tree_entries(root: &Path, deadline: Instant) -> io::Result<Option<BTreeMap<PathBuf, Entry>>> {
+    let Some(listing) = list_tree(root, deadline)? else {
+        return Ok(None);
+    };
+    let hash = |file: &Listed, buffer: &mut [u8]| hash_file(&root.join(&file.relative), buffer);
+    Ok(for_each_file(&listing.files, deadline, &hash)?.map(|digests| listing.entries(digests)))
+}
+
+/// Hand what was written to `file` (a file or a directory) to the device,
+/// without waiting for the device's own write cache: `fsync(2)` on macOS,
+/// where Rust's `sync_all` is `F_FULLFSYNC`, a flush of the device's whole
+/// cache on every call (the one [`flush_device`] makes once per archive).
+/// Elsewhere `sync_all` (Linux `fsync` already waits for the device).
+fn submit(file: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` owns a valid descriptor for the whole call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// Make everything submitted to the volume holding `directory` durable,
+/// that directory's entries included: `sync_all` on it, which is
+/// `F_FULLFSYNC` on macOS (it empties the device's write cache, so it covers
+/// every earlier [`submit`] on that volume).
+fn flush_device(directory: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FLUSH_FAILURES_FOR_TEST.with(|cell| {
+        let left = cell.get();
+        cell.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(io::Error::other("the device flush failed (test)"));
+    }
+    sync_directory(directory)
+}
+
+/// Copy one file, hashing what it reads: its size and SHA-256 as read.
+fn copy_file(from: &Path, to: &Path, buffer: &mut [u8]) -> io::Result<(u64, [u8; 32])> {
+    use sha2::Digest as _;
+    use std::io::Write as _;
+    let mut source = fs::File::open(from)?;
+    let permissions = source.metadata()?.permissions();
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut bytes = 0_u64;
+    loop {
+        let read = source.read(buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hasher.update(&buffer[..read]);
+        destination.write_all(&buffer[..read])?;
+    }
+    destination.set_permissions(permissions)?;
+    submit(&destination)?;
+    Ok((bytes, hasher.finalize().into()))
+}
+
+/// What [`copy_tree`] copied: the bytes and files, the entries as read from
+/// the source (to compare the copy with), and the source's listing (to
+/// prove it unchanged).
+#[derive(Debug)]
+struct Copied {
+    bytes: u64,
+    files: u64,
+    entries: BTreeMap<PathBuf, Entry>,
+    source: Listing,
 }
 
 /// Copy `source` to the new directory `destination`, never following a
-/// link, syncing every file and directory; the bytes copied, or `Ok(None)`
-/// when `deadline` passed first.
-fn copy_tree(source: &Path, destination: &Path, deadline: Instant) -> io::Result<Option<u64>> {
-    let mut bytes = 0_u64;
-    let mut directories = Vec::new();
-    let mut pending = vec![PathBuf::new()];
-    while let Some(relative) = pending.pop() {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let from = source.join(&relative);
-        let to = destination.join(&relative);
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
-            #[cfg(not(unix))]
+/// link: directories and links first, then the files by [`COPY_THREADS`]
+/// threads (each hashed as read and submitted once written), then every
+/// directory submitted deepest first. `Ok(None)` when `deadline` passed
+/// first. Nothing here waits for the device's cache: [`flush_device`] does,
+/// once, after the copy is in place.
+fn copy_tree(source: &Path, destination: &Path, deadline: Instant) -> io::Result<Option<Copied>> {
+    let Some(listing) = list_tree(source, deadline)? else {
+        return Ok(None);
+    };
+    if listing
+        .directories
+        .first()
+        .is_none_or(|(relative, _)| !relative.as_os_str().is_empty())
+    {
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            source.display()
+        )));
+    }
+    for (relative, _) in &listing.directories {
+        fs::create_dir(destination.join(relative))?;
+    }
+    for (relative, target) in &listing.links {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, destination.join(relative))?;
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, target);
             return Err(io::Error::other("links are not copied on this platform"));
-        } else if metadata.is_dir() {
-            fs::create_dir(&to)?;
-            for child in fs::read_dir(&from)? {
-                pending.push(relative.join(child?.file_name()));
-            }
-            directories.push((to, metadata.permissions()));
-        } else if metadata.is_file() {
-            bytes += fs::copy(&from, &to)?;
-            fs::File::open(&to)?.sync_all()?;
-        } else {
-            return Err(io::Error::other(format!(
-                "{} is not a file, directory or link",
-                from.display()
-            )));
         }
     }
-    // Deepest first, so each directory's entries are durable before it; its
-    // mode last, so a read-only directory was still writable while filled.
-    for (directory, permissions) in directories.into_iter().rev() {
-        fs::set_permissions(&directory, permissions)?;
-        sync_directory(&directory)?;
+    let copy = |file: &Listed, buffer: &mut [u8]| {
+        copy_file(
+            &source.join(&file.relative),
+            &destination.join(&file.relative),
+            buffer,
+        )
+    };
+    let Some(digests) = for_each_file(&listing.files, deadline, &copy)? else {
+        return Ok(None);
+    };
+    // Deepest first, so each directory's entries are submitted before it;
+    // its mode last, so a read-only directory was still writable while filled.
+    for (relative, permissions) in listing.directories.iter().rev() {
+        let directory = destination.join(relative);
+        fs::set_permissions(&directory, permissions.clone())?;
+        submit(&fs::File::open(&directory)?)?;
     }
-    Ok(Some(bytes))
+    Ok(Some(Copied {
+        bytes: digests.iter().map(|(bytes, _)| bytes).sum(),
+        files: digests.len() as u64,
+        entries: listing.entries(digests),
+        source: listing,
+    }))
+}
+
+/// A file changed this close to (or after) the start of its listing may
+/// change again within the same file system timestamp tick, unseen by its
+/// stamp: it is read again instead (as Git treats a "racily clean" file).
+const RACY_WINDOW_NS: i128 = 2_000_000_000;
+
+/// Whether `source` is still what `copied` read: it lists as it did (same
+/// entries, every file with the same size, inode, modification and
+/// status-change time), and every file changed within [`RACY_WINDOW_NS`] of
+/// the listing still has the digest that was copied. The copy, made from
+/// one read of each file, is then a copy of the archive as it is.
+/// `Ok(None)` when `deadline` passed first.
+fn source_unchanged(source: &Path, copied: &Copied, deadline: Instant) -> io::Result<Option<bool>> {
+    let Some(now) = list_tree(source, deadline)? else {
+        return Ok(None);
+    };
+    if now.shape() != copied.source.shape() {
+        return Ok(Some(false));
+    }
+    let racy_from = copied.source.listed_at_ns - RACY_WINDOW_NS;
+    let racy: Vec<Listed> = copied
+        .source
+        .files
+        .iter()
+        .filter(|file| file.stamp.modified_ns.max(file.stamp.changed_ns) >= racy_from)
+        .cloned()
+        .collect();
+    let hash = |file: &Listed, buffer: &mut [u8]| hash_file(&source.join(&file.relative), buffer);
+    let Some(digests) = for_each_file(&racy, deadline, &hash)? else {
+        return Ok(None);
+    };
+    Ok(Some(racy.iter().zip(digests).all(
+        |(file, (bytes, sha256))| {
+            copied.entries.get(&file.relative) == Some(&Entry::File { bytes, sha256 })
+        },
+    )))
 }
 
 /// Copy the keep and dismissal markers of `source` beside `destination`,
@@ -866,6 +1328,17 @@ fn migrate_one(
                 tree_entries(&destination, hard_deadline),
             ) {
                 (Ok(Some(left)), Ok(Some(right))) if left == right => {
+                    // Identical in the page cache is not durable: the pass
+                    // that placed it may have stopped (or failed) before its
+                    // device flush. Every copied file was submitted before
+                    // that rename, so this one flush makes it durable; the
+                    // source stays when it fails.
+                    let flush_span =
+                        crate::phase_telemetry::span("storage_placement_migrate_flush");
+                    if let Err(error) = flush_device(&destination_dir) {
+                        return Moved::Failed(format!("sync the destination: {error}"));
+                    }
+                    drop(flush_span);
                     match copy_markers(&source, &destination)
                         .and_then(|()| remove_source(host_state, id, beat))
                         .and_then(|()| remove_source_markers(&source))
@@ -875,7 +1348,7 @@ fn migrate_one(
                                 "storage_placement_archive_reconciled",
                                 Duration::ZERO,
                             );
-                            Moved::Done(0)
+                            Moved::Done(0, 0)
                         }
                         Err(error) => Moved::Failed(format!("remove the host copy: {error}")),
                     }
@@ -901,8 +1374,8 @@ fn migrate_one(
             Err(error) => return Moved::Failed(format!("rename: {error}")),
         }
     };
-    let copied = if renamed {
-        0
+    let (copied, files) = if renamed {
+        (0, 0)
     } else {
         let staging = destination_dir.join(format!("{MIGRATING_PREFIX}{name}.partial"));
         if fs::symlink_metadata(&staging).is_ok()
@@ -911,8 +1384,8 @@ fn migrate_one(
             return Moved::Failed(format!("remove an earlier staging copy: {error}"));
         }
         let copy_span = crate::phase_telemetry::span("storage_placement_migrate_copy");
-        let bytes = match copy_tree(&source, &staging, hard_deadline) {
-            Ok(Some(bytes)) => bytes,
+        let copied = match copy_tree(&source, &staging, hard_deadline) {
+            Ok(Some(copied)) => copied,
             Ok(None) => {
                 crate::warn_unrecorded(
                     "remove an unfinished archive copy",
@@ -929,12 +1402,14 @@ fn migrate_one(
             }
         };
         drop(copy_span);
+        // The copy read back once, against what was read from the source,
+        // and the source listed again: unchanged since it was listed.
         let verify_span = crate::phase_telemetry::span("storage_placement_migrate_verify");
         let verdict = match (
-            tree_entries(&source, hard_deadline),
             tree_entries(&staging, hard_deadline),
+            source_unchanged(&source, &copied, hard_deadline),
         ) {
-            (Ok(Some(left)), Ok(Some(right))) if left == right => None,
+            (Ok(Some(written)), Ok(Some(true))) if written == copied.entries => None,
             (Ok(None), _) | (_, Ok(None)) => Some(Moved::OutOfTime),
             (Ok(Some(_)), Ok(Some(_))) => Some(Moved::Failed(
                 "the copy differs from the source (changed while copied?)".into(),
@@ -959,12 +1434,15 @@ fn migrate_one(
         if let Err(error) = fs::rename(&staging, &destination) {
             return Moved::Failed(format!("place the copy: {error}"));
         }
-        bytes
+        (copied.bytes, copied.files)
     };
-    // The host copy goes only once the placed one is durable.
-    if let Err(error) = sync_directory(&destination_dir) {
+    // The host copy goes only once the placed one is durable: one device
+    // flush covers every file and directory submitted during the copy.
+    let flush_span = crate::phase_telemetry::span("storage_placement_migrate_flush");
+    if let Err(error) = flush_device(&destination_dir) {
         return Moved::Failed(format!("sync the destination: {error}"));
     }
+    drop(flush_span);
     if crashed_for_test("after_place") {
         return Moved::Failed("stopped after placing the copy (test)".into());
     }
@@ -973,11 +1451,13 @@ fn migrate_one(
     if let Err(error) = copy_markers(&source, &destination) {
         return Moved::Failed(format!("markers: {error}"));
     }
+    let remove_span = crate::phase_telemetry::span("storage_placement_migrate_remove_source");
     if fs::symlink_metadata(&source).is_ok()
         && let Err(error) = remove_source(host_state, id, beat)
     {
         return Moved::Failed(format!("remove the host copy: {error}"));
     }
+    drop(remove_span);
     // And once more after it: the markers sit beside the archive, so one
     // written while the source was removed is still there to copy.
     if let Err(error) = copy_markers(&source, &destination) {
@@ -989,21 +1469,24 @@ fn migrate_one(
     if let Some(parent) = source.parent() {
         crate::warn_unrecorded("sync the archive source", sync_directory(parent));
     }
-    Moved::Done(copied)
+    Moved::Done(copied, files)
 }
 
-/// Move host state's recovery archives to `storage_root` until `deadline`
-/// (see the module documentation). `alive` refreshes the worker's heartbeat
-/// and says whether the worker still holds its lock.
+/// Move host state's recovery archives to `storage_root` (see the module
+/// documentation) until the deadline of the lane `lane` returns, read again
+/// before each archive. `alive` refreshes the worker's heartbeat and says
+/// whether the worker still holds its lock.
 pub fn migrate_archives(
     host_state: &Path,
     storage_root: &Path,
-    deadline: Instant,
+    deadlines: MigrationDeadlines,
     pace: Duration,
     alive: &mut dyn FnMut() -> bool,
+    lane: &mut dyn FnMut() -> MigrationLane,
     report: &mut PlacementReport,
 ) {
     let _span = crate::phase_telemetry::span("storage_placement_migrate");
+    let started = Instant::now();
     let source_root = host_state.join(RECOVERY_ARCHIVE_DIRECTORY);
     let destination_root = storage_root.join(RECOVERY_ARCHIVE_DIRECTORY);
     // Readers learn of the root before anything is moved or written there,
@@ -1035,12 +1518,26 @@ pub fn migrate_archives(
     let mut stop = "done";
     let mut reached = 0;
     let mut moved = 0;
+    let mut current: Option<MigrationLane> = None;
+    let mut ordinary_time = Duration::ZERO;
     for (index, id) in ids.iter().cycle().skip(start).take(ids.len()).enumerate() {
+        let now_lane = lane();
+        if current.is_some_and(|before| before != now_lane) {
+            report.migration_lane_changes += 1;
+        }
+        current = Some(now_lane);
+        let deadline = deadlines.of(now_lane);
         if Instant::now() >= deadline {
-            stop = "deadline";
+            // Throttled before the backlog budget ran out: foreground work
+            // (or memory pressure) holds the migration back.
+            stop = if now_lane == MigrationLane::Throttled && Instant::now() < deadlines.ordinary {
+                "throttled"
+            } else {
+                "deadline"
+            };
             break;
         }
-        if moved >= MIGRATIONS_PER_PASS {
+        if moved >= now_lane.cap() {
             stop = "per_pass_cap";
             break;
         }
@@ -1049,7 +1546,8 @@ pub fn migrate_archives(
             break;
         }
         reached = index + 1;
-        match migrate_one(
+        let archive_started = Instant::now();
+        let outcome = migrate_one(
             host_state,
             &destination_root,
             id,
@@ -1057,12 +1555,24 @@ pub fn migrate_archives(
             &mut || {
                 alive();
             },
-        ) {
-            Moved::Done(bytes) => {
+        );
+        if now_lane == MigrationLane::Ordinary {
+            ordinary_time += archive_started.elapsed();
+        }
+        match outcome {
+            Moved::Done(bytes, files) => {
                 moved += 1;
-                crate::phase_telemetry::add("storage_placement_archive_migrated", Duration::ZERO);
+                crate::phase_telemetry::add(
+                    "storage_placement_archive_migrated",
+                    archive_started.elapsed(),
+                );
                 report.archives_migrated += 1;
                 report.bytes_migrated += bytes;
+                report.files_migrated += files;
+                if now_lane == MigrationLane::Ordinary {
+                    report.archives_migrated_ordinary += 1;
+                }
+                report.moved.push(id.clone());
                 state.archives_migrated_total += 1;
                 state.bytes_migrated_total += bytes;
             }
@@ -1088,8 +1598,9 @@ pub fn migrate_archives(
             }
         }
         state.cursor = Some(id.clone());
-        if !pace.is_zero() {
-            std::thread::sleep(pace);
+        let pause = now_lane.pace(pace);
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
         }
     }
     if stop == "done" && reached == ids.len() {
@@ -1104,21 +1615,93 @@ pub fn migrate_archives(
                 .is_some_and(|(_, name)| !super::is_partial_archive_name(name))
         })
         .count() as u64;
+    let elapsed = started.elapsed();
+    report.migration_elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let seconds = elapsed.as_secs_f64();
+    let per_second = |count: u64| {
+        if seconds > 0.0 {
+            (count as f64 / seconds).round() as u64
+        } else {
+            0
+        }
+    };
     crate::phase_telemetry::attach(
         "storage_placement",
         serde_json::json!({
             "archives_migrated": report.archives_migrated,
+            "archives_migrated_ordinary": report.archives_migrated_ordinary,
             "bytes_migrated": report.bytes_migrated,
+            "files_migrated": report.files_migrated,
             "archives_skipped": report.archives_skipped,
             "archives_failed": report.archives_failed,
             "archives_left": report.archives_left,
             "migration_stop": stop,
+            "migration_elapsed_ms": report.migration_elapsed_ms,
+            "migration_ordinary_ms": u64::try_from(ordinary_time.as_millis()).unwrap_or(u64::MAX),
+            "migration_lane": current.map(MigrationLane::as_str),
+            "migration_lane_changes": report.migration_lane_changes,
+            "bytes_per_second": per_second(report.bytes_migrated),
+            "archives_per_minute": per_second(report.archives_migrated.saturating_mul(60)),
         }),
     );
     crate::warn_unrecorded("record the archive migration", state.save(host_state));
-    if report.archives_migrated > 0 {
-        super::note_written(host_state, RootKind::HostState, RECOVERY_ARCHIVE_DIRECTORY);
-        super::note_written(host_state, RootKind::Storage, RECOVERY_ARCHIVE_DIRECTORY);
+}
+
+/// Account for the archives moved this pass in the ledger, instead of
+/// having the next pass walk both roots' recovery archives again: each is
+/// dropped from host state's entry and measured (that archive alone) into
+/// the storage root's. An entry the ledger cannot update this way (not yet
+/// discovered or measured, or a walk in progress) is noted for measuring.
+pub(crate) fn account_moved_archives(
+    ledger: &mut Ledger,
+    host_state: &Path,
+    storage_root: &Path,
+    moved: &[String],
+    beat: &mut dyn FnMut(),
+) {
+    if moved.is_empty() {
+        return;
+    }
+    let _span = crate::phase_telemetry::span("storage_placement_account_moved");
+    fn archives_of(item: &Item, root: &Path) -> bool {
+        item.root == root
+            && item.name == RECOVERY_ARCHIVE_DIRECTORY
+            && item.class == Class::RecoveryArchives
+    }
+    let host = ledger
+        .items
+        .iter_mut()
+        .find(|item| archives_of(item, host_state));
+    match host {
+        Some(item) if item.measured && item.walk.is_none() => {
+            item.children.retain(|child| !moved.contains(&child.name));
+            super::set_child_totals(item);
+            crate::phase_telemetry::add("storage_placement_ledger_updated", Duration::ZERO);
+        }
+        _ => {
+            crate::phase_telemetry::add("storage_placement_ledger_noted", Duration::ZERO);
+            super::note_written(host_state, RootKind::HostState, RECOVERY_ARCHIVE_DIRECTORY);
+        }
+    }
+    let stored = ledger
+        .items
+        .iter_mut()
+        .find(|item| archives_of(item, storage_root));
+    match stored {
+        Some(item) if item.measured && item.walk.is_none() => {
+            for id in moved {
+                item.children.retain(|child| child.name != *id);
+                if let Some(child) = super::measure_child(item, id, beat) {
+                    item.children.push(child);
+                }
+            }
+            super::set_child_totals(item);
+            crate::phase_telemetry::add("storage_placement_ledger_updated", Duration::ZERO);
+        }
+        _ => {
+            crate::phase_telemetry::add("storage_placement_ledger_noted", Duration::ZERO);
+            super::note_written(host_state, RootKind::Storage, RECOVERY_ARCHIVE_DIRECTORY);
+        }
     }
 }
 
@@ -1224,14 +1807,76 @@ pub fn run(
         ..PlacementReport::default()
     };
     if let Some(root) = archives.on_storage() {
+        let devices: Vec<u64> = [host_state, root]
+            .iter()
+            .filter_map(|path| crate::foreground_io::device_of(path))
+            .collect();
+        // The storage worker is its own process (`aethyme storage worker`,
+        // or `storage run`): the checkout trash deleter, which sets the same
+        // process-scope disk policy, runs only in the `gc __trash-catchup`
+        // process and the retirement drain, never here, so the two never
+        // overwrite each other's setting. Only a process that began
+        // throttled is switched at all.
+        let base_policy = crate::gc::current_io_policy();
+        let floor = super::Budgets::load(host_state).0.free_floor_bytes;
+        let mut raised = false;
+        let mut sampled: Option<(Instant, MigrationLane)> = None;
+        let mut lane = || {
+            if let Some((at, lane)) = sampled
+                && at.elapsed() < LANE_RESAMPLE
+            {
+                return lane;
+            }
+            let _span = crate::phase_telemetry::span("storage_placement_lane_sample");
+            let foreground = crate::foreground_io::active_on(&devices);
+            let memory_critical = crate::checkout_trash::sample_host_pressure().memory_critical;
+            let below_floor = super::check::statvfs(root).is_some_and(|(free, _)| free < floor);
+            if below_floor {
+                crate::phase_telemetry::add(
+                    "storage_placement_destination_below_floor",
+                    Duration::ZERO,
+                );
+            }
+            let lane = migration_lane(foreground, memory_critical, below_floor);
+            if foreground {
+                crate::phase_telemetry::add(
+                    "storage_placement_yielded_to_foreground",
+                    Duration::ZERO,
+                );
+            }
+            if let Some(target) = migration_io_switch(base_policy, raised, lane)
+                && crate::gc::set_storage_migration_io(target)
+            {
+                raised = target;
+                crate::phase_telemetry::add(
+                    if target {
+                        "storage_placement_io_raised"
+                    } else {
+                        "storage_placement_io_throttled"
+                    },
+                    Duration::ZERO,
+                );
+            }
+            sampled = Some((Instant::now(), lane));
+            lane
+        };
         migrate_archives(
             host_state,
             root,
-            Instant::now() + MIGRATION_BUDGET,
+            MigrationDeadlines::starting(Instant::now()),
             pace,
             alive,
+            &mut lane,
             &mut report,
         );
+        // The rest of the pass runs throttled, as the worker began.
+        if raised && crate::gc::set_storage_migration_io(false) {
+            crate::phase_telemetry::add("storage_placement_io_throttled", Duration::ZERO);
+        }
+        let moved = std::mem::take(&mut report.moved);
+        account_moved_archives(ledger, host_state, root, &moved, &mut || {
+            alive();
+        });
     }
     if gates.on_storage().is_some() {
         evict_superseded_host_gate_caches(
