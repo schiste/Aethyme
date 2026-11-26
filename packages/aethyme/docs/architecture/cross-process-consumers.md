@@ -2384,6 +2384,15 @@ whole file. Now:
   cleared (set empty) after any other outcome. Every stale-temporary sweep
   (the reviewed trim's too) spares the recorded temporary while its record
   still matches the log and the temporary's length.
+  Changed 2026-11-26 (spare capped by age): the record also carries
+  `recorded_at_ms` (epoch ms, rewritten by each `budget_exhausted`; absent in
+  an older record, which reads as 0). Once it is 24 hours old the record
+  spares nothing and is not resumed: a sweep that reads it clears it (a
+  compare-and-set, so a newer record is never cleared) and removes its
+  temporary, and an unattended trim removes the temporary and starts over
+  (counter `command_metrics_trim_resume_expired`, one per expired record
+  found). Unattended trims that stop running therefore leave no temporary
+  spared for more than a day.
 - **Clock check.** When every timestamped row, the newest included, is older
   than the cutoff, nothing is removed (`clock_suspect`): the clock is suspect,
   or the repository was idle for the whole window, and in either case keeping
@@ -2406,7 +2415,7 @@ whole file. Now:
   counters `command_metrics_trim_not_due`,
   `command_metrics_trim_no_time_this_run`,
   `command_metrics_trim_claimed_elsewhere`, `command_metrics_trim_resumed`,
-  `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
+  `command_metrics_trim_resume_expired`, `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
   `command_metrics_trim_missing`,
   `command_metrics_trim_skipped_concurrent_append`,
   `command_metrics_trim_lock_unavailable`, `command_metrics_trim_refused`,
