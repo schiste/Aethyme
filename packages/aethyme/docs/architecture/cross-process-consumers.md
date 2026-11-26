@@ -6472,7 +6472,9 @@ across a child process, a sleep or a network call.
 - Span `broker_db_busy_wait`: time slept waiting for a database lock, one
   occurrence per retry; counted as wait time in the command's attribution.
 - Counters `broker_db_busy_retry` (one per retry) and
-  `broker_db_busy_failure` (one per wait that ran out of budget).
+  `broker_db_busy_failure` (one per wait that ran out of budget), and
+  `broker_db_holder_record_failed` (a holder record that could not be
+  written or removed; never fails the transaction).
 - Attachment `broker_db_busy_wait_by_holder`: `{<holder command>: {count,
   total_ms, max_ms}}` of time waited, keyed by the recorded holder's command
   surface read when the wait began (`unrecorded` when there was none).

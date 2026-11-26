@@ -188,12 +188,14 @@ impl HolderState {
             since_ms: crate::clock::epoch_ms(),
         };
         // Best effort: a failed record write must never fail the transaction.
-        let _ = write_holder(&self.path, &holder);
+        if write_holder(&self.path, &holder).is_err() {
+            crate::phase_telemetry::add("broker_db_holder_record_failed", Duration::ZERO);
+        }
     }
 
     fn disarm(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
-            let _ = std::fs::remove_file(&self.path);
+            remove_record_file(&self.path);
         }
     }
 }
@@ -259,9 +261,19 @@ fn write_holder(path: &Path, holder: &WriterHolder) -> std::io::Result<()> {
         std::fs::rename(&temporary, path)
     });
     if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        remove_record_file(&temporary);
     }
     written
+}
+
+/// Remove a holder record (or its temporary file); an absent file is fine,
+/// any other failure is counted, never fatal to the transaction.
+fn remove_record_file(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::phase_telemetry::add("broker_db_holder_record_failed", Duration::ZERO);
+    }
 }
 
 /// The recorded write-lock holder of `db_path`, if its record names a live
