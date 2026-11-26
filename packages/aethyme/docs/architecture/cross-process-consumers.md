@@ -6126,3 +6126,26 @@ other caller of proof 3 is unchanged. New counter
 `proof_empty_ignored_directory_released` (one per released directory) and
 span `checkout_retirement_phase_recheck` (the proof 3 re-check under the
 claim).
+
+### Unattended deletion yields to foreground I/O (2026-11-26)
+
+A 30-minute offline install on an external volume used about 6 s of child
+CPU while the checkout trash catch-up removed 17.7 GB on the same volume:
+the deleter, raised to `IOPOL_IMPORTANT` so a busy disk cannot starve it,
+starved the install instead.
+
+Each preparation step and each gate command leaves a marker in `<host state>/run/foreground-io/`
+naming its volume (device number) and process, removed when it ends; a
+marker whose process is gone counts for nothing and is removed by the next
+reader. Before each slice, the checkout trash catch-up reads the markers
+for the volumes of its trash entries. While one is live, a deleter that
+raised itself to `IOPOL_IMPORTANT` drops to `IOPOL_THROTTLE` (macOS) and
+waits 5 s instead of 1 s between slices; it returns to `important` when
+the work ends or the lap does. A process that was not `important` (the
+throttled worker, Linux's idle class) is never switched.
+
+- Counter `foreground_io_marked`: one per marker written.
+- Counter `checkout_trash_catchup_yielded_to_foreground`: slices that found
+  foreground work on a trash volume.
+- Counter `checkout_trash_catchup_io_restored`: laps that returned to
+  `important` at their end.

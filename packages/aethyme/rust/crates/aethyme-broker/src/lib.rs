@@ -109,6 +109,7 @@ pub mod execution_resources;
 pub mod execution_snapshot;
 pub mod execution_supervisor;
 pub mod execution_verifier;
+mod foreground_io;
 mod gate_doctor;
 mod gates;
 mod gc;

@@ -2583,6 +2583,10 @@ impl Broker {
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         let mut step_timings: Vec<PreparationStepTiming> = Vec::new();
         for (index, step) in config.steps.iter().enumerate() {
+            // Unattended bulk deleters on this volume yield the disk while
+            // the step runs.
+            let _foreground_io =
+                crate::foreground_io::ForegroundIoMark::enter("preparation", &root);
             let step_started = Instant::now();
             let step_free_before = package_store::volume_free_bytes(&root);
             let _step_span = crate::phase_telemetry::span("preparation_step");
