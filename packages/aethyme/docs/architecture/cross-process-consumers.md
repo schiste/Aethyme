@@ -6419,3 +6419,7 @@ uncertain outcome installed again from the start. The changes:
     opened and the step's streams were inherited as before.
   - Counter `preparation_step_output_drain_timed_out`: a stream stayed open
     2 s after the step (a descendant kept it); the tail so far was kept.
+
+The optional phase span `content_gate_v2_final_newline_check` measures native
+portable-verdict final-newline comparisons when a phase recorder is installed.
+Its name contains no source text, paths, gate IDs or entity IDs.
