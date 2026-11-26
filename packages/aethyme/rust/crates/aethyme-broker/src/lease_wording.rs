@@ -53,14 +53,34 @@ pub(crate) fn host_resource_busy(what: &str, retry_after_secs: Option<u64>) -> S
     )
 }
 
-/// A host resource request that could not be granted. Only ordinary
-/// contention (`resource_contention`) is worth waiting for; a capacity-policy
-/// mismatch or an orphaned holder is not, and says so without the advice.
-pub(crate) fn host_resource_conflict(code: &str, message: &str) -> String {
-    if code == "resource_contention" {
-        host_resource_busy(message, None)
+/// A host resource request that could not be granted, named by what was
+/// requested: a build/cache slot (capacity pools and exclusive cache keys), a
+/// port, managed storage, or else a host resource. Only ordinary contention
+/// (`resource_contention`) on slots is worth waiting for; port exhaustion, a
+/// capacity-policy mismatch, an orphaned holder or a managed-storage refusal
+/// says what happened without that advice.
+pub(crate) fn host_resource_conflict<'a>(
+    code: &str,
+    message: &str,
+    kinds: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let kinds: Vec<&str> = kinds.into_iter().collect();
+    let slot = |kind: &&str| matches!(*kind, "capacity" | "exclusive_key");
+    let noun = if code.starts_with("managed_storage") {
+        "managed storage"
+    } else if !kinds.is_empty() && kinds.iter().all(slot) {
+        "build/cache slot"
+    } else if !kinds.is_empty() && kinds.iter().all(|kind| *kind == "tcp_port") {
+        "port"
     } else {
-        format!("build/cache slot unavailable (host resource, not a path lease): {message}")
+        "host resource"
+    };
+    if code == "resource_contention" && !kinds.is_empty() && kinds.iter().all(slot) {
+        host_resource_busy(message, None)
+    } else if noun == "host resource" {
+        format!("host resource unavailable (not a path lease): {message}")
+    } else {
+        format!("{noun} unavailable (host resource, not a path lease): {message}")
     }
 }
 
@@ -108,12 +128,38 @@ mod tests {
         );
         assert!(host_resource_busy("x", None).ends_with("retry shortly"));
         assert_eq!(
-            host_resource_conflict("resource_contention", "pool full"),
+            host_resource_conflict("resource_contention", "pool full", ["capacity"]),
             host_resource_busy("pool full", None)
         );
-        let mismatch = host_resource_conflict("capacity_policy_mismatch", "limits differ");
-        assert!(!mismatch.contains("waiting is normal"), "{mismatch}");
-        assert!(mismatch.ends_with(": limits differ"), "{mismatch}");
+        let mismatch =
+            host_resource_conflict("capacity_policy_mismatch", "limits differ", ["capacity"]);
+        assert_eq!(
+            mismatch,
+            "build/cache slot unavailable (host resource, not a path lease): limits differ"
+        );
+        let ports = host_resource_conflict(
+            "resource_contention",
+            "no broker-free and OS-bindable port remains",
+            ["tcp_port"],
+        );
+        assert_eq!(
+            ports,
+            "port unavailable (host resource, not a path lease): no broker-free and OS-bindable port remains"
+        );
+        let storage =
+            host_resource_conflict("managed_storage_claim_missing", "claim does not exist", []);
+        assert_eq!(
+            storage,
+            "managed storage unavailable (host resource, not a path lease): claim does not exist"
+        );
+        for text in [&mismatch, &ports, &storage] {
+            assert!(!text.contains("waiting is normal"), "{text}");
+            assert!(!text.contains("build/cache slot busy"), "{text}");
+        }
+        assert_eq!(
+            host_resource_conflict("other", "odd", ["tcp_port", "capacity"]),
+            "host resource unavailable (not a path lease): odd"
+        );
 
         let refusal = task_lease_holder_refusal(7);
         assert!(refusal.contains("session holder"), "{refusal}");

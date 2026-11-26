@@ -2898,6 +2898,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         acquire_session_operation_context(
             &parsed,
             subcommand == "finish" || closed_session_command_reaches_handler(subcommand, &parsed),
+            task_lease_command == TaskLeaseCommandClass::SessionRead,
         )?
     };
     if subcommand == "advance" {
@@ -3084,6 +3085,10 @@ struct SessionOperationContext {
     main_root: std::path::PathBuf,
     session_id: i64,
     session_open: bool,
+    /// For a session read only: the latest holder binding, read from the
+    /// snapshot the guard was revalidated against, so counting a read the
+    /// task lease used to refuse needs no store open of its own.
+    read_holder_event: Option<crate::Event>,
     _guard: crate::file_lock::SessionOperationGuard,
 }
 
@@ -3096,6 +3101,7 @@ struct SessionOperationContext {
 fn acquire_session_operation_context(
     parsed: &Parsed,
     allow_closed: bool,
+    read_holder: bool,
 ) -> Result<Option<SessionOperationContext>, UsageError> {
     if parsed.read_only_snapshot {
         return Ok(None);
@@ -3199,10 +3205,19 @@ fn acquire_session_operation_context(
             ));
         }
     }
+    let read_holder_event = if read_holder && session_open {
+        current_store
+            .latest_session_holder_event(session_id)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     Ok(Some(SessionOperationContext {
         main_root,
         session_id,
         session_open,
+        read_holder_event,
         _guard: guard,
     }))
 }
@@ -3429,18 +3444,15 @@ fn heartbeat_session_task_lease(
 /// A read from someone other than the finite task lease's holder used to be
 /// refused as uncovered session work. It now runs; count the reads that
 /// would have been refused (`task_lease_read_allowed`) so the change stays
-/// measurable. Best effort: an unreadable store counts nothing.
+/// measurable. It reuses the holder binding the session guard's snapshot
+/// already read, and identifies the caller (a process-table read) only when
+/// that binding is a finite task lease.
 fn note_task_lease_read_allowed(context: Option<&SessionOperationContext>) {
-    let Some(context) = context else {
+    let _span = crate::phase_telemetry::span("task_lease_read_check");
+    let Some(latest) = context.and_then(|context| context.read_holder_event.as_ref()) else {
         return;
     };
-    let Ok(store) = crate::BrokerStore::open_in_repo(&context.main_root) else {
-        return;
-    };
-    let Ok(Some(latest)) = store.latest_session_holder_event(context.session_id) else {
-        return;
-    };
-    if !crate::session_holder::task_lease_binding_present(&latest) {
+    if !crate::session_holder::task_lease_binding_present(latest) {
         return;
     }
     let bound_holder = latest.payload_json.as_deref().and_then(|payload| {

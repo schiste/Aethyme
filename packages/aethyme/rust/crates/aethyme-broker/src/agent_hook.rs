@@ -506,6 +506,16 @@ fn recorded_peer_view(
     store: &BrokerStore,
     session_id: i64,
 ) -> Result<serde_json::Value, crate::BrokerError> {
+    recorded_peer_view_with_rows_digest(store, session_id).map(|(view, _)| view)
+}
+
+/// The recorded peer view plus a digest of every overlap and scope row (the
+/// view itself lists only the first ten), so the hook can tell a changed
+/// overlap set from a repeat without widening the status document.
+fn recorded_peer_view_with_rows_digest(
+    store: &BrokerStore,
+    session_id: i64,
+) -> Result<(serde_json::Value, String), crate::BrokerError> {
     use sha2::{Digest, Sha256};
     let leases = store.session_peer_lease_overlaps(session_id, now_ms())?;
     let scopes = {
@@ -530,16 +540,30 @@ fn recorded_peer_view(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&all).expect("serializable peer records"))
     );
+    let rows_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&serde_json::json!([all["leases"], all["scopes"]]))
+                .expect("serializable peer records")
+        )
+    );
     let lease_rows = all["leases"].as_array().expect("lease records");
     let scope_rows = all["scopes"].as_array().expect("scope records");
-    Ok(serde_json::json!({
-        "lease_count": lease_rows.len(), "scope_count": scope_rows.len(),
-        "leases": lease_rows.iter().take(10).collect::<Vec<_>>(),
-        "scopes": scope_rows.iter().take(10).collect::<Vec<_>>(),
-        "pre_edit": all["pre_edit"],
-        "digest": hash, "source": "recorded",
-    }))
+    Ok((
+        serde_json::json!({
+            "lease_count": lease_rows.len(), "scope_count": scope_rows.len(),
+            "leases": lease_rows.iter().take(10).collect::<Vec<_>>(),
+            "scopes": scope_rows.iter().take(10).collect::<Vec<_>>(),
+            "pre_edit": all["pre_edit"],
+            "digest": hash, "source": "recorded",
+        }),
+        rows_digest,
+    ))
 }
+
+/// The pre-edit instruction for an ordinary overlap with an earlier live
+/// session; the hook renders its `wait` action as "coordinate".
+const OVERLAP_WAIT_INSTRUCTION: &str = "An earlier session is also editing overlapping paths (informational: path leases never block your edits or submit). Prefer disjoint paths, and coordinate with that session only if you change the same lines.";
 
 fn pre_edit_decision(
     store: &BrokerStore,
@@ -589,10 +613,7 @@ fn pre_edit_decision(
             "Confirm the assignments match before editing. Preserve any existing work. If your checkout is unchanged, use the guarded duplicate close command.",
         )
     } else {
-        (
-            "wait",
-            "An earlier session is also editing overlapping paths (informational: path leases never block your edits or submit). Prefer disjoint paths, and coordinate with that session only if you change the same lines.",
-        )
+        ("wait", OVERLAP_WAIT_INSTRUCTION)
     };
     // Bound and normalize user-supplied task labels in the default brief.
     let task = peer.task.as_deref().map(|label| {
@@ -750,7 +771,10 @@ pub(crate) fn render_peer_information(view: &serde_json::Value) -> Option<String
     let instruction = decision["instruction"].as_str()?;
     // `wait` is the stable machine value for "an earlier session overlaps";
     // rendered as a bare word it read as a block, which a path lease never is.
-    let shown = if action == "wait" && decision["peer"]["session_id"].is_i64() {
+    let shown = if action == "wait"
+        && decision["peer"]["session_id"].is_i64()
+        && decision["instruction"].as_str() == Some(OVERLAP_WAIT_INSTRUCTION)
+    {
         "coordinate"
     } else {
         action
@@ -831,7 +855,8 @@ fn recorded_peer_view_update(
     let previous: Option<serde_json::Value> = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let current = recorded_peer_view(store, session_id).ok()?;
+    let (mut current, rows_digest) = recorded_peer_view_with_rows_digest(store, session_id).ok()?;
+    current["rows_digest"] = serde_json::Value::String(rows_digest);
     let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
         || current["scope_count"].as_u64().unwrap_or(0) > 0;
     if !force && previous.as_ref() == Some(&current) {
@@ -860,8 +885,9 @@ fn recorded_peer_view_update(
 }
 
 /// Whether `current` tells the agent nothing `previous` did not: the same
-/// overlapping paths and declared scopes with the same peers, and the same
-/// pre-edit decision about the same peer. A peer flipping between active and
+/// overlapping paths and declared scopes with the same peers (every row, by
+/// `rows_digest`), and the same pre-edit decision and instruction about the
+/// same peer. A peer flipping between active and
 /// idle, or renaming its task, used to re-inject every coordination line at
 /// the next prompt or tool boundary.
 fn coordination_repeat(previous: &serde_json::Value, current: &serde_json::Value) -> bool {
@@ -869,13 +895,16 @@ fn coordination_repeat(previous: &serde_json::Value, current: &serde_json::Value
         serde_json::json!([
             view["lease_count"],
             view["scope_count"],
-            view["leases"],
-            view["scopes"],
+            view["rows_digest"],
             view["pre_edit"]["action"],
+            view["pre_edit"]["instruction"],
             view["pre_edit"]["peer"]["session_id"],
         ])
     };
-    !previous["pre_edit"].is_null() && key(previous) == key(current)
+    // A baseline saved before `rows_digest` existed is never a repeat.
+    !previous["pre_edit"].is_null()
+        && previous["rows_digest"].is_string()
+        && key(previous) == key(current)
 }
 
 fn append_context(outcome: HookOutcome, addition: Option<String>) -> HookOutcome {
@@ -1898,14 +1927,16 @@ mod tests {
     use super::*;
 
     fn peer_view(status: &str, task: &str, leases: serde_json::Value) -> serde_json::Value {
+        let rows_digest = leases.to_string();
         serde_json::json!({
+            "rows_digest": rows_digest,
             "lease_count": leases.as_array().map_or(0, Vec::len),
             "scope_count": 0,
             "leases": leases,
             "scopes": [],
             "pre_edit": {
                 "action": "wait",
-                "instruction": "An earlier session is also editing overlapping paths.",
+                "instruction": OVERLAP_WAIT_INSTRUCTION,
                 "command": null,
                 "peer": {"session_id": 4, "task": task, "recorded_status": status},
             },
@@ -1933,6 +1964,23 @@ mod tests {
         let mut decided = first.clone();
         decided["pre_edit"]["action"] = "yield".into();
         assert!(!coordination_repeat(&first, &decided));
+        // The peer closed between queries: same action and peer, new
+        // instruction. That is news, not a repeat.
+        let mut ownership_changed = first.clone();
+        ownership_changed["pre_edit"]["instruction"] =
+            "Peer ownership changed during this observation. Read the scoped session view again before editing the overlapping paths.".into();
+        assert!(!coordination_repeat(&first, &ownership_changed));
+        // An overlap past the tenth row swapped for another: the listed rows
+        // and the count match, the full-row digest does not.
+        let mut swapped = first.clone();
+        swapped["rows_digest"] = "a different eleventh row".into();
+        assert!(!coordination_repeat(&first, &swapped));
+        let mut legacy = first.clone();
+        legacy.as_object_mut().unwrap().remove("rows_digest");
+        assert!(
+            !coordination_repeat(&legacy, &first),
+            "a baseline without a row digest is never a repeat"
+        );
         assert!(
             !coordination_repeat(&serde_json::json!({}), &first),
             "no delivered baseline is never a repeat"
@@ -1963,6 +2011,14 @@ mod tests {
         for misleading in ["Before editing: wait", " holds ", "leases \""] {
             assert!(!text.contains(misleading), "{misleading}: {text}");
         }
+        let mut ownership_changed = view.clone();
+        ownership_changed["pre_edit"]["instruction"] =
+            "Peer ownership changed during this observation. Read the scoped session view again before editing the overlapping paths.".into();
+        let text = render_peer_information(&ownership_changed).expect("renders");
+        assert!(
+            text.starts_with("Before editing: wait. Peer ownership changed"),
+            "only an ordinary overlap renders as coordinate: {text}"
+        );
     }
 
     #[test]

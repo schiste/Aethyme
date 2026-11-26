@@ -958,7 +958,7 @@ pub enum HostResourceError {
     IdempotencyMismatch(String),
     #[error("request {request_id:?} is {state}; use a new request id")]
     RequestNotActive { request_id: String, state: String },
-    #[error("{}", crate::lease_wording::host_resource_conflict(code, message))]
+    #[error("{}", conflict_display(.code, .message, .conflicts))]
     Conflict {
         code: String,
         message: String,
@@ -4644,6 +4644,15 @@ fn managed_storage_claim_digest(
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// How a refused host resource request reads: named by the kinds it asked for.
+fn conflict_display(code: &str, message: &str, conflicts: &[HostResourceConflict]) -> String {
+    crate::lease_wording::host_resource_conflict(
+        code,
+        message,
+        conflicts.iter().map(|conflict| conflict.kind.as_str()),
+    )
+}
+
 fn managed_storage_refusal(code: &str, message: &str) -> HostResourceError {
     HostResourceError::Conflict {
         code: code.to_owned(),
@@ -6254,6 +6263,47 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_request_is_named_by_what_it_asked_for() {
+        let storage =
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+                .to_string();
+        assert_eq!(
+            storage,
+            "managed storage unavailable (host resource, not a path lease): claim does not exist"
+        );
+        let ports = HostResourceError::from(AttemptConflict {
+            code: "resource_contention".into(),
+            message: "no broker-free and OS-bindable port remains".into(),
+            conflicts: vec![conflict(
+                "resource_contention",
+                "http",
+                "tcp_port",
+                "4000-4001".into(),
+                "no broker-free and OS-bindable port remains",
+                None,
+            )],
+        })
+        .to_string();
+        assert!(ports.starts_with("port unavailable"), "{ports}");
+        assert!(!ports.contains("waiting is normal"), "{ports}");
+        let slot = HostResourceError::from(AttemptConflict {
+            code: "resource_contention".into(),
+            message: "pool has 6/6 units in use".into(),
+            conflicts: vec![conflict(
+                "resource_contention",
+                "build",
+                "capacity",
+                "aethyme-host-build:3/6".into(),
+                "pool has 6/6 units in use",
+                None,
+            )],
+        })
+        .to_string();
+        assert!(slot.starts_with("build/cache slot busy"), "{slot}");
+        assert!(slot.contains("waiting is normal"), "{slot}");
+    }
 
     fn managed_policy(
         repository: &str,

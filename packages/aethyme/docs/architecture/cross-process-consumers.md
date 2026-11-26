@@ -744,7 +744,9 @@ unchanged unless listed here.
   classed as observation-only (`prepare status`, `leases` listing, `plan`,
   `explain`, `export`, and the rest) are unchanged. Count
   `task_lease_read_allowed` records each read that the old check would have
-  refused. State-changing commands still refuse, now with "is held by another
+  refused; span `task_lease_read_check` times that check, which reuses the
+  holder binding the session guard's snapshot read and reads the process
+  table only when the binding is a finite task lease. State-changing commands still refuse, now with "is held by another
   agent process (session holder with a finite task lease, not a path lease)".
 - **Status advice for conflicting path pairs.** `advice[].id` and compact
   `advice.categories[].id` change from `lease.overlap-conflict` to
@@ -761,17 +763,25 @@ unchanged unless listed here.
   `Before editing: coordinate.` (the JSON value stays `wait`).
   `request-release` no longer suggests `leases wait`. A multi-path `leases
   claim` failure names each failed path and its error inline.
-- **Host resources.** `HostResourceError::Conflict` renders as "build/cache
+- **Host resources.** `HostResourceError::Conflict` no longer renders as
+  "host resource bundle unavailable: …". It is named by `conflicts[].kind`:
+  "build/cache slot" (`capacity`, `exclusive_key`), "port" (`tcp_port`),
+  "managed storage" (codes starting `managed_storage`), else "host
+  resource". Only `resource_contention` on build/cache slots reads "build/cache
   slot busy (host resource, not a path lease): …; waiting is normal; retry
-  shortly" for `resource_contention`, and "build/cache slot unavailable (host
-  resource, not a path lease): …" for other codes, in place of "host resource
-  bundle unavailable: …". `code` and `conflicts[]` are unchanged.
+  shortly"; everything else reads "<noun> unavailable (host resource, not a
+  path lease): …". `code` and `conflicts[]` are unchanged.
 - **Hook repeats.** The prompt/tool hook re-injects coordination lines only
-  when the overlapping paths, declared scopes or the pre-edit decision (action
-  and peer) change; a peer's liveness or task label alone no longer does. Count
+  when the overlapping paths or declared scopes (every row, by a digest kept in
+  the hook's own state file, not in the status document) or the pre-edit
+  decision (action, instruction and peer) change; a peer's liveness or task
+  label alone no longer does. Only the ordinary-overlap instruction renders
+  `wait` as "coordinate"; a peer whose ownership changed still reads `wait`. Count
   `hook_coordination_repeat_suppressed` records each suppressed repeat.
-- **Generated guidance.** The broker protocol block, `references/broker.md`
-  and the skill card explain the three kinds in one paragraph and no longer
+- **Generated guidance.** The broker protocol block says path leases only
+  inform and never block edits or submit (it stays within
+  `GENERATED_POLICY_MAX_TOKENS`); `references/broker.md` and the skill card
+  explain the three kinds in one paragraph. None of them
   say another explicit lease can refuse a claim (the broker has not refused
   claims on another session's lease since that rule was removed).
 

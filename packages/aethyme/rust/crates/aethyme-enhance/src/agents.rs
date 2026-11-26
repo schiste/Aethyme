@@ -391,10 +391,8 @@ Use `aethyme broker status --json` in your worktree to inspect the session on
 demand. Add `--session <id>` from another checkout. Reuse its revision with
 `--since-revision <token>` for changes only. Treat deferred checks as unknown.
 Use `aethyme broker status --full --json` for exact session or lease-path
-evidence. Check overlapping work before duplicating it. Path leases (who edits
-what) are informational and never block edits or submit; build/cache slots may
-make a command wait, which is normal; only the session holder refuses another
-process's state-changing commands, never reads. Reconcile before merging and
+evidence. Check overlapping work before duplicating it. Path leases only
+inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
@@ -433,10 +431,8 @@ Use `aethyme broker status --json` in your worktree to inspect the session on
 demand. Add `--session <id>` from another checkout. Reuse its revision with
 `--since-revision <token>` for changes only. Treat deferred checks as unknown.
 Use `aethyme broker status --full --json` for exact session or lease-path
-evidence. Check overlapping work before duplicating it. Path leases (who edits
-what) are informational and never block edits or submit; build/cache slots may
-make a command wait, which is normal; only the session holder refuses another
-process's state-changing commands, never reads. Reconcile before merging and
+evidence. Check overlapping work before duplicating it. Path leases only
+inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
@@ -1957,8 +1953,7 @@ mod tests {
                 "`--since-revision <token>` for changes only. Treat deferred checks as unknown.",
                 "changes and changes to repository warning counts at prompt and tool boundaries.",
                 "`aethyme broker status --full --json` for exact session or lease-path",
-                "what) are informational and never block edits or submit; build/cache slots may",
-                "process's state-changing commands, never reads. Reconcile before merging and",
+                "inform: they never block edits or submit. Reconcile before merging and",
                 "resolve blockers and refusals.",
             ] {
                 assert!(
