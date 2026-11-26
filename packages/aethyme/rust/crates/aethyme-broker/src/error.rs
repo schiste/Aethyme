@@ -19,7 +19,7 @@ pub enum BrokerError {
 
     /// A busy error also says how long it waited and who holds the write
     /// lock (see `db_busy`).
-    #[error("broker db: {0}{}", crate::db_busy::busy_context(.0))]
+    #[error("broker db: {error}{context}", error = .0, context = crate::db_busy::busy_context(.0))]
     Sqlite(#[from] rusqlite::Error),
 
     /// A `.aethyme` configuration file could not be resolved or parsed.
