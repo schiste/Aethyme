@@ -445,11 +445,15 @@ fn profiles(target: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// A test hook run on a target's path.
+#[cfg(test)]
+pub(super) type TargetHook = Box<dyn Fn(&Path)>;
+
 #[cfg(test)]
 thread_local! {
     /// Test hook: runs on a target's path after its profiles were first
     /// listed, just before their build locks are taken.
-    pub(super) static BEFORE_LOCK_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+    pub(super) static BEFORE_LOCK_FOR_TEST: std::cell::RefCell<Option<TargetHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -562,16 +566,20 @@ const GIT_ROUTING_VARIABLES: [&str; 11] = [
 
 /// Run one bounded Git query in `dir`; its exit code, `None` when it did not
 /// complete. `inherited` is added to the environment first (tests model a
-/// hook's environment with it); every routing variable is then dropped,
-/// pathspecs are literal and no file-system monitor is asked.
+/// hook's environment with it); every routing variable is then dropped and
+/// no file-system monitor is asked. `ls-files` gets literal pathspecs;
+/// `check-ignore` refuses that magic (it takes paths).
 fn git_exit_code_inheriting(dir: &Path, args: &[&str], inherited: &[(&str, &str)]) -> Option<i32> {
     let mut command = crate::git::git_command();
     command.envs(inherited.iter().copied());
     for variable in GIT_ROUTING_VARIABLES {
         command.env_remove(variable);
     }
+    if args.first() == Some(&"ls-files") {
+        command.arg("--literal-pathspecs");
+    }
     command
-        .args(["--literal-pathspecs", "-c", "core.fsmonitor=false", "-C"])
+        .args(["-c", "core.fsmonitor=false", "-C"])
         .arg(dir)
         .args(args)
         .current_dir(dir);
