@@ -955,8 +955,19 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
 
 #[test]
 fn changed_workflows_have_read_only_permissions() {
-    for name in ["oss-ci.yml", "aethyme-local-tests.yml"] {
+    for name in [
+        "oss-ci.yml",
+        "aethyme-local-tests.yml",
+        "release-prepare.yml",
+    ] {
         assert_eq!(block(&workflow(name), "permissions:"), ["  contents: read"]);
+    }
+    // Release preparation renders a patch for the broker session to commit;
+    // it runs only on request and never writes back.
+    let prepare = workflow("release-prepare.yml");
+    assert_eq!(block(&prepare, "on:"), ["  workflow_dispatch:"]);
+    for write in ["git push", "git commit", "gh pr", "gh api"] {
+        assert!(!prepare.contains(write), "release-prepare.yml runs {write}");
     }
     // The contract gate reads the merged PR's body on main; still read-only.
     assert_eq!(

@@ -56,6 +56,18 @@ the requested version change.
    self-correcting at the next deploy, which is exactly why it survives review:
    nothing fails, and the committed digest is quietly wrong until someone
    redeploys.
+
+   To skip the local build, commit and push the version bump on the release
+   branch, then dispatch `gh workflow run release-prepare.yml --ref <branch>`.
+   It builds the router on Linux, runs the same deploy and
+   `deploy verify --generated-only`, and uploads the changed generated files as
+   the artifact `release-generated-<commit sha>` (one file,
+   `release-generated.patch`). It writes nothing to the repository and fails if
+   the render touches any other tracked path. Download it with
+   `gh run download <run id> -n release-generated-<commit sha>`, apply it with
+   `git apply --index release-generated.patch`, and commit through the broker
+   session. The render depends only on the tracked tree and the built version,
+   so it matches a local render byte for byte.
 4. Run `cargo fmt --check --all`, `cargo test --workspace`, release contract
    checks, and `git diff --check`.
 5. Push the release series with `aethyme broker push --session <id> --pr` and
