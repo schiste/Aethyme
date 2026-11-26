@@ -5739,3 +5739,38 @@ due (`recent_activity`, `work_class_not_due`), which is not deferred, the
 pass now reports deferred work: the retirement request stays armed, the
 retirement issue reads as actionable, and the checkout-cleanup generation is
 not completed as having no deferred work. Covered by `session_auto_close.rs` tests.
+
+Changed 2026-11-26 (status retention stops probing Git for pool directories
+Git cannot read). Measured on 0.8.180 in the busiest repository: over about an
+hour, 39 full `broker status` views spent 145 s in the `retention` phase, 61 s
+of it in 15,366 `worktree_common_dir_probe` spans (about 394 Git processes per
+status). The managed worktree root held 1,290 directories: 758 with a valid
+`.git` file, 24 whose `.git` file names a removed Git directory, and 483 with
+no `.git` at all (retired and stripped checkouts). The ownership check behind
+the cleanup inventory (`is_broker_owned_worktree_checked`) put each of the
+last two kinds to Git on every status. It now answers them from the
+filesystem when Git's discovery is certain to fail: no `.git` or `HEAD` in the
+directory or any ancestor, or a `.git` file of the exact `gitdir: <path>` form
+naming a directory that does not exist. Git's answer for both is an error, so
+the existing error branch runs unchanged (an orphan pointer naming this
+repository's `worktrees/` directory is still owned; anything else is still an
+inspection error, which the boolean form reads as not owned). Paths inside a
+checkout, every other pointer shape, a Git environment override and an
+expired Git deadline (still a timeout) still go to Git.
+
+- Counter `worktree_common_dir_no_git_entry`: ownership checks answered
+  without Git because no `.git` or `HEAD` exists on the path or above it.
+- Counter `worktree_common_dir_dangling_pointer`: ownership checks answered
+  without Git because the `.git` file names a missing Git directory.
+- Span `worktree_common_dir_probe` is unchanged and still counts each Git
+  probe that remains.
+
+The GC plan behind `retention` (also used by `gc plan`, `doctor` and the GC
+service) now times its steps, each a span: `gc_plan_retention_policy`,
+`gc_plan_cleanup_inventory` (encloses `cleanup_plan`), `gc_plan_store_reads`,
+`gc_plan_gate_logs`, `gc_plan_command_metrics`, `gc_plan_worktree_blockers`,
+`gc_plan_artifact_candidates`, `gc_plan_orphan_roots`,
+`gc_plan_recovery_archives`, `gc_plan_gate_cache` (size records and the gate
+cache inventory), `gc_plan_environment_cache`,
+`gc_plan_worktree_reconciliation` and `gc_plan_cleanup_reports`;
+`gc_health_journal` times the GC journal read that follows the plan.
