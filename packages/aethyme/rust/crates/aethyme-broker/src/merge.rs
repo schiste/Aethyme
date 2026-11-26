@@ -2642,6 +2642,13 @@ impl Broker {
                     &plan.integration_head,
                     &simulation.conflicts,
                 );
+                // Rebasing flattens the session's sync merges, so each
+                // pre-sync commit would replay against later integration
+                // edits again. A conflict in a covering sync merge is
+                // resolved by merging the integration head instead.
+                let covering_merge = covering
+                    .as_ref()
+                    .is_some_and(|cover| cover.merge == commit.commit);
                 let conflict_details = simulation
                     .conflicts
                     .iter()
@@ -2650,13 +2657,24 @@ impl Broker {
                         originating_commit: commit.commit.clone(),
                         ownership: commit.ownership,
                         integration_side_commits: history.remove(path).unwrap_or_default(),
-                        remediation: format!(
-                            "rebase session {} onto integration {}, resolve {} while replaying {}, then resubmit",
-                            plan.session_id, plan.integration_head, path, commit.commit
-                        ),
+                        remediation: if covering_merge {
+                            format!(
+                                "merge integration {} into session {}, resolve {}, commit the merge, then resubmit",
+                                plan.integration_head, plan.session_id, path
+                            )
+                        } else {
+                            format!(
+                                "rebase session {} onto integration {}, resolve {} while replaying {}, then resubmit",
+                                plan.session_id, plan.integration_head, path, commit.commit
+                            )
+                        },
                         commands: vec![
                             format!("git fetch . {}", plan.integration_head),
-                            format!("git rebase {}", plan.integration_head),
+                            if covering_merge {
+                                format!("git merge {}", plan.integration_head)
+                            } else {
+                                format!("git rebase {}", plan.integration_head)
+                            },
                             format!("aethyme broker submit --session {}", plan.session_id),
                         ],
                     })
@@ -6134,7 +6152,104 @@ mod sync_merge_replay_tests {
             .unwrap();
         assert_eq!(replay.conflicts, vec!["f.txt".to_string()]);
         assert_eq!(replay.conflict_details.len(), 1);
-        assert_eq!(replay.conflict_details[0].path, "f.txt");
+        let conflict = &replay.conflict_details[0];
+        assert_eq!(conflict.path, "f.txt");
+        assert_eq!(conflict.originating_commit, fixture.session_head());
+        // Rebasing would flatten the sync merge and conflict again on
+        // pre-sync commits; the recovery merges the integration head.
+        let integration = fixture.integration_head();
+        assert_eq!(
+            conflict.commands,
+            vec![
+                format!("git fetch . {integration}"),
+                format!("git merge {integration}"),
+                format!("aethyme broker submit --session {}", fixture.session.id),
+            ]
+        );
+        assert!(conflict.remediation.starts_with("merge integration "));
+    }
+
+    #[test]
+    fn a_session_commit_integrated_inside_the_synced_commit_is_covered() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-session\n");
+        fixture.session_commit("c.txt", "c\n");
+        let promoted = fixture.session_head();
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        git(&fixture.root, &["cherry-pick", &promoted]);
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        fixture.integrate("f.txt", &with_line(2, "2-p2"));
+
+        let plan = fixture.plan();
+        let copy = plan.commits.iter().find(|c| c.commit == promoted).unwrap();
+        assert_eq!(
+            copy.integration_state,
+            SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+        );
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let tree = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            fixture.assert_replays_like_the_pull_request_merge()
+        };
+        assert_eq!(fixture.file_in(&tree, "c.txt"), "c");
+        assert_eq!(fixture.file_in(&tree, "f.txt"), with_line(2, "2-p2").trim());
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("submission_replay_sync_merge_three_way"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_session_commit_integrated_after_the_synced_commit_is_not_covered() {
+        let fixture = Fixture::new();
+        fixture.session_commit("g.txt", "g-session\n");
+        fixture.session_commit("c.txt", "c\n");
+        let promoted = fixture.session_head();
+        fixture.integrate("f.txt", &with_line(2, "2-p1"));
+        fixture.integrate("h.txt", "h-p1\n");
+        fixture.sync();
+        // The promoted copy lands after the synced commit, then integration
+        // reverts it: the session's copy must not bring it back.
+        git(&fixture.root, &["cherry-pick", &promoted]);
+        git(&fixture.root, &["revert", "--no-edit", "HEAD"]);
+
+        let plan = fixture.plan();
+        let copy = plan.commits.iter().find(|c| c.commit == promoted).unwrap();
+        assert_eq!(
+            copy.integration_state,
+            SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+        );
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let replay = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            fixture.broker.replay_submission_plan(&plan).unwrap()
+        };
+        assert!(replay.conflicts.is_empty(), "{:?}", replay.conflicts);
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("submission_replay_sync_merge_three_way"),
+            None,
+            "a sync merge whose session side reaches work integrated after it was covered"
+        );
+        let reverted = command(
+            &fixture.root,
+            &["cat-file", "-e", &format!("{}:c.txt", replay.tree)],
+        );
+        assert!(
+            !reverted.status.success(),
+            "the replay brought back work the integration reverted"
+        );
+        assert_eq!(fixture.file_in(&replay.tree, "g.txt"), "g-session");
+        assert_eq!(
+            fixture.file_in(&replay.tree, "f.txt"),
+            with_line(2, "2-p1").trim()
+        );
     }
 
     #[test]
