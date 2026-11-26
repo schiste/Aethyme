@@ -1227,6 +1227,8 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     let command_output = crate::cli_output::snapshot();
     let spans = crate::phase_telemetry::Recorder::default();
     let _recording = crate::phase_telemetry::install(spans.clone());
+    // Names this process in broker-database write-lock holder records.
+    crate::db_busy::set_process_command(safe_command_surface(args));
     // The opt-in host service has its own bounded parser and never opens a
     // repository, runs startup maintenance or fast-forwards a checkout.
     if args.first().map(String::as_str) == Some("service") {

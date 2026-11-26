@@ -610,9 +610,7 @@ impl BrokerStore {
         let settled =
             self.settle_coordinated_operation_once(binding, status, exit_code, details_json);
         let synchronous = self.conn.pragma_update(None, "synchronous", "NORMAL");
-        let restored = self
-            .conn
-            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS));
+        let restored = crate::db_busy::install_handler(&self.conn, &self.path);
         let settled = settled?;
         synchronous?;
         restored?;
@@ -1946,8 +1944,7 @@ impl BrokerStore {
             }
             result => result,
         };
-        self.conn
-            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        crate::db_busy::install_handler(&self.conn, &self.path)?;
         result
     }
 

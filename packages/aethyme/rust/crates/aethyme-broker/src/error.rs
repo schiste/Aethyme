@@ -6,8 +6,9 @@ pub(crate) const GC_ROW_DELETE_BATCH_SIZE: usize = 128;
 /// Errors surfaced by the broker store.
 ///
 /// `SQLITE_BUSY` must never leak to callers as a raw code: the store opens
-/// every connection with a busy timeout, and anything that still times out
-/// surfaces as [`BrokerError::Sqlite`] with full context.
+/// every connection with the bounded busy handler of `db_busy`, and
+/// anything that still times out surfaces as [`BrokerError::Sqlite`] naming
+/// how long it waited and the recorded write-lock holder.
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
     #[error("broker db i/o at {path}: {source}")]
@@ -16,8 +17,10 @@ pub enum BrokerError {
         source: std::io::Error,
     },
 
+    /// A busy error also says how long it waited and who held the write
+    /// lock, attached when the error is converted (see `db_busy`).
     #[error("broker db: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[source] rusqlite::Error),
 
     /// A `.aethyme` configuration file could not be resolved or parsed.
     /// Boxed so the error enum stays small.
@@ -206,5 +209,11 @@ pub enum BrokerError {
 impl From<aethyme_config::ConfigSourceError> for BrokerError {
     fn from(error: aethyme_config::ConfigSourceError) -> Self {
         Self::Config(Box::new(error))
+    }
+}
+
+impl From<rusqlite::Error> for BrokerError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(crate::db_busy::with_busy_context(error))
     }
 }

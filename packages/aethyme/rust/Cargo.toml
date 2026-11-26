@@ -42,7 +42,7 @@ ra_ap_syntax = "=0.0.331"
 rayon = "1.10"
 redb = "4"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15" }
 ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.15" }
 ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }

@@ -57,6 +57,7 @@ impl Accumulated {
                 | "shared_cache_waited_for_fill"
                 | "operation_outcome_record_wait"
                 | "gate_verdict_wait"
+                | "broker_db_busy_wait"
         ) {
             self.intervals.push((start, end, false));
         }

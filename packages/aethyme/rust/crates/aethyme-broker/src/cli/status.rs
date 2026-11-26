@@ -393,6 +393,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
         let phase_timings_ms = brief.phase_timings_ms.clone();
         let compact = super::status_compact::CompactStatus::from_brief(brief, context);
+        // Outside the revision: who holds the write lock right now is not a
+        // repository change a `--since-revision` reader should see.
+        let write_lock = crate::db_busy::long_held_write_lock(broker.store_ref().db_path());
         if parsed.json {
             let value = serde_json::to_value(&compact)?;
             let mut value = super::status_revision::render(
@@ -409,9 +412,15 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             if let Some(advice) = broker.remote_branch_cleanup_advice() {
                 value["remote_branch_cleanup"] = advice;
             }
+            if let Some(lock) = &write_lock {
+                value["database_write_lock"] = serde_json::to_value(lock)?;
+            }
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             out!("{}", compact.render_text().trim_end());
+            if let Some(lock) = &write_lock {
+                out!("{}", lock.message);
+            }
             if let Some(stacks) = broker.repository_stack_view() {
                 out!(
                     "Stacks: {} stacked session(s), {} needing attention.",
