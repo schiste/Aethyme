@@ -2554,11 +2554,20 @@ impl Broker {
                 conflict_details: Vec::new(),
             });
         }
+        let covering = self.covering_sync_merge(plan)?;
         let mut current = plan.integration_head.clone();
         let mut plain_history = None;
         for commit in &plan.commits {
             if commit.ownership != SubmissionCommitOwnership::SessionOwned
                 || commit.integration_state != SubmissionIntegrationState::Pending
+            {
+                continue;
+            }
+            // The covering sync merge's tree already carries this commit's
+            // work, merged with the integration content it synced.
+            if let Some(cover) = &covering
+                && cover.merge != commit.commit
+                && cover.session_side.contains(&commit.commit)
             {
                 continue;
             }
@@ -2578,10 +2587,12 @@ impl Broker {
                 );
                 continue;
             }
-            // A sync merge can be replayed as its first-parent delta when
-            // the other parent is already present in the captured integration
-            // history. This retains merge-resolution edits without importing
-            // an unaccepted side branch. Other merge shapes remain refused.
+            // A sync merge can be replayed when the other parent is already
+            // present in the captured integration history: as its
+            // first-parent delta, or from that parent when it covers its
+            // session side (see `covering_sync_merge`). Both retain
+            // merge-resolution edits without importing an unaccepted side
+            // branch. Other merge shapes remain refused.
             let replayable_sync = commit.parents.len() == 2
                 && repo.has_complete_unmodified_history()?
                 && repo.is_ancestor_checked(&commit.parents[1], &plan.integration_head)?;
@@ -2602,8 +2613,22 @@ impl Broker {
                     ),
                 });
             }
-            let simulation =
-                repo.merge_tree_with_base(&commit.parents[0], &current, &commit.commit)?;
+            // A covering sync merge is replayed against the integration
+            // commit it merged: its delta from there is exactly the session's
+            // work and merge resolutions, and integration edits made since
+            // are already in `current`. Any other commit replays its
+            // first-parent delta.
+            let replay_base = match &covering {
+                Some(cover) if cover.merge == commit.commit => {
+                    crate::phase_telemetry::add(
+                        "submission_replay_sync_merge_three_way",
+                        std::time::Duration::ZERO,
+                    );
+                    &cover.integration_parent
+                }
+                _ => &commit.parents[0],
+            };
+            let simulation = repo.merge_tree_with_base(replay_base, &current, &commit.commit)?;
             if !simulation.conflicts.is_empty() {
                 let conflict_details = simulation
                     .conflicts
@@ -2614,7 +2639,7 @@ impl Broker {
                         ownership: commit.ownership,
                         integration_side_commits: self
                             .integration_commits_touching_path(
-                                &commit.parents[0],
+                                replay_base,
                                 &plan.integration_head,
                                 path,
                             ),
@@ -2653,6 +2678,89 @@ impl Broker {
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
         })
+    }
+
+    /// The newest pending owned sync merge whose whole session side (every
+    /// commit it reaches that its integration parent does not) is the
+    /// session's own work. Replaying it against that integration parent
+    /// lands what merging the session branch would, so the commits it covers
+    /// are not replayed one by one: their first-parent deltas carry
+    /// integration content the sync already merged, which conflicts with, or
+    /// silently undoes, integration edits made after the sync.
+    ///
+    /// A session side that reaches inherited, ambiguous or ancestry-integrated
+    /// commits, or patch-integrated commits whose integration copy the merged
+    /// parent lacks, keeps the first-parent replay: replaying from the
+    /// integration parent would import that work.
+    fn covering_sync_merge(
+        &self,
+        plan: &SubmissionPlan,
+    ) -> Result<Option<CoveringSyncMerge>, BrokerOpError> {
+        if !plan.commits.iter().any(|c| c.parents.len() == 2) {
+            return Ok(None);
+        }
+        let _span = crate::phase_telemetry::span("submission_replay_covering_sync_merge");
+        let repo = self.repo_handle();
+        if !repo.has_complete_unmodified_history()? {
+            return Ok(None);
+        }
+        let by_id = plan
+            .commits
+            .iter()
+            .map(|commit| (commit.commit.as_str(), commit))
+            .collect::<BTreeMap<_, _>>();
+        let pending_owned = |commit: &SubmissionCommitProvenance| {
+            commit.ownership == SubmissionCommitOwnership::SessionOwned
+                && commit.integration_state == SubmissionIntegrationState::Pending
+        };
+        'merges: for merge in plan
+            .commits
+            .iter()
+            .rev()
+            .filter(|commit| commit.parents.len() == 2 && pending_owned(commit))
+        {
+            let integration_parent = &merge.parents[1];
+            if !repo.is_ancestor_checked(integration_parent, &plan.integration_head)? {
+                continue;
+            }
+            let session_side = repo.commits_excluding_oldest(&merge.commit, integration_parent)?;
+            for id in &session_side {
+                let Some(commit) = by_id.get(id.as_str()) else {
+                    continue 'merges;
+                };
+                // Merges on the session side must themselves be sync merges:
+                // any other merge shape stays refused by the ordinary replay.
+                let supported_shape = match commit.parents.as_slice() {
+                    [_] => true,
+                    [_, synced] => repo.is_ancestor_checked(synced, &plan.integration_head)?,
+                    _ => false,
+                };
+                let accounted = match commit.integration_state {
+                    SubmissionIntegrationState::Pending => true,
+                    SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity => {
+                        let mut merged = !commit.matching_integration_commits.is_empty();
+                        for copy in &commit.matching_integration_commits {
+                            merged =
+                                merged && repo.is_ancestor_checked(copy, integration_parent)?;
+                        }
+                        merged
+                    }
+                    _ => false,
+                };
+                let covered = commit.ownership == SubmissionCommitOwnership::SessionOwned
+                    && supported_shape
+                    && accounted;
+                if !covered {
+                    continue 'merges;
+                }
+            }
+            return Ok(Some(CoveringSyncMerge {
+                merge: merge.commit.clone(),
+                integration_parent: integration_parent.clone(),
+                session_side: session_side.into_iter().collect(),
+            }));
+        }
+        Ok(None)
     }
 
     /// Retain a merge DAG only when its entire exclusive history is owned,
@@ -3022,6 +3130,13 @@ impl Broker {
         blocking.dedup();
         Ok(blocking)
     }
+}
+
+/// A sync merge replayed in one step for every commit on its session side.
+struct CoveringSyncMerge {
+    merge: String,
+    integration_parent: String,
+    session_side: BTreeSet<String>,
 }
 
 /// The commits in `commits` that have a parent, in order: a root commit has

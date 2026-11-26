@@ -4980,6 +4980,16 @@ Submit counts owned linear commits already based on the exact replay tip
 as `submit_replay_exact_parent`. The replay uses their existing Git trees
 in a complete, unmodified history view. Divergent inputs and merge commits
 retain their ordinary replay and provenance checks.
+Submit replays the newest pending sync merge (a merge of an integration
+commit into the session branch) in one step when every commit it reaches
+that the merged integration commit does not is the session's own work:
+it merges that sync merge onto the replay tip with the merged integration
+commit as the base, which lands what merging the pull request would. The
+commits it covers are not replayed one by one, because their first-parent
+deltas carry integration content the sync brought in and conflict with, or
+undo, integration edits made since. Other sync merges keep the first-parent
+replay. Submit times the search as `submission_replay_covering_sync_merge`
+and counts each one-step replay as `submission_replay_sync_merge_three_way`.
 
 The parent records `gate_preverify_launch`. These describe gate work and
 scheduling. The worker never creates or updates a submission queue entry.
