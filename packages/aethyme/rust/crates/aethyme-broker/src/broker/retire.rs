@@ -3955,6 +3955,10 @@ impl Broker {
                 super::retire_operation::sweep_stale_partials(&root);
             }
         }
+        // The command metrics log otherwise grows until a reviewed GC runs
+        // (about 500 MB on the busiest repository): trim it to retention, at
+        // most daily, within this run's deadline.
+        self.trim_command_metrics_log_if_due(deadline);
         // Expiring pins is not urgent (a pin only keeps a commit longer)
         // and used its whole budget on every run: it runs at most every
         // `RETIRE_PIN_PRUNE_INTERVAL_MS`, so the runs in between end sooner

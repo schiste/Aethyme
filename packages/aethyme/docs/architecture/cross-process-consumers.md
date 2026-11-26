@@ -2247,6 +2247,76 @@ changed since review:
 - **Abandon.** `gc abandon` accepts schema 2, 3 and 4 journals, as it already
   did; only its help text said otherwise.
 
+### Unattended command-metrics trim (changed 2026-11-26)
+
+The `command_metrics_days` policy (default 30) was applied only by a reviewed
+`gc plan` / `gc apply --confirm`, so on the busiest repository
+`.aethyme/logs/command-metrics.jsonl` reached about 500 MB and 622,000 rows
+with its oldest row three months old, and every reader of it paid for the
+whole file. Now:
+
+- **Where and when.** Each checkout retirement run (`run_checkout_retirement`,
+  after the stale-partial sweep) calls the trim with the run's deadline. It
+  is due when broker meta key `command_metrics_trim.next_due_at_ms` (epoch ms)
+  is absent or reached, or lies more than a day ahead (a clock that went
+  back). Staging gets the lesser of 60 s and the time left before the run's
+  deadline; with less than 5 s left the trim does not start and the key is
+  left as it is (counter `command_metrics_trim_no_time_this_run`). Before it
+  runs the key is set 30 minutes ahead. After an outcome that a retry would
+  not change (`trimmed`, `nothing_expired`, `missing`, `clock_suspect`,
+  `unsupported`) it is set a day ahead; otherwise it stays 30 minutes ahead.
+  Read-only stores never trim. The cutoff is the one a plan made the same
+  UTC day reviews: rows with `ts` older than the day's midnight UTC less
+  `command_metrics_days`. A size trigger was not added: the policy is by age,
+  so a large log within the window has nothing to remove.
+- **Concurrency.** It reuses the reviewed trim's protocol above: the same
+  row rule (a malformed or timestamp-free line is kept), the exclusive
+  `.aethyme/run/command-metrics.lock`, the `.command-metrics.jsonl-XXXXXX`
+  temporary name, the version checks that restart an attempt (up to three)
+  when an unlocked writer appended, and the 250 ms copy of the replaced
+  inode's late tail. It differs in one step: it *stages* first. Without the
+  lock, it streams the log's whole lines (an unterminated last line is left
+  for later) and writes the kept rows to the temporary, synced. Only then
+  does it take the lock, read what was appended since, filter it with the
+  same rule (an unterminated last line kept as written), append it to the
+  temporary, sync, and rename. The lock is held for the tail, not the whole
+  file, so locked writers are not pushed past their 2 s wait into unlocked
+  appends. Staging relies on the log being append-only between trims: the
+  locked phase publishes only over the same inode (device and inode number,
+  the staged file held open meanwhile so its inode cannot be reused) at least
+  as long as what was staged; any other trim replaces the inode, so that case
+  ends `skipped_concurrent_append` with nothing removed. Without inode numbers
+  (non-Unix) the unattended trim does not run (`unsupported`; the reviewed
+  `gc apply` still trims there). Every trim's stale-temporary sweep, reviewed
+  or unattended, now removes only temporaries last modified at least 120 s
+  ago (the staging budget and a margin; staging writes at least every 1 MiB),
+  and an unattended trim also spares its own.
+- **Clock check.** When every timestamped row, the newest included, is older
+  than the cutoff, nothing is removed (`clock_suspect`): the clock is suspect,
+  or the repository was idle for the whole window, and in either case keeping
+  the rows is the safe answer.
+- **Telemetry**, on the retirement run's metric row: span
+  `command_metrics_trim` (the whole trim) with `command_metrics_trim_stage`
+  (unlocked) and `command_metrics_trim_publish` (locked); the attachment
+  `command_metrics_trim` with `outcome` (`trimmed`, `nothing_expired`,
+  `missing`, `skipped_concurrent_append`, `lock_unavailable`, `refused`,
+  `budget_exhausted`, `clock_suspect`, `unsupported`, `failed`), `elapsed_ms`,
+  and as they apply `rows_expired` and `rows_kept` (what staging and the tail
+  found, also when the outcome removed nothing), `rows_removed` (0 unless
+  `trimmed`), `bytes_before`, `bytes_after`, `attempts`,
+  `recovered_tail_bytes`, `stale_temporaries_removed`, `bytes_scanned`,
+  `cutoff_ms` and `newest_row_ts`; and counters
+  `command_metrics_trim_not_due`, `command_metrics_trim_no_time_this_run`,
+  `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
+  `command_metrics_trim_missing`,
+  `command_metrics_trim_skipped_concurrent_append`,
+  `command_metrics_trim_lock_unavailable`, `command_metrics_trim_refused`,
+  `command_metrics_trim_budget_exhausted`, `command_metrics_trim_clock_suspect`,
+  `command_metrics_trim_unsupported`, `command_metrics_trim_failed` and
+  `command_metrics_trim_tail_recovered`.
+
+Covered by `gc/metrics_trim.rs` tests.
+
 ### Spawned-worktree instance witnesses (#995)
 
 Broker schema 53 adds `spawned_worktree_instances`, with a session ID and a

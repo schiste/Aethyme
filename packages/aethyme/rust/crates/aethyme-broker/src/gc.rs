@@ -2963,6 +2963,14 @@ where
     }
 }
 
+/// A command metric row's `ts`, or `None` for a malformed or timestamp-free
+/// line. Every trim (reviewed or unattended) classifies rows with this rule.
+fn metric_row_timestamp(line: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64))
+}
+
 fn retained_metric_bytes_until(
     bytes: &[u8],
     cutoff: i64,
@@ -2975,10 +2983,7 @@ fn retained_metric_bytes_until(
         if deadline_expired(deadline) {
             return None;
         }
-        let timestamp = serde_json::from_slice::<serde_json::Value>(line)
-            .ok()
-            .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64));
-        match timestamp {
+        match metric_row_timestamp(line) {
             Some(timestamp) if timestamp < cutoff => removed = true,
             Some(_) => after.extend_from_slice(line),
             None => {
