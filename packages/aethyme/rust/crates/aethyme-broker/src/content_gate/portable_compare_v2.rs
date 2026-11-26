@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "portable_host_v2.rs"]
+mod portable_host_v2;
+
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Inputs independently acquired for a fresh offline evaluation. This draft
@@ -1011,9 +1014,21 @@ pub fn compare(
             .iter()
             .filter_map(|c| c["id"].as_str().map(|id| (id, c)))
             .collect();
+        let host_verified = portable_host_v2::verify(&policy, verdict, input.after, &checks)?;
+        let mut coverage_change = change.clone();
+        if host_verified {
+            for entry in coverage_change["entries"]
+                .as_array_mut()
+                .ok_or("invalid entries")?
+            {
+                if entry["media_type"] == portable_host_v2::MEDIA {
+                    entry["media_type"] = json!("text/plain");
+                }
+            }
+        }
         coverage = Some(policy_coverage(
             &policy,
-            &change,
+            &coverage_change,
             input.collection.is_some(),
             &checks,
         )?);
@@ -1106,6 +1121,53 @@ mod tests {
         )
         .is_ok()
     }
+    #[test]
+    fn matches_aexeo_generated_host_vector_and_rejects_changed_candidate() {
+        let vector: Value =
+            serde_json::from_str(include_str!("portable-host-vector.json")).unwrap();
+        let base: Snapshot = serde_json::from_value(vector["base"].clone()).unwrap();
+        let mut after: Vec<Item> = serde_json::from_value(vector["after"].clone()).unwrap();
+        let check_ids = [
+            "gate:7:article:paragraphs",
+            "gate:7:article:pwords",
+            "gate:7:article:pchars",
+        ];
+        let run = |items: &[Item]| {
+            let input = Inputs {
+                base: &base,
+                after: items,
+                change: vector["artifacts"]["change"].as_str().unwrap().as_bytes(),
+                resolved_policy: vector["artifacts"]["resolved_policy"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                host_options: vector["artifacts"]["host_options"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                collection: None,
+                external_evidence: None,
+                evaluator_identity: vector["artifacts"]["evaluator"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                expected_validator_name: "aexeo",
+                expected_validator_version: "0.0.26",
+                required_checks: &check_ids,
+                fresh_exit_code: Some(0),
+                fresh_timed_out: false,
+            };
+            compare(
+                vector["previous"].to_string().as_bytes(),
+                vector["fresh"].to_string().as_bytes(),
+                &input,
+            )
+        };
+        assert!(run(&after).is_ok());
+        after[0].source.push(' ');
+        assert!(run(&after).is_err());
+    }
+
     #[test]
     fn matches_shared_vector_but_does_not_authorize_publication() {
         let (v, base, after, old) = fixture();
