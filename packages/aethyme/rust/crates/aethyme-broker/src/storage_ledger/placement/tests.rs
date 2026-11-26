@@ -281,7 +281,7 @@ fn migration_moves_complete_archives_with_their_markers_and_nothing_else() {
     // Readers learn of the root before anything lands there.
     assert_eq!(
         recorded_archive_storage_roots(&fixture.host_state),
-        [fixture.storage.clone()]
+        std::slice::from_ref(&fixture.storage)
     );
     assert_eq!(
         MigrationState::load(&fixture.host_state).archives_migrated_total,
