@@ -528,3 +528,41 @@ fn gate_caches_follow_the_placement_and_fall_back_to_the_host_cache() {
     };
     assert_eq!(none.gate_cache_dir(), None);
 }
+
+/// Gate caches placed on a storage root are pruned like host ones: the
+/// over-budget prune selects them, and stages beside them in that root.
+#[test]
+fn gate_caches_on_a_storage_root_are_selected_for_pruning() {
+    let fixture = Fixture::new();
+    let entry = fixture.storage.join("gates/example-0123/rust-workspace-v1");
+    fs::create_dir_all(entry.join("target")).unwrap();
+    fs::write(entry.join("target/blob"), vec![1_u8; 8192]).unwrap();
+    let mut ledger = Ledger {
+        roots: vec![crate::storage_ledger::Root::new(
+            &fixture.storage,
+            RootKind::Storage,
+        )],
+        ..Ledger::default()
+    };
+    crate::storage_ledger::discover(&mut ledger);
+    for item in &mut ledger.items {
+        crate::storage_ledger::measure_item(
+            item,
+            Instant::now() + Duration::from_secs(60),
+            &mut || {},
+        );
+    }
+    let budgets = crate::storage_ledger::Budgets {
+        gate_cache_bytes_per_repository: 1,
+        ..crate::storage_ledger::Budgets::default()
+    };
+    let selected = crate::storage_ledger::gate_prune::entries_to_prune(
+        &ledger,
+        &budgets,
+        &std::collections::BTreeSet::new(),
+    );
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    let (index, name) = &selected[0];
+    assert_eq!(ledger.items[*index].root, fixture.storage);
+    assert_eq!(name, "example-0123/rust-workspace-v1");
+}

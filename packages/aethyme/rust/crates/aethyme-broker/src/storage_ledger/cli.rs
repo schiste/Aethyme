@@ -154,6 +154,13 @@ pub fn status_value(host_state: &Path) -> Value {
     let summary = Summary::load(host_state);
     let (budgets, budget_error) = Budgets::load(host_state);
     let class_bytes = ledger.class_bytes();
+    // The gate cache's budget is per repository: its class budget is the sum
+    // of the budgets of the repositories it holds, each shown with its bytes.
+    let gate_repositories = super::evict::gate_cache_by_repository(&ledger);
+    let gate_budget: u64 = gate_repositories
+        .keys()
+        .map(|repository| budgets.gate_budget(repository))
+        .fold(0, u64::saturating_add);
     let mut classes: BTreeMap<Class, Value> = BTreeMap::new();
     for class in class_bytes.keys() {
         let items: Vec<&super::Item> = ledger
@@ -177,13 +184,17 @@ pub fn status_value(host_state: &Path) -> Value {
             _ => None,
         };
         let telemetry = ledger.telemetry.get(class).cloned().unwrap_or_default();
+        let budget_bytes = match class {
+            Class::GateCache if !gate_repositories.is_empty() => Some(gate_budget),
+            _ => budgets.class_bytes(*class),
+        };
         classes.insert(
             *class,
             json!({
                 "bytes": class_bytes.get(class),
                 "entries": items.iter().map(|item| item.entries).sum::<u64>(),
                 "oldest_ms": oldest,
-                "budget_bytes": budgets.class_bytes(*class),
+                "budget_bytes": budget_bytes,
                 "reclaimable_bytes": reclaimable,
                 "why_not": why_not,
                 "unmeasured": items.iter().filter(|item| item.measured_at_ms == 0).count(),
@@ -192,6 +203,32 @@ pub fn status_value(host_state: &Path) -> Value {
                 "over_budget_since_ms": telemetry.over_budget_since_ms,
                 "over_budget_ms_total": telemetry.over_budget_ms_total,
             }),
+        );
+    }
+    if let Some(gate) = classes.get_mut(&Class::GateCache)
+        && let Some(object) = gate.as_object_mut()
+    {
+        object.insert(
+            "repositories".into(),
+            gate_repositories
+                .iter()
+                .map(|(repository, bytes)| {
+                    (
+                        repository.clone(),
+                        json!({"bytes": bytes, "budget_bytes": budgets.gate_budget(repository)}),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>()
+                .into(),
+        );
+        object.insert(
+            "last_prune".into(),
+            json!(
+                ledger
+                    .last_pass
+                    .as_ref()
+                    .and_then(|pass| pass.gate_cache_prune.clone())
+            ),
         );
     }
     let unclassified: Vec<Value> = ledger

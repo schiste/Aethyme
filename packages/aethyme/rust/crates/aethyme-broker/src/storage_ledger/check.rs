@@ -419,10 +419,11 @@ pub fn decide(
     let stale = now.saturating_sub(summary.updated_at_ms) > duration_ms(REFRESH_EVERY);
     // A staged deletion left waiting (its stager could not start a worker,
     // or the worker that ran had already swept): one listing of the host
-    // cache root.
+    // cache root, and of each storage root (gate caches placed there stage
+    // their pruned units beside them, on the same volume).
     let staged_waiting = roots
         .iter()
-        .filter(|root| root.kind == RootKind::HostCache)
+        .filter(|root| matches!(root.kind, RootKind::HostCache | RootKind::Storage))
         .any(|root| {
             staged_deletions(&root.path)
                 .iter()
@@ -1025,6 +1026,24 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     report.pressure = !aggressive.is_empty();
     report.phases_ms.insert("volumes".into(), elapsed(phase));
 
+    // Superseded workspace build units out of over-budget gate caches,
+    // before any whole entry is planned for eviction.
+    phase = Instant::now();
+    let leases = evict::leased_gate_caches(&inputs.registry);
+    report.gate_cache_prune = super::gate_prune::prune_pass(
+        &mut ledger,
+        &super::gate_prune::PruneInputs {
+            budgets: &inputs.budgets,
+            aggressive: &aggressive,
+            registry: &inputs.registry,
+            leases: leases.as_ref(),
+            pace: inputs.pace,
+            deadline: Instant::now() + super::gate_prune::GATE_PRUNE_BUDGET,
+        },
+        lock.as_deref_mut(),
+    );
+    report.phases_ms.insert("gate_prune".into(), elapsed(phase));
+
     // Eviction.
     phase = Instant::now();
     let now = now_ms();
@@ -1038,12 +1057,14 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         prover.expire_tips();
         prover.stats().clone()
     };
-    let leases = evict::leased_gate_caches(&inputs.registry);
     let mut class_bytes = ledger.class_bytes();
     let mut gate_bytes = evict::gate_cache_by_repository(&ledger);
     let mut root_bytes = ledger.root_bytes();
     // Age expiry is capped per pass; the rest stay noticed.
     let (mut aged, mut aged_bytes) = (0usize, 0u64);
+    // Entries and bytes removed per class this pass, and why it stopped.
+    let mut evicted_by_class: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
+    let mut eviction_stop = "done";
     for candidate in candidates {
         let age_expiry =
             candidate.class == Class::RecoveryArchives && candidate.reason == Reason::Expired;
@@ -1088,6 +1109,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             report
                 .skipped
                 .push("the storage worker lock was taken over".into());
+            eviction_stop = "lock_lost";
             break;
         }
         if let Some(why) = evict::refuse(&candidate, leases.as_ref(), now) {
@@ -1126,6 +1148,20 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                 let telemetry = ledger.telemetry.entry(candidate.class).or_default();
                 telemetry.evictions += 1;
                 telemetry.bytes_reclaimed += candidate.bytes;
+                let removed = evicted_by_class
+                    .entry(candidate.class.as_str())
+                    .or_default();
+                removed.0 += 1;
+                removed.1 = removed.1.saturating_add(candidate.bytes);
+                if candidate.class == Class::ToolCaches
+                    && candidate.relative.split('/').next()
+                        == Some(crate::node_compile_cache::CACHE_DIRECTORY)
+                {
+                    crate::phase_telemetry::add(
+                        "storage_node_compile_cache_day_evicted",
+                        Duration::ZERO,
+                    );
+                }
                 if age_expiry {
                     aged += 1;
                     aged_bytes += candidate.bytes;
@@ -1158,6 +1194,18 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         }
     }
     report.phases_ms.insert("evict".into(), elapsed(phase));
+    crate::phase_telemetry::attach(
+        "storage_eviction",
+        serde_json::json!({
+            "by_class": evicted_by_class
+                .iter()
+                .map(|(class, (entries, bytes))| {
+                    ((*class).to_string(), serde_json::json!({"entries": entries, "bytes": bytes}))
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "stop": eviction_stop,
+        }),
+    );
     // The recovery archive floor, after the cheaper classes had their turn.
     phase = Instant::now();
     let archive_floor = archive_floor_pass(

@@ -302,6 +302,47 @@ recovery archive) are operator surfaces; `storage.toml` `[budget]` adds
 paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the
 start-of-command check off or on.
 
+Changed 2026-11-26 (host cache reclaim). Discovery classifies every known
+entry again on each pass: an entry an older binary recorded as
+`unclassified` (it did not know the name; the Node.js compile cache was the
+case: 7 GB never measured) is reset to unmeasured and measured as its class
+(counter `storage_ledger_reclassified`). `node-compile-cache/d<days>`
+children go once their UTC day is over and they have not changed for an hour,
+whatever the tool-cache budget; today's directory is never removed, not even
+under pressure, and is refused at removal; other children keep the
+tool-cache rules (counter `storage_node_compile_cache_day_evicted` per
+removed day). Gate caches: while a repository's gate caches are over its
+budget (`gate_cache_bytes_per_repository`, or the repository's registered
+`gate_cache_bytes_budget`), or their root is under pressure, the pass first
+prunes each of its entries, largest first, under the entry's exclusive gate
+cache lease (an entry a gate holds is skipped): superseded generations of
+local packages only (a package whose units' `deps/*.d` dep-info names local
+sources and none under a cargo `registry/src/` or `git/checkouts/`
+directory), not read since their successor was built, are renamed into
+`<host cache>/.aethyme-storage-evicting-<pid>-<ms>-pruned` and deleted after
+the lease is released, within one 60 s budget per pass (pass phase
+`gate_prune`), paced like removals; staged units are added to the entry's
+`.aethyme-pruned-units` record so the next gate counts rebuilt units. Spans
+`storage_gate_cache_prune` (the step), `storage_gate_cache_prune_entry` (one
+entry: lease and renames) and `storage_gate_cache_prune_delete` (deleting
+the staged units); counters `storage_gate_cache_pruned_unit`,
+`storage_gate_cache_prune_leased` and one of
+`storage_gate_cache_prune_stop_done`, `storage_gate_cache_prune_stop_deadline`,
+`storage_gate_cache_prune_stop_lock_lost` or
+`storage_gate_cache_prune_stop_no_registry` per step; attachment
+`storage_gate_cache_prune` (`entries`, `units`, `bytes`, `candidates`,
+`not_local`, `leased`, `stop`), also in the pass report as
+`gate_cache_prune`. Then whole entries: older entries of a kind first, then
+the other kinds' most recently used entries idle for a day (any idle time
+under pressure), never the repository's most recently used entry, until the
+repository is within budget. Attachment `storage_eviction` (`by_class`:
+class to `entries` and `bytes` removed this pass; `stop`: `done` or
+`lock_lost`). `storage status --json` gives the `gate_cache` class a
+`budget_bytes` (the sum of its repositories' budgets; it was `null`),
+`repositories` (each repository's `bytes` and `budget_bytes`) and
+`last_prune` (the last pass's `gate_cache_prune`), and the gate cache's
+over-budget clock now runs while any repository is over its budget.
+
 Host temp folders (2026-11-22): after each pass the worker reads the per-user
 temp folder (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`, never `$TMPDIR`) and
 `/tmp`, at most every 10 minutes, into
@@ -2426,6 +2467,15 @@ whole file. Now:
   cleared (set empty) after any other outcome. Every stale-temporary sweep
   (the reviewed trim's too) spares the recorded temporary while its record
   still matches the log and the temporary's length.
+  Changed 2026-11-26 (spare capped by age): the record also carries
+  `recorded_at_ms` (epoch ms, rewritten by each `budget_exhausted`; absent in
+  an older record, which reads as 0). Once it is 24 hours old the record
+  spares nothing and is not resumed: a sweep that reads it clears it (a
+  compare-and-set, so a newer record is never cleared) and removes its
+  temporary, and an unattended trim removes the temporary and starts over
+  (counter `command_metrics_trim_resume_expired`, one per expired record
+  found). Unattended trims that stop running therefore leave no temporary
+  spared for more than a day.
 - **Clock check.** When every timestamped row, the newest included, is older
   than the cutoff, nothing is removed (`clock_suspect`): the clock is suspect,
   or the repository was idle for the whole window, and in either case keeping
@@ -2448,7 +2498,7 @@ whole file. Now:
   counters `command_metrics_trim_not_due`,
   `command_metrics_trim_no_time_this_run`,
   `command_metrics_trim_claimed_elsewhere`, `command_metrics_trim_resumed`,
-  `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
+  `command_metrics_trim_resume_expired`, `command_metrics_trim_trimmed`, `command_metrics_trim_nothing_expired`,
   `command_metrics_trim_missing`,
   `command_metrics_trim_skipped_concurrent_append`,
   `command_metrics_trim_lock_unavailable`, `command_metrics_trim_refused`,

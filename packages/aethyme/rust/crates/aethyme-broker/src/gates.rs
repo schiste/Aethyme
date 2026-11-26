@@ -3027,13 +3027,26 @@ impl GateResourceRuntime {
         // it first instead of waiting for its turn.
         if let Some(host_state) = self.resource_db_path.parent() {
             let prefix = managed_cache_lease_name("", "");
+            // Placed on an adopted storage root (`[placement]`), the cache
+            // is that root's `gates` entry, not the host cache's.
+            let kind = {
+                use crate::storage_ledger::placement;
+                if placement::resolve(host_state, placement::Data::GateCaches)
+                    .on_storage()
+                    .is_some()
+                {
+                    crate::storage_ledger::RootKind::Storage
+                } else {
+                    crate::storage_ledger::RootKind::HostCache
+                }
+            };
             for allocation in &self.grant.lease.allocations {
                 if let Some(rest) = allocation.value.strip_prefix(prefix.trim_end_matches(':'))
                     && let Some((repository, key)) = rest.trim_start_matches(':').split_once(':')
                 {
                     crate::storage_ledger::note_written(
                         host_state,
-                        crate::storage_ledger::RootKind::HostCache,
+                        kind,
                         &format!("gates/{repository}/{key}"),
                     );
                 }
@@ -3260,9 +3273,11 @@ fn prepare_managed_gate_cache(
     let root = storage.gate_cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
-    // Pruned units are handed to the storage worker, which removes the
-    // host cache root's `.aethyme-storage-evicting-*` leftovers in the
-    // background on every pass; with the worker off, they go inline.
+    // Pruned units are staged beside the cache, under `root` (the host
+    // cache, or the storage root `[placement]` names: the same volume as
+    // the units), and handed to the storage worker, which removes every
+    // root's `.aethyme-storage-evicting-*` leftovers in the background on
+    // every pass; with the worker off, they go inline.
     let deferred_to = storage
         .resource_db_path()
         .ok()
@@ -3345,7 +3360,7 @@ fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error
 
 /// The pruned-units record inside a managed cache: which units the last
 /// prune staged, read by the next gate to count rebuilds.
-const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
+pub(crate) const PRUNED_UNITS_MARKER: &str = ".aethyme-pruned-units";
 
 /// How long a gate may spend moving superseded units out of its managed
 /// cache before it runs its command.
