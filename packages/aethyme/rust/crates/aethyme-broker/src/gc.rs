@@ -2963,12 +2963,254 @@ where
     }
 }
 
-/// A command metric row's `ts`, or `None` for a malformed or timestamp-free
-/// line. Every trim (reviewed or unattended) classifies rows with this rule.
+/// A command metric row's `ts` read through a full JSON tree: `None` for a
+/// line `serde_json::Value` rejects or whose last top-level `ts` is not an
+/// `i64`. This was the trim rule until 2026-11-26 and is kept as the oracle
+/// [`validated_metric_row_timestamp`] is tested against.
+#[cfg(test)]
 fn metric_row_timestamp(line: &[u8]) -> Option<i64> {
     serde_json::from_slice::<serde_json::Value>(line)
         .ok()
         .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64))
+}
+
+/// A command metric row's `ts`, exactly as the full parse (the test oracle
+/// `metric_row_timestamp`) reads it, without building the tree: `serde_json`
+/// drives the same `deserialize_any` walk it drives for `Value`, so the line
+/// is rejected for exactly the same reasons (invalid UTF-8 or a lone
+/// surrogate escape in any string or key, an out-of-range number, the
+/// nesting limit, trailing characters), and only the last top-level `ts`
+/// (the one `Value` keeps) is read, with `as_i64`'s rule: an integer in
+/// `i64`, never a float (`-0` included). The workspace builds `serde_json`
+/// without `arbitrary_precision` or `raw_value`, the features that would
+/// make `Value` treat some keys and numbers specially.
+fn validated_metric_row_timestamp(line: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<MetricRowTimestamp>(line)
+        .ok()
+        .and_then(|row| row.0)
+}
+
+/// The top-level `ts` of a validated metric row (see
+/// [`validated_metric_row_timestamp`]).
+struct MetricRowTimestamp(Option<i64>);
+
+impl<'de> serde::Deserialize<'de> for MetricRowTimestamp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(JsonShape::Row)
+            .map(MetricRowTimestamp)
+    }
+}
+
+/// Any JSON value, walked and validated as `Value` would be, keeping nothing.
+struct AnyJsonValue;
+
+impl<'de> serde::Deserialize<'de> for AnyJsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(JsonShape::Any)
+            .map(|_| AnyJsonValue)
+    }
+}
+
+/// The value of a top-level `ts` key: its `as_i64`, once validated.
+struct TimestampValue(Option<i64>);
+
+impl<'de> serde::Deserialize<'de> for TimestampValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(JsonShape::Timestamp)
+            .map(TimestampValue)
+    }
+}
+
+/// An object key, decoded (escapes included) as `Value` decodes it: whether
+/// it is `ts`.
+struct TimestampKey(bool);
+
+impl<'de> serde::Deserialize<'de> for TimestampKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `Value` reads keys with `deserialize_str`/`deserialize_string`,
+        // which `serde_json` forwards to its string parse with validation.
+        deserializer
+            .deserialize_str(TimestampKeyVisitor)
+            .map(TimestampKey)
+    }
+}
+
+struct TimestampKeyVisitor;
+
+impl serde::de::Visitor<'_> for TimestampKeyVisitor {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an object key")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<bool, E> {
+        Ok(key == "ts")
+    }
+}
+
+/// Which value a [`JsonShape`] visitor is reading.
+#[derive(Clone, Copy)]
+enum JsonShape {
+    /// The whole row: the last top-level `ts` when it is an object.
+    Row,
+    /// A top-level `ts` value: its `as_i64`.
+    Timestamp,
+    /// Anything else: validated, nothing kept.
+    Any,
+}
+
+impl JsonShape {
+    /// The `as_i64` of a scalar read in this position.
+    fn integer(self, value: Option<i64>) -> Option<i64> {
+        match self {
+            Self::Timestamp => value,
+            Self::Row | Self::Any => None,
+        }
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonShape {
+    type Value = Option<i64>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Option<i64>, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Option<i64>, E> {
+        Ok(self.integer(Some(value)))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Option<i64>, E> {
+        // `Number::as_i64` on a positive integer: only up to `i64::MAX`.
+        Ok(self.integer(i64::try_from(value).ok()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Option<i64>, E> {
+        // `Number::as_i64` on a float is `None`, `-0` (parsed as a float)
+        // included. An out-of-range float never gets here: the parse fails.
+        Ok(None)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Option<i64>, E> {
+        // Reached only after `serde_json` parsed the string as a `str`, which
+        // validates UTF-8 and surrogate escapes as it does for `Value`.
+        Ok(None)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Option<i64>, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Option<i64>, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Option<i64>, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Option<i64>, A::Error> {
+        while seq.next_element::<AnyJsonValue>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Option<i64>, A::Error> {
+        let mut timestamp = None;
+        match self {
+            Self::Row => {
+                while let Some(TimestampKey(is_timestamp)) = map.next_key::<TimestampKey>()? {
+                    if is_timestamp {
+                        // A later duplicate replaces an earlier one, as in
+                        // `Value`'s map.
+                        timestamp = map.next_value::<TimestampValue>()?.0;
+                    } else {
+                        map.next_value::<AnyJsonValue>()?;
+                    }
+                }
+            }
+            Self::Timestamp | Self::Any => {
+                while map.next_key::<TimestampKey>()?.is_some() {
+                    map.next_value::<AnyJsonValue>()?;
+                }
+            }
+        }
+        Ok(timestamp)
+    }
+}
+
+/// The `ts` of a row that starts `{"ts":<integer>,` (or `}`), the shape the
+/// broker writes, without parsing the rest; `None` for any other start
+/// (`-0` included, which `Value` reads as a float).
+fn leading_metric_row_timestamp(line: &[u8]) -> Option<i64> {
+    let rest = line.strip_prefix(b"{\"ts\":")?;
+    let (negative, digits) = match rest.strip_prefix(b"-") {
+        Some(digits) => (true, digits),
+        None => (false, rest),
+    };
+    let length = digits
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if length == 0 || (length > 1 && digits[0] == b'0') {
+        return None;
+    }
+    if !matches!(digits.get(length), Some(b',' | b'}')) {
+        return None;
+    }
+    let mut value = 0_i64;
+    for digit in &digits[..length] {
+        value = value
+            .checked_mul(10)?
+            .checked_add(i64::from(digit - b'0'))?;
+    }
+    if negative && value == 0 {
+        return None;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// One row's trim verdict: whether it is removed, and the `ts` it carries
+/// for the newest-row clock check. Every trim (reviewed or unattended)
+/// classifies rows with this rule.
+///
+/// A row is removed only when [`validated_metric_row_timestamp`] (which
+/// agrees with a full `serde_json::Value` parse on every input) reads a `ts`
+/// older than `cutoff`, so no line the full parse would keep is removed: a
+/// malformed or timestamp-free line is always kept.
+///
+/// Measured on 2026-11-26, parsing every row into a JSON tree staged a
+/// 508 MB log at 3.5 MB/s inside a background worker, so the unattended trim
+/// never finished in its budget. Two shortcuts follow. A row in the broker's
+/// own shape whose leading `ts` is inside retention is kept without being
+/// read further; every other row takes the validating walk, which builds
+/// nothing. The kept-early rows differ from the full parse in two reported
+/// values, never in what is kept: such a row damaged after its leading `ts`
+/// is no longer counted as malformed (so `gc plan` no longer raises a
+/// `command_metric_line` blocker for it), and its leading `ts` (not a later
+/// duplicate) feeds the newest-row clock check, where the full parse would
+/// have read a later duplicate or, for a damaged row, nothing.
+fn metric_row_verdict(line: &[u8], cutoff: i64) -> (bool, Option<i64>) {
+    match leading_metric_row_timestamp(line) {
+        Some(timestamp) if timestamp >= cutoff => (false, Some(timestamp)),
+        _ => {
+            let timestamp = validated_metric_row_timestamp(line);
+            (
+                timestamp.is_some_and(|timestamp| timestamp < cutoff),
+                timestamp,
+            )
+        }
+    }
 }
 
 fn retained_metric_bytes_until(
@@ -2983,10 +3225,10 @@ fn retained_metric_bytes_until(
         if deadline_expired(deadline) {
             return None;
         }
-        match metric_row_timestamp(line) {
-            Some(timestamp) if timestamp < cutoff => removed = true,
-            Some(_) => after.extend_from_slice(line),
-            None => {
+        match metric_row_verdict(line, cutoff) {
+            (true, _) => removed = true,
+            (false, Some(_)) => after.extend_from_slice(line),
+            (false, None) => {
                 malformed_lines = malformed_lines.saturating_add(1);
                 after.extend_from_slice(line);
             }
@@ -3179,11 +3421,14 @@ fn delete_reviewed_file(path: &Path, candidate: &GcFileCandidate) -> GcFileStep 
 /// anchor and `command_metrics_days`; the plan's hashes describe the bytes it
 /// saw and are not compared, because every command appends a row. Journals
 /// written before this rule carry the same candidate and resume the same way.
+/// `spare` is an unattended trim's resumable temporary, which this trim's
+/// stale-temporary sweep keeps.
 fn trim_reviewed_metrics_log(
     main_root: &Path,
     path: &Path,
     candidate: &GcFileCandidate,
     cutoff: i64,
+    spare: Option<&Path>,
 ) -> GcFileStep {
     use metrics_trim::MetricsTrim;
 
@@ -3193,7 +3438,7 @@ fn trim_reviewed_metrics_log(
             reason: "GC rewrites only the command metrics log; this rewrite was retained".into(),
         };
     }
-    let outcome = match metrics_trim::trim_expired_rows(main_root, path, cutoff) {
+    let outcome = match metrics_trim::trim_expired_rows(main_root, path, cutoff, spare) {
         Ok(outcome) => outcome,
         Err(error) => {
             return GcFileStep::Stopped {
@@ -14228,6 +14473,7 @@ impl Broker {
                     &path,
                     &candidate,
                     cutoff(age_reference_ms, journal.policy.command_metrics_days),
+                    metrics_trim::resumable_temporary(self.store_ref(), &path).as_deref(),
                 ),
             };
             match step {
@@ -19839,6 +20085,268 @@ mod tests {
         .unwrap()
         .expect("a fresh positive pass completes after the partial pass");
         assert_eq!(complete, content);
+    }
+
+    #[test]
+    fn leading_metric_row_timestamp_reads_only_the_brokers_row_shape() {
+        assert_eq!(
+            leading_metric_row_timestamp(b"{\"ts\":42,\"a\":1}\n"),
+            Some(42)
+        );
+        assert_eq!(leading_metric_row_timestamp(b"{\"ts\":42}\n"), Some(42));
+        assert_eq!(
+            leading_metric_row_timestamp(b"{\"ts\":-7,\"a\":1}"),
+            Some(-7)
+        );
+        assert_eq!(leading_metric_row_timestamp(b"{\"ts\":0}"), Some(0));
+        for other in [
+            &b"{\"ts\": 42}"[..],
+            b"{ \"ts\":42}",
+            b"{\"a\":1,\"ts\":42}",
+            b"{\"ts\":4.2}",
+            b"{\"ts\":4e2}",
+            b"{\"ts\":042}",
+            b"{\"ts\":42",
+            b"{\"ts\":\"42\"}",
+            b"{\"ts\":-}",
+            b"{\"ts\":99999999999999999999}",
+            // `Value` reads `-0` as a float, which `as_i64` does not read.
+            b"{\"ts\":-0}",
+            b"{\"ts\":-0,\"a\":1}",
+            b"not-json",
+        ] {
+            assert_eq!(leading_metric_row_timestamp(other), None, "{other:?}");
+        }
+    }
+
+    /// Lines the validating walk must judge exactly as a `Value` parse does.
+    fn metric_row_corpus() -> Vec<Vec<u8>> {
+        let mut corpus: Vec<Vec<u8>> = [
+            // Well-formed broker rows.
+            &b"{\"ts\":1,\"command\":\"gc\",\"n\":{\"x\":[1,2]}}\n"[..],
+            b"{\"ts\":5000,\"command\":\"gc\"}\n",
+            b"{\"ts\":1}",
+            // Invalid UTF-8 in a value, a key, and a nested string.
+            b"{\"ts\":1,\"a\":\"\xff\"}\n",
+            b"{\"ts\":1,\"\xff\":1}\n",
+            b"{\"ts\":1,\"a\":[{\"b\":\"\xc3\x28\"}]}\n",
+            b"{\"ts\":5000,\"a\":\"\xed\xa0\x80\"}\n",
+            // Valid non-ASCII text.
+            "{\"ts\":1,\"a\":\"\u{e9}\u{1f600}\"}\n".as_bytes(),
+            // Surrogate escapes: lone leading, lone trailing, unpaired, in a
+            // key, and a valid pair.
+            b"{\"ts\":1,\"a\":\"\\ud800\"}\n",
+            b"{\"ts\":1,\"a\":\"\\udc00\"}\n",
+            b"{\"ts\":1,\"a\":\"\\ud800\\u0041\"}\n",
+            b"{\"ts\":1,\"a\":\"\\ud800x\"}\n",
+            b"{\"ts\":1,\"\\ud800\":1}\n",
+            b"{\"ts\":1,\"a\":[\"\\udfff\"]}\n",
+            b"{\"ts\":1,\"a\":\"\\ud83d\\ude00\"}\n",
+            // Other escapes.
+            b"{\"ts\":1,\"a\":\"\\n\\t\\\"\\\\\\/\\b\\f\\r\"}\n",
+            b"{\"ts\":1,\"a\":\"\\x\"}\n",
+            b"{\"ts\":1,\"a\":\"\\u12\"}\n",
+            b"{\"ts\":1,\"a\":\"\x01\"}\n",
+            // Out-of-range and underflowing numbers.
+            b"{\"ts\":1,\"a\":1e400}\n",
+            b"{\"ts\":1,\"a\":-1e400}\n",
+            b"{\"ts\":1,\"a\":[1e309]}\n",
+            b"{\"ts\":1e400}\n",
+            b"{\"ts\":1,\"a\":1e-400}\n",
+            b"{\"ts\":1,\"a\":1.7976931348623157e308}\n",
+            b"{\"ts\":1,\"a\":01}\n",
+            b"{\"ts\":1,\"a\":1.}\n",
+            b"{\"ts\":1,\"a\":-}\n",
+            // Duplicate `ts`: `Value` keeps the last.
+            b"{\"ts\":1,\"ts\":5000}\n",
+            b"{\"ts\":5000,\"ts\":1}\n",
+            b"{\"ts\":1,\"ts\":\"x\"}\n",
+            b"{\"ts\":1,\"ts\":1.5}\n",
+            b"{\"ts\":1,\"a\":2,\"ts\":3,\"b\":4}\n",
+            // Negative zero and other floats.
+            b"{\"ts\":-0}\n",
+            b"{\"ts\":-0,\"a\":1}\n",
+            b"{\"ts\":-0.0}\n",
+            b"{\"ts\":0}\n",
+            b"{\"ts\":1.0}\n",
+            b"{\"ts\":1e2}\n",
+            b"{\"ts\":-1}\n",
+            // The edges of `i64` and `u64`.
+            b"{\"ts\":-9223372036854775808}\n",
+            b"{\"ts\":-9223372036854775809}\n",
+            b"{\"ts\":9223372036854775807}\n",
+            b"{\"ts\":9223372036854775808}\n",
+            b"{\"ts\":18446744073709551615}\n",
+            b"{\"ts\":18446744073709551616}\n",
+            // `ts` keys that are not top-level.
+            b"{\"a\":{\"ts\":1}}\n",
+            b"{\"a\":[{\"ts\":1}],\"ts\":7}\n",
+            b"{\"ts\":{\"ts\":1}}\n",
+            b"{\"ts\":[1]}\n",
+            b"[{\"ts\":1}]\n",
+            b"{\"ts\":1,\"a\":{\"ts\":5000}}\n",
+            // Keys spelled with escapes decode to `ts`.
+            b"{\"t\\u0073\":1}\n",
+            b"{\"\\u0074s\":1,\"a\":2}\n",
+            b"{\"ts\":5000,\"t\\u0073\":1}\n",
+            b"{\"t\\u0073\":5000,\"ts\":1}\n",
+            b"{\"ts \":1}\n",
+            b"{\"TS\":1}\n",
+            // Whitespace, CRLF and trailing characters.
+            b"{\"ts\":1}\r\n",
+            b" {\"ts\":1} \n",
+            b"{\r\n\"ts\"\t:\n1}\n",
+            b"{\"ts\":1}\n\n",
+            b"{\"ts\":1}x\n",
+            b"{\"ts\":1}{\"ts\":2}\n",
+            b"{\"ts\":1}\x0b\n",
+            // Other malformed or timestamp-free lines.
+            b"{\"ts\":1,}\n",
+            b"{\"ts\":1,\"a\":[1,]}\n",
+            b"{\"ts\":1,\"a\":[1\n",
+            b"{\"ts\":1\n",
+            b"{\"ts\":true}\n",
+            b"{\"ts\":null}\n",
+            b"{\"ts\":\"1\"}\n",
+            b"{\"a\":tru}\n",
+            b"{}\n",
+            b"null\n",
+            b"1\n",
+            b"\"ts\"\n",
+            b"\n",
+            b"",
+            b"not-json\n",
+        ]
+        .iter()
+        .map(|line| line.to_vec())
+        .collect();
+        // Around `serde_json`'s nesting limit, in a value and in `ts` itself.
+        for depth in [1_usize, 126, 127, 128, 129, 200] {
+            let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            corpus.push(format!("{{\"ts\":1,\"a\":{nested}}}\n").into_bytes());
+            corpus.push(format!("{{\"ts\":{nested}}}\n").into_bytes());
+            let objects = format!("{}1{}", "{\"ts\":".repeat(depth), "}".repeat(depth));
+            corpus.push(format!("{objects}\n").into_bytes());
+        }
+        corpus
+    }
+
+    #[test]
+    fn validated_metric_row_timestamp_equals_the_full_parse_on_every_input() {
+        for line in metric_row_corpus() {
+            assert_eq!(
+                validated_metric_row_timestamp(&line),
+                metric_row_timestamp(&line),
+                "{}",
+                String::from_utf8_lossy(&line)
+            );
+        }
+        // Spot checks of what the full parse reads, so the corpus cannot
+        // agree on a wrong answer unnoticed.
+        for (line, expected) in [
+            (&b"{\"ts\":1,\"ts\":5000}"[..], Some(5000)),
+            (b"{\"ts\":5000,\"ts\":1}", Some(1)),
+            (b"{\"t\\u0073\":1}", Some(1)),
+            (b"{\"ts\":-0}", None),
+            (b"{\"ts\":-9223372036854775808}", Some(i64::MIN)),
+            (b"{\"ts\":9223372036854775808}", None),
+            (b"{\"ts\":1,\"a\":\"\\ud800\"}", None),
+            (b"{\"ts\":1,\"a\":\"\xff\"}", None),
+            (b"{\"ts\":1,\"a\":1e400}", None),
+            (b"{\"a\":{\"ts\":1}}", None),
+            (b"{\"ts\":1}\r\n", Some(1)),
+        ] {
+            assert_eq!(metric_row_timestamp(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn metric_row_verdict_never_removes_a_line_the_full_parse_keeps() {
+        for line in metric_row_corpus() {
+            let full = metric_row_timestamp(&line);
+            for cutoff in [i64::MIN, -1, 0, 1, 2, 7, 1_000, 5_000, 5_001, i64::MAX] {
+                let (removed, timestamp) = metric_row_verdict(&line, cutoff);
+                let shown = String::from_utf8_lossy(&line);
+                if removed {
+                    assert!(
+                        full.is_some_and(|full| full < cutoff),
+                        "removed a line the full parse keeps at {cutoff}: {shown}"
+                    );
+                }
+                match leading_metric_row_timestamp(&line) {
+                    // Kept early, reporting its leading `ts`.
+                    Some(leading) if leading >= cutoff => {
+                        assert_eq!((removed, timestamp), (false, Some(leading)), "{shown}");
+                    }
+                    // Otherwise the verdict is the full parse's.
+                    _ => assert_eq!(
+                        (removed, timestamp),
+                        (full.is_some_and(|full| full < cutoff), full),
+                        "at {cutoff}: {shown}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metric_row_verdict_keeps_damaged_rows_and_reports_kept_early_ones_by_their_leading_ts() {
+        // Expired and well-formed: removed.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"a\":[1]}\n", 2),
+            (true, Some(1))
+        );
+        // Expired by its leading ts but damaged later: kept, as malformed.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"a\":[1\n", 2),
+            (false, None)
+        );
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"a\":\"\\ud800\"}\n", 2),
+            (false, None)
+        );
+        // Expired by its leading ts, but a later duplicate is recent: kept.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":1,\"ts\":5000}\n", 2),
+            (false, Some(5000))
+        );
+        // Inside retention by its leading ts: kept without being read
+        // further, so damage after it is not reported as malformed, and the
+        // leading ts (not the full parse's `None` or later duplicate) is the
+        // one reported. Neither changes what is kept.
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":3,\"a\":[1\n", 2),
+            (false, Some(3))
+        );
+        assert_eq!(
+            metric_row_verdict(b"{\"ts\":3,\"ts\":1}\n", 2),
+            (false, Some(3))
+        );
+        // Other shapes take the validating walk.
+        assert_eq!(
+            metric_row_verdict(b"{\"a\":1,\"ts\":1}\n", 2),
+            (true, Some(1))
+        );
+        assert_eq!(metric_row_verdict(b"{ \"ts\": 3 }\n", 2), (false, Some(3)));
+        assert_eq!(metric_row_verdict(b"{\"ts\":1.5}\n", 2), (false, None));
+        assert_eq!(metric_row_verdict(b"{\"ts\":-0}\n", 2), (false, None));
+        assert_eq!(metric_row_verdict(b"{}\n", 2), (false, None));
+        assert_eq!(metric_row_verdict(b"not-json\n", 2), (false, None));
+    }
+
+    #[test]
+    fn metric_row_verdict_matches_the_full_parse_on_well_formed_rows() {
+        let cutoff = 1_000;
+        for ts in [i64::MIN, -5_i64, 0, 999, 1_000, 1_001, i64::MAX] {
+            let row = format!("{{\"ts\":{ts},\"command\":\"gc\",\"n\":{{\"x\":[1,2]}}}}\n");
+            let full = metric_row_timestamp(row.as_bytes());
+            let expected = (full.is_some_and(|value| value < cutoff), full);
+            assert_eq!(
+                metric_row_verdict(row.as_bytes(), cutoff),
+                expected,
+                "{row}"
+            );
+        }
     }
 
     #[test]

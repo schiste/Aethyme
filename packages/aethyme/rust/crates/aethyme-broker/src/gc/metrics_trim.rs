@@ -34,16 +34,28 @@
 //! relies on the log being append-only between trims: the locked phase
 //! proceeds only on the same inode, at least as long as what was staged, and
 //! any trim replaces the inode.
+//!
+//! Staging that runs out of its budget keeps its temporary and records where
+//! it stopped (broker meta key [`UNATTENDED_TRIM_RESUME_KEY`]): the log's
+//! device and inode, the line boundary reached, a fingerprint of the bytes
+//! before it, the temporary's length and the row counts so far. The next run
+//! continues from there when the log, the fingerprint and the temporary still
+//! match the record, and starts over otherwise. Rows staged under an earlier
+//! cutoff were judged against that cutoff, which is never later than the
+//! current one (a record from a later cutoff is not resumed), so at worst
+//! they keep a row the current cutoff would remove.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::file_lock::open_command_metrics_lock;
 
 use super::{
-    metric_row_timestamp, open_regular_file_nonblocking, retained_metric_bytes_until,
+    metric_row_verdict, open_regular_file_nonblocking, retained_metric_bytes_until,
     same_regular_file_version,
 };
 
@@ -101,11 +113,13 @@ pub(super) enum TrimPoint {
 }
 
 /// Drop rows with `ts < cutoff` from the log at `path`, keeping everything
-/// else in its current order.
+/// else in its current order. `spare` is an unattended trim's resumable
+/// temporary ([`resumable_temporary`]), which the stale-temporary sweep keeps.
 pub(super) fn trim_expired_rows(
     main_root: &Path,
     path: &Path,
     cutoff: i64,
+    spare: Option<&Path>,
 ) -> io::Result<MetricsTrim> {
     trim_expired_rows_with(
         main_root,
@@ -113,6 +127,7 @@ pub(super) fn trim_expired_rows(
         cutoff,
         TRIM_MAX_ATTEMPTS,
         TAIL_SETTLE,
+        spare,
         &mut |_| {},
     )
 }
@@ -123,6 +138,7 @@ pub(super) fn trim_expired_rows_with(
     cutoff: i64,
     max_attempts: u32,
     settle: Duration,
+    spare: Option<&Path>,
     at: &mut dyn FnMut(TrimPoint),
 ) -> io::Result<MetricsTrim> {
     match std::fs::symlink_metadata(path) {
@@ -149,8 +165,8 @@ pub(super) fn trim_expired_rows_with(
         // Only a trim writes these: the reviewed one under this lock, an
         // unattended one also while staging without it. The sweep removes
         // only those older than any staging lasts, which were left by a trim
-        // that stopped before its rename.
-        stale_temporaries_removed += remove_stale_temporaries(path, None);
+        // that stopped before its rename, except a resumable one.
+        stale_temporaries_removed += remove_stale_temporaries(path, spare);
         let mut file = match open_regular_file_nonblocking(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -221,9 +237,19 @@ const UNATTENDED_TRIM_BUDGET: Duration = Duration::from_secs(60);
 const UNATTENDED_TRIM_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 /// The next unattended trim after one that did not finish.
 const UNATTENDED_TRIM_RETRY_MS: i64 = 30 * 60 * 1_000;
+/// The next unattended trim after staging ran out of budget and recorded
+/// where to resume: the next retirement run, since its progress is kept.
+const UNATTENDED_TRIM_RESUME_MS: i64 = 0;
 /// Broker meta key: the epoch ms at or after which the next unattended trim
 /// runs.
 pub(crate) const UNATTENDED_TRIM_NEXT_DUE_KEY: &str = "command_metrics_trim.next_due_at_ms";
+/// Broker meta key: where the next unattended trim resumes staging (a JSON
+/// [`StagingResume`]), or empty when it starts over.
+pub(crate) const UNATTENDED_TRIM_RESUME_KEY: &str = "command_metrics_trim.resume";
+/// A resume record fingerprints this many bytes from the log's start and as
+/// many ending at the offset reached, so a log whose inode number was reused
+/// by another file is not mistaken for the one staged.
+const RESUME_FINGERPRINT_BYTES: u64 = 64 * 1024;
 /// The least staging budget worth starting a trim with; with less left in
 /// the retirement run, the trim waits for a later run.
 const UNATTENDED_TRIM_MIN_BUDGET: Duration = Duration::from_secs(5);
@@ -256,19 +282,16 @@ impl RowCounts {
     /// so a malformed or timestamp-free line is kept. `newest` tracks the
     /// latest `ts` seen.
     fn keep(&mut self, line: &[u8], cutoff: i64, newest: &mut Option<i64>) -> bool {
-        let timestamp = metric_row_timestamp(line);
+        let (expired, timestamp) = metric_row_verdict(line, cutoff);
         if let Some(timestamp) = timestamp {
             *newest = Some(newest.map_or(timestamp, |seen| seen.max(timestamp)));
         }
-        match timestamp {
-            Some(timestamp) if timestamp < cutoff => {
-                self.removed = self.removed.saturating_add(1);
-                false
-            }
-            _ => {
-                self.kept = self.kept.saturating_add(1);
-                true
-            }
+        if expired {
+            self.removed = self.removed.saturating_add(1);
+            false
+        } else {
+            self.kept = self.kept.saturating_add(1);
+            true
         }
     }
 }
@@ -282,8 +305,15 @@ pub(super) enum UnattendedTrim {
         outcome: MetricsTrim,
         rows: RowCounts,
     },
-    /// Staging ran out of its budget after `bytes_scanned`; nothing changed.
-    BudgetExhausted { bytes_scanned: u64 },
+    /// Staging ran out of its budget at log offset `bytes_scanned` (counting
+    /// what earlier attempts staged when this one resumed); the log is
+    /// unchanged. `resume` is where the next attempt continues, its staged
+    /// temporary kept; `None` when nothing was staged. Boxed: the record is
+    /// several times larger than every other variant.
+    BudgetExhausted {
+        bytes_scanned: u64,
+        resume: Option<Box<StagingResume>>,
+    },
     /// Every row with a timestamp is older than the cutoff, newest included:
     /// the clock is suspect (or the repository has been idle for the whole
     /// retention window), so nothing was removed.
@@ -311,9 +341,123 @@ impl UnattendedTrim {
             }
             | Self::ClockSuspect { .. }
             | Self::Unsupported => UNATTENDED_TRIM_INTERVAL_MS,
+            Self::BudgetExhausted {
+                resume: Some(_), ..
+            } => UNATTENDED_TRIM_RESUME_MS,
             _ => UNATTENDED_TRIM_RETRY_MS,
         }
     }
+}
+
+/// Where an unattended trim whose staging ran out of budget resumes. Stored
+/// as JSON under [`UNATTENDED_TRIM_RESUME_KEY`]; the next attempt resumes
+/// only when the log is the same file (device, inode and fingerprint), at
+/// least `source_offset` long, the cutoff is not earlier than `cutoff`, and
+/// the temporary still exists with exactly `staged_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct StagingResume {
+    /// The staged log's device number.
+    pub(super) device: u64,
+    /// The staged log's inode number.
+    pub(super) inode: u64,
+    /// SHA-256 of the log's first bytes and of the bytes ending at
+    /// `source_offset` ([`RESUME_FINGERPRINT_BYTES`] each).
+    pub(super) fingerprint: String,
+    /// Bytes of the log staged: whole lines from its start.
+    pub(super) source_offset: u64,
+    /// Bytes of the temporary those lines kept.
+    pub(super) staged_bytes: u64,
+    /// Rows staged so far, by verdict.
+    pub(super) removed: u64,
+    pub(super) kept: u64,
+    /// The newest `ts` staged so far, for the clock check.
+    pub(super) newest: Option<i64>,
+    /// The cutoff the rows were staged under.
+    pub(super) cutoff: i64,
+    /// The temporary's file name, beside the log.
+    pub(super) temporary: String,
+}
+
+impl StagingResume {
+    /// Parse a stored record; `None` for an empty or unreadable one.
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("a resume record serializes")
+    }
+
+    /// The recorded temporary's path, when its name is a trim temporary's.
+    fn temporary_path(&self, log: &Path) -> Option<PathBuf> {
+        if !is_temporary_name(&self.temporary) {
+            return None;
+        }
+        log.parent()
+            .map(|directory| directory.join(&self.temporary))
+    }
+
+    /// Whether `log` is the file staged (by device and inode) and still
+    /// holds the staged bytes.
+    fn describes(&self, log: &std::fs::Metadata) -> bool {
+        file_identity(log) == Some((self.device, self.inode)) && log.len() >= self.source_offset
+    }
+}
+
+/// The recorded resumable temporary of the log at `log`, while the record
+/// still describes the log and the temporary; a trim's stale-temporary sweep
+/// spares it.
+pub(super) fn resumable_temporary(store: &crate::BrokerStore, log: &Path) -> Option<PathBuf> {
+    let resume = StagingResume::parse(&store.meta_get(UNATTENDED_TRIM_RESUME_KEY).ok()??)?;
+    recorded_temporary_if_valid(&resume, log)
+}
+
+/// `resume`'s temporary, while the record still describes the log at `log`
+/// and the temporary.
+fn recorded_temporary_if_valid(resume: &StagingResume, log: &Path) -> Option<PathBuf> {
+    let temporary = resume.temporary_path(log)?;
+    let log_metadata = std::fs::symlink_metadata(log).ok()?;
+    let temporary_metadata = std::fs::symlink_metadata(&temporary).ok()?;
+    (log_metadata.is_file()
+        && resume.describes(&log_metadata)
+        && temporary_metadata.is_file()
+        && temporary_metadata.len() == resume.staged_bytes)
+        .then_some(temporary)
+}
+
+/// The device and inode number of `metadata`, where the platform has them.
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// SHA-256 (hex) of the first [`RESUME_FINGERPRINT_BYTES`] of `source` and
+/// of as many ending at `offset`, with `offset` itself.
+fn source_fingerprint(source: &mut File, offset: u64) -> io::Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(offset.to_le_bytes());
+    let window = offset.min(RESUME_FINGERPRINT_BYTES);
+    for start in [0, offset - window] {
+        source.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(window).unwrap_or(0));
+        Read::take(&mut *source, window).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != window {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the command metrics log is shorter than what was staged",
+            ));
+        }
+        digest.update(&bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// The retained rows of a log's whole lines, written (unlocked) to the
@@ -332,22 +476,41 @@ pub(super) struct StagedLog {
     rows: RowCounts,
 }
 
+/// What staging produced, and the log offset it resumed from (0 when it
+/// started from the first byte).
+pub(super) struct Staging {
+    pub(super) result: Result<StagedLog, UnattendedTrim>,
+    pub(super) resumed_from_bytes: u64,
+}
+
+/// Staging's position: what it has read and kept so far.
+#[derive(Default)]
+struct StagingProgress {
+    staged_len: u64,
+    staged_after: u64,
+    rows: RowCounts,
+    newest: Option<i64>,
+}
+
 /// Drop rows with `ts < cutoff` from the log at `path`, unattended: stage
-/// without the lock until `deadline`, then publish under it.
-pub(super) fn trim_expired_rows_unattended(
+/// without the lock until `deadline`, then publish under it. Staging resumes
+/// from `resume` when it still matches. Returns the outcome and the log
+/// offset staging resumed from.
+pub(super) fn trim_expired_rows_resuming(
     main_root: &Path,
     path: &Path,
     cutoff: i64,
     deadline: Instant,
-) -> io::Result<UnattendedTrim> {
+    resume: Option<&StagingResume>,
+) -> io::Result<(UnattendedTrim, u64)> {
     if cfg!(not(unix)) {
-        return Ok(UnattendedTrim::Unsupported);
+        return Ok((UnattendedTrim::Unsupported, 0));
     }
-    let staged = {
+    let staging = {
         let _span = crate::phase_telemetry::span("command_metrics_trim_stage");
-        stage_retained_rows(path, cutoff, deadline)?
+        stage_retained_rows_resuming(path, cutoff, deadline, resume)?
     };
-    match staged {
+    let outcome = match staging.result {
         Ok(staged) => {
             let _span = crate::phase_telemetry::span("command_metrics_trim_publish");
             publish_staged_rows(
@@ -358,26 +521,81 @@ pub(super) fn trim_expired_rows_unattended(
                 TRIM_MAX_ATTEMPTS,
                 TAIL_SETTLE,
                 &mut |_| {},
-            )
+            )?
         }
-        Err(done) => Ok(done),
-    }
+        Err(done) => done,
+    };
+    Ok((outcome, staging.resumed_from_bytes))
 }
 
-/// Write the rows of the log's whole lines that `cutoff` keeps to a new
-/// temporary beside it, without the append lock. An unterminated last line
-/// (a row being written) is left to the locked phase. `Err` carries an
-/// outcome that needs no locked phase.
+/// [`trim_expired_rows_resuming`] from the log's first byte.
+#[cfg(test)]
+pub(super) fn trim_expired_rows_unattended(
+    main_root: &Path,
+    path: &Path,
+    cutoff: i64,
+    deadline: Instant,
+) -> io::Result<UnattendedTrim> {
+    trim_expired_rows_resuming(main_root, path, cutoff, deadline, None).map(|(trim, _)| trim)
+}
+
+/// [`stage_retained_rows_resuming`] from the log's first byte.
+#[cfg(test)]
 pub(super) fn stage_retained_rows(
     path: &Path,
     cutoff: i64,
     deadline: Instant,
 ) -> io::Result<Result<StagedLog, UnattendedTrim>> {
-    let finished = |outcome: MetricsTrim| -> io::Result<Result<StagedLog, UnattendedTrim>> {
-        Ok(Err(UnattendedTrim::Finished {
-            outcome,
-            rows: RowCounts::default(),
-        }))
+    stage_retained_rows_resuming(path, cutoff, deadline, None).map(|staging| staging.result)
+}
+
+/// Write the rows of the log's whole lines that `cutoff` keeps to a
+/// temporary beside it, without the append lock: continuing `resume`'s
+/// temporary when it still matches, else a new one. An unterminated last
+/// line (a row being written) is left to the locked phase. `Err` carries an
+/// outcome that needs no locked phase. A recorded temporary that is not
+/// resumed is removed.
+pub(super) fn stage_retained_rows_resuming(
+    path: &Path,
+    cutoff: i64,
+    deadline: Instant,
+    resume: Option<&StagingResume>,
+) -> io::Result<Staging> {
+    stage_retained_rows_checking(path, cutoff, resume, STAGE_DEADLINE_CHECK_ROWS, &mut || {
+        Instant::now() >= deadline
+    })
+}
+
+/// [`stage_retained_rows_resuming`], asking `out_of_time` before every
+/// `check_every`th row (tests run out of budget at a chosen row).
+fn stage_retained_rows_checking(
+    path: &Path,
+    cutoff: i64,
+    resume: Option<&StagingResume>,
+    check_every: u64,
+    out_of_time: &mut dyn FnMut() -> bool,
+) -> io::Result<Staging> {
+    let recorded = resume.and_then(|resume| resume.temporary_path(path));
+    let discard_recorded = || {
+        if let Some(recorded) = &recorded {
+            remove_recorded_temporary(recorded);
+        }
+    };
+    let done = |result: UnattendedTrim, resumed_from_bytes: u64| -> io::Result<Staging> {
+        Ok(Staging {
+            result: Err(result),
+            resumed_from_bytes,
+        })
+    };
+    let finished = |outcome: MetricsTrim| -> io::Result<Staging> {
+        discard_recorded();
+        done(
+            UnattendedTrim::Finished {
+                outcome,
+                rows: RowCounts::default(),
+            },
+            0,
+        )
     };
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -410,31 +628,44 @@ pub(super) fn stage_retained_rows(
             "the command metrics log has no parent",
         )
     })?;
-    // `with_synced_temporary`'s naming, so a temporary left by a stopped
-    // trim of either kind is recognised and removed by the next one.
-    let mut temporary = tempfile::Builder::new()
-        .prefix(TEMPORARY_PREFIX)
-        .rand_bytes(TEMPORARY_RANDOM_LEN)
-        .tempfile_in(directory)?;
-    crate::host_state::protect_host_state_path(temporary.path(), false)?;
-    let mut rows = RowCounts::default();
-    let mut newest = None;
-    let mut staged_len = 0_u64;
-    let mut staged_after = 0_u64;
+    let resumed = match resume {
+        Some(resume) => resume_staged_temporary(path, &mut source, &opened, cutoff, resume)?,
+        None => None,
+    };
+    let (mut temporary, mut progress) = match resumed {
+        Some(resumed) => resumed,
+        None => {
+            discard_recorded();
+            // `with_synced_temporary`'s naming, so a temporary left by a
+            // stopped trim of either kind is recognised and removed by the
+            // next one.
+            let temporary = tempfile::Builder::new()
+                .prefix(TEMPORARY_PREFIX)
+                .rand_bytes(TEMPORARY_RANDOM_LEN)
+                .tempfile_in(directory)?;
+            crate::host_state::protect_host_state_path(temporary.path(), false)?;
+            (temporary, StagingProgress::default())
+        }
+    };
+    let resumed_from_bytes = progress.staged_len;
+    let mut exhausted = false;
     {
+        source.seek(SeekFrom::Start(progress.staged_len))?;
+        let unread = opened.len().saturating_sub(progress.staged_len);
         let mut reader =
-            BufReader::with_capacity(STAGE_BUFFER_BYTES, Read::take(&mut source, opened.len()));
-        let mut writer = BufWriter::with_capacity(STAGE_BUFFER_BYTES, temporary.as_file_mut());
+            BufReader::with_capacity(STAGE_BUFFER_BYTES, Read::take(&mut source, unread));
+        let file = temporary.as_file_mut();
+        file.seek(SeekFrom::Start(progress.staged_after))?;
+        let mut writer = BufWriter::with_capacity(STAGE_BUFFER_BYTES, file);
         let mut line = Vec::new();
         let mut rows_until_deadline_check = 0_u64;
         loop {
             if rows_until_deadline_check == 0 {
-                if Instant::now() >= deadline {
-                    return Ok(Err(UnattendedTrim::BudgetExhausted {
-                        bytes_scanned: staged_len,
-                    }));
+                if out_of_time() {
+                    exhausted = true;
+                    break;
                 }
-                rows_until_deadline_check = STAGE_DEADLINE_CHECK_ROWS;
+                rows_until_deadline_check = check_every.max(1);
             }
             rows_until_deadline_check -= 1;
             line.clear();
@@ -442,40 +673,155 @@ pub(super) fn stage_retained_rows(
             if read == 0 || line.last() != Some(&b'\n') {
                 break;
             }
-            staged_len = staged_len.saturating_add(read as u64);
-            if rows.keep(&line, cutoff, &mut newest) {
+            progress.staged_len = progress.staged_len.saturating_add(read as u64);
+            if progress.rows.keep(&line, cutoff, &mut progress.newest) {
                 writer.write_all(&line)?;
-                staged_after = staged_after.saturating_add(read as u64);
+                progress.staged_after = progress.staged_after.saturating_add(read as u64);
             }
         }
         writer.flush()?;
     }
+    if exhausted {
+        if progress.staged_len == 0 {
+            // Nothing staged: dropping the temporary removes it.
+            return done(
+                UnattendedTrim::BudgetExhausted {
+                    bytes_scanned: 0,
+                    resume: None,
+                },
+                resumed_from_bytes,
+            );
+        }
+        // Synced before it is recorded, so a record never describes bytes
+        // a crash could lose.
+        temporary.as_file().sync_all()?;
+        let fingerprint = source_fingerprint(&mut source, progress.staged_len)?;
+        let (device, inode) = file_identity(&opened).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "the log has no inode number")
+        })?;
+        let name = temporary
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        temporary.keep().map_err(|error| error.error)?;
+        return done(
+            UnattendedTrim::BudgetExhausted {
+                bytes_scanned: progress.staged_len,
+                resume: Some(Box::new(StagingResume {
+                    device,
+                    inode,
+                    fingerprint,
+                    source_offset: progress.staged_len,
+                    staged_bytes: progress.staged_after,
+                    removed: progress.rows.removed,
+                    kept: progress.rows.kept,
+                    newest: progress.newest,
+                    cutoff,
+                    temporary: name,
+                })),
+            },
+            resumed_from_bytes,
+        );
+    }
+    let rows = progress.rows;
     if rows.removed == 0 {
         // Dropping the temporary removes it; the log is left as it is.
-        return Ok(Err(UnattendedTrim::Finished {
-            outcome: MetricsTrim::NothingExpired {
-                attempts: 1,
-                stale_temporaries_removed: 0,
+        return done(
+            UnattendedTrim::Finished {
+                outcome: MetricsTrim::NothingExpired {
+                    attempts: 1,
+                    stale_temporaries_removed: 0,
+                },
+                rows,
             },
-            rows,
-        }));
+            resumed_from_bytes,
+        );
     }
-    if let Some(newest_row_ts) = newest.filter(|newest| *newest < cutoff) {
-        return Ok(Err(UnattendedTrim::ClockSuspect {
-            cutoff,
-            newest_row_ts,
-            rows,
-        }));
+    if let Some(newest_row_ts) = progress.newest.filter(|newest| *newest < cutoff) {
+        return done(
+            UnattendedTrim::ClockSuspect {
+                cutoff,
+                newest_row_ts,
+                rows,
+            },
+            resumed_from_bytes,
+        );
     }
     temporary.as_file().sync_all()?;
-    Ok(Ok(StagedLog {
+    Ok(Staging {
+        result: Ok(StagedLog {
+            temporary,
+            _source: source,
+            source: opened,
+            staged_len: progress.staged_len,
+            staged_after: progress.staged_after,
+            rows,
+        }),
+        resumed_from_bytes,
+    })
+}
+
+/// `resume`'s temporary and progress, when the record still matches the log
+/// staging opened (`opened`, read through `source`) and the temporary.
+fn resume_staged_temporary(
+    path: &Path,
+    source: &mut File,
+    opened: &std::fs::Metadata,
+    cutoff: i64,
+    resume: &StagingResume,
+) -> io::Result<Option<(tempfile::NamedTempFile, StagingProgress)>> {
+    let Some(temporary_path) = resume.temporary_path(path) else {
+        return Ok(None);
+    };
+    // Rows staged under a later cutoff than this one may have been removed
+    // where this cutoff keeps them.
+    if resume.cutoff > cutoff || resume.source_offset == 0 || !resume.describes(opened) {
+        return Ok(None);
+    }
+    if source_fingerprint(source, resume.source_offset)? != resume.fingerprint {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(file) = options.open(&temporary_path) else {
+        return Ok(None);
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != resume.staged_bytes {
+        return Ok(None);
+    }
+    // Touched, so a sweep that judges temporaries by age sees it in use.
+    let _ = file.set_modified(std::time::SystemTime::now());
+    let temporary = tempfile::NamedTempFile::from_parts(
+        file,
+        tempfile::TempPath::try_from_path(temporary_path)?,
+    );
+    Ok(Some((
         temporary,
-        _source: source,
-        source: opened,
-        staged_len,
-        staged_after,
-        rows,
-    }))
+        StagingProgress {
+            staged_len: resume.source_offset,
+            staged_after: resume.staged_bytes,
+            rows: RowCounts {
+                removed: resume.removed,
+                kept: resume.kept,
+            },
+            newest: resume.newest,
+        },
+    )))
+}
+
+/// Remove a recorded temporary that will not be resumed. Only a regular
+/// file is removed; anything else is left to the stale-temporary sweep.
+fn remove_recorded_temporary(path: &Path) {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Whether `left` and `right` are the same file (not the same version).
@@ -613,19 +959,33 @@ pub(super) fn publish_staged_rows(
 }
 
 /// Record one unattended trim's outcome in the command's telemetry.
-fn record_unattended_trim(result: &io::Result<UnattendedTrim>, elapsed: Duration) {
+/// `resumed_from_bytes` is the log offset staging resumed from (0 when it
+/// started from the first byte).
+fn record_unattended_trim(
+    result: &io::Result<UnattendedTrim>,
+    resumed_from_bytes: u64,
+    elapsed: Duration,
+) {
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let add = |name| crate::phase_telemetry::add(name, Duration::ZERO);
     let mut fields = serde_json::Map::new();
     fields.insert("elapsed_ms".into(), elapsed_ms.into());
+    fields.insert("resumed_from_bytes".into(), resumed_from_bytes.into());
+    if resumed_from_bytes > 0 {
+        add("command_metrics_trim_resumed");
+    }
     let outcome = match result {
         Err(_) => {
             add("command_metrics_trim_failed");
             "failed"
         }
-        Ok(UnattendedTrim::BudgetExhausted { bytes_scanned }) => {
+        Ok(UnattendedTrim::BudgetExhausted {
+            bytes_scanned,
+            resume,
+        }) => {
             add("command_metrics_trim_budget_exhausted");
             fields.insert("bytes_scanned".into(), (*bytes_scanned).into());
+            fields.insert("resume_recorded".into(), resume.is_some().into());
             "budget_exhausted"
         }
         Ok(UnattendedTrim::ClockSuspect {
@@ -706,10 +1066,11 @@ fn record_unattended_trim(result: &io::Result<UnattendedTrim>, elapsed: Duration
 
 impl crate::Broker {
     /// Trim `.aethyme/logs/command-metrics.jsonl` to `command_metrics_days`
-    /// when an unattended trim is due (at most daily; 30 minutes after one
-    /// that did not finish). The cutoff is the one a GC plan made today
-    /// would review. Staging stops by `deadline` (the calling run's) or
-    /// after [`UNATTENDED_TRIM_BUDGET`]; with less than
+    /// when an unattended trim is due (at most daily; on the next run after
+    /// staging ran out of budget with its progress recorded; 30 minutes
+    /// after any other outcome that did not finish). The cutoff is the one a
+    /// GC plan made today would review. Staging stops by `deadline` (the
+    /// calling run's) or after [`UNATTENDED_TRIM_BUDGET`]; with less than
     /// [`UNATTENDED_TRIM_MIN_BUDGET`] left the trim waits for a later run.
     /// Best effort: a failure is warned about and retried.
     pub(crate) fn trim_command_metrics_log_if_due(&self, deadline: Instant) {
@@ -718,10 +1079,9 @@ impl crate::Broker {
             return;
         }
         let now_ms = crate::clock::epoch_ms();
-        let next_due = store
-            .meta_get(UNATTENDED_TRIM_NEXT_DUE_KEY)
-            .ok()
-            .flatten()
+        let recorded_next_due = store.meta_get(UNATTENDED_TRIM_NEXT_DUE_KEY).ok().flatten();
+        let next_due = recorded_next_due
+            .as_deref()
             .and_then(|value| value.parse().ok());
         if !unattended_trim_due(next_due, now_ms) {
             crate::phase_telemetry::add("command_metrics_trim_not_due", Duration::ZERO);
@@ -751,16 +1111,65 @@ impl crate::Broker {
                 ),
             );
         };
-        // Claimed before the trim, so a worker that stops mid-trim, or a
-        // second worker meanwhile, does not start another at once.
-        record_next_due(UNATTENDED_TRIM_RETRY_MS);
+        // Claimed before the trim, atomically, so a worker that stops
+        // mid-trim, or a second worker meanwhile, does not start another at
+        // once: two would otherwise resume into the same temporary.
+        let claimed = store.meta_compare_and_set(
+            UNATTENDED_TRIM_NEXT_DUE_KEY,
+            recorded_next_due.as_deref(),
+            &now_ms.saturating_add(UNATTENDED_TRIM_RETRY_MS).to_string(),
+        );
+        match claimed {
+            Ok(true) => {}
+            Ok(false) => {
+                crate::phase_telemetry::add(
+                    "command_metrics_trim_claimed_elsewhere",
+                    Duration::ZERO,
+                );
+                return;
+            }
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>("claim the command metrics trim", Err(error));
+                return;
+            }
+        }
         let _span = crate::phase_telemetry::span("command_metrics_trim");
         let main_root = self.main_root();
         let path = main_root.join(crate::retention::COMMAND_METRICS_LOG);
         let cutoff = super::cutoff(super::utc_day_floor_ms(now_ms), policy.command_metrics_days);
+        let recorded_resume = store
+            .meta_get(UNATTENDED_TRIM_RESUME_KEY)
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty());
+        let resume = recorded_resume.as_deref().and_then(StagingResume::parse);
         let started = Instant::now();
-        let result = trim_expired_rows_unattended(main_root, &path, cutoff, started + budget);
-        record_unattended_trim(&result, started.elapsed());
+        let (result, resumed_from_bytes) = match trim_expired_rows_resuming(
+            main_root,
+            &path,
+            cutoff,
+            started + budget,
+            resume.as_ref(),
+        ) {
+            Ok((trim, resumed_from_bytes)) => (Ok(trim), resumed_from_bytes),
+            Err(error) => (Err(error), 0),
+        };
+        record_unattended_trim(&result, resumed_from_bytes, started.elapsed());
+        // A new resume record replaces the old one; any other outcome
+        // clears it (its temporary was resumed, published or removed).
+        match &result {
+            Ok(UnattendedTrim::BudgetExhausted {
+                resume: Some(next), ..
+            }) => crate::warn_unrecorded(
+                "record where the command metrics trim resumes",
+                store.meta_set(UNATTENDED_TRIM_RESUME_KEY, &next.to_json()),
+            ),
+            _ if recorded_resume.is_some() => crate::warn_unrecorded(
+                "clear where the command metrics trim resumes",
+                store.meta_set(UNATTENDED_TRIM_RESUME_KEY, ""),
+            ),
+            _ => {}
+        }
         match &result {
             Ok(trim) => record_next_due(trim.next_due_in_ms()),
             Err(error) => {
@@ -789,7 +1198,8 @@ fn lock_exclusive(main_root: &Path) -> io::Result<Option<File>> {
 
 /// Remove temporaries an interrupted trim left beside the log: regular files
 /// in that directory whose name is exactly the trim's temporary pattern,
-/// except `keep`, the calling trim's own staged temporary, and any modified
+/// except `keep` (the calling trim's own staged temporary, or an unattended
+/// trim's resumable one whose record still matches), and any modified
 /// within [`STALE_TEMPORARY_MIN_AGE`] (an unattended trim may be staging it
 /// without the lock; a modification time in the future counts as recent).
 fn remove_stale_temporaries(path: &Path, keep: Option<&Path>) -> usize {
@@ -802,11 +1212,7 @@ fn remove_stale_temporaries(path: &Path, keep: Option<&Path>) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(random) = name.strip_prefix(TEMPORARY_PREFIX) else {
-            continue;
-        };
-        if random.len() != TEMPORARY_RANDOM_LEN
-            || !random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        if !is_temporary_name(&name)
             || !entry.file_type().is_ok_and(|kind| kind.is_file())
             || keep.is_some_and(|keep| keep == entry.path().as_path())
             || !temporary_is_stale(&entry)
@@ -818,6 +1224,15 @@ fn remove_stale_temporaries(path: &Path, keep: Option<&Path>) -> usize {
         }
     }
     removed
+}
+
+/// Whether `name` is exactly a trim temporary's: the prefix and
+/// [`TEMPORARY_RANDOM_LEN`] alphanumeric characters.
+fn is_temporary_name(name: &str) -> bool {
+    name.strip_prefix(TEMPORARY_PREFIX).is_some_and(|random| {
+        random.len() == TEMPORARY_RANDOM_LEN
+            && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 /// Watch the replaced inode for `settle` and copy what an unlocked writer
@@ -947,7 +1362,7 @@ mod tests {
 
     /// Three attempts, no settle period, and `at` as the concurrent writer.
     fn trim(root: &Path, path: &Path, at: &mut dyn FnMut(TrimPoint)) -> MetricsTrim {
-        let result = trim_expired_rows_with(root, path, 10, 3, Duration::ZERO, at);
+        let result = trim_expired_rows_with(root, path, 10, 3, Duration::ZERO, None, at);
         result.unwrap()
     }
 
@@ -1058,7 +1473,7 @@ mod tests {
         // Whatever the runner's timing, the settle period copies the whole
         // row first and the unterminated bytes when it ends.
         let settle = Duration::from_millis(30);
-        let result = trim_expired_rows_with(root.path(), &path, 10, 3, settle, &mut at);
+        let result = trim_expired_rows_with(root.path(), &path, 10, 3, settle, None, &mut at);
         let outcome = result.unwrap();
 
         assert!(
@@ -1505,7 +1920,10 @@ mod tests {
 
         assert_eq!(
             outcome.unwrap(),
-            UnattendedTrim::BudgetExhausted { bytes_scanned: 0 }
+            UnattendedTrim::BudgetExhausted {
+                bytes_scanned: 0,
+                resume: None,
+            }
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1559,8 +1977,31 @@ mod tests {
         assert_eq!(nothing.next_due_in_ms(), UNATTENDED_TRIM_INTERVAL_MS);
         let skipped = finished(MetricsTrim::SkippedConcurrentAppend { attempts: 3 });
         assert_eq!(skipped.next_due_in_ms(), UNATTENDED_TRIM_RETRY_MS);
-        let exhausted = UnattendedTrim::BudgetExhausted { bytes_scanned: 1 };
+        let exhausted = UnattendedTrim::BudgetExhausted {
+            bytes_scanned: 0,
+            resume: None,
+        };
         assert_eq!(exhausted.next_due_in_ms(), UNATTENDED_TRIM_RETRY_MS);
+        let resumable = UnattendedTrim::BudgetExhausted {
+            bytes_scanned: 1,
+            resume: Some(Box::new(StagingResume {
+                device: 1,
+                inode: 2,
+                fingerprint: String::new(),
+                source_offset: 1,
+                staged_bytes: 0,
+                removed: 1,
+                kept: 0,
+                newest: None,
+                cutoff: 10,
+                temporary: ".command-metrics.jsonl-a1B2c3".into(),
+            })),
+        };
+        assert_eq!(
+            resumable.next_due_in_ms(),
+            UNATTENDED_TRIM_RESUME_MS,
+            "kept progress is resumed on the next run"
+        );
     }
 
     #[test]
@@ -1611,6 +2052,282 @@ mod tests {
         );
         let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(entries, 1, "no temporary is left behind");
+    }
+
+    /// Stage from `resume` under `cutoff`, running out of budget once
+    /// `budget_rows` rows were read in this attempt (never with `None`).
+    #[cfg(unix)]
+    fn stage_rows(
+        path: &Path,
+        cutoff: i64,
+        resume: Option<&StagingResume>,
+        budget_rows: Option<u64>,
+    ) -> Staging {
+        let mut checks = 0_u64;
+        stage_retained_rows_checking(path, cutoff, resume, 1, &mut || {
+            let out = budget_rows.is_some_and(|rows| checks >= rows);
+            checks += 1;
+            out
+        })
+        .unwrap()
+    }
+
+    /// The resume record of a staging that ran out of budget.
+    #[cfg(unix)]
+    fn exhausted(staging: Staging) -> StagingResume {
+        match staging.result {
+            Err(UnattendedTrim::BudgetExhausted {
+                bytes_scanned,
+                resume: Some(resume),
+            }) => {
+                assert_eq!(bytes_scanned, resume.source_offset);
+                *resume
+            }
+            Err(other) => panic!("expected an exhausted budget, got {other:?}"),
+            Ok(_) => panic!("expected an exhausted budget, got a staged log"),
+        }
+    }
+
+    /// Publish a staging that finished, with no settle period.
+    #[cfg(unix)]
+    fn publish(root: &Path, path: &Path, staging: Staging) -> UnattendedTrim {
+        match staging.result {
+            Ok(staged) => {
+                publish_staged_rows(root, path, 10, staged, 3, Duration::ZERO, &mut |_| {}).unwrap()
+            }
+            Err(done) => panic!("expected a staged log, got {done:?}"),
+        }
+    }
+
+    /// What a one-shot unattended trim leaves of `content`.
+    #[cfg(unix)]
+    fn one_shot(content: &str) -> (String, RowCounts) {
+        let root = tempfile::tempdir().unwrap();
+        let path = log(root.path(), content);
+        let outcome = trim_expired_rows_unattended(root.path(), &path, 10, far_deadline());
+        let rows = trimmed_rows(&outcome.unwrap());
+        (std::fs::read_to_string(&path).unwrap(), rows)
+    }
+
+    #[cfg(unix)]
+    fn temporaries(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| is_temporary_name(name))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_staging_resumes_and_publishes_what_a_one_shot_trim_would() {
+        let root = tempfile::tempdir().unwrap();
+        let first = format!("{OLD}{KEPT}{OLD}{MALFORMED}");
+        let path = log(root.path(), &first);
+
+        let resume = exhausted(stage_rows(&path, 10, None, Some(2)));
+        assert_eq!(resume.source_offset, (OLD.len() + KEPT.len()) as u64);
+        assert_eq!(resume.staged_bytes, KEPT.len() as u64);
+        assert_eq!((resume.removed, resume.kept), (1, 1));
+        assert_eq!(resume.newest, Some(50));
+        assert_eq!(temporaries(&path), vec![resume.temporary.clone()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "unchanged");
+
+        // Writers append between attempts; the next attempt continues.
+        append(&path, OLD);
+        append(&path, LATE);
+        let second = stage_rows(&path, 10, Some(&resume), Some(2));
+        assert_eq!(second.resumed_from_bytes, resume.source_offset);
+        let resume_again = exhausted(second);
+        assert_eq!(resume_again.temporary, resume.temporary);
+        assert_eq!(
+            resume_again.source_offset,
+            resume.source_offset + (OLD.len() + MALFORMED.len()) as u64
+        );
+
+        // A later cutoff resumes rows staged under an earlier one.
+        append(&path, LATER);
+        let last = stage_rows(&path, 11, Some(&resume_again), None);
+        assert_eq!(last.resumed_from_bytes, resume_again.source_offset);
+        let outcome = publish(root.path(), &path, last);
+
+        let content = format!("{first}{OLD}{LATE}{LATER}");
+        let (expected, rows) = one_shot(&content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(trimmed_rows(&outcome), rows);
+        assert!(
+            temporaries(&path).is_empty(),
+            "the temporary became the log"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_replaced_or_rewritten_between_attempts_restarts_staging() {
+        for rewrite_in_place in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = log(root.path(), &format!("{OLD}{KEPT}{OLD}"));
+            let resume = exhausted(stage_rows(&path, 10, None, Some(2)));
+            // Same length and longer, so only the identity or the
+            // fingerprint tells the logs apart.
+            let replaced = format!("{KEPT}{OLD}{OLD}{LATE}");
+            if rewrite_in_place {
+                std::fs::write(&path, &replaced).unwrap();
+            } else {
+                let other = path.with_file_name("other");
+                std::fs::write(&other, &replaced).unwrap();
+                std::fs::rename(&other, &path).unwrap();
+            }
+
+            let staging = stage_rows(&path, 10, Some(&resume), None);
+
+            assert_eq!(
+                staging.resumed_from_bytes, 0,
+                "in place: {rewrite_in_place}"
+            );
+            assert!(
+                !path.with_file_name(&resume.temporary).exists(),
+                "the recorded temporary is removed"
+            );
+            let outcome = publish(root.path(), &path, staging);
+            let (expected, rows) = one_shot(&replaced);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert_eq!(trimmed_rows(&outcome), rows);
+            assert!(temporaries(&path).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_truncated_or_missing_temporary_or_an_earlier_cutoff_restarts_staging() {
+        enum Damage {
+            Truncated,
+            Extended,
+            Missing,
+            EarlierCutoff,
+        }
+        for damage in [
+            Damage::Truncated,
+            Damage::Extended,
+            Damage::Missing,
+            Damage::EarlierCutoff,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let content = format!("{OLD}{KEPT}{OLD}{LATE}");
+            let path = log(root.path(), &content);
+            let resume = exhausted(stage_rows(&path, 10, None, Some(2)));
+            let temporary = path.with_file_name(&resume.temporary);
+            let mut cutoff = 10;
+            match damage {
+                Damage::Truncated => {
+                    let file = OpenOptions::new().write(true).open(&temporary).unwrap();
+                    file.set_len(resume.staged_bytes - 1).unwrap();
+                }
+                Damage::Extended => append(&temporary, LATE),
+                Damage::Missing => std::fs::remove_file(&temporary).unwrap(),
+                Damage::EarlierCutoff => cutoff = 9,
+            }
+
+            let staging = stage_rows(&path, cutoff, Some(&resume), None);
+
+            assert_eq!(staging.resumed_from_bytes, 0);
+            assert!(!temporary.exists(), "the recorded temporary is removed");
+            let outcome = match staging.result {
+                Ok(staged) => publish_staged_rows(
+                    root.path(),
+                    &path,
+                    cutoff,
+                    staged,
+                    3,
+                    Duration::ZERO,
+                    &mut |_| {},
+                )
+                .unwrap(),
+                Err(done) => panic!("expected a staged log, got {done:?}"),
+            };
+            let (expected, rows) = one_shot(&content);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert_eq!(trimmed_rows(&outcome), rows);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_that_finishes_without_publishing_removes_its_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = log(root.path(), &format!("{OLD}{OLD}{MALFORMED}"));
+        let resume = exhausted(stage_rows(&path, 10, None, Some(1)));
+
+        // Every timestamped row is expired: the clock check keeps the log.
+        let staging = stage_rows(&path, 10, Some(&resume), None);
+
+        assert_eq!(staging.resumed_from_bytes, resume.source_offset);
+        assert!(matches!(
+            staging.result,
+            Err(UnattendedTrim::ClockSuspect {
+                newest_row_ts: 1,
+                rows: RowCounts {
+                    removed: 2,
+                    kept: 1
+                },
+                ..
+            })
+        ));
+        assert!(temporaries(&path).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{OLD}{OLD}{MALFORMED}")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_temporary_sweeps_spare_a_resumable_temporary_while_its_record_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let path = log(root.path(), &format!("{OLD}{KEPT}{OLD}{MALFORMED}"));
+        let resume = exhausted(stage_rows(&path, 10, None, Some(2)));
+        let temporary = path.with_file_name(&resume.temporary);
+        let stale = path.with_file_name(".command-metrics.jsonl-Old456");
+        std::fs::write(&stale, "partial").unwrap();
+        age(&temporary);
+        age(&stale);
+
+        let spare = recorded_temporary_if_valid(&resume, &path);
+        assert_eq!(spare.as_deref(), Some(temporary.as_path()));
+        // A reviewed trim's sweep keeps it and removes the stale one.
+        let outcome = trim_expired_rows_with(
+            root.path(),
+            &path,
+            10,
+            3,
+            Duration::ZERO,
+            spare.as_deref(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                MetricsTrim::Trimmed {
+                    stale_temporaries_removed: 1,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(temporary.exists());
+        assert!(!stale.exists());
+
+        // That trim replaced the log, so the record no longer matches: the
+        // temporary is no longer spared, and the next unattended attempt
+        // starts over and removes it.
+        assert_eq!(recorded_temporary_if_valid(&resume, &path), None);
+        let staging = stage_rows(&path, 10, Some(&resume), None);
+        assert_eq!(staging.resumed_from_bytes, 0);
+        assert!(!temporary.exists());
+        assert!(temporaries(&path).is_empty());
     }
 
     #[cfg(not(unix))]
@@ -1701,7 +2418,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
         assert_eq!(next_due(&broker), None);
 
+        // A resume record that no longer matches the log (another inode) is
+        // not resumed: its temporary is removed and the record cleared.
+        let orphan = path.with_file_name(".command-metrics.jsonl-Orph4n");
+        std::fs::write(&orphan, "staged").unwrap();
+        let stale_resume = StagingResume {
+            device: 0,
+            inode: 0,
+            fingerprint: String::new(),
+            source_offset: 1,
+            staged_bytes: 6,
+            removed: 1,
+            kept: 0,
+            newest: None,
+            cutoff,
+            temporary: ".command-metrics.jsonl-Orph4n".into(),
+        };
+        broker
+            .store_ref()
+            .meta_set(UNATTENDED_TRIM_RESUME_KEY, &stale_resume.to_json())
+            .unwrap();
+
         broker.trim_command_metrics_log_if_due(deadline());
+        assert!(!orphan.exists(), "the unmatched temporary is removed");
+        assert_eq!(
+            broker
+                .store_ref()
+                .meta_get(UNATTENDED_TRIM_RESUME_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a finished trim clears the resume record"
+        );
         let after_ms = crate::clock::epoch_ms();
         if super::super::utc_day_floor_ms(after_ms) != super::super::utc_day_floor_ms(before_ms) {
             // The UTC day turned during the test and moved the cutoff.
