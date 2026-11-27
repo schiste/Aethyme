@@ -600,6 +600,9 @@ pub struct Walk {
     pub pending: Vec<PathBuf>,
     pub usage: Usage,
     pub done: Vec<Child>,
+    /// Bytes of the foreign entries walked so far ([`FOREIGN_CHILD`]).
+    #[serde(default)]
+    pub foreign_bytes: u64,
 }
 
 /// One top-level entry of a root, as last measured.
@@ -625,6 +628,11 @@ pub struct Item {
     /// A walk the deadline interrupted.
     #[serde(default)]
     pub walk: Option<Walk>,
+    /// Recovery archives: bytes of the entries under the directory that are
+    /// not archives ([`foreign_archive_entries`]), counted into `bytes` so
+    /// the class total matches the disk, never evicted.
+    #[serde(default)]
+    pub foreign_bytes: u64,
 }
 
 impl Item {
@@ -1362,10 +1370,45 @@ pub(crate) fn read_names(path: &Path) -> Vec<String> {
     names
 }
 
+/// Marks a name in a walk's `children_left` as a foreign entry under a
+/// recovery-archive directory: walked so its bytes count into the class
+/// total, never recorded as a child. A file name never holds a NUL.
+const FOREIGN_CHILD: &str = "\u{0}foreign\u{0}";
+
 /// The children of an evictable entry: `<group>/<name>` for two-level
-/// classes, `<name>` otherwise.
+/// classes, `<name>` otherwise. A recovery-archive directory's children are
+/// only its archive-shaped entries ([`is_archive_shaped`]); the rest
+/// ([`foreign_archive_entries`]) follow, marked with [`FOREIGN_CHILD`]: they
+/// are measured, never recorded or evicted as archives.
 fn child_names(class: Class, path: &Path) -> Vec<String> {
-    let two_level = matches!(class, Class::RecoveryArchives | Class::GateCache);
+    if class == Class::RecoveryArchives {
+        let foreign = foreign_archive_entries(path);
+        for _ in &foreign {
+            crate::phase_telemetry::add("storage_ledger_foreign_archive_entry", Duration::ZERO);
+        }
+        let mut names = Vec::new();
+        for group in read_names(path) {
+            let group_path = path.join(&group);
+            if fs::symlink_metadata(&group_path).is_ok_and(|metadata| metadata.is_dir()) {
+                names.extend(
+                    read_names(&group_path)
+                        .into_iter()
+                        .filter(|name| {
+                            !is_archive_marker_name(name)
+                                && is_archive_shaped(&group_path.join(name), name)
+                        })
+                        .map(|name| format!("{group}/{name}")),
+                );
+            }
+        }
+        names.extend(
+            foreign
+                .into_iter()
+                .map(|name| format!("{FOREIGN_CHILD}{name}")),
+        );
+        return names;
+    }
+    let two_level = class == Class::GateCache;
     let mut names = Vec::new();
     for group in read_names(path) {
         let group_path = path.join(&group);
@@ -1374,10 +1417,7 @@ fn child_names(class: Class, path: &Path) -> Vec<String> {
                 names.extend(
                     read_names(&group_path)
                         .into_iter()
-                        // Keep markers sit beside archives; they are not one.
-                        .filter(|name| {
-                            !name.ends_with(KEEP_SUFFIX) && !name.ends_with(DISMISS_SUFFIX)
-                        })
+                        .filter(|name| !is_archive_marker_name(name))
                         .map(|name| format!("{group}/{name}")),
                 );
             }
@@ -1386,6 +1426,61 @@ fn child_names(class: Class, path: &Path) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether `name` is a keep or dismissal marker written beside an archive.
+fn is_archive_marker_name(name: &str) -> bool {
+    name.ends_with(KEEP_SUFFIX) || name.ends_with(DISMISS_SUFFIX)
+}
+
+/// Files and directories only a recovery archive writer puts in an archive
+/// directory. A directory holding any of them is an archive, even with its
+/// manifest deleted, replaced or damaged.
+const ARCHIVE_PARTS: [&str; 8] = [
+    "manifest.json",
+    "commits.bundle",
+    "staged.patch",
+    "unstaged.patch",
+    "README.md",
+    "retirement.json",
+    "untracked",
+    "ignored",
+];
+
+/// Whether `<group>/<name>` under a recovery-archive directory has a
+/// recovery archive's shape: a real directory holding any of
+/// [`ARCHIVE_PARTS`] (a damaged archive without a readable manifest still
+/// counts, and is never removable), or an archive still being written
+/// ([`is_partial_archive_name`]). A stray file (`.DS_Store`) or a directory
+/// with none of them (an old deploy rollout backup) is not.
+pub(crate) fn is_archive_shaped(path: &Path, name: &str) -> bool {
+    is_partial_archive_name(name)
+        || (fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+            && ARCHIVE_PARTS
+                .iter()
+                .any(|part| fs::symlink_metadata(path.join(part)).is_ok()))
+}
+
+/// Entries under a recovery-archive directory that are not archives: plain
+/// files or links at its top level and `<group>/<name>` entries without an
+/// archive's shape ([`is_archive_shaped`]). Keep and dismissal markers are
+/// not counted. They are excluded from the archive listing and accounting.
+pub fn foreign_archive_entries(path: &Path) -> Vec<String> {
+    let mut foreign = Vec::new();
+    for group in read_names(path) {
+        let group_path = path.join(&group);
+        if !fs::symlink_metadata(&group_path).is_ok_and(|metadata| metadata.is_dir()) {
+            foreign.push(group);
+            continue;
+        }
+        for name in read_names(&group_path) {
+            if !is_archive_marker_name(&name) && !is_archive_shaped(&group_path.join(&name), &name)
+            {
+                foreign.push(format!("{group}/{name}"));
+            }
+        }
+    }
+    foreign
 }
 
 /// What a recovery archive's manifest says about its age.
@@ -1569,6 +1664,7 @@ pub fn discover(ledger: &mut Ledger) {
                     measured_at_ms: 0,
                     children: Vec::new(),
                     walk: None,
+                    foreign_bytes: 0,
                 });
             }
         }
@@ -1650,7 +1746,8 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
             let Some(next) = walk.children_left.pop() else {
                 break;
             };
-            walk.pending = vec![path.join(&next)];
+            let target = next.strip_prefix(FOREIGN_CHILD).unwrap_or(&next);
+            walk.pending = vec![path.join(target)];
             walk.usage = Usage::default();
             walk.current = Some(next);
         }
@@ -1666,7 +1763,9 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
             return false;
         }
         let name = walk.current.take().unwrap_or_default();
-        if child_level {
+        if name.starts_with(FOREIGN_CHILD) {
+            walk.foreign_bytes = walk.foreign_bytes.saturating_add(walk.usage.bytes);
+        } else if child_level {
             let child_path = path.join(&name);
             walk.done
                 .push(child_record(item.class, &child_path, name, &walk.usage));
@@ -1683,6 +1782,7 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
     }
     if child_level {
         item.children = walk.done;
+        item.foreign_bytes = walk.foreign_bytes;
         set_child_totals(item);
     }
     item.measured = true;
@@ -1711,9 +1811,15 @@ fn child_record(class: Class, child_path: &Path, name: String, usage: &Usage) ->
     }
 }
 
-/// An item evicted child by child: its totals from its children.
+/// An item evicted child by child: its totals from its children, plus the
+/// foreign entries beside them (recovery archives).
 pub(crate) fn set_child_totals(item: &mut Item) {
-    item.bytes = item.children.iter().map(|child| child.bytes).sum();
+    item.bytes = item
+        .children
+        .iter()
+        .map(|child| child.bytes)
+        .sum::<u64>()
+        .saturating_add(item.foreign_bytes);
     item.entries = item.children.len() as u64;
     item.newest_ms = item
         .children

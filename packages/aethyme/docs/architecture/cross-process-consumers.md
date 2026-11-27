@@ -616,6 +616,41 @@ and they are not counted in `unlanded_archives`). Spans
 `storage_landing_probe_timeout`, `storage_landing_budget_spent`,
 `storage_landing_tip_advanced` and `storage_landing_tip_reset`.
 
+Changed 2026-11-27 (what a recovery archive holds). `storage archives
+--json` rows add `holds` (`unlanded_commits`, `staged_bytes`,
+`unstaged_bytes`, `untracked_files`, `ignored_files`: counts or bytes read
+from the manifest, `null` when its schema does not carry the field;
+`unknown`: true when a field that decides landing (`staged_patch`,
+`unstaged_patch`, `untracked_files`, `ignored_files`) is absent or the
+manifest cannot be read). `not_landed_because`, and the storage worker's
+`unlanded: ...` refusal, name what the manifest records in priority order
+(unlanded commits, staged patch bytes, unstaged patch bytes, untracked
+files, ignored files), then `its manifest (schema N) does not say whether it
+holds <fields>` only for fields it lacks (schemas before 5 have no
+`ignored_files`); the old `it holds <field> or does not say` is gone, which
+called a schema-1 archive holding commits an archive of ignored files.
+A `<group>/<name>` directory holding any archive part (`manifest.json` of
+any type, `commits.bundle`, `staged.patch`, `unstaged.patch`, `README.md`,
+`retirement.json`, `untracked/`, `ignored/`) or named `*.partial` is an
+archive. One whose manifest is missing, a link, not a regular file or
+unreadable is a damaged archive: listed with `not_landed_because`
+`manifest missing or unreadable; treat as an archive and inspect before
+removing` and `holds.unknown` true, and never removed by any lane (landing
+and age both need its manifest). Anything else under `recovery-archives/`
+(a plain file or link at either level, or a directory with no archive part,
+such as `.DS_Store` or an old `rollout-<version>/<repo>` deploy backup) is a
+foreign entry: not a ledger child, never evicted, and no longer listed as
+`manifest unreadable`. Its bytes are still walked into the class total, so
+`storage status` matches the disk, and shown apart as the
+`recovery_archives` class's `foreign_bytes` (ledger item field
+`foreign_bytes`). `storage archives` adds `foreign_entries` (`count`,
+`bytes` measured within a shared 5 s budget, `measured`, `paths` naming at
+most 20), described as not recognised as recovery archives, to inspect
+before removing. Counters
+`storage_archive_foreign_entry` (one per foreign entry `storage archives`
+found) and `storage_ledger_foreign_archive_entry` (one per foreign entry a
+worker walk measured outside the children); span `storage_archives_foreign_scan`.
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
