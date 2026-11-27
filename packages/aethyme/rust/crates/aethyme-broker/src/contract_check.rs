@@ -1718,10 +1718,13 @@ mod tests {
         let reflow = diff_of(&["- foo.bar", "- foo.bar", "+ foo.bar foo.bar"]);
         assert!(find_touched_symbols(&reflow, &tracked).unwrap().is_empty());
         let removed = diff_of(&["- foo.bar foo.bar", "+ foo.bar"]);
-        assert!(
+        assert_eq!(
             find_touched_symbols(&removed, &tracked)
                 .unwrap()
-                .contains_key("foo.bar")
+                .get("foo.bar")
+                .map(Vec::len),
+            Some(1),
+            "retain the matching line once despite multiple occurrences"
         );
     }
 
