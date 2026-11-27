@@ -238,7 +238,7 @@ pub fn run(args: &[String]) -> u8 {
 
     println!("Cross-process symbols touched on removed lines:");
     for (symbol, lines) in &findings {
-        println!("  - `{symbol}` ({} occurrence(s))", lines.len());
+        println!("  - `{symbol}` ({} removed line(s))", lines.len());
     }
     println!();
     match verdict {
@@ -885,10 +885,19 @@ fn find_touched_symbols_by_filepair(
         }
 
         let mut removed = vec![Vec::new(); symbols.len()];
+        let mut removed_counts = vec![0usize; symbols.len()];
         let mut added = vec![0usize; symbols.len()];
+        let mut seen_on_line = vec![false; symbols.len()];
         visit_changed_lines(filepair, |is_removal, line, body| {
             if is_removal {
-                let mut record_match = |id: usize| removed[id].push(line.clone());
+                seen_on_line.fill(false);
+                let mut record_match = |id: usize| {
+                    removed_counts[id] += 1;
+                    if !seen_on_line[id] {
+                        removed[id].push(line.clone());
+                        seen_on_line[id] = true;
+                    }
+                };
                 match_line(body, &mut record_match);
             } else {
                 let mut record_match = |id: usize| added[id] += 1;
@@ -896,10 +905,14 @@ fn find_touched_symbols_by_filepair(
             }
         });
 
-        for ((symbol, removed_lines), added_count) in
-            symbols.iter().copied().zip(removed).zip(added)
+        for (((symbol, removed_lines), removed_count), added_count) in symbols
+            .iter()
+            .copied()
+            .zip(removed)
+            .zip(removed_counts)
+            .zip(added)
         {
-            if removed_lines.len() > added_count {
+            if removed_count > added_count {
                 findings
                     .entry(symbol.to_string())
                     .or_default()
