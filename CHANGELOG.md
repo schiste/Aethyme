@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.188] - 2026-11-27
+
+### Added
+
+- Portable content-gate host verification supports Aexeo duplicate-heading outcomes, binding the reported checks to the supplied candidate observations (#2061). This does not verify source freshness or authorize publication.
+
 ## [0.8.187] - 2026-11-27
 
 ### Changed
