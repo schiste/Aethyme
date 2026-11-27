@@ -417,12 +417,13 @@ fn failed_gate_diagnostics_report_failure_before_log_creation() {
     );
 }
 
-/// Main's Aethyme Gates skip a gate only when an OSS CI run on a branch of
-/// this repository (a pull_request run, or the workflow_dispatch run the
-/// release lane starts on its branch) passed both suites on a byte-identical
-/// tree, and then only the gates those suites cover. Any other gate, including
-/// one added later, runs. A push to main runs no workspace suite in OSS CI, so
-/// it must never record a tested tree.
+/// Main's Aethyme Gates skip a gate only when a dispatched OSS CI run of this
+/// repository (the release lane starts one on its branch) passed both suites
+/// on a byte-identical tree, and then only the gates those suites cover. Any
+/// other gate, including one added later, runs. A push to main runs no
+/// workspace suite in OSS CI, so it must never record a tested tree. The
+/// artifact name only finds candidates; each is verified through the API
+/// (`verify_tested_tree_run_trusts_the_api_not_the_artifact_name`).
 #[test]
 fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let oss = workflow("oss-ci.yml");
@@ -433,7 +434,7 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
         .find(|line| line.starts_with("    if:"))
         .unwrap();
     assert!(!condition.contains("'push'"), "{condition}");
-    assert!(record.contains(&"    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
+    assert!(record.contains(&"    if: ${{ github.event_name == 'workflow_dispatch' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
     assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
     assert!(record.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
     assert!(record.contains(&"          name: tested-tree-${{ env.TESTED_TREE }}"));
@@ -441,6 +442,21 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let gates = workflow("aethyme-gates.yml");
     let lookup = block(&gates, "  tested-tree:");
     assert!(lookup.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
+    // Every candidate is verified against this commit; a refusal moves on, an
+    // API error fails the lookup, and only a verified run is reported.
+    assert!(lookup.contains(
+        &"            if bash .github/scripts/verify-tested-tree-run.sh \"$candidate\" \"$commit\"; then"
+    ));
+    assert!(lookup.contains(&"              [ \"$status\" -eq 1 ] || exit \"$status\""));
+    assert!(lookup.contains(&"              run=\"$candidate\""));
+    assert_eq!(
+        lookup
+            .iter()
+            .filter(|line| line.trim_start().starts_with("run=\""))
+            .count(),
+        2,
+        "run is set only empty or to a verified candidate"
+    );
     // An artifact uploaded by a fork's run never counts.
     assert!(
         lookup
@@ -608,7 +624,15 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
         verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' }}")
     );
     assert!(verdict.contains(&"          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}"));
-    assert!(verdict.contains(&"            [[ \"$TESTED_BY_RUN\" =~ ^[0-9]+$ ]] || { echo \"invalid tested-by run '$TESTED_BY_RUN'\" >&2; exit 1; }"));
+    // The verdict re-verifies the cited run itself before recording the suite.
+    assert!(verdict.contains(&"          GH_TOKEN: ${{ github.token }}"));
+    assert!(verdict.contains(
+        &"            bash .github/scripts/verify-tested-tree-run.sh \"$TESTED_BY_RUN\" \"$(git rev-parse HEAD)\""
+    ));
+    // The release re-verifies it too, from this artifact's name.
+    assert!(
+        verdict.contains(&"          name: tested-by-run-${{ needs.tested-tree.outputs.run }}")
+    );
     assert!(verdict.contains(&"            full|changed) [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]] ;;"));
     // The record names the tree and the run that tested it.
     assert!(
@@ -981,7 +1005,7 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
 
     let record = block(&oss, "  record-tested-tree:");
     assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
-    assert!(record.contains(&"    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
+    assert!(record.contains(&"    if: ${{ github.event_name == 'workflow_dispatch' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
 
     let lint = block(&oss, "  lint:");
     assert!(lint.contains(&"    needs: classify_changes"));
@@ -1578,4 +1602,221 @@ fn prepush_always_run_entries_name_timed_tests() {
     ] {
         assert!(binaries.contains(&guard), "{guard} is not always run");
     }
+}
+
+/// The `tested-tree-<tree>` artifact name proves nothing: any run on any branch
+/// can upload one. The verifier accepts a cited run only on the API's word:
+/// OSS CI, dispatched in this repository, successful, suite jobs successful,
+/// head commit with the wanted tree. An API error is neither verdict.
+#[cfg(unix)]
+#[test]
+fn verify_tested_tree_run_trusts_the_api_not_the_artifact_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let script = root.join(".github/scripts/verify-tested-tree-run.sh");
+    let fixture = tempfile::tempdir().unwrap();
+    let gh = fixture.path().join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/usr/bin/env bash
+case "$2" in
+  */actions/runs/*/jobs*) [ -z "$JOBS_FAIL" ] || exit 1; printf '%s' "$JOBS" ;;
+  */actions/runs/*) [ -z "$RUN_FAIL" ] || exit 1; printf '%s' "$RUN" ;;
+  */git/commits/1111111111111111111111111111111111111111) printf '{"tree":{"sha":"%s"}}' "$RUN_TREE" ;;
+  */git/commits/*) printf '{"tree":{"sha":"%s"}}' "$WANT_TREE" ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let tree = "a".repeat(40);
+    let run = |path: &str, event: &str, conclusion: &str, head_repo: &str| {
+        serde_json::json!({
+            "path": path, "event": event, "status": "completed", "conclusion": conclusion,
+            "head_sha": "1".repeat(40),
+            "repository": {"full_name": "owner/repo"},
+            "head_repository": {"full_name": head_repo},
+        })
+        .to_string()
+    };
+    let good_run = run(
+        ".github/workflows/oss-ci.yml",
+        "workflow_dispatch",
+        "success",
+        "owner/repo",
+    );
+    let jobs = |shard2: &str, record: &str| {
+        serde_json::json!({"jobs": [
+            {"name": "Rust workspace tests (build)", "conclusion": "success"},
+            {"name": "Rust workspace tests (shard 1/10)", "conclusion": "success"},
+            {"name": "Rust workspace tests (shard 2/10)", "conclusion": shard2},
+            {"name": "Rust workspace tests", "conclusion": "success"},
+            {"name": "Rust examples and doctests", "conclusion": "success"},
+            {"name": "Record the tested tree", "conclusion": record},
+        ]})
+        .to_string()
+    };
+    let good_jobs = jobs("success", "success");
+    let other_tree = "b".repeat(40);
+    let cases: Vec<(&str, String, String, &str, &str, i32, &str)> = vec![
+        (
+            "verified",
+            good_run.clone(),
+            good_jobs.clone(),
+            &tree,
+            "",
+            0,
+            "passed the workspace suite",
+        ),
+        (
+            "other workflow",
+            run(
+                ".github/workflows/aethyme-gates.yml",
+                "workflow_dispatch",
+                "success",
+                "owner/repo",
+            ),
+            good_jobs.clone(),
+            &tree,
+            "",
+            1,
+            "workflow is",
+        ),
+        (
+            "pull_request",
+            run(
+                ".github/workflows/oss-ci.yml",
+                "pull_request",
+                "success",
+                "owner/repo",
+            ),
+            good_jobs.clone(),
+            &tree,
+            "",
+            1,
+            "event is",
+        ),
+        (
+            "push",
+            run(
+                ".github/workflows/oss-ci.yml",
+                "push",
+                "success",
+                "owner/repo",
+            ),
+            good_jobs.clone(),
+            &tree,
+            "",
+            1,
+            "event is",
+        ),
+        (
+            "failed run",
+            run(
+                ".github/workflows/oss-ci.yml",
+                "workflow_dispatch",
+                "failure",
+                "owner/repo",
+            ),
+            good_jobs.clone(),
+            &tree,
+            "",
+            1,
+            "conclusion is",
+        ),
+        (
+            "fork",
+            run(
+                ".github/workflows/oss-ci.yml",
+                "workflow_dispatch",
+                "success",
+                "fork/repo",
+            ),
+            good_jobs.clone(),
+            &tree,
+            "",
+            1,
+            "head repository is",
+        ),
+        (
+            "other tree",
+            good_run.clone(),
+            good_jobs.clone(),
+            &other_tree,
+            "",
+            1,
+            "it tested tree",
+        ),
+        (
+            "failed shard",
+            good_run.clone(),
+            jobs("failure", "success"),
+            &tree,
+            "",
+            1,
+            "1 of 2 shard jobs passed",
+        ),
+        (
+            "skipped record",
+            good_run.clone(),
+            jobs("success", "skipped"),
+            &tree,
+            "",
+            1,
+            "Record the tested tree",
+        ),
+        (
+            "api error",
+            good_run.clone(),
+            good_jobs.clone(),
+            &tree,
+            "1",
+            2,
+            "could not read run",
+        ),
+    ];
+    for (name, run_json, jobs_json, run_tree, run_fail, code, expected) in cases {
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("42")
+            .arg("2".repeat(40))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fixture.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("RUN", run_json)
+            .env("JOBS", jobs_json)
+            .env("RUN_TREE", run_tree)
+            .env("WANT_TREE", &tree)
+            .env("RUN_FAIL", run_fail)
+            .env("JOBS_FAIL", "")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(code), "{name}: {text}");
+        assert!(text.contains(expected), "{name}: {text}");
+    }
+    // A run id or commit that is not well formed is a usage error.
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("42; true")
+        .arg("2".repeat(40))
+        .env("GITHUB_REPOSITORY", "owner/repo")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
 }

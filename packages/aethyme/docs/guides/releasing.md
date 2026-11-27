@@ -80,9 +80,22 @@ the requested version change.
    commit has that same tree, and the Aethyme Gates run on main does not
    run the workspace suite again: its `cargo-test gate` job cites the branch
    run and still uploads the `full-suite` record (with `tree` and
-   `tested-by-run` files) that `release.yml` requires before it builds. The
-   other gates still run on main. If main moved, the trees differ and main
-   runs the whole suite as before; nothing is skipped on a different tree.
+   `tested-by-run` files, plus a `tested-by-run-<id>` artifact) that
+   `release.yml` requires before it builds. The other gates still run on
+   main. If main moved, the trees differ and main runs the whole suite as
+   before; nothing is skipped on a different tree.
+
+   The artifact name only finds candidates, since any run can upload an
+   artifact with that name. `.github/scripts/verify-tested-tree-run.sh`
+   accepts a cited run only when the API says it is
+   `.github/workflows/oss-ci.yml`, a `workflow_dispatch` run in this
+   repository, concluded `success`, with its build, every shard, the suite
+   verdict, the examples and doctests, and the tree record all successful,
+   on a head commit whose tree is the merge commit's tree. Main's tree
+   lookup, main's `cargo-test gate` verdict, and the release's
+   `verify-green-main` (`wait-for-release-gates.sh`) each run it again.
+   Pull-request runs never count: they test GitHub's merge ref, whose tree
+   the run does not name.
    Measured on v0.8.186: main's gates took 8m00 (run 45876819603) because
    they rebuilt and re-ran the suite on the tree that run 45875430580 had
    already passed; without the suite jobs, the other gates finish in about

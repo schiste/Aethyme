@@ -1439,8 +1439,13 @@ fn release_gate_waits_for_success_and_rejects_failures() {
 case "$2" in
   */runs/7/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false}]}'; exit 0 ;;
   */runs/8/artifacts*) echo '{"artifacts":[]}'; exit 0 ;;
+  */runs/11/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false},{"name":"tested-by-run-5","expired":false}]}'; exit 0 ;;
+  */actions/runs/5/jobs*) echo '{"jobs":[{"name":"Rust workspace tests (build)","conclusion":"success"},{"name":"Rust workspace tests (shard 1/10)","conclusion":"success"},{"name":"Rust workspace tests","conclusion":"success"},{"name":"Rust examples and doctests","conclusion":"success"},{"name":"Record the tested tree","conclusion":"success"}]}'; exit 0 ;;
+  */actions/runs/5) echo "{\"path\":\".github/workflows/oss-ci.yml\",\"event\":\"$CITED_EVENT\",\"status\":\"completed\",\"conclusion\":\"success\",\"head_sha\":\"1111111111111111111111111111111111111111\",\"repository\":{\"full_name\":\"owner/repo\"},\"head_repository\":{\"full_name\":\"owner/repo\"}}"; exit 0 ;;
+  */git/commits/*) echo '{"tree":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'; exit 0 ;;
 esac
 case "$CASE" in
+  reused_verified|reused_refused) echo '{"workflow_runs":[{"id":11,"status":"completed","conclusion":"success"}]}' ;;
   pending) if test -e "$STATE"; then echo '{"workflow_runs":[{"id":7,"status":"completed","conclusion":"success"}]}'; else touch "$STATE"; echo '{"workflow_runs":[{"id":7,"status":"in_progress","conclusion":null}]}'; fi ;;
   changed_only) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"}]}' ;;
   full_after_changed) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"},{"id":7,"status":"completed","conclusion":"success"}]}' ;;
@@ -1454,6 +1459,15 @@ esac
         aethyme_testkit::paths::repo_root().join(".github/scripts/wait-for-release-gates.sh");
     for (case, wait, succeeds, expected) in [
         ("pending", "3", true, "passed the full suite on"),
+        // A gates run that cited a branch run's suite qualifies only after
+        // that run is verified again here.
+        ("reused_verified", "0", true, "suite in run 5"),
+        (
+            "reused_refused",
+            "3",
+            false,
+            "does not prove the suite passed",
+        ),
         ("full_after_changed", "0", true, "passed the full suite on"),
         ("changed_only", "3", false, "without the full suite"),
         ("failed", "3", false, "completed without success"),
@@ -1471,10 +1485,18 @@ esac
                 ),
             )
             .env("GITHUB_REPOSITORY", "owner/repo")
-            .env("SHA", "abc123")
+            .env("SHA", "2222222222222222222222222222222222222222")
             .env("AETHYME_GATE_WAIT_SECONDS", wait)
             .env("AETHYME_GATE_POLL_SECONDS", "1")
             .env("CASE", case)
+            .env(
+                "CITED_EVENT",
+                if case == "reused_refused" {
+                    "pull_request"
+                } else {
+                    "workflow_dispatch"
+                },
+            )
             .env("STATE", fixture.path().join("state"))
             .output()
             .unwrap();

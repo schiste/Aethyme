@@ -50,15 +50,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # A merge commit whose tree an OSS CI run on a branch already tested (its
-  # record-tested-tree job, after the workspace suite and the examples and
-  # doctests passed; a pull_request run or, since pull requests stopped
-  # triggering OSS CI, a workflow_dispatch run such as the release lane's)
-  # skips the gates those suites cover. Only an artifact from a run in this
-  # repository counts, not one from a fork. Every other gate still runs,
-  # including gates added later. A manual dispatch of this workflow, or any
-  # tree no branch run tested, runs every gate. A failed lookup runs nothing
-  # and fails the workflow.
+  # A merge commit whose tree a dispatched OSS CI run on a branch already
+  # tested (the release lane's, for one) skips the gates the workspace suite
+  # and the examples and doctests cover. The `tested-tree-<tree>` artifacts
+  # only name candidate runs: any run can upload one under that name. A
+  # candidate counts only when verify-tested-tree-run.sh confirms through the
+  # API that it is OSS CI, dispatched in this repository (never a fork),
+  # successful, with its suite jobs successful, on a head commit whose tree is
+  # this commit's tree. Every other gate still runs, including gates added
+  # later. A manual dispatch of this workflow, or any tree no verified run
+  # tested, runs every gate. A failed lookup runs nothing and fails the
+  # workflow.
   #
   # "pull-request run" in the step and gate log names below means that branch
   # run; gate-telemetry.py parses the log wording.
@@ -85,9 +87,22 @@ jobs:
         run: |
           set -euo pipefail
           tree="$(git rev-parse 'HEAD^{tree}')"
+          commit="$(git rev-parse HEAD)"
           repo_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .id)"
-          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
-            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == $repo_id) | .workflow_run.id] | first // empty")"
+          # Candidates only; the artifact name proves nothing.
+          candidates="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == $repo_id) | .workflow_run.id] | unique | .[]")"
+          run=""
+          for candidate in $candidates; do
+            # 0 verified, 1 refused; anything else is an API error and fails.
+            if bash .github/scripts/verify-tested-tree-run.sh "$candidate" "$commit"; then
+              run="$candidate"
+              break
+            else
+              status=$?
+              [ "$status" -eq 1 ] || exit "$status"
+            fi
+          done
           if [ -n "$run" ]; then
             echo "Tree $tree passed the workspace suite in pull-request run $run."
           else
@@ -514,6 +529,7 @@ jobs:
 
       - name: Require every part of the gate
         env:
+          GH_TOKEN: ${{ github.token }}
           SCOPE: ${{ needs.tested-tree.outputs.scope }}
           TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}
           BUILD: ${{ needs.cargo-test-build.result }}
@@ -523,9 +539,9 @@ jobs:
           set -euo pipefail
           echo "scope=$SCOPE build=$BUILD shards=$SHARDS examples=$EXAMPLES tested_by_run=$TESTED_BY_RUN"
           if [ -n "$TESTED_BY_RUN" ]; then
-            # The lookup matched this commit's own tree to that run's record.
-            [[ "$TESTED_BY_RUN" =~ ^[0-9]+$ ]] || { echo "invalid tested-by run '$TESTED_BY_RUN'" >&2; exit 1; }
-            echo "The workspace suite, examples and doctests passed on this tree in run $TESTED_BY_RUN."
+            # Not on the lookup job's word: ask the API again, here, before
+            # this job records the full suite on that run's behalf.
+            bash .github/scripts/verify-tested-tree-run.sh "$TESTED_BY_RUN" "$(git rev-parse HEAD)"
             exit 0
           fi
           case "$SCOPE" in
@@ -553,6 +569,18 @@ jobs:
         with:
           name: full-suite
           path: ${{ runner.temp }}/full-suite/
+          if-no-files-found: error
+          retention-days: 90
+
+      # Names the run the record relies on where the release can read it
+      # without downloading: wait-for-release-gates.sh verifies that run
+      # again before a release builds.
+      - name: Name the run that tested this tree
+        if: ${{ needs.tested-tree.outputs.scope == 'full' && needs.tested-tree.outputs.run != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tested-by-run-${{ needs.tested-tree.outputs.run }}
+          path: ${{ runner.temp }}/full-suite/tested-by-run
           if-no-files-found: error
           retention-days: 90
 
