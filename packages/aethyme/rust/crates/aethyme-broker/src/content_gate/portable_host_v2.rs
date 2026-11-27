@@ -28,6 +28,7 @@ fn valid_gate(gate: &Value) -> Result<&str, &'static str> {
         "paragraph_character_length" | "heading_length" => &["max_chars"],
         "required_headings" => &["headings"],
         "heading_hierarchy" => &["initial_level"],
+        "duplicate_headings" => &["case_sensitive"],
         _ => return Err("host adapter portable verification does not support this gate"),
     };
     let mut required = vec!["kind", "id", "severity", "blocking"];
@@ -77,6 +78,11 @@ fn valid_gate(gate: &Value) -> Result<&str, &'static str> {
                     .any(|value| value.as_str().is_none_or(|s| s.trim().is_empty()))
             {
                 return Err("invalid required headings");
+            }
+        }
+        "duplicate_headings" => {
+            if !gate["case_sensitive"].is_boolean() {
+                return Err("invalid duplicate headings case policy");
             }
         }
         "heading_hierarchy" => {
@@ -298,6 +304,35 @@ pub(super) fn verify(
                         heading.trim().chars().count() as u64
                             > gate["max_chars"].as_u64().unwrap_or(0)
                     }),
+                "duplicate_headings" => {
+                    let actual = headings.as_ref().ok_or("host headings unavailable")?;
+                    let case_sensitive = gate["case_sensitive"]
+                        .as_bool()
+                        .ok_or("invalid duplicate headings case policy")?;
+                    let mut seen = BTreeSet::new();
+                    let mut duplicate = false;
+                    for heading in actual {
+                        let trimmed = heading.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if !case_sensitive && !trimmed.is_ascii() {
+                            return Err(
+                                "non-ASCII case-insensitive headings are not independently supported",
+                            );
+                        }
+                        let key = if case_sensitive {
+                            trimmed.to_owned()
+                        } else {
+                            trimmed.to_ascii_lowercase()
+                        };
+                        if !seen.insert(key) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    duplicate
+                }
                 "heading_hierarchy" => {
                     headings.as_ref().ok_or("host headings unavailable")?;
                     let mut previous = gate["initial_level"].as_u64();
@@ -376,6 +411,35 @@ mod tests {
             &checks,
         )
     }
+    #[test]
+    fn duplicate_headings_require_observed_consistent_status_and_valid_policy() {
+        let mut policy = json!({"gates":[{"kind":"duplicate_headings","id":"dup","severity":"warning","blocking":false,"case_sensitive":false}]});
+        let mut projection = json!({"schema":"aexeo.content-adapter/v1","text":"", "headings":[" Alpha ","", "alpha"]});
+        let evaluate = |policy: &Value, projection: &Value, status: &str| {
+            let check = json!({"status":status});
+            let checks = BTreeMap::from([("gate:7:article:dup", &check)]);
+            verify(
+                policy,
+                &json!({"findings":[]}),
+                &[item(projection.clone())],
+                &checks,
+            )
+        };
+        assert_eq!(evaluate(&policy, &projection, "failed"), Ok(true));
+        assert!(evaluate(&policy, &projection, "passed").is_err());
+        policy["gates"][0]["case_sensitive"] = json!(true);
+        assert_eq!(evaluate(&policy, &projection, "passed"), Ok(true));
+        projection["headings"] = json!(["é", "é"]);
+        assert_eq!(evaluate(&policy, &projection, "failed"), Ok(true));
+        policy["gates"][0]["case_sensitive"] = json!(false);
+        assert!(evaluate(&policy, &projection, "failed").is_err());
+        projection.as_object_mut().unwrap().remove("headings");
+        assert!(evaluate(&policy, &projection, "passed").is_err());
+        assert_eq!(evaluate(&policy, &projection, "not_checked"), Ok(true));
+        policy["gates"][0]["case_sensitive"] = json!("false");
+        assert!(evaluate(&policy, &projection, "not_checked").is_err());
+    }
+
     #[test]
     fn checks_composed_host_gates_and_rejects_forged_status() {
         assert_eq!(run(&policy(), projection(), "passed", json!([])), Ok(true));
