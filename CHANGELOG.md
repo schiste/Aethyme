@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.187] - 2026-11-27
+
+### Changed
+
+- `database is locked` no longer fails broker commands under normal contention. Every broker database connection waits up to 30 s with jittered backoff instead of 5 s, and writable connections begin every transaction with `BEGIN IMMEDIATE`, so a transaction that read before writing can no longer fail instantly when another writer commits first. On the busiest repository 63 commands failed this way in 6 hours. A wait that runs out names the write-lock holder (pid, command, how long), read from a private holder record written while the lock is held; `broker status` shows a holder that has held the lock for 5 s or more (#2054).
+- Leases read as what they are. Read-only commands (`status` in every form, `agents`, `resources list|pressure|plan|explain` and others) are no longer refused for a session whose finite task lease another agent process holds — about 90 such refusals a day on the busiest repository. Path-lease overlaps say they are informational and never block edits or submit; host resource conflicts name the build/cache slot, port or managed storage and say "waiting is normal" only for real contention; the status advice `lease.overlap-conflict` (warning) becomes `paths.merge-conflict-risk` (info). The hook repeats coordination lines only when the overlap or decision changes (#2055).
+- `storage archives` reports what each recovery archive holds from every manifest field, in priority order (unlanded commits, staged and unstaged patches, untracked and ignored files), with a machine-readable `holds` object. Before, archives holding unlanded commits were reported as "it holds ignored_files or does not say" — 255 of 927 on the maintainer's machine. Plain files and directories that are not archives (for example old deploy backups) are listed as `foreign_entries` and counted in `foreign_bytes`; a manifest-less directory holding archive parts is listed as a damaged archive that no lane removes (#2057).
+
+### Added
+
+- Telemetry: span `broker_db_busy_wait`, counters `broker_db_busy_retry`, `broker_db_busy_failure`, attachment `broker_db_busy_wait_by_holder` (#2054); `task_lease_read_allowed`, `hook_coordination_repeat_suppressed`, span `task_lease_read_check` (#2055); `storage_archive_foreign_entry`, `storage_ledger_foreign_archive_entry` (#2057). All documented in `cross-process-consumers.md`.
+
+### Build and release
+
+- Main's Aethyme Gates reuse a successful OSS CI run dispatched on the release branch when its tree is identical to main's, instead of running the cargo-test suite a second time. The cited run is verified through the API (workflow path, dispatch event, success, same repository, identical tree, every suite job and exactly shards 1..M successful) in the lookup, again before recording, and again by the release workflow before building. On v0.8.186 main's gates took 8m00 re-testing the tree the release branch had passed; expected about 4m50, and about 37 runner-minutes fewer per release (#2056).
+
+### Upgrade notes
+
+- Consumers keying on the status advice id `lease.overlap-conflict` or its warning severity must read `reason: overlap_conflict` or the new id `paths.merge-conflict-risk` (#2055).
+- `HostResourceError::Conflict` text no longer starts with "host resource bundle unavailable" (#2055).
+- A wedged write-lock holder now delays waiters up to 30 s before they fail; the error names it (#2054).
+- `storage archives` reason text changed; scripts matching the old wording must read `holds` (#2057).
+
 ## [0.8.186] - 2026-11-26
 
 ### Changed
