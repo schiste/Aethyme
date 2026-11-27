@@ -1770,7 +1770,7 @@ mod tests {
         let edges = ["", " ", "x", "_", "-", ".", "é", "\n"];
         for symbol in symbols {
             let oracle = regex::Regex::new(&format!(
-                r"(?:\A|[^\p{Alphabetic}\p{Number}_-]){}(?:\z|[^\p{Alphabetic}\p{Number}_-])",
+                r"(?:\A|[^\p{{Alphabetic}}\p{{Number}}_-]){}(?:\z|[^\p{{Alphabetic}}\p{{Number}}_-])",
                 regex::escape(symbol)
             ))
             .unwrap();
