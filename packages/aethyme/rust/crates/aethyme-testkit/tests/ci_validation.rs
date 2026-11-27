@@ -1082,6 +1082,27 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
 }
 
 #[test]
+fn docs_gate_classifier_preserves_full_path_for_mixed_and_unknown_changes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("bash")
+        .arg(root.join("packages/aethyme/scripts/test-gate-docs-only.sh"))
+        .current_dir(root)
+        .env("AETHYME_SESSION_SCRATCH_DIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "classifier test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn changed_workflows_have_read_only_permissions() {
     for name in [
         "oss-ci.yml",
