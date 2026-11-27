@@ -373,8 +373,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   a regression from the path producer to the runtime-path classifier; keep
   private-file checks strict if an ignore mismatch is found.
 - Choose focused local Cargo checks by compilation target as well as test name.
-  A name filter selects cases at runtime; `--lib` still compiles the full unit-test
-  target. Start with a relevant integration-test target when available, keep one
+  A name filter selects cases at runtime; for a unit test, add `--lib` to avoid
+  launching unrelated integration-test binaries. `--lib` still compiles the full
+  unit-test target. Start with a relevant integration-test target when available, keep one
   Cargo worker, and retain the remaining unit coverage as pending qualification.
   A resource-stopped compile provides no test result.
 - If CI cancels older runs on push, retain useful in-progress workspace test
