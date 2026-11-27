@@ -25,6 +25,12 @@ if AETHYME_GATE_BASE_COMMIT="$base" "$classifier"; then
     exit 1
 fi
 rm untracked
+printf 'dirty\n' >> packages/aethyme/docs/guide.md
+if AETHYME_GATE_BASE_COMMIT="$base" "$classifier"; then
+    echo 'tracked edits must not use the documentation path' >&2
+    exit 1
+fi
+git restore -- packages/aethyme/docs/guide.md
 if AETHYME_GATE_BASE_COMMIT=does-not-exist "$classifier"; then
     echo 'invalid base must not use the documentation path' >&2
     exit 1
