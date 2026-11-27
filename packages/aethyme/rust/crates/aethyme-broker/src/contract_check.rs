@@ -791,30 +791,25 @@ fn build_literal_fallback(symbol: &str) -> Result<Vec<usize>, String> {
     Ok(fallback)
 }
 
-/// Report each literal at most once per line, just as the former regex set did.
-fn literal_symbol_matches(body: &str, symbol: &str, fallback: &[usize]) -> bool {
-    if symbol.is_empty() {
-        return false;
+/// Count non-overlapping, boundary-delimited occurrences in a line. Counting
+/// occurrences instead of matching lines preserves the result when text is
+/// wrapped or unwrapped, and exposes a removal from a repeated declaration.
+fn literal_symbol_match_count(body: &str, symbol: &str, fallback: &[usize]) -> usize {
+    if symbol.is_empty() || !body.contains(symbol) {
+        return 0;
     }
-    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    let is_word = |character: char| character.is_alphanumeric() || matches!(character, '_' | '-');
     let boundary_matches = |start: usize, end: usize| {
-        (start == 0 || !is_word(body.as_bytes()[start - 1]))
-            && (end == body.len() || !is_word(body.as_bytes()[end]))
+        body[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c))
+            && body[end..].chars().next().is_none_or(|c| !is_word(c))
     };
-    let Some(first) = body.find(symbol) else {
-        return false;
-    };
-    if boundary_matches(first, first + symbol.len()) {
-        return true;
-    }
-    // Fast substring search handles the common absent/first-valid cases. If
-    // boundaries reject the first occurrence, use KMP rather than restarting
-    // substring search at every overlapping offset (which can be quadratic).
-    // Byte slices are intentional: a complete valid UTF-8 literal cannot
-    // match starting within a continuation sequence.
     let pattern = symbol.as_bytes();
     let mut matched = 0;
-    for (relative, byte) in body.as_bytes()[first + 1..].iter().enumerate() {
+    let mut count = 0;
+    for (offset, byte) in body.as_bytes().iter().enumerate() {
         while matched > 0 && *byte != pattern[matched] {
             matched = fallback[matched - 1];
         }
@@ -822,14 +817,21 @@ fn literal_symbol_matches(body: &str, symbol: &str, fallback: &[usize]) -> bool 
             matched += 1;
         }
         if matched == pattern.len() {
-            let end = first + 1 + relative + 1;
+            let end = offset + 1;
             if boundary_matches(end - pattern.len(), end) {
-                return true;
+                count += 1;
+                matched = 0;
+            } else {
+                matched = fallback[matched - 1];
             }
-            matched = fallback[matched - 1];
         }
     }
-    false
+    count
+}
+
+#[cfg(test)]
+fn literal_symbol_matches(body: &str, symbol: &str, fallback: &[usize]) -> bool {
+    literal_symbol_match_count(body, symbol, fallback) > 0
 }
 
 /// Find tracked symbols whose occurrences are reduced by a diff.
@@ -859,7 +861,7 @@ fn find_touched_symbols_with_limit(
         &matcher.symbols,
         |body, visit_match| {
             for (id, symbol) in matcher.symbols.iter().enumerate() {
-                if literal_symbol_matches(body, symbol, &matcher.fallbacks[id]) {
+                for _ in 0..literal_symbol_match_count(body, symbol, &matcher.fallbacks[id]) {
                     visit_match(id);
                 }
             }
@@ -1698,11 +1700,16 @@ mod tests {
     }
 
     #[test]
-    fn repeated_occurrences_on_one_line_count_once_for_both_sides() {
+    fn repeated_occurrences_count_when_reflowed_or_removed() {
         let tracked = BTreeSet::from(["foo.bar".to_string()]);
-        let diff = diff_of(&["- foo.bar foo.bar", "+ foo.bar"]);
-
-        assert!(find_touched_symbols(&diff, &tracked).unwrap().is_empty());
+        let reflow = diff_of(&["- foo.bar", "- foo.bar", "+ foo.bar foo.bar"]);
+        assert!(find_touched_symbols(&reflow, &tracked).unwrap().is_empty());
+        let removed = diff_of(&["- foo.bar foo.bar", "+ foo.bar"]);
+        assert!(
+            find_touched_symbols(&removed, &tracked)
+                .unwrap()
+                .contains_key("foo.bar")
+        );
     }
 
     #[test]
@@ -1713,6 +1720,23 @@ mod tests {
         let findings = find_touched_symbols(&diff, &tracked).unwrap();
 
         assert_eq!(findings.get("éé").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn tracked_fields_do_not_match_inside_unicode_identifiers() {
+        let tracked = BTreeSet::from(["code".to_string()]);
+        let unrelated = diff_of(&["- let écode = 1;", "- let codeé = 2;"]);
+        assert!(
+            find_touched_symbols(&unrelated, &tracked)
+                .unwrap()
+                .is_empty()
+        );
+        let field = diff_of(&["- \"code\": 2"]);
+        assert!(
+            find_touched_symbols(&field, &tracked)
+                .unwrap()
+                .contains_key("code")
+        );
     }
 
     #[test]
@@ -1729,7 +1753,7 @@ mod tests {
         let edges = ["", " ", "x", "_", "-", ".", "é", "\n"];
         for symbol in symbols {
             let oracle = regex::Regex::new(&format!(
-                r"(?:\A|[^A-Za-z0-9_-]){}(?:\z|[^A-Za-z0-9_-])",
+                r"(?:\A|[^\p{Alphabetic}\p{Number}_-]){}(?:\z|[^\p{Alphabetic}\p{Number}_-])",
                 regex::escape(symbol)
             ))
             .unwrap();
