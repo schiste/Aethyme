@@ -169,8 +169,11 @@ pub(crate) fn process(
 #[cfg(unix)]
 pub(crate) fn await_ready(stdout: &mut std::process::ChildStdout, nonce: &str) -> io::Result<()> {
     crate::gates::bounded_log::set_nonblocking(stdout)?;
+    let _span = crate::phase_telemetry::span("agent_supervisor_readiness");
     let expected = format!("AETHYME_AGENT_READY {nonce}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The supervisor verifies the repository and starts its cleanup watcher
+    // before announcing readiness; allow slow hosts to complete that work.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     await_ready_with_wait(stdout, &expected, deadline, || {
         std::thread::sleep(std::time::Duration::from_millis(5));
     })
@@ -685,6 +688,21 @@ mod tests {
             return;
         };
         std::process::exit(super::cleanup_watcher(&parent).unwrap_or(125).into());
+    }
+
+    #[test]
+    fn readiness_accepts_a_slow_supervisor() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 6; printf 'AETHYME_AGENT_READY slow\\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = super::await_ready(child.stdout.as_mut().unwrap(), "slow");
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        result.unwrap();
     }
 
     #[test]

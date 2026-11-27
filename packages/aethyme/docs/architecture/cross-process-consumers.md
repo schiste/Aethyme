@@ -3162,6 +3162,8 @@ remains explicitly incomplete. Cleanup covers ordinary descendants in the
 owned process group; it is not containment of programs that deliberately
 escape that group. Consumers must preserve the private dispatch and exact
 runtime selection when changing entrypoints.
+Supervisor and cleanup-watcher readiness waits have a 30-second bound; the
+`agent_supervisor_readiness` phase measures each wait without recording its nonce.
 
 ### Generic guarded-command supervision
 
