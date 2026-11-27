@@ -13,6 +13,10 @@
 # Only workflow_dispatch: a dispatched run checks out its head commit, so that
 # commit's tree is the tree it tested. A pull_request run tests GitHub's merge
 # ref, whose tree the run's `head_sha` does not name.
+# A dispatched run uses the workflow file at its head commit, which a branch
+# can edit. The tree check covers that: the workflow and tests that ran are
+# byte for byte the ones in <commit>, so faking the suite means merging the
+# fake into main.
 #
 # Exit 0: verified. Exit 1: refused (the reason is printed). Exit 2: usage or
 # API error; callers must not read it as either verdict.
