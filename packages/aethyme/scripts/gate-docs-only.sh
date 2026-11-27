@@ -5,7 +5,8 @@ set -euo pipefail
 base="${AETHYME_GATE_BASE_COMMIT:-}"
 [ -n "$base" ] || exit 1
 git rev-parse --verify "$base^{commit}" >/dev/null || exit 1
-[ -z "$(git status --porcelain --untracked-files=normal)" ] || exit 1
+status="$(git status --porcelain --untracked-files=normal)" || exit 1
+[ -z "$status" ] || exit 1
 git diff --no-renames --name-only -z "$base" HEAD -- | (
     seen=0
     while IFS= read -r -d '' path; do

@@ -19,6 +19,16 @@ printf 'after\n' > packages/aethyme/docs/guide.md
 git add packages/aethyme/docs/guide.md
 git commit -qm docs
 AETHYME_GATE_BASE_COMMIT="$base" "$classifier"
+printf 'untracked\n' > untracked
+if AETHYME_GATE_BASE_COMMIT="$base" "$classifier"; then
+    echo 'untracked file must not use the documentation path' >&2
+    exit 1
+fi
+rm untracked
+if AETHYME_GATE_BASE_COMMIT=does-not-exist "$classifier"; then
+    echo 'invalid base must not use the documentation path' >&2
+    exit 1
+fi
 printf 'after\n' > packages/aethyme/rust/main.rs
 git add packages/aethyme/rust/main.rs
 git commit -qm mixed
