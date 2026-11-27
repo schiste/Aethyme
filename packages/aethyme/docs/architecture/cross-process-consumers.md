@@ -6583,5 +6583,6 @@ across a child process, a sleep or a network call.
   surface read when the wait began (`unrecorded` when there was none).
 
 Gate admission phase telemetry records `gate_load_admission`, `gate_owner_lock_wait`,
-and `gate_resource_admission` separately. These spans measure elapsed admission
-time, including immediate acquisition; child execution has its own subprocess span.
+and `gate_resource_admission` separately on the admission loop. An immediate
+verification-slot probe can bypass that loop; missing spans do not imply zero
+wait. Child execution has its own subprocess span.
