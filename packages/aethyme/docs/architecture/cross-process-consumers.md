@@ -629,17 +629,27 @@ files, ignored files), then `its manifest (schema N) does not say whether it
 holds <fields>` only for fields it lacks (schemas before 5 have no
 `ignored_files`); the old `it holds <field> or does not say` is gone, which
 called a schema-1 archive holding commits an archive of ignored files.
-Entries under `recovery-archives/` that are not archives (a plain file or
-link at either level, or a `<group>/<name>` directory without
-`manifest.json`, such as `.DS_Store` or an old `rollout-<version>/<repo>`
-deploy backup; `*.partial` staging still counts as an archive) are no longer
-ledger children, so they are neither measured into the class nor evicted,
-and `storage archives` no longer lists them as `manifest unreadable`: the
-document adds `foreign_entries` (`count`, `bytes` measured within a shared
-5 s budget, `measured`, `paths` naming at most 20). Counters
+A `<group>/<name>` directory holding any archive part (`manifest.json` of
+any type, `commits.bundle`, `staged.patch`, `unstaged.patch`, `README.md`,
+`retirement.json`, `untracked/`, `ignored/`) or named `*.partial` is an
+archive. One whose manifest is missing, a link, not a regular file or
+unreadable is a damaged archive: listed with `not_landed_because`
+`manifest missing or unreadable; treat as an archive and inspect before
+removing` and `holds.unknown` true, and never removed by any lane (landing
+and age both need its manifest). Anything else under `recovery-archives/`
+(a plain file or link at either level, or a directory with no archive part,
+such as `.DS_Store` or an old `rollout-<version>/<repo>` deploy backup) is a
+foreign entry: not a ledger child, never evicted, and no longer listed as
+`manifest unreadable`. Its bytes are still walked into the class total, so
+`storage status` matches the disk, and shown apart as the
+`recovery_archives` class's `foreign_bytes` (ledger item field
+`foreign_bytes`). `storage archives` adds `foreign_entries` (`count`,
+`bytes` measured within a shared 5 s budget, `measured`, `paths` naming at
+most 20), described as not recognised as recovery archives, to inspect
+before removing. Counters
 `storage_archive_foreign_entry` (one per foreign entry `storage archives`
-found) and `storage_ledger_foreign_archive_entry` (one per entry a worker
-walk left out); span `storage_archives_foreign_scan`.
+found) and `storage_ledger_foreign_archive_entry` (one per foreign entry a
+worker walk measured outside the children); span `storage_archives_foreign_scan`.
 
 ## Build output of kept worktrees
 

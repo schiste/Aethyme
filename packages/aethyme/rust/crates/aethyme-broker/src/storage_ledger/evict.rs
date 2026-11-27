@@ -484,19 +484,25 @@ fn manifest_landing(
         .and_then(|(repository, commits)| prover.prove(&repository, &commits))
 }
 
-/// An archive's parsed `manifest.json` (at most 32 MiB).
+/// Why an archive-shaped directory without a readable manifest is kept: it
+/// may be a real archive whose manifest was deleted, replaced by a link or
+/// damaged.
+pub const DAMAGED_ARCHIVE_REASON: &str =
+    "manifest missing or unreadable; treat as an archive and inspect before removing";
+
+/// An archive's parsed `manifest.json` (a regular file, never a link, at
+/// most 32 MiB).
 fn read_manifest(archive: &Path) -> Result<Value, String> {
     let manifest_path = archive.join("manifest.json");
-    let size = fs::metadata(&manifest_path)
-        .map_err(|error| format!("manifest unreadable: {error}"))?
-        .len();
-    if size > 32 * 1024 * 1024 {
+    let metadata = fs::symlink_metadata(&manifest_path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .ok_or(DAMAGED_ARCHIVE_REASON)?;
+    if metadata.len() > 32 * 1024 * 1024 {
         return Err("manifest too large".into());
     }
-    serde_json::from_slice(
-        &fs::read(&manifest_path).map_err(|error| format!("manifest unreadable: {error}"))?,
-    )
-    .map_err(|error| format!("manifest invalid: {error}"))
+    serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| DAMAGED_ARCHIVE_REASON)?)
+        .map_err(|error| format!("manifest invalid: {error}"))
 }
 
 /// What a recovery archive's manifest records it holds. A `None` count is a

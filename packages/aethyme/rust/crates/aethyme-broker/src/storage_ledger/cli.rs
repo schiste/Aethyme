@@ -206,6 +206,23 @@ pub fn status_value(host_state: &Path) -> Value {
             }),
         );
     }
+    // Entries beside the archives that are not archives: counted into the
+    // class bytes (the disk holds them), named apart, never evicted.
+    if let Some(archives) = classes.get_mut(&Class::RecoveryArchives)
+        && let Some(object) = archives.as_object_mut()
+    {
+        object.insert(
+            "foreign_bytes".into(),
+            json!(
+                ledger
+                    .items
+                    .iter()
+                    .filter(|item| item.class == Class::RecoveryArchives)
+                    .map(|item| item.foreign_bytes)
+                    .sum::<u64>()
+            ),
+        );
+    }
     if let Some(gate) = classes.get_mut(&Class::GateCache)
         && let Some(object) = gate.as_object_mut()
     {
@@ -1247,9 +1264,9 @@ const FOREIGN_MEASURE_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// How many foreign entries [`archives_value`] names; the rest are counted.
 const FOREIGN_NAMED: usize = 20;
 
-/// Entries under the recovery-archive directories that are not archives
-/// (stray files, old deploy rollout backups): counted and measured apart,
-/// never listed or accounted as archives.
+/// Entries under the recovery-archive directories not recognised as
+/// archives (stray files, old deploy rollout backups): counted and measured
+/// apart, never listed as archives; inspect before removing.
 #[derive(Default)]
 struct ForeignEntries {
     names: Vec<String>,
@@ -1339,7 +1356,7 @@ fn archives(json_output: bool) -> u8 {
     let foreign = &value["foreign_entries"];
     if foreign["count"].as_u64().is_some_and(|count| count > 0) {
         println!(
-            "  {} foreign entr{} (not recovery archives; never listed, measured or removed as one)  {}{}",
+            "  {} foreign entr{} (not recognised as recovery archives; inspect before removing)  {}{}",
             foreign["count"],
             if foreign["count"] == 1 { "y" } else { "ies" },
             human(foreign["bytes"].as_u64().unwrap_or(0)),

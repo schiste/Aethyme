@@ -305,6 +305,7 @@ fn gate_ledger(children: Vec<super::Child>) -> super::Ledger {
             measured_at_ms: now,
             children,
             walk: None,
+            foreign_bytes: 0,
         }],
         ..super::Ledger::default()
     }
@@ -1305,6 +1306,7 @@ fn report_only_classes_are_counted_never_walked() {
         measured_at_ms: 0,
         children: Vec::new(),
         walk: None,
+        foreign_bytes: 0,
     };
     let walks = super::WALKS.with(std::cell::Cell::get);
     assert!(super::measure_item(
@@ -1345,6 +1347,7 @@ fn a_walk_stops_at_its_deadline_and_resumes_where_it_stopped() {
         measured_at_ms: 0,
         children: Vec::new(),
         walk: None,
+        foreign_bytes: 0,
     };
     // An expired deadline: one step, then a persisted cursor.
     assert!(!super::measure_item(&mut item, Instant::now(), &mut || {}));
@@ -1605,6 +1608,7 @@ fn links_recent_use_and_unknown_recency_keep_an_entry() {
             kept: false,
         }],
         walk: None,
+        foreign_bytes: 0,
     };
     let ledger = super::Ledger {
         items: vec![item],
@@ -2649,6 +2653,7 @@ fn past_node_compile_cache_days_go_after_an_hour_and_today_never() {
         measured_at_ms: now,
         children,
         walk: None,
+        foreign_bytes: 0,
     };
     let long_ago = format!("d{}", today - 20);
     let yesterday = format!("d{}", today - 1);
@@ -2945,11 +2950,13 @@ fn a_schema_1_archive_with_commits_is_refused_for_what_it_holds() {
     assert!(holds.unknown);
 }
 
-/// Stray files and manifest-less directories (old deploy rollout backups)
-/// under `recovery-archives/` are foreign entries: never listed, measured
-/// or accounted as archives, and reported apart.
+/// Stray files and directories with no archive part (old deploy rollout
+/// backups) under `recovery-archives/` are foreign entries: never listed or
+/// evicted as archives, reported apart, and still counted into the class
+/// bytes so the ledger matches the disk. A directory holding archive parts
+/// without a readable manifest is a damaged archive: listed, never removed.
 #[test]
-fn foreign_entries_are_not_archives() {
+fn foreign_entries_are_not_archives_and_damaged_archives_are() {
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path();
     let real = manifest_archive(host_state, "real", Some(1), 0);
@@ -2966,7 +2973,23 @@ fn foreign_entries_are_not_archives() {
     );
     // A partial archive is still being written: an archive, not foreign.
     fs::create_dir_all(archives.join("example-0123/next.partial")).unwrap();
-    assert!(super::is_archive_shaped(&real, "real"));
+    // Damaged archives: manifest deleted (a bundle remains), manifest
+    // replaced by a link, manifest a directory.
+    let deleted = archives.join("example-0123/deleted");
+    file(&deleted.join("commits.bundle"), 4 * 1024);
+    let linked = archives.join("example-0123/linked");
+    file(&linked.join("untracked/notes.txt"), 1024);
+    std::os::unix::fs::symlink(real.join("manifest.json"), linked.join("manifest.json")).unwrap();
+    let odd = archives.join("example-0123/odd");
+    fs::create_dir_all(odd.join("manifest.json")).unwrap();
+    for (path, name) in [
+        (&real, "real"),
+        (&deleted, "deleted"),
+        (&linked, "linked"),
+        (&odd, "odd"),
+    ] {
+        assert!(super::is_archive_shaped(path, name), "{name}");
+    }
     assert_eq!(
         super::foreign_archive_entries(&archives),
         vec![
@@ -2976,13 +2999,26 @@ fn foreign_entries_are_not_archives() {
             "rollout-0.8.62/some-repository".to_string(),
         ]
     );
+    for damaged in [&deleted, &linked, &odd] {
+        assert_eq!(
+            evict::archive_landed(damaged).unwrap_err(),
+            evict::DAMAGED_ARCHIVE_REASON
+        );
+    }
 
     empty_registry(host_state);
     let ledger = pass(
         host_state,
         vec![root(host_state, RootKind::HostState)],
-        Budgets::default(),
+        Budgets {
+            recovery_archives_bytes: 1,
+            ..Budgets::default()
+        },
     );
+    // Over budget, yet nothing damaged, foreign or unlanded is removed.
+    assert!(ledger.last_pass.as_ref().unwrap().evicted.is_empty());
+    assert!(deleted.exists() && linked.exists() && odd.exists());
+    assert!(archives.join("rollout-0.8.61/some-repository").exists());
     let item = ledger
         .items
         .iter()
@@ -2995,26 +3031,54 @@ fn foreign_entries_are_not_archives() {
         .collect();
     assert_eq!(
         names,
-        vec!["example-0123/next.partial", "example-0123/real"]
+        vec![
+            "example-0123/deleted",
+            "example-0123/linked",
+            "example-0123/next.partial",
+            "example-0123/odd",
+            "example-0123/real",
+        ]
     );
+    assert!(item.foreign_bytes >= 28 * 1024, "{item:?}");
+    let children: u64 = item.children.iter().map(|child| child.bytes).sum();
+    assert_eq!(item.bytes, children + item.foreign_bytes);
+    let status = super::cli::status_value(host_state);
+    assert_eq!(
+        status["classes"]["recovery_archives"]["foreign_bytes"],
+        item.foreign_bytes
+    );
+    assert_eq!(status["classes"]["recovery_archives"]["bytes"], item.bytes);
 
     let value = super::cli::archives_value(host_state);
     let rows = value["archives"].as_array().unwrap();
-    assert_eq!(rows.len(), 1, "{value}");
-    assert_eq!(rows[0]["id"], "example-0123/real");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {value}"))
+    };
+    assert_eq!(rows.len(), 4, "{value}");
     assert_eq!(
-        rows[0]["not_landed_because"],
+        row("example-0123/real")["not_landed_because"],
         "it holds a 1-byte staged patch"
     );
-    assert_eq!(rows[0]["holds"]["staged_bytes"], 1);
-    assert_eq!(rows[0]["holds"]["unknown"], false);
+    assert_eq!(row("example-0123/real")["holds"]["staged_bytes"], 1);
+    assert_eq!(row("example-0123/real")["holds"]["unknown"], false);
+    for id in [
+        "example-0123/deleted",
+        "example-0123/linked",
+        "example-0123/odd",
+    ] {
+        assert_eq!(row(id)["landed"], false);
+        assert_eq!(
+            row(id)["not_landed_because"],
+            evict::DAMAGED_ARCHIVE_REASON,
+            "{id}"
+        );
+        assert_eq!(row(id)["holds"]["unknown"], true, "{id}");
+    }
     let foreign = &value["foreign_entries"];
     assert_eq!(foreign["count"], 4, "{value}");
     assert_eq!(foreign["measured"], true, "{value}");
     assert!(foreign["bytes"].as_u64().unwrap() > 0, "{value}");
     assert_eq!(foreign["paths"].as_array().unwrap().len(), 4);
-    assert!(
-        !value.to_string().contains("manifest unreadable"),
-        "{value}"
-    );
 }
