@@ -5,6 +5,7 @@ members = [
     "crates/aethyme-cli",
     "crates/aethyme-config",
     "crates/aethyme-contracts",
+    "crates/aethyme-contract-check",
     "crates/aethyme-engine",
     "crates/aethyme-enhance",
     "crates/aethyme-graph-indexer",
