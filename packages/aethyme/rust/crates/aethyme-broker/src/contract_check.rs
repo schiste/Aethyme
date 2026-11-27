@@ -1690,13 +1690,14 @@ mod tests {
     }
 
     #[test]
-    fn ascii_boundary_rule_treats_non_ascii_characters_as_boundaries() {
+    fn unicode_letters_are_identifier_boundaries() {
         let tracked = BTreeSet::from(["paths".to_string()]);
-        let diff = vec!["- épathsé".to_string()];
+        let diff = vec!["- épathsé".to_string(), "- «paths»".to_string()];
 
         let findings = find_touched_symbols(&diff, &tracked).unwrap();
 
         assert_eq!(findings.get("paths").map(Vec::len), Some(1));
+        assert_eq!(findings["paths"][0], "- «paths»");
     }
 
     #[test]
