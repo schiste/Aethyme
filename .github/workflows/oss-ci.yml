@@ -5,6 +5,8 @@ name: OSS CI
 # controls there, and warms the cache. Dispatch it on a branch to run the whole
 # pull-request suite before merging:
 #   gh workflow run oss-ci.yml --ref <branch>
+# A dispatched run that passes records the branch's tree (record-tested-tree),
+# so a merge commit with that exact tree is not tested again by Aethyme Gates.
 # The job conditions still accept a `pull_request` event, so restoring that
 # trigger brings the old lane back, fast lanes and tested-tree record included.
 on:
@@ -606,16 +608,25 @@ jobs:
         run: cargo test --locked --workspace --doc
 
   # ── Tested tree ─────────────────────────────────────────────────────────
-  # A pull_request run tests GitHub's merge of the PR into its base. Once both
-  # suites pass, record that merge's tree as an artifact. When a merge commit
-  # on main has a byte-identical tree, Aethyme Gates skips the gates these
-  # suites already cover (aethyme-gates.yml). If main moved after this run,
-  # the trees differ and every gate runs.
+  # A pull_request run tests GitHub's merge of the PR into its base; a
+  # workflow_dispatch run tests the dispatched branch's head. Once both suites
+  # pass, record that tree as an artifact. When a merge commit on main has a
+  # byte-identical tree, Aethyme Gates skips the gates these suites already
+  # cover (aethyme-gates.yml). If main moved after this run, the trees differ
+  # and every gate runs.
+  #
+  # Dispatch counts since 2026-11-27: pull requests no longer trigger this
+  # workflow, so the release lane's dispatched suite on the release branch
+  # (v0.8.186: run 45875430580, tree 3a3acfa5) recorded nothing, and main's
+  # gates ran the same suite again on the identical merge tree (run
+  # 45876819603: build plus twelve shards, 8m00 where the other gates took
+  # 4m47).
   record-tested-tree:
     name: Record the tested tree
     # Fast-lane trees did not run the workspace/examples suites; never emit
     # the artifact that tells Aethyme Gates those suites covered this tree.
-    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}
+    # A push to main runs no workspace suite here, so it never records one.
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}
     needs: [classify_changes, rust-tests, rust-examples-doctests]
     runs-on: ubuntu-latest
     steps:

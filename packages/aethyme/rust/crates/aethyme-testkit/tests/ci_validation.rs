@@ -417,15 +417,23 @@ fn failed_gate_diagnostics_report_failure_before_log_creation() {
     );
 }
 
-/// Pull requests run no suite, so this skip finds nothing today; it stays for a
-/// restored trigger. Main's Aethyme Gates skip a gate only when a pull-request run of this
-/// repository passed both suites on a byte-identical tree, and then only the
-/// gates those suites cover. Any other gate, including one added later, runs.
+/// Main's Aethyme Gates skip a gate only when an OSS CI run on a branch of
+/// this repository (a pull_request run, or the workflow_dispatch run the
+/// release lane starts on its branch) passed both suites on a byte-identical
+/// tree, and then only the gates those suites cover. Any other gate, including
+/// one added later, runs. A push to main runs no workspace suite in OSS CI, so
+/// it must never record a tested tree.
 #[test]
 fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let oss = workflow("oss-ci.yml");
+    assert!(block(&oss, "on:").contains(&"  workflow_dispatch:"));
     let record = block(&oss, "  record-tested-tree:");
-    assert!(record.contains(&"    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
+    let condition = record
+        .iter()
+        .find(|line| line.starts_with("    if:"))
+        .unwrap();
+    assert!(!condition.contains("'push'"), "{condition}");
+    assert!(record.contains(&"    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
     assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
     assert!(record.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
     assert!(record.contains(&"          name: tested-tree-${{ env.TESTED_TREE }}"));
@@ -593,8 +601,23 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
     }
     let verdict = block(&gates, "  cargo-test:");
     assert!(verdict.contains(&"    needs: [tested-tree, cargo-test-build, cargo-test-shard, cargo-test-examples-doctests]"));
-    assert!(verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}"));
+    // The verdict runs whether this run's shards or a branch run on the same
+    // tree ran the suite, so the full-suite record a release tag requires is
+    // written either way; it still needs a successful tree lookup.
+    assert!(
+        verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' }}")
+    );
+    assert!(verdict.contains(&"          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}"));
+    assert!(verdict.contains(&"            [[ \"$TESTED_BY_RUN\" =~ ^[0-9]+$ ]] || { echo \"invalid tested-by run '$TESTED_BY_RUN'\" >&2; exit 1; }"));
     assert!(verdict.contains(&"            full|changed) [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]] ;;"));
+    // The record names the tree and the run that tested it.
+    assert!(
+        verdict
+            .contains(&"          git rev-parse 'HEAD^{tree}' > \"$RUNNER_TEMP/full-suite/tree\"")
+    );
+    assert!(verdict.contains(
+        &"          printf '%s\\n' \"$TESTED_BY_RUN\" > \"$RUNNER_TEMP/full-suite/tested-by-run\""
+    ));
 
     // The gates job leaves out only the gates this suite runs in full, and
     // each one's test targets must be in that suite: none selects a package or
@@ -958,7 +981,7 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
 
     let record = block(&oss, "  record-tested-tree:");
     assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
-    assert!(record.contains(&"    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
+    assert!(record.contains(&"    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}"));
 
     let lint = block(&oss, "  lint:");
     assert!(lint.contains(&"    needs: classify_changes"));

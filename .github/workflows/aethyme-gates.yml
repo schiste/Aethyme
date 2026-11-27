@@ -7,8 +7,10 @@ name: Aethyme Gates
 # this workflow runs the gates, via the runner, that the broker runs before
 # promoting a session (`aethyme broker advanced gates run --only <gate>`).
 # Certify merged trees here. Pull requests no longer run the Rust workspace, so
-# this is the first run of the suite on a merged change; dispatch OSS CI on a
-# branch to run it sooner. Keep the binary-driven subset available manually.
+# this is the first run of the suite on a merged change unless OSS CI was
+# dispatched on the branch and passed on the same tree (the release lane does
+# this); then the suite is not run twice. Keep the binary-driven subset
+# available manually.
 #
 # One gate runs differently. `cargo-test` runs as the `cargo-test-*` jobs below,
 # with the commands OSS CI's suite uses: one compile, then partitions of it on
@@ -48,14 +50,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Finds nothing while OSS CI has no pull_request trigger, so every gate runs.
-  # Kept so restoring that trigger needs no change here.
-  # A merge commit whose tree a pull-request run already tested (OSS CI's
+  # A merge commit whose tree an OSS CI run on a branch already tested (its
   # record-tested-tree job, after the workspace suite and the examples and
-  # doctests passed) skips the gates those suites cover. Only an artifact from a
-  # run in this repository counts, not one from a fork. Every other gate still
-  # runs, including gates added later. A manual dispatch, or any tree no PR run
-  # tested, runs every gate. A failed lookup runs nothing and fails the workflow.
+  # doctests passed; a pull_request run or, since pull requests stopped
+  # triggering OSS CI, a workflow_dispatch run such as the release lane's)
+  # skips the gates those suites cover. Only an artifact from a run in this
+  # repository counts, not one from a fork. Every other gate still runs,
+  # including gates added later. A manual dispatch of this workflow, or any
+  # tree no branch run tested, runs every gate. A failed lookup runs nothing
+  # and fails the workflow.
+  #
+  # "pull-request run" in the step and gate log names below means that branch
+  # run; gate-telemetry.py parses the log wording.
   tested-tree:
     name: Look for a pull-request run of this tree
     runs-on: ubuntu-latest
@@ -488,10 +494,17 @@ jobs:
 
   # The gate's verdict and telemetry: job phases, shard balance, slowest and
   # flaky tests, and the time from the first of these jobs to the last.
+  #
+  # When a branch run passed the same suite on this exact tree, the jobs above
+  # are skipped and this verdict cites that run instead. It still records the
+  # full suite: release.yml tags only a commit with that record, and the
+  # suite did pass on this tree on GitHub, in the cited run. Before 2026-11-27
+  # this job was skipped then, so a tree tested on its branch could not be
+  # released without running the suite a second time.
   cargo-test:
     name: cargo-test gate
     needs: [tested-tree, cargo-test-build, cargo-test-shard, cargo-test-examples-doctests]
-    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}
+    if: ${{ !cancelled() && needs.tested-tree.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -502,12 +515,19 @@ jobs:
       - name: Require every part of the gate
         env:
           SCOPE: ${{ needs.tested-tree.outputs.scope }}
+          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}
           BUILD: ${{ needs.cargo-test-build.result }}
           SHARDS: ${{ needs.cargo-test-shard.result }}
           EXAMPLES: ${{ needs.cargo-test-examples-doctests.result }}
         run: |
           set -euo pipefail
-          echo "scope=$SCOPE build=$BUILD shards=$SHARDS examples=$EXAMPLES"
+          echo "scope=$SCOPE build=$BUILD shards=$SHARDS examples=$EXAMPLES tested_by_run=$TESTED_BY_RUN"
+          if [ -n "$TESTED_BY_RUN" ]; then
+            # The lookup matched this commit's own tree to that run's record.
+            [[ "$TESTED_BY_RUN" =~ ^[0-9]+$ ]] || { echo "invalid tested-by run '$TESTED_BY_RUN'" >&2; exit 1; }
+            echo "The workspace suite, examples and doctests passed on this tree in run $TESTED_BY_RUN."
+            exit 0
+          fi
           case "$SCOPE" in
             none) echo "No change since the parent commit; nothing to test." ;;
             full|changed) [[ "$BUILD" == success && "$SHARDS" == success && "$EXAMPLES" == success ]] ;;
@@ -517,10 +537,15 @@ jobs:
       # A release tag requires this record (wait-for-release-gates.sh).
       - name: Record a passing full suite
         if: ${{ needs.tested-tree.outputs.scope == 'full' }}
+        env:
+          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/full-suite"
           git rev-parse HEAD > "$RUNNER_TEMP/full-suite/commit"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/full-suite/tree"
+          # Empty when this run's own shards ran the suite.
+          printf '%s\n' "$TESTED_BY_RUN" > "$RUNNER_TEMP/full-suite/tested-by-run"
 
       - name: Upload the full-suite record
         if: ${{ needs.tested-tree.outputs.scope == 'full' }}

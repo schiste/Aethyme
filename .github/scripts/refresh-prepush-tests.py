@@ -10,7 +10,9 @@ Rewrites `modules`, `slow_tests` (over 5 s), `source.junit_run`,
 packages/aethyme/rust/.config/prepush-tests.json from nextest's JUnit reports.
 The always-run lists are kept: they come from failure history, not from
 timings, and change only by review. Use the shards of a full-suite run (one
-that uploaded `full-suite`); a changed-scope run times only part of the suite.
+that uploaded `full-suite` and whose `tested-by-run` is empty: a run that
+reused a branch run's verdict has no shards); a changed-scope run times only
+part of the suite.
 """
 
 from __future__ import annotations
