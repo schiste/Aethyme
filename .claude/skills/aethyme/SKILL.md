@@ -110,6 +110,10 @@ claim; trace the consumer's check and state its limits.
 
 ## Generated Guidance Refresh
 
+`aethyme deploy plan` plans shared enrollment, not a generated-only deploy
+inside a session worktree; its unchanged entries do not prove that such a
+deploy will leave those files unchanged.
+
 A generated-only deploy can rewrite existing skill and reference files as well
 as version stamps. Claim the paths it may change before running the broker guard,
 then inspect the complete diff; preserve maintained guidance that the generator
