@@ -50,12 +50,27 @@ want_tree="$(tree_of "$commit")" || { echo "could not read commit $commit" >&2; 
 [ "$run_tree" = "$want_tree" ] || refuse "it tested tree '$run_tree', not $want_tree"
 
 jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")" || { echo "could not read the jobs of run $run_id" >&2; exit 2; }
+# One page holds every job; a job on a page not read could be a failure.
+listed="$(jq '.jobs | length' <<< "$jobs")"
+total="$(jq '.total_count // -1' <<< "$jobs")"
+[ "$total" = "$listed" ] || refuse "the jobs API lists $listed of $total jobs"
 for name in "Rust workspace tests (build)" "Rust workspace tests" "Rust examples and doctests" "Record the tested tree"; do
   conclusion="$(jq -r --arg n "$name" '[.jobs[] | select(.name == $n) | .conclusion] | if length == 1 then .[0] // "none" else "count \(length)" end' <<< "$jobs")"
   [ "$conclusion" = success ] || refuse "job '$name' is '$conclusion'"
 done
-shards="$(jq '[.jobs[] | select(.name | startswith("Rust workspace tests (shard "))] | length' <<< "$jobs")"
-passed="$(jq '[.jobs[] | select((.name | startswith("Rust workspace tests (shard ")) and .conclusion == "success")] | length' <<< "$jobs")"
-[ "$shards" -gt 0 ] && [ "$passed" = "$shards" ] || refuse "$passed of $shards shard jobs passed"
+# Exactly shards 1..M of one M, each once and each successful: a missing,
+# duplicated, failed or differently partitioned shard refuses.
+shards="$(jq -r '
+  [.jobs[] | select(.name | startswith("Rust workspace tests (shard "))
+   | {c: .conclusion, p: (.name | capture("^Rust workspace tests \\(shard (?<n>[1-9][0-9]*)/(?<m>[1-9][0-9]*)\\)$")? // null)}] as $s
+  | if ($s | length) == 0 then "no shard jobs"
+    elif any($s[]; .p == null) then "a shard job name is not (shard N/M)"
+    elif ([$s[].p.m] | unique | length) != 1 then "shard jobs disagree on the partition count"
+    else ($s[0].p.m | tonumber) as $m
+      | ([$s[] | select(.c == "success") | .p.n | tonumber] | sort) as $ok
+      | if ($s | length) == $m and $ok == [range(1; $m + 1)] then "ok"
+        else "\($ok | unique | length) of \($m) shards passed in \($s | length) shard jobs" end
+    end' <<< "$jobs")"
+[ "$shards" = ok ] || refuse "$shards"
 
 echo "Run $run_id passed the workspace suite on tree $want_tree (commit $commit)."

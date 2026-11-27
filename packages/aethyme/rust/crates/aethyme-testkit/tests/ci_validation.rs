@@ -427,7 +427,61 @@ fn failed_gate_diagnostics_report_failure_before_log_creation() {
 #[test]
 fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let oss = workflow("oss-ci.yml");
-    assert!(block(&oss, "on:").contains(&"  workflow_dispatch:"));
+    // A dispatched run certifies a tree for main and the release, so nothing a
+    // dispatcher chooses may weaken it: no inputs, no repository variables,
+    // and every non-PR event runs the full suite.
+    assert_eq!(
+        block(&oss, "on:"),
+        [
+            "  push:",
+            "    branches: [\"main\", \"master\"]",
+            "  workflow_dispatch:"
+        ],
+        "workflow_dispatch must declare no inputs"
+    );
+    for line in oss
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        for toggle in ["inputs.", "inputs:", "vars.", "github.event.inputs"] {
+            assert!(!line.contains(toggle), "{toggle} in oss-ci.yml: {line}");
+        }
+    }
+    for job in [
+        "  rust-tests-build:",
+        "  rust-examples-doctests:",
+        "  rust-tests:",
+    ] {
+        let condition = block(&oss, job)
+            .into_iter()
+            .find(|line| line.starts_with("    if:"))
+            .unwrap();
+        assert!(
+            !condition.contains("inputs.") && !condition.contains("vars."),
+            "{job} {condition}"
+        );
+    }
+    let classify = block(&oss, "  classify_changes:");
+    let forced = [
+        "          EVENT_NAME: ${{ github.event_name }}",
+        "          if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then",
+        "            echo \"docs_fast=false\" >> \"$GITHUB_OUTPUT\"",
+        "            echo \"performance_fast=false\" >> \"$GITHUB_OUTPUT\"",
+        "            exit 0",
+    ];
+    let positions: Vec<usize> = forced
+        .iter()
+        .map(|wanted| {
+            classify
+                .iter()
+                .position(|line| line == wanted)
+                .unwrap_or_else(|| panic!("classify_changes is missing {wanted}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{positions:?}"
+    );
     let record = block(&oss, "  record-tested-tree:");
     let condition = record
         .iter()
@@ -1650,18 +1704,32 @@ esac
         "success",
         "owner/repo",
     );
-    let jobs = |shard2: &str, record: &str| {
-        serde_json::json!({"jobs": [
-            {"name": "Rust workspace tests (build)", "conclusion": "success"},
-            {"name": "Rust workspace tests (shard 1/10)", "conclusion": "success"},
-            {"name": "Rust workspace tests (shard 2/10)", "conclusion": shard2},
-            {"name": "Rust workspace tests", "conclusion": "success"},
-            {"name": "Rust examples and doctests", "conclusion": "success"},
-            {"name": "Record the tested tree", "conclusion": record},
-        ]})
-        .to_string()
+    // `hidden` jobs are counted in total_count but not listed on the page.
+    let jobs_with = |shards: &[(&str, &str)], record: &str, hidden: usize| {
+        let mut list = vec![
+            serde_json::json!({"name": "Rust workspace tests (build)", "conclusion": "success"}),
+            serde_json::json!({"name": "Rust workspace tests", "conclusion": "success"}),
+            serde_json::json!({"name": "Rust examples and doctests", "conclusion": "success"}),
+            serde_json::json!({"name": "Record the tested tree", "conclusion": record}),
+        ];
+        for (shard, conclusion) in shards {
+            list.push(serde_json::json!({
+                "name": format!("Rust workspace tests (shard {shard})"),
+                "conclusion": conclusion,
+            }));
+        }
+        let total = list.len() + hidden;
+        serde_json::json!({"total_count": total, "jobs": list}).to_string()
     };
-    let good_jobs = jobs("success", "success");
+    let all_shards = [("1/3", "success"), ("2/3", "success"), ("3/3", "success")];
+    let jobs = |shard2: &str, record: &str| {
+        jobs_with(
+            &[("1/3", "success"), ("2/3", shard2), ("3/3", "success")],
+            record,
+            0,
+        )
+    };
+    let good_jobs = jobs_with(&all_shards, "success", 0);
     let other_tree = "b".repeat(40);
     let cases: Vec<(&str, String, String, &str, &str, i32, &str)> = vec![
         (
@@ -1759,7 +1827,56 @@ esac
             &tree,
             "",
             1,
-            "1 of 2 shard jobs passed",
+            "2 of 3 shards passed in 3 shard jobs",
+        ),
+        (
+            "missing shard",
+            good_run.clone(),
+            jobs_with(&all_shards[..2], "success", 0),
+            &tree,
+            "",
+            1,
+            "2 of 3 shards passed in 2 shard jobs",
+        ),
+        (
+            "duplicated shard",
+            good_run.clone(),
+            jobs_with(
+                &[("1/3", "success"), ("1/3", "success"), ("3/3", "success")],
+                "success",
+                0,
+            ),
+            &tree,
+            "",
+            1,
+            "shards passed in 3 shard jobs",
+        ),
+        (
+            "mixed partition",
+            good_run.clone(),
+            jobs_with(&[("1/2", "success"), ("2/3", "success")], "success", 0),
+            &tree,
+            "",
+            1,
+            "disagree on the partition count",
+        ),
+        (
+            "unparsed shard",
+            good_run.clone(),
+            jobs_with(&[("1 of 1", "success")], "success", 0),
+            &tree,
+            "",
+            1,
+            "not (shard N/M)",
+        ),
+        (
+            "hidden page",
+            good_run.clone(),
+            jobs_with(&all_shards, "success", 1),
+            &tree,
+            "",
+            1,
+            "lists 7 of 8 jobs",
         ),
         (
             "skipped record",

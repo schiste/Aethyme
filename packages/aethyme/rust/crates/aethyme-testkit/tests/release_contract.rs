@@ -1440,12 +1440,19 @@ case "$2" in
   */runs/7/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false}]}'; exit 0 ;;
   */runs/8/artifacts*) echo '{"artifacts":[]}'; exit 0 ;;
   */runs/11/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false},{"name":"tested-by-run-5","expired":false}]}'; exit 0 ;;
-  */actions/runs/5/jobs*) echo '{"jobs":[{"name":"Rust workspace tests (build)","conclusion":"success"},{"name":"Rust workspace tests (shard 1/10)","conclusion":"success"},{"name":"Rust workspace tests","conclusion":"success"},{"name":"Rust examples and doctests","conclusion":"success"},{"name":"Record the tested tree","conclusion":"success"}]}'; exit 0 ;;
+  */runs/12/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false},{"name":"tested-by-run-6","expired":false}]}'; exit 0 ;;
+  */runs/14/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false},{"name":"tested-by-run-5","expired":true}]}'; exit 0 ;;
+  */runs/13/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false},{"name":"tested-by-run-5","expired":true},{"name":"tested-by-run-5","expired":false}]}'; exit 0 ;;
+  */actions/runs/6) echo '{"path":".github/workflows/oss-ci.yml","event":"push","status":"completed","conclusion":"success"}'; exit 0 ;;
+  */actions/runs/5/jobs*) echo '{"total_count":5,"jobs":[{"name":"Rust workspace tests (build)","conclusion":"success"},{"name":"Rust workspace tests (shard 1/1)","conclusion":"success"},{"name":"Rust workspace tests","conclusion":"success"},{"name":"Rust examples and doctests","conclusion":"success"},{"name":"Record the tested tree","conclusion":"success"}]}'; exit 0 ;;
   */actions/runs/5) echo "{\"path\":\".github/workflows/oss-ci.yml\",\"event\":\"$CITED_EVENT\",\"status\":\"completed\",\"conclusion\":\"success\",\"head_sha\":\"1111111111111111111111111111111111111111\",\"repository\":{\"full_name\":\"owner/repo\"},\"head_repository\":{\"full_name\":\"owner/repo\"}}"; exit 0 ;;
   */git/commits/*) echo '{"tree":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'; exit 0 ;;
 esac
 case "$CASE" in
   reused_verified|reused_refused) echo '{"workflow_runs":[{"id":11,"status":"completed","conclusion":"success"}]}' ;;
+  refused_then_verified) echo '{"workflow_runs":[{"id":12,"status":"completed","conclusion":"success"},{"id":11,"status":"completed","conclusion":"success"}]}' ;;
+  expired_citation) echo '{"workflow_runs":[{"id":14,"status":"completed","conclusion":"success"}]}' ;;
+  rerun_duplicate) echo '{"workflow_runs":[{"id":13,"status":"completed","conclusion":"success"}]}' ;;
   pending) if test -e "$STATE"; then echo '{"workflow_runs":[{"id":7,"status":"completed","conclusion":"success"}]}'; else touch "$STATE"; echo '{"workflow_runs":[{"id":7,"status":"in_progress","conclusion":null}]}'; fi ;;
   changed_only) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"}]}' ;;
   full_after_changed) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"},{"id":7,"status":"completed","conclusion":"success"}]}' ;;
@@ -1462,12 +1469,18 @@ esac
         // A gates run that cited a branch run's suite qualifies only after
         // that run is verified again here.
         ("reused_verified", "0", true, "suite in run 5"),
+        // A refused citation disqualifies only that gates run.
         (
-            "reused_refused",
-            "3",
-            false,
-            "does not prove the suite passed",
+            "refused_then_verified",
+            "0",
+            true,
+            "(run 11, suite in run 5)",
         ),
+        // A re-run attempt that uploaded the same name twice still verifies.
+        ("rerun_duplicate", "0", true, "(run 13, suite in run 5)"),
+        // A citation that expired cannot be checked, so it never qualifies.
+        ("expired_citation", "3", false, "record expired"),
+        ("reused_refused", "3", false, "failed verification"),
         ("full_after_changed", "0", true, "passed the full suite on"),
         ("changed_only", "3", false, "without the full suite"),
         ("failed", "3", false, "completed without success"),
