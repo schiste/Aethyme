@@ -69,6 +69,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For Cargo tests that may spawn Cargo, export `CARGO_TARGET_DIR` to the session
+  scratch target so child builds inherit it. A parent `--target-dir` flag alone
+  does not propagate. When using prebuilt test binaries, verify they match the
+  candidate and set `AETHYME_TESTKIT_PREBUILT_BINS=1` to avoid nested builds.
+
 - For `release_contract` after building the release router and engine, run
   from the Rust workspace with `AETHYME_RELEASE_BINARY_DIR="$PWD/target/debug"`
   so the version check reuses those binaries instead of rebuilding them.
