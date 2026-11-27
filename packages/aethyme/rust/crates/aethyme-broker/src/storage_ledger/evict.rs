@@ -456,14 +456,36 @@ pub fn archive_landing_with(
     archive: &Path,
     prover: &mut super::landing::LandingProver,
 ) -> Result<(), Refusal> {
-    archive_content_and_commits(archive)
+    read_manifest(archive)
+        .map_err(Refusal::NotLanded)
+        .and_then(|manifest| manifest_landing(&manifest, prover))
+}
+
+/// An archive's landing (as [`archive_landed`]) and what its manifest
+/// records it holds, from one read of the manifest. An unreadable manifest
+/// holds [`ArchiveHolds::unreadable`].
+pub fn archive_landing_and_holds(archive: &Path) -> (Result<(), String>, ArchiveHolds) {
+    match read_manifest(archive) {
+        Err(why) => (Err(why), ArchiveHolds::unreadable()),
+        Ok(manifest) => (
+            manifest_landing(&manifest, &mut super::landing::shared())
+                .map_err(|refusal| refusal.to_string()),
+            ArchiveHolds::from_manifest(&manifest),
+        ),
+    }
+}
+
+fn manifest_landing(
+    manifest: &Value,
+    prover: &mut super::landing::LandingProver,
+) -> Result<(), Refusal> {
+    content_and_commits(manifest)
         .map_err(Refusal::NotLanded)
         .and_then(|(repository, commits)| prover.prove(&repository, &commits))
 }
 
-/// The archive's repository and recorded commits, once its manifest says it
-/// holds nothing outside them.
-fn archive_content_and_commits(archive: &Path) -> Result<(PathBuf, Vec<String>), String> {
+/// An archive's parsed `manifest.json` (at most 32 MiB).
+fn read_manifest(archive: &Path) -> Result<Value, String> {
     let manifest_path = archive.join("manifest.json");
     let size = fs::metadata(&manifest_path)
         .map_err(|error| format!("manifest unreadable: {error}"))?
@@ -471,27 +493,163 @@ fn archive_content_and_commits(archive: &Path) -> Result<(PathBuf, Vec<String>),
     if size > 32 * 1024 * 1024 {
         return Err("manifest too large".into());
     }
-    let manifest: Value = serde_json::from_slice(
+    serde_json::from_slice(
         &fs::read(&manifest_path).map_err(|error| format!("manifest unreadable: {error}"))?,
     )
-    .map_err(|error| format!("manifest invalid: {error}"))?;
-    for patch in ["staged_patch", "unstaged_patch"] {
-        if manifest
-            .pointer(&format!("/{patch}/bytes"))
-            .and_then(Value::as_u64)
-            != Some(0)
-        {
-            return Err(format!("it holds a {patch} or does not say"));
+    .map_err(|error| format!("manifest invalid: {error}"))
+}
+
+/// What a recovery archive's manifest records it holds. A `None` count is a
+/// field the manifest does not carry: manifests before schema 5 have no
+/// `ignored_files`, and archives made outside the broker may carry none of
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ArchiveHolds {
+    /// Commits the archive's bundle carries that were not landed when it was
+    /// written (`unlanded_commits`); whether they landed since is proven
+    /// separately.
+    pub unlanded_commits: Option<u64>,
+    /// `staged_patch.bytes`.
+    pub staged_bytes: Option<u64>,
+    /// `unstaged_patch.bytes`.
+    pub unstaged_bytes: Option<u64>,
+    /// Entries of `untracked_files`.
+    pub untracked_files: Option<u64>,
+    /// Entries of `ignored_files`.
+    pub ignored_files: Option<u64>,
+    /// The manifest lacks a field that says whether the archive holds work
+    /// outside its commits (a patch, untracked or ignored files), or cannot
+    /// be read: such an archive is never called landed.
+    pub unknown: bool,
+    /// The manifest's `schema_version`, named when it does not say.
+    #[serde(skip)]
+    schema_version: Option<u64>,
+}
+
+impl ArchiveHolds {
+    /// What `manifest` records, field by field, across every schema.
+    pub fn from_manifest(manifest: &Value) -> Self {
+        let count = |field: &str| {
+            manifest.get(field).and_then(|value| {
+                value
+                    .as_array()
+                    .map(|items| items.len() as u64)
+                    .or_else(|| value.as_u64())
+            })
+        };
+        let list = |field: &str| {
+            manifest
+                .get(field)
+                .and_then(Value::as_array)
+                .map(|items| items.len() as u64)
+        };
+        let bytes = |field: &str| {
+            manifest
+                .pointer(&format!("/{field}/bytes"))
+                .and_then(Value::as_u64)
+        };
+        let mut holds = Self {
+            unlanded_commits: count("unlanded_commits"),
+            staged_bytes: bytes("staged_patch"),
+            unstaged_bytes: bytes("unstaged_patch"),
+            untracked_files: list("untracked_files"),
+            ignored_files: list("ignored_files"),
+            unknown: false,
+            schema_version: manifest.get("schema_version").and_then(Value::as_u64),
+        };
+        holds.unknown = !holds.missing().is_empty();
+        holds
+    }
+
+    /// An archive whose manifest cannot be read: nothing known.
+    pub fn unreadable() -> Self {
+        Self {
+            unknown: true,
+            ..Self::default()
         }
     }
-    for files in ["untracked_files", "ignored_files"] {
-        if !manifest
-            .get(files)
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
-            return Err(format!("it holds {files} or does not say"));
+
+    /// The manifest fields that decide landing and are absent.
+    fn missing(&self) -> Vec<&'static str> {
+        [
+            ("staged_patch", self.staged_bytes),
+            ("unstaged_patch", self.unstaged_bytes),
+            ("untracked_files", self.untracked_files),
+            ("ignored_files", self.ignored_files),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(field, _)| field)
+        .collect()
+    }
+
+    /// Why the archive cannot be landed whatever Git holds: what it records
+    /// outside its commits, then what its manifest does not say, led by its
+    /// unlanded commits so the most valuable content is named first. `None`
+    /// when it records nothing outside its commits (they are then proven).
+    pub fn reason(&self) -> Option<String> {
+        let positive = |value: Option<u64>| value.filter(|value| *value > 0);
+        let outside = [
+            self.staged_bytes,
+            self.unstaged_bytes,
+            self.untracked_files,
+            self.ignored_files,
+        ]
+        .into_iter()
+        .any(|value| positive(value).is_some());
+        let missing = self.missing();
+        if !outside && missing.is_empty() {
+            return None;
         }
+        let plural = |count: u64, noun: &str| {
+            if count == 1 {
+                format!("1 {noun}")
+            } else {
+                format!("{count} {noun}s")
+            }
+        };
+        let mut parts = Vec::new();
+        if let Some(count) = positive(self.unlanded_commits) {
+            parts.push(plural(count, "unlanded commit"));
+        }
+        if let Some(bytes) = positive(self.staged_bytes) {
+            parts.push(format!("a {bytes}-byte staged patch"));
+        }
+        if let Some(bytes) = positive(self.unstaged_bytes) {
+            parts.push(format!("a {bytes}-byte unstaged patch"));
+        }
+        if let Some(count) = positive(self.untracked_files) {
+            parts.push(plural(count, "untracked file"));
+        }
+        if let Some(count) = positive(self.ignored_files) {
+            parts.push(plural(count, "ignored file"));
+        }
+        let mut reason = String::new();
+        if !parts.is_empty() {
+            reason = format!("it holds {}", parts.join(", "));
+        }
+        if !missing.is_empty() {
+            let schema = self.schema_version.map_or_else(
+                || "no schema version".to_string(),
+                |v| format!("schema {v}"),
+            );
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!(
+                "its manifest ({schema}) does not say whether it holds {}",
+                missing.join(", ")
+            ));
+        }
+        Some(reason)
+    }
+}
+
+/// The archive's repository and recorded commits, once its manifest says it
+/// holds nothing outside them.
+fn content_and_commits(manifest: &Value) -> Result<(PathBuf, Vec<String>), String> {
+    if let Some(why) = ArchiveHolds::from_manifest(manifest).reason() {
+        return Err(why);
     }
     let repository = manifest
         .get("repository")

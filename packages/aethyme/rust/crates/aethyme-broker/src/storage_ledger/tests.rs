@@ -2809,3 +2809,212 @@ fn unfinished_archive_staging_is_listed_and_counted() {
         ])
     );
 }
+
+/// What each manifest schema records, named in priority order. Schema 1
+/// (bundle, patches, untracked files, no ignored list) holding commits was
+/// once reported as "it holds ignored_files or does not say".
+#[test]
+fn archive_holds_names_what_each_manifest_schema_records() {
+    let holds = |manifest: serde_json::Value| evict::ArchiveHolds::from_manifest(&manifest);
+    let commit = |digit: char| digit.to_string().repeat(40);
+
+    // Schema 1: unlanded commits in a bundle; it has no ignored list.
+    let schema_1 = holds(serde_json::json!({
+        "schema_version": 1,
+        "disposition": "pending_commits",
+        "bundle": "commits.bundle",
+        "unlanded_commits": [commit('a'), commit('b')],
+        "staged_patch": {"file": "staged.patch", "bytes": 0},
+        "unstaged_patch": {"file": "unstaged.patch", "bytes": 0},
+        "untracked_files": [],
+    }));
+    assert_eq!(schema_1.unlanded_commits, Some(2));
+    assert_eq!(schema_1.ignored_files, None);
+    assert!(schema_1.unknown);
+    assert_eq!(
+        schema_1.reason().unwrap(),
+        "it holds 2 unlanded commits; its manifest (schema 1) does not say whether it holds ignored_files"
+    );
+    assert_eq!(
+        serde_json::to_value(&schema_1).unwrap(),
+        serde_json::json!({
+            "unlanded_commits": 2,
+            "staged_bytes": 0,
+            "unstaged_bytes": 0,
+            "untracked_files": 0,
+            "ignored_files": null,
+            "unknown": true,
+        })
+    );
+
+    // Schemas 2 to 4: patches and untracked files, still no ignored list.
+    let schema_3 = holds(serde_json::json!({
+        "schema_version": 3,
+        "unlanded_commits": [],
+        "staged_patch": {"bytes": 120},
+        "unstaged_patch": {"bytes": 0},
+        "untracked_files": [{"path": "a"}, {"path": "b"}],
+    }));
+    assert_eq!(
+        schema_3.reason().unwrap(),
+        "it holds a 120-byte staged patch, 2 untracked files; its manifest (schema 3) does not say whether it holds ignored_files"
+    );
+
+    // Schema 6: every field recorded; only ignored files held.
+    let schema_6 = holds(serde_json::json!({
+        "schema_version": 6,
+        "unlanded_commits": [],
+        "staged_patch": {"bytes": 0},
+        "unstaged_patch": {"bytes": 0},
+        "untracked_files": [],
+        "ignored_files": [{"path": "x"}, {"path": "y"}, {"path": "z"}, {"path": "w"}],
+    }));
+    assert!(!schema_6.unknown);
+    assert_eq!(schema_6.reason().unwrap(), "it holds 4 ignored files");
+
+    // Everything at once: commits first, then staged, unstaged, untracked,
+    // ignored.
+    let all = holds(serde_json::json!({
+        "schema_version": 6,
+        "unlanded_commits": [commit('c')],
+        "staged_patch": {"bytes": 5},
+        "unstaged_patch": {"bytes": 7},
+        "untracked_files": [{"path": "a"}],
+        "ignored_files": [{"path": "b"}],
+    }));
+    assert_eq!(
+        all.reason().unwrap(),
+        "it holds 1 unlanded commit, a 5-byte staged patch, a 7-byte unstaged patch, 1 untracked file, 1 ignored file"
+    );
+
+    // Nothing outside its commits: no content reason; the commits are proven.
+    let clean = holds(serde_json::json!({
+        "schema_version": 6,
+        "unlanded_commits": [commit('d')],
+        "staged_patch": {"bytes": 0},
+        "unstaged_patch": {"bytes": 0},
+        "untracked_files": [],
+        "ignored_files": [],
+    }));
+    assert!(!clean.unknown);
+    assert_eq!(clean.reason(), None);
+
+    // A manifest written outside the broker records none of it.
+    let manual = holds(serde_json::json!({"worktrees": []}));
+    assert!(manual.unknown);
+    assert_eq!(manual.unlanded_commits, None);
+    assert_eq!(
+        manual.reason().unwrap(),
+        "its manifest (no schema version) does not say whether it holds staged_patch, unstaged_patch, untracked_files, ignored_files"
+    );
+    assert!(evict::ArchiveHolds::unreadable().unknown);
+}
+
+/// The landing refusal for a schema-1 archive holding commits names them,
+/// not ignored files.
+#[test]
+fn a_schema_1_archive_with_commits_is_refused_for_what_it_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("recovery-archives/example-0123/old");
+    fs::create_dir_all(&archive).unwrap();
+    fs::write(
+        archive.join("manifest.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "aethyme_version": "0.8.15",
+            "disposition": "pending_commits",
+            "bundle": "commits.bundle",
+            "head": "a".repeat(40),
+            "unlanded_commits": ["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+            "staged_patch": {"bytes": 0},
+            "unstaged_patch": {"bytes": 0},
+            "untracked_files": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let why = evict::archive_landed(&archive).unwrap_err();
+    assert!(why.starts_with("it holds 3 unlanded commits;"), "{why}");
+    assert!(
+        why.contains("does not say whether it holds ignored_files"),
+        "{why}"
+    );
+    let (landed, holds) = evict::archive_landing_and_holds(&archive);
+    assert_eq!(landed.unwrap_err(), why);
+    assert_eq!(holds.unlanded_commits, Some(3));
+    assert!(holds.unknown);
+}
+
+/// Stray files and manifest-less directories (old deploy rollout backups)
+/// under `recovery-archives/` are foreign entries: never listed, measured
+/// or accounted as archives, and reported apart.
+#[test]
+fn foreign_entries_are_not_archives() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    let real = manifest_archive(host_state, "real", Some(1), 0);
+    let archives = host_state.join("recovery-archives");
+    file(&archives.join(".DS_Store"), 6 * 1024);
+    file(&archives.join("example-0123/.DS_Store"), 6 * 1024);
+    file(
+        &archives.join("rollout-0.8.61/some-repository/AGENTS.md"),
+        8 * 1024,
+    );
+    file(
+        &archives.join("rollout-0.8.62/some-repository/AGENTS.md"),
+        8 * 1024,
+    );
+    // A partial archive is still being written: an archive, not foreign.
+    fs::create_dir_all(archives.join("example-0123/next.partial")).unwrap();
+    assert!(super::is_archive_shaped(&real, "real"));
+    assert_eq!(
+        super::foreign_archive_entries(&archives),
+        vec![
+            ".DS_Store".to_string(),
+            "example-0123/.DS_Store".to_string(),
+            "rollout-0.8.61/some-repository".to_string(),
+            "rollout-0.8.62/some-repository".to_string(),
+        ]
+    );
+
+    empty_registry(host_state);
+    let ledger = pass(
+        host_state,
+        vec![root(host_state, RootKind::HostState)],
+        Budgets::default(),
+    );
+    let item = ledger
+        .items
+        .iter()
+        .find(|item| item.class == Class::RecoveryArchives)
+        .unwrap();
+    let names: Vec<&str> = item
+        .children
+        .iter()
+        .map(|child| child.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["example-0123/next.partial", "example-0123/real"]
+    );
+
+    let value = super::cli::archives_value(host_state);
+    let rows = value["archives"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{value}");
+    assert_eq!(rows[0]["id"], "example-0123/real");
+    assert_eq!(
+        rows[0]["not_landed_because"],
+        "it holds a 1-byte staged patch"
+    );
+    assert_eq!(rows[0]["holds"]["staged_bytes"], 1);
+    assert_eq!(rows[0]["holds"]["unknown"], false);
+    let foreign = &value["foreign_entries"];
+    assert_eq!(foreign["count"], 4, "{value}");
+    assert_eq!(foreign["measured"], true, "{value}");
+    assert!(foreign["bytes"].as_u64().unwrap() > 0, "{value}");
+    assert_eq!(foreign["paths"].as_array().unwrap().len(), 4);
+    assert!(
+        !value.to_string().contains("manifest unreadable"),
+        "{value}"
+    );
+}

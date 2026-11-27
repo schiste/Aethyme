@@ -1363,29 +1363,79 @@ pub(crate) fn read_names(path: &Path) -> Vec<String> {
 }
 
 /// The children of an evictable entry: `<group>/<name>` for two-level
-/// classes, `<name>` otherwise.
+/// classes, `<name>` otherwise. A recovery-archive directory's children are
+/// only its archive-shaped entries ([`is_archive_shaped`]); the rest are
+/// [`foreign_archive_entries`], never measured or evicted as archives.
 fn child_names(class: Class, path: &Path) -> Vec<String> {
     let two_level = matches!(class, Class::RecoveryArchives | Class::GateCache);
     let mut names = Vec::new();
+    let mut foreign = 0_u64;
     for group in read_names(path) {
         let group_path = path.join(&group);
         if two_level {
             if fs::symlink_metadata(&group_path).is_ok_and(|metadata| metadata.is_dir()) {
-                names.extend(
-                    read_names(&group_path)
-                        .into_iter()
-                        // Keep markers sit beside archives; they are not one.
-                        .filter(|name| {
-                            !name.ends_with(KEEP_SUFFIX) && !name.ends_with(DISMISS_SUFFIX)
-                        })
-                        .map(|name| format!("{group}/{name}")),
-                );
+                for name in read_names(&group_path)
+                    .into_iter()
+                    // Keep markers sit beside archives; they are not one.
+                    .filter(|name| !is_archive_marker_name(name))
+                {
+                    if class == Class::RecoveryArchives
+                        && !is_archive_shaped(&group_path.join(&name), &name)
+                    {
+                        foreign += 1;
+                        continue;
+                    }
+                    names.push(format!("{group}/{name}"));
+                }
             }
         } else {
             names.push(group);
         }
     }
+    for _ in 0..foreign {
+        crate::phase_telemetry::add("storage_ledger_foreign_archive_entry", Duration::ZERO);
+    }
     names
+}
+
+/// Whether `name` is a keep or dismissal marker written beside an archive.
+fn is_archive_marker_name(name: &str) -> bool {
+    name.ends_with(KEEP_SUFFIX) || name.ends_with(DISMISS_SUFFIX)
+}
+
+/// Whether `<group>/<name>` under a recovery-archive directory has a
+/// recovery archive's shape: a real directory carrying `manifest.json`
+/// (every schema writes it before the archive gets its final name), or an
+/// archive still being written ([`is_partial_archive_name`]). A stray file
+/// (`.DS_Store`) or a directory without a manifest (an old deploy rollout
+/// backup) is not an archive.
+pub(crate) fn is_archive_shaped(path: &Path, name: &str) -> bool {
+    is_partial_archive_name(name)
+        || (fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+            && fs::symlink_metadata(path.join("manifest.json"))
+                .is_ok_and(|metadata| metadata.is_file()))
+}
+
+/// Entries under a recovery-archive directory that are not archives: plain
+/// files or links at its top level and `<group>/<name>` entries without an
+/// archive's shape ([`is_archive_shaped`]). Keep and dismissal markers are
+/// not counted. They are excluded from the archive listing and accounting.
+pub fn foreign_archive_entries(path: &Path) -> Vec<String> {
+    let mut foreign = Vec::new();
+    for group in read_names(path) {
+        let group_path = path.join(&group);
+        if !fs::symlink_metadata(&group_path).is_ok_and(|metadata| metadata.is_dir()) {
+            foreign.push(group);
+            continue;
+        }
+        for name in read_names(&group_path) {
+            if !is_archive_marker_name(&name) && !is_archive_shaped(&group_path.join(&name), &name)
+            {
+                foreign.push(format!("{group}/{name}"));
+            }
+        }
+    }
+    foreign
 }
 
 /// What a recovery archive's manifest says about its age.

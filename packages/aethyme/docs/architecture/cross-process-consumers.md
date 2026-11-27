@@ -616,6 +616,31 @@ and they are not counted in `unlanded_archives`). Spans
 `storage_landing_probe_timeout`, `storage_landing_budget_spent`,
 `storage_landing_tip_advanced` and `storage_landing_tip_reset`.
 
+Changed 2026-11-27 (what a recovery archive holds). `storage archives
+--json` rows add `holds` (`unlanded_commits`, `staged_bytes`,
+`unstaged_bytes`, `untracked_files`, `ignored_files`: counts or bytes read
+from the manifest, `null` when its schema does not carry the field;
+`unknown`: true when a field that decides landing (`staged_patch`,
+`unstaged_patch`, `untracked_files`, `ignored_files`) is absent or the
+manifest cannot be read). `not_landed_because`, and the storage worker's
+`unlanded: ...` refusal, name what the manifest records in priority order
+(unlanded commits, staged patch bytes, unstaged patch bytes, untracked
+files, ignored files), then `its manifest (schema N) does not say whether it
+holds <fields>` only for fields it lacks (schemas before 5 have no
+`ignored_files`); the old `it holds <field> or does not say` is gone, which
+called a schema-1 archive holding commits an archive of ignored files.
+Entries under `recovery-archives/` that are not archives (a plain file or
+link at either level, or a `<group>/<name>` directory without
+`manifest.json`, such as `.DS_Store` or an old `rollout-<version>/<repo>`
+deploy backup; `*.partial` staging still counts as an archive) are no longer
+ledger children, so they are neither measured into the class nor evicted,
+and `storage archives` no longer lists them as `manifest unreadable`: the
+document adds `foreign_entries` (`count`, `bytes` measured within a shared
+5 s budget, `measured`, `paths` naming at most 20). Counters
+`storage_archive_foreign_entry` (one per foreign entry `storage archives`
+found) and `storage_ledger_foreign_archive_entry` (one per entry a worker
+walk left out); span `storage_archives_foreign_scan`.
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of

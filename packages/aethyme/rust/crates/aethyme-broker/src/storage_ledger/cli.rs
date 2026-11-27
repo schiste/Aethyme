@@ -1192,18 +1192,25 @@ pub fn archives_value(host_state: &Path) -> Value {
     // Live answers: every default tip is read afresh for this listing.
     super::landing::shared().expire_tips();
     let mut rows = Vec::new();
+    let mut foreign = ForeignEntries::default();
     for item in ledger
         .items
         .iter()
         .filter(|item| item.class == Class::RecoveryArchives)
     {
+        foreign.add(&item.path());
         for child in item
             .children
             .iter()
             .filter(|child| !super::is_partial_archive_name(&child.name))
         {
             let path = item.path().join(&child.name);
-            let landed = super::evict::archive_landed(&path);
+            // A ledger written before foreign entries were told apart may
+            // still list one: judged afresh, never listed as an archive.
+            if !super::is_archive_shaped(&path, &child.name) {
+                continue;
+            }
+            let (landed, holds) = super::evict::archive_landing_and_holds(&path);
             let kept = super::keep_marker(&path).exists();
             let notice = ledger.archive_notices.get(&child.name);
             let mut probe = child.clone();
@@ -1214,6 +1221,7 @@ pub fn archives_value(host_state: &Path) -> Value {
                 "bytes": child.bytes,
                 "landed": landed.is_ok(),
                 "not_landed_because": landed.err(),
+                "holds": holds,
                 "created_ms": child.created_ms,
                 "expires_ms": super::archive_expiry(&probe, &budgets),
                 "noticed_at_ms": notice.map(|notice| notice.noticed_at_ms),
@@ -1230,7 +1238,66 @@ pub fn archives_value(host_state: &Path) -> Value {
         "unlanded_archive_days": budgets.unlanded_archive_days,
         "archives": rows,
         "unfinished_staging": staging,
+        "foreign_entries": foreign.value(),
     })
+}
+
+/// How long [`archives_value`] spends measuring foreign entries in all.
+const FOREIGN_MEASURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How many foreign entries [`archives_value`] names; the rest are counted.
+const FOREIGN_NAMED: usize = 20;
+
+/// Entries under the recovery-archive directories that are not archives
+/// (stray files, old deploy rollout backups): counted and measured apart,
+/// never listed or accounted as archives.
+#[derive(Default)]
+struct ForeignEntries {
+    names: Vec<String>,
+    count: u64,
+    bytes: u64,
+    unmeasured: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl ForeignEntries {
+    fn add(&mut self, directory: &Path) {
+        let _span = crate::phase_telemetry::span("storage_archives_foreign_scan");
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| std::time::Instant::now() + FOREIGN_MEASURE_BUDGET);
+        let device = super::device_of(directory);
+        for name in super::foreign_archive_entries(directory) {
+            crate::phase_telemetry::add("storage_archive_foreign_entry", std::time::Duration::ZERO);
+            self.count += 1;
+            let mut usage = super::Usage::default();
+            let mut pending = vec![directory.join(&name)];
+            let finished = device.is_some_and(|device| {
+                super::walk_until(
+                    &mut pending,
+                    &mut usage,
+                    device,
+                    deadline,
+                    super::BEAT_EVERY,
+                    &mut || {},
+                )
+            });
+            self.unmeasured |= !finished;
+            self.bytes += usage.bytes;
+            if self.names.len() < FOREIGN_NAMED {
+                self.names
+                    .push(directory.join(&name).to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "count": self.count,
+            "bytes": self.bytes,
+            "measured": !self.unmeasured,
+            "paths": self.names,
+        })
+    }
 }
 
 fn archives(json_output: bool) -> u8 {
@@ -1267,6 +1334,20 @@ fn archives(json_output: bool) -> u8 {
                 .as_u64()
                 .map_or_else(|| "never".to_string(), |ms| ms.to_string()),
             if row["kept"] == true { "  kept" } else { "" }
+        );
+    }
+    let foreign = &value["foreign_entries"];
+    if foreign["count"].as_u64().is_some_and(|count| count > 0) {
+        println!(
+            "  {} foreign entr{} (not recovery archives; never listed, measured or removed as one)  {}{}",
+            foreign["count"],
+            if foreign["count"] == 1 { "y" } else { "ies" },
+            human(foreign["bytes"].as_u64().unwrap_or(0)),
+            if foreign["measured"] == true {
+                ""
+            } else {
+                " (partly measured)"
+            }
         );
     }
     for entry in staging.into_iter().flatten() {
