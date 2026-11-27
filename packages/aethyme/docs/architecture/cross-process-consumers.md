@@ -6585,4 +6585,6 @@ across a child process, a sleep or a network call.
 Gate admission phase telemetry records `gate_load_admission`, `gate_owner_lock_wait`,
 and `gate_resource_admission` separately on the admission loop. An immediate
 verification-slot probe can bypass that loop; missing spans do not imply zero
-wait. Child execution has its own subprocess span.
+wait. `gate_command_execution` records the gate command lifecycle separately,
+including setup (also recorded by `gate_command_setup`); spans overlap and must
+not be summed.

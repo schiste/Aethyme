@@ -5044,6 +5044,7 @@ where
         let command_process_group = std::sync::atomic::AtomicI32::new(0);
         let run_labels =
             crate::gate_debris::GateRunLabels::new(&gate.name, session_id, &repository);
+        let command_span = crate::phase_telemetry::span("gate_command_execution");
         let status = run_gate_command(
             &gate.command,
             GateCommandContext {
@@ -5074,6 +5075,7 @@ where
             },
             &mut artifact_use,
         );
+        drop(command_span);
         let writers_quiescent = gate_process_group_absent(
             command_process_group.load(std::sync::atomic::Ordering::Acquire),
         );
@@ -11990,6 +11992,8 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
     /// and runs once the lock is free and it holds a slot again.
     #[test]
     fn a_gate_waiting_for_an_owner_lock_gives_its_slot_back() {
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _recording = crate::phase_telemetry::install(recorder.clone());
         const NAMESPACE: &str = "owner-handoff";
         let owner = tempfile::tempdir().unwrap();
         let root = owner.path().join("repo");
@@ -12085,6 +12089,16 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
         assert_eq!(counts, (1, 1), "one release and one re-acquire");
+        let (_, phases) = recorder.totals();
+        for name in [
+            "gate_load_admission",
+            "gate_owner_lock_wait",
+            "gate_resource_admission",
+            "gate_command_setup",
+            "gate_command_execution",
+        ] {
+            assert!(phases.contains_key(name), "missing {name}: {phases:?}");
+        }
         assert!(
             lines
                 .iter()
