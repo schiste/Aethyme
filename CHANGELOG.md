@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.190] - 2026-11-28
+
+### Changed
+
+- The idle strip no longer mistakes a Git index refresh for work. On the busiest repository, 0.8.189 examined 596 idle sessions in 47 minutes and stripped one: 557 were refused as `recent_file_activity`, 140 of them only because some tool's plain `git status` had rewritten their index (about 170 indexes rewritten in one 12-minute burst on sessions idle up to 7 days). Activity is now a moved `HEAD` (checkout), a new reflog entry in `logs/HEAD` (commit, reset, stash, merge), a changed or new file found by the status probe, or a recently created dependency tree among the strip's candidates (`node_modules` and its `.modules.yaml`/`.package-lock.json`, `.venv` and its `pyvenv.cfg`). The index mtime, the checkout root's mtime and the tracked top-level directories' mtimes are no longer evidence on their own. Open-file, working-directory, artifact-use and producer-marker protections are unchanged and still run before any removal (#2080).
+- A `recent_file_activity` refusal backs off for 30 minutes, or until the session's activity moves, instead of re-running the whole precondition chain every pass (#2080).
+- The checkout byte estimate also measures up to 8 refused sessions per pass, after the stripped ones, within the existing 3 s pass budget. When nothing is measured, `storage status` reports the estimate as unmeasured instead of 0 bytes (#2080).
+
+### Added
+
+- Activity evidence kinds `git_reflog` and `regenerable_root`; counters `checkout_idle_strip_activity_index_uncorroborated`, `checkout_idle_strip_activity_checkout_directory_uncorroborated`, `checkout_idle_strip_kept_sampled`; span `checkout_idle_strip_kept_sample`. All documented in `cross-process-consumers.md` (#2080).
+
+### Build and release
+
+- Main's contract gate runs the router the Aethyme Gates job has just built from the same tree (`AETHYME_CONTRACT_BIN`) instead of `cargo run`. The broker refreshes every tree file's mtime before a gate with a managed cache, so `cargo run` recompiled the workspace for 102 s even with the cache warm; "Run all gates" was 261 s on v0.8.189 and is expected near 160 s. Local and pull-request runs still build from the worktree (#2079).
+- A nightly macOS job refreshes the `rust-tests-macos` cache that release test builds restore. Only release tags ran that build, and tags cannot save the cache, so v0.8.189's macOS test build started cold (327 crates, 1,035 s); expected about 10 minutes off the release's macOS test tail (#2079).
+
+### Upgrade notes
+
+- `estimated_checkout_bytes` (storage ledger) and `estimated_bytes` (meta `checkout_strip.byte_estimate`) are omitted when unmeasured; `storage status --json` shows `null` for the aggregate. Older readers still parse the record and read 0 as before (#2080).
+- Sessions in a refusal backoff are not counted in `idle_backlog` (#2080).
+- Expect the first passes after upgrade to strip many idle sessions on busy repositories that 0.8.189 kept for an index refresh (#2080).
+
 ## [0.8.189] - 2026-11-28
 
 ### Changed
