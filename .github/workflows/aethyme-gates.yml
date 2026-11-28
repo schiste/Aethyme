@@ -163,15 +163,22 @@ jobs:
           toolchain: stable
 
       # The Rust gates build into the broker's managed cache,
-      # `<host cache>/gates/<repository key>/rust-workspace-v3`, where the key
-      # is the SHA-256 of the repository's canonical origin
-      # (`repository_key` in aethyme-broker gates.rs). A wrong key only means
-      # a cold build, never a wrong verdict.
+      # `<host cache>/gates/<repository key>/<cache key>`, where the repository
+      # key is the SHA-256 of the repository's canonical origin
+      # (`repository_key` in aethyme-broker gates.rs). The cache key is the
+      # `managed_cache.key` of cross-process-contract, the one Rust gate this
+      # job still runs (the others are covered by the workspace suite). Since
+      # 8c5509b95 that gate has its own `rust-contract-v1` cache; this job kept
+      # warming `rust-workspace-v3`, so the gate compiled the CLI from nothing
+      # (170 s in run 46007797311) after this job had spent 2m17 building the
+      # same crates elsewhere. A wrong path only means a cold build, never a
+      # wrong verdict; `main_gate_cache_is_the_contract_gates_managed_cache`
+      # keeps them equal.
       - name: Locate the gates' managed build cache
         run: |
           set -euo pipefail
           key="$(printf '%s' "github.com/${GITHUB_REPOSITORY,,}" | sha256sum | cut -c1-64)"
-          echo "GATE_CACHE_DIR=$HOME/.cache/aethyme/gates/$key/rust-workspace-v3" >> "$GITHUB_ENV"
+          echo "GATE_CACHE_DIR=$HOME/.cache/aethyme/gates/$key/rust-contract-v1" >> "$GITHUB_ENV"
 
       # Restores now; its post-step saves at the end of a successful job only
       # when no entry matched the key exactly (a lockfile or toolchain change).
@@ -179,9 +186,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GATE_CACHE_DIR }}
-          key: aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('packages/aethyme/rust/Cargo.lock') }}
+          key: aethyme-contract-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('packages/aethyme/rust/Cargo.lock') }}
           restore-keys: |
-            aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
+            aethyme-contract-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
 
       # Build the router with the same dev profile and managed target directory
       # used by cross-process-contract, so that gate reuses these compiled

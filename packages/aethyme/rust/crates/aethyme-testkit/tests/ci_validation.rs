@@ -330,6 +330,37 @@ fn main_gate_router_prebuild_reuses_the_managed_debug_target() {
     assert!(gates[run..].contains("aethyme=\"$GATE_CACHE_DIR/debug/aethyme\""));
 }
 
+/// The prebuild only helps if it fills the cache the contract gate builds in.
+/// After 8c5509b95 gave that gate its own `managed_cache.key`, this job kept
+/// warming another one and the gate compiled from nothing (170 s on main).
+#[test]
+fn main_gate_cache_is_the_contract_gates_managed_cache() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let policy = std::fs::read_to_string(root.join(".aethyme/gates.toml")).unwrap();
+    let gate = policy
+        .split("[[gate]]")
+        .find(|gate| gate.contains("name = \"cross-process-contract\""))
+        .unwrap();
+    let cache = gate
+        .split("[gate.managed_cache]")
+        .nth(1)
+        .expect("cross-process-contract declares a managed cache");
+    let key = cache
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("key = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("managed cache key");
+    let gates = workflow("aethyme-gates.yml");
+    let expected = format!("/{key}\" >> \"$GITHUB_ENV\"");
+    assert!(
+        gates.contains(&expected),
+        "the main gates job must warm the contract gate's managed cache `{key}`"
+    );
+}
+
 /// Failed nextest output must survive later passing doc/example output. The
 /// failure-only step adds diagnostics; it never changes gate selection/results.
 #[test]
