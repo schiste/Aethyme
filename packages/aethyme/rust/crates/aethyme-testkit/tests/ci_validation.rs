@@ -2041,3 +2041,27 @@ esac
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
 }
+
+/// A pushed commit or an edited PR body supersedes the contract check still
+/// running for the same PR. The group lives on the job so a skipped job
+/// (title-only edit) never joins it and cancels a real run.
+#[test]
+fn the_contract_check_cancels_superseded_runs_per_pull_request() {
+    let text = workflow("cross-process-contract.yml");
+    let job = text
+        .split("  contract-check:")
+        .nth(1)
+        .expect("contract-check job");
+    let job = job.split("    steps:").next().unwrap();
+    assert!(
+        job.contains(
+            "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+        ),
+        "the group is keyed on the PR number"
+    );
+    assert!(job.contains("cancel-in-progress: true"));
+    assert!(
+        !text.split("jobs:").next().unwrap().contains("concurrency:"),
+        "a workflow-level group would let a skipped title edit cancel a real run"
+    );
+}
