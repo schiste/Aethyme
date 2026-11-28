@@ -134,11 +134,17 @@ fn report_only_commands_do_not_append_metrics() {
     assert_eq!(rows[0]["phase_budget_ms"], 5_000, "{appended}");
     for phase in ["graph_read", "manifest", "selection", "lock_wait"] {
         assert!(
-            rows[0]["phase_timings_ms"][phase].is_u64(),
-            "{phase} timing missing: {appended}"
+            // A zero timing is omitted from a row: absent means 0.
+            rows[0]["phase_timings_ms"][phase].is_null()
+                || rows[0]["phase_timings_ms"][phase].is_u64(),
+            "{phase} timing malformed: {appended}"
         );
     }
-    assert!(rows[0]["over_budget_phases"].is_array(), "{appended}");
+    // An empty list is omitted from a row.
+    assert!(
+        rows[0]["over_budget_phases"].is_null() || rows[0]["over_budget_phases"].is_array(),
+        "{appended}"
+    );
     let before = after_affected.into_bytes();
 
     let stateful_args = ["broker", "status", "--full", "--json"];
@@ -285,12 +291,23 @@ mod interrupted {
             .as_u64()
             .expect("the open span's time is in the phase timings");
         assert!(phase > 0, "{row}");
-        assert_eq!(row["phase_counts"]["test_command_hold"], 1, "{row}");
+        // One occurrence beside a timing is left implicit.
+        assert_eq!(
+            row["phase_counts"]["test_command_hold"]
+                .as_u64()
+                .unwrap_or(1),
+            1,
+            "{row}"
+        );
         assert!(row["duration_ms"].as_u64().unwrap() >= phase, "{row}");
         assert_eq!(row["attribution"]["schema_version"], 1, "{row}");
         assert!(row["cpu_ms"]["user"].is_u64(), "{row}");
         assert!(row["output_bytes"].is_u64(), "{row}");
-        assert!(row.get("session_id").is_some(), "{row}");
+        // A null session id is omitted from a row.
+        assert!(
+            row["session_id"].is_null() || row["session_id"].is_i64(),
+            "{row}"
+        );
     }
 
     #[test]
@@ -324,7 +341,14 @@ mod interrupted {
         assert_eq!(row["exit"], 130, "{row}");
         assert_eq!(row["outcome"], "interrupted", "{row}");
         assert_eq!(row["interrupted"]["signal"], "SIGINT", "{row}");
-        assert_eq!(row["phase_counts"]["test_command_hold"], 1, "{row}");
+        // One occurrence beside a timing is left implicit.
+        assert_eq!(
+            row["phase_counts"]["test_command_hold"]
+                .as_u64()
+                .unwrap_or(1),
+            1,
+            "{row}"
+        );
     }
 
     #[test]

@@ -311,10 +311,25 @@ fn review_overlaps_the_change_read_with_the_other_provider_reads() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find_map(|metric| {
-            metric["phase_timings_ms"]
-                .get("review_run_change_read")
-                .is_some()
-                .then(|| metric["phase_timings_ms"].clone())
+            // A span under a millisecond keeps only its count.
+            let ran = |name: &str| {
+                metric["phase_timings_ms"].get(name).is_some()
+                    || metric["phase_counts"].get(name).is_some()
+            };
+            ran("review_run_change_read").then(|| {
+                let mut phases = metric["phase_timings_ms"].clone();
+                for name in metric["phase_counts"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(n, _)| n)
+                {
+                    if phases.get(name).is_none() {
+                        phases[name] = serde_json::json!(0);
+                    }
+                }
+                phases
+            })
         })
         .expect("a review run metric with its phases");
     for phase in [

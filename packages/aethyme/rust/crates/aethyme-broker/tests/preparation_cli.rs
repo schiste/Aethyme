@@ -1434,8 +1434,14 @@ max_concurrent = 2
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|value| value["command"] == "prepare")
         .any(|value| {
-            value["phase_counts"]["shared_cache_downgraded_to_shared"] == 1
-                && value["phase_counts"]["shared_cache_downgrade_wait_floor"] == 1
+            // One occurrence beside a timing is left implicit in a row.
+            let count = |name: &str| {
+                value["phase_counts"][name]
+                    .as_u64()
+                    .unwrap_or_else(|| u64::from(value["phase_timings_ms"][name].is_u64()))
+            };
+            count("shared_cache_downgraded_to_shared") == 1
+                && count("shared_cache_downgrade_wait_floor") == 1
         });
     assert!(downgraded, "{metrics}");
 }

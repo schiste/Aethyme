@@ -154,11 +154,17 @@ fn affected_gates_json_stays_an_array_and_timings_are_opt_in() {
     assert_eq!(rows.len(), 2, "{metrics}");
     for metric in &rows {
         assert_eq!(metric["phase_budget_ms"], 5_000);
+        // A zero timing is omitted from a row: absent means 0 ms.
         assert!(
-            metric["phase_timings_ms"]["selection"].is_u64(),
+            metric["phase_timings_ms"]["selection"].is_null()
+                || metric["phase_timings_ms"]["selection"].is_u64(),
             "{metric:#}"
         );
-        assert!(metric["over_budget_phases"].is_array(), "{metric:#}");
+        // An empty list is omitted from a row.
+        assert!(
+            metric["over_budget_phases"].is_null() || metric["over_budget_phases"].is_array(),
+            "{metric:#}"
+        );
     }
 }
 
