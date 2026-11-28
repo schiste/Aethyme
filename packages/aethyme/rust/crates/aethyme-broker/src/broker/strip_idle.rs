@@ -840,7 +840,6 @@ impl Broker {
                 run,
                 checkout_deadline,
                 &venv_markers,
-                past_max_age,
                 max_age_ms
                     .filter(|_| past_max_age)
                     .map(|age| now_ms.saturating_sub(age)),
@@ -1036,11 +1035,12 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         deadline: Instant,
         venv_markers: &[String],
-        past_max_age: bool,
         receipt_stale_before_ms: Option<i64>,
         report: &mut IdleStripReport,
     ) -> IdleStrip {
         use IdleStrip::Refused;
+        // Set exactly when the session is idle for the artifact max age.
+        let past_max_age = receipt_stale_before_ms.is_some();
         if Instant::now() >= deadline {
             return Refused("deadline");
         }
