@@ -348,7 +348,10 @@ pub fn status_value(host_state: &Path) -> Value {
                 "checkouts_retired_today": checkouts.values().map(|counts| counts.checkouts_retired_today).sum::<usize>(),
                 "open_checkouts": checkouts.values().map(|counts| counts.open_checkouts).sum::<usize>(),
                 "sampled_checkouts": checkouts.values().map(|counts| counts.sampled_checkouts).sum::<usize>(),
-                "estimated_checkout_bytes": checkouts.values().map(|counts| counts.estimated_checkout_bytes).sum::<u64>(),
+                "estimated_checkout_bytes": checkouts
+                    .values()
+                    .filter_map(|counts| counts.estimated_checkout_bytes)
+                    .reduce(u64::saturating_add),
                 "repositories": checkouts,
                 "why_not": "folder counts; bytes are an estimate of the open checkouts' regenerable directories, sampled by the idle strip (checkout folders are never walked in one go)",
             }),
@@ -568,10 +571,14 @@ fn status(json_output: bool) -> u8 {
                         if counts["open_checkouts"].as_u64().unwrap_or(0) == 0 {
                             continue;
                         }
+                        let estimate = counts["estimated_checkout_bytes"].as_u64().map_or_else(
+                            || "unmeasured".to_string(),
+                            |bytes| format!("~{}", human(bytes)),
+                        );
                         println!(
-                            "  {}: ~{} of dependency directories in {} open checkout(s) (estimate, {} measured)",
+                            "  {}: {} of dependency directories in {} open checkout(s) (estimate, {} measured)",
                             counts["worktree_root"].as_str().unwrap_or("?"),
-                            human(counts["estimated_checkout_bytes"].as_u64().unwrap_or(0)),
+                            estimate,
                             counts["open_checkouts"].as_u64().unwrap_or(0),
                             counts["sampled_checkouts"].as_u64().unwrap_or(0),
                         );

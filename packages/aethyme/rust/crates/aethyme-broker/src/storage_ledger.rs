@@ -918,8 +918,9 @@ pub struct CheckoutCounts {
     pub sampled_checkouts: usize,
     #[serde(default)]
     pub measured_checkout_bytes: u64,
+    /// `None` while no open checkout has been measured (unmeasured, not zero).
     #[serde(default)]
-    pub estimated_checkout_bytes: u64,
+    pub estimated_checkout_bytes: Option<u64>,
 }
 
 /// One repository's recorded counts, with the repository it names.
