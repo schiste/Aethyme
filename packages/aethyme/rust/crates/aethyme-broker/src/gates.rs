@@ -4605,11 +4605,15 @@ where
             let outside_slot =
                 yielded.then(|| crate::phase_telemetry::span("gate_admission_wait_outside_slot"));
             // Before owner locks, leases and the timeout clock: see gate_admission.
+            let load_admission = {
+                let _span = crate::phase_telemetry::span("gate_load_admission");
+                crate::gate_admission::admit_gate_with(gate, progress, admission_host)
+            };
             if let crate::gate_admission::Admission::BoundReached {
                 waited,
                 last,
                 threshold,
-            } = crate::gate_admission::admit_gate_with(gate, progress, admission_host)
+            } = load_admission
             {
                 if early_verification {
                     break 'gates;
@@ -4641,21 +4645,24 @@ where
                 outcomes.push(outcome);
                 break 'gates;
             }
-            let owner_locks = GateOwnerLocks::acquire_bounded(
-                &owner_dir,
-                &gate.name,
-                &selection.owner_paths,
-                &gate_owner_holder_record(
-                    &worker_id,
-                    crate::clock::epoch_ms(),
-                    // No checkout is this run's while it waits without a slot.
-                    gate_checkout_root.as_deref().filter(|_| !yielded),
-                ),
-                heartbeat_interval(),
-                progress,
-                (main_root, session_id),
-                runtime.deadline,
-            );
+            let owner_locks = {
+                let _span = crate::phase_telemetry::span("gate_owner_lock_wait");
+                GateOwnerLocks::acquire_bounded(
+                    &owner_dir,
+                    &gate.name,
+                    &selection.owner_paths,
+                    &gate_owner_holder_record(
+                        &worker_id,
+                        crate::clock::epoch_ms(),
+                        // No checkout is this run's while it waits without a slot.
+                        gate_checkout_root.as_deref().filter(|_| !yielded),
+                    ),
+                    heartbeat_interval(),
+                    progress,
+                    (main_root, session_id),
+                    runtime.deadline,
+                )
+            };
             let owner_locks = match owner_locks {
                 Ok(locks) => locks,
                 Err(source)
@@ -4695,16 +4702,20 @@ where
                     .into());
                 }
             };
-            let mut resource_runtime = match acquire_gate_resources(
-                gate,
-                &repository,
-                &checkout_root,
-                &tree,
-                &worker_id,
-                progress,
-                runtime.deadline,
-                runtime.storage.clone(),
-            ) {
+            let resource_admission = {
+                let _span = crate::phase_telemetry::span("gate_resource_admission");
+                acquire_gate_resources(
+                    gate,
+                    &repository,
+                    &checkout_root,
+                    &tree,
+                    &worker_id,
+                    progress,
+                    runtime.deadline,
+                    runtime.storage.clone(),
+                )
+            };
+            let mut resource_runtime = match resource_admission {
                 Ok(runtime) => runtime,
                 Err(message) => {
                     drop(owner_locks);
@@ -5033,6 +5044,7 @@ where
         let command_process_group = std::sync::atomic::AtomicI32::new(0);
         let run_labels =
             crate::gate_debris::GateRunLabels::new(&gate.name, session_id, &repository);
+        let command_span = crate::phase_telemetry::span("gate_command_execution");
         let status = run_gate_command(
             &gate.command,
             GateCommandContext {
@@ -5063,6 +5075,7 @@ where
             },
             &mut artifact_use,
         );
+        drop(command_span);
         let writers_quiescent = gate_process_group_absent(
             command_process_group.load(std::sync::atomic::Ordering::Acquire),
         );
@@ -11979,6 +11992,8 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
     /// and runs once the lock is free and it holds a slot again.
     #[test]
     fn a_gate_waiting_for_an_owner_lock_gives_its_slot_back() {
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _recording = crate::phase_telemetry::install(recorder.clone());
         const NAMESPACE: &str = "owner-handoff";
         let owner = tempfile::tempdir().unwrap();
         let root = owner.path().join("repo");
@@ -12074,6 +12089,16 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
         assert_eq!(counts, (1, 1), "one release and one re-acquire");
+        let (_, phases) = recorder.totals();
+        for name in [
+            "gate_load_admission",
+            "gate_owner_lock_wait",
+            "gate_resource_admission",
+            "gate_command_setup",
+            "gate_command_execution",
+        ] {
+            assert!(phases.contains_key(name), "missing {name}: {phases:?}");
+        }
         assert!(
             lines
                 .iter()
