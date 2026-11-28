@@ -96,6 +96,47 @@ fn valid_gate(gate: &Value) -> Result<&str, &'static str> {
     Ok(kind)
 }
 
+// These host assertions are not evidence of provenance or checked metadata gates.
+// Validate their bounded shape even when the selected text gates ignore them.
+fn validate_metadata(projection: &Value) -> Result<(), &'static str> {
+    let metadata = match projection.get("metadata") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let values = value.as_object().ok_or("invalid host metadata")?;
+            if values.len() > LIMIT || values.values().any(|value| !value.is_string()) {
+                return Err("invalid host metadata");
+            }
+            Some(values)
+        }
+    };
+    if let Some(observed) = projection
+        .get("observed_metadata_fields")
+        .filter(|v| !v.is_null())
+    {
+        let metadata = metadata.ok_or("invalid host metadata coverage")?;
+        let values = observed
+            .as_array()
+            .ok_or("invalid host metadata coverage")?;
+        if values.len() > LIMIT {
+            return Err("invalid host metadata coverage");
+        }
+        let mut fields = BTreeSet::new();
+        for value in values {
+            let field = value
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or("invalid host metadata coverage")?;
+            if !fields.insert(field) {
+                return Err("invalid host metadata coverage");
+            }
+        }
+        if metadata.keys().any(|key| !fields.contains(key.as_str())) {
+            return Err("invalid host metadata coverage");
+        }
+    }
+    Ok(())
+}
+
 /// Verify every supported checked gate against the exact bound host projection.
 pub(super) fn verify(
     policy: &Value,
@@ -142,8 +183,16 @@ pub(super) fn verify(
         fields(
             &projection,
             &["schema", "text"],
-            &["block_ends", "paragraphs", "headings", "heading_levels"],
+            &[
+                "block_ends",
+                "paragraphs",
+                "headings",
+                "heading_levels",
+                "metadata",
+                "observed_metadata_fields",
+            ],
         )?;
+        validate_metadata(&projection)?;
         if projection["schema"] != "aexeo.content-adapter/v1" {
             return Err("unsupported host projection");
         }
@@ -411,6 +460,52 @@ mod tests {
             &checks,
         )
     }
+    #[test]
+    fn host_metadata_is_bounded_and_consistent_but_not_verified_as_a_gate() {
+        for (metadata, observed) in [
+            (json!({"title":"Example"}), json!(["title", "description"])),
+            (json!({}), json!([])),
+            (json!({"title":"Example"}), Value::Null),
+            (Value::Null, Value::Null),
+        ] {
+            let mut p = projection();
+            p["metadata"] = metadata;
+            p["observed_metadata_fields"] = observed;
+            assert_eq!(run(&policy(), p, "passed", json!([])), Ok(true));
+        }
+        for (metadata, observed) in [
+            (json!({"title":"Example"}), json!([])),
+            (json!({}), json!(["title", "title"])),
+            (json!({}), json!([" "])),
+            (json!({"title":2}), Value::Null),
+            (Value::Null, json!([])),
+            (json!([]), Value::Null),
+        ] {
+            let mut p = projection();
+            p["metadata"] = metadata;
+            p["observed_metadata_fields"] = observed;
+            assert!(run(&policy(), p, "passed", json!([])).is_err());
+        }
+        let mut p = projection();
+        p["metadata"] = json!({});
+        p["observed_metadata_fields"] =
+            json!((0..=LIMIT).map(|i| format!("field{i}")).collect::<Vec<_>>());
+        assert!(run(&policy(), p, "passed", json!([])).is_err());
+        let mut p = projection();
+        p["metadata"] = json!(
+            (0..=LIMIT)
+                .map(|i| (format!("field{i}"), "value"))
+                .collect::<BTreeMap<_, _>>()
+        );
+        assert!(run(&policy(), p, "passed", json!([])).is_err());
+        let mut unsupported = policy();
+        unsupported["gates"].as_array_mut().unwrap().push(json!({
+            "kind":"required_metadata", "id":"metadata", "severity":"warning",
+            "blocking":false, "fields":["title"]
+        }));
+        assert!(run(&unsupported, projection(), "passed", json!([])).is_err());
+    }
+
     #[test]
     fn duplicate_headings_require_observed_consistent_status_and_valid_policy() {
         let mut policy = json!({"gates":[{"kind":"duplicate_headings","id":"dup","severity":"warning","blocking":false,"case_sensitive":false}]});
