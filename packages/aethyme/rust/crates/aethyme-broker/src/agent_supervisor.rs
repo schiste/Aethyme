@@ -137,6 +137,8 @@ pub(crate) fn process(
         ));
     }
     let mut process = std::process::Command::new(&launch.executable);
+    // Opt in: older launchers must not see a frame they cannot parse.
+    process.env("AETHYME_AGENT_SUPERVISOR_PROGRESS", "1");
     #[cfg(not(test))]
     process.arg(FLAG).arg(payload);
     #[cfg(test)]
@@ -169,20 +171,63 @@ pub(crate) fn process(
 #[cfg(unix)]
 pub(crate) fn await_ready(stdout: &mut std::process::ChildStdout, nonce: &str) -> io::Result<()> {
     crate::gates::bounded_log::set_nonblocking(stdout)?;
+    let _span = crate::phase_telemetry::span("agent_supervisor_readiness");
     let expected = format!("AETHYME_AGENT_READY {nonce}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    await_ready_with_wait(stdout, &expected, deadline, || {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    })
+    // The supervisor verifies the repository and starts its cleanup watcher
+    // before announcing readiness; allow slow hosts to complete that work.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let progress = format!("AETHYME_AGENT_VALIDATED {nonce}");
+    await_ready_with_progress(
+        stdout,
+        &expected,
+        deadline,
+        Some((&progress, std::time::Duration::from_secs(30))),
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        },
+    )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn await_ready_with_wait<R: std::io::Read>(
     stdout: &mut R,
     expected: &str,
     deadline: std::time::Instant,
-    mut wait: impl FnMut(),
+    wait: impl FnMut(),
 ) -> io::Result<()> {
+    await_ready_with_progress(stdout, expected, deadline, None, wait)
+}
+
+#[cfg(unix)]
+fn await_ready_with_progress<R: std::io::Read>(
+    stdout: &mut R,
+    expected: &str,
+    deadline: std::time::Instant,
+    progress: Option<(&str, std::time::Duration)>,
+    wait: impl FnMut(),
+) -> io::Result<()> {
+    await_ready_with_clock(
+        stdout,
+        expected,
+        deadline,
+        progress,
+        wait,
+        std::time::Instant::now,
+    )
+}
+
+#[cfg(unix)]
+fn await_ready_with_clock<R: std::io::Read>(
+    stdout: &mut R,
+    expected: &str,
+    mut deadline: std::time::Instant,
+    mut progress: Option<(&str, std::time::Duration)>,
+    mut wait: impl FnMut(),
+    mut now: impl FnMut() -> std::time::Instant,
+) -> io::Result<()> {
+    let mut phase = Some(crate::phase_telemetry::span(
+        "agent_supervisor_initial_readiness",
+    ));
     let mut line = Vec::new();
     let mut total = 0;
     loop {
@@ -201,7 +246,31 @@ fn await_ready_with_wait<R: std::io::Read>(
                 }
                 if byte[0] == b'\n' {
                     if line == expected.as_bytes() {
+                        if now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "agent supervisor readiness timed out",
+                            ));
+                        }
                         return Ok(());
+                    }
+                    if let Some((frame, allowance)) = progress {
+                        if line == frame.as_bytes() {
+                            if now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "agent supervisor readiness timed out",
+                                ));
+                            }
+                            drop(phase.take());
+                            phase = Some(crate::phase_telemetry::span(
+                                "agent_supervisor_cleanup_readiness",
+                            ));
+                            deadline = now() + allowance;
+                            progress = None;
+                            line.clear();
+                            continue;
+                        }
                     }
                     #[cfg(not(test))]
                     return Err(io::Error::other("invalid supervisor readiness response"));
@@ -213,7 +282,7 @@ fn await_ready_with_wait<R: std::io::Read>(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
+                if now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "agent supervisor readiness timed out",
@@ -224,7 +293,7 @@ fn await_ready_with_wait<R: std::io::Read>(
             }
             Err(error) => return Err(error),
         }
-        if std::time::Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "agent supervisor readiness timed out",
@@ -338,6 +407,13 @@ fn run(payload: &str) -> io::Result<u8> {
     let mut collector = BoundedGateLog::from_file(log, AGENT_LOG_MAX_BYTES, "agent")?;
     collector.write_header(b"aethyme: agent capture initially INCOMPLETE; only a final COMPLETE footer confirms capture\n")?;
     collector.sync_data()?;
+    if std::env::var_os("AETHYME_AGENT_SUPERVISOR_PROGRESS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        let mut progress = io::stdout().lock();
+        writeln!(progress, "AETHYME_AGENT_VALIDATED {}", launch.nonce)?;
+        progress.flush()?;
+    }
     let mut cleanup = start_cleanup_watcher()?;
     let mut ready = io::stdout().lock();
     writeln!(ready, "AETHYME_AGENT_READY {}", launch.nonce)?;
@@ -685,6 +761,78 @@ mod tests {
             return;
         };
         std::process::exit(super::cleanup_watcher(&parent).unwrap_or(125).into());
+    }
+
+    #[test]
+    fn readiness_accepts_a_slow_supervisor() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 6; printf 'AETHYME_AGENT_READY slow\\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = super::await_ready(child.stdout.as_mut().unwrap(), "slow");
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        result.unwrap();
+    }
+
+    #[test]
+    fn validation_progress_gives_cleanup_its_own_bounded_wait() {
+        struct PhasedReader {
+            first: std::io::Cursor<Vec<u8>>,
+            second: std::io::Cursor<Vec<u8>>,
+            blocked: bool,
+        }
+        impl std::io::Read for PhasedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.first.read(buf)?;
+                if n != 0 {
+                    return Ok(n);
+                }
+                if !self.blocked {
+                    self.blocked = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.second.read(buf)
+            }
+        }
+        let progress = "AETHYME_AGENT_VALIDATED test";
+        let ready = "AETHYME_AGENT_READY test";
+        let mut reader = PhasedReader {
+            first: std::io::Cursor::new(format!("{progress}\n").into_bytes()),
+            second: std::io::Cursor::new(format!("{ready}\n").into_bytes()),
+            blocked: false,
+        };
+        let start = std::time::Instant::now();
+        let elapsed = std::cell::Cell::new(std::time::Duration::ZERO);
+        super::await_ready_with_clock(
+            &mut reader,
+            ready,
+            start + std::time::Duration::from_millis(500),
+            Some((progress, std::time::Duration::from_secs(3))),
+            || elapsed.set(std::time::Duration::from_millis(600)),
+            || start + elapsed.get(),
+        )
+        .unwrap();
+
+        let mut expired_reader = PhasedReader {
+            first: std::io::Cursor::new(format!("{progress}\n").into_bytes()),
+            second: std::io::Cursor::new(format!("{ready}\n").into_bytes()),
+            blocked: false,
+        };
+        elapsed.set(std::time::Duration::ZERO);
+        let error = super::await_ready_with_clock(
+            &mut expired_reader,
+            ready,
+            start + std::time::Duration::from_millis(500),
+            Some((progress, std::time::Duration::from_secs(3))),
+            || elapsed.set(std::time::Duration::from_secs(4)),
+            || start + elapsed.get(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
