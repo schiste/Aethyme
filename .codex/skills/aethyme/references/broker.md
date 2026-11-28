@@ -174,8 +174,8 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
-   Before running repository tools or audits, inspect the session's preparation
-   status and follow its `next_action` when dependencies are required:
+   In a session, before running tools that need dependencies, inspect its
+   preparation status and follow its `next_action`:
    `aethyme broker submit prepare status --session <your-session-id> --json`.
    Worktrees do not inherit ignored dependencies such as `node_modules/` or
    `.venv/` from the main checkout; preparation is explicit.
