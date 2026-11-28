@@ -670,10 +670,10 @@ fn the_slice_listing_answers_as_the_fresh_reading() {
 fn a_cleaned_spawned_session_keeps_its_branch_until_the_retention_age() {
     let mut fixture = fixture();
     let id = fixture.session("agent/retained", false);
-    let set = |completed: i64| {
+    let set = |fixture: &Fixture, completed: i64| {
         fixture
             .broker
-            .store()
+            .store_ref()
             .connection()
             .execute(
                 "UPDATE sessions SET origin = 'spawned', cleanup_completed_at = ?1 WHERE id = ?2",
@@ -681,16 +681,20 @@ fn a_cleaned_spawned_session_keeps_its_branch_until_the_retention_age() {
             )
             .unwrap();
     };
-    let judge = || {
+    let judge = |fixture: &Fixture| {
         let session = fixture.broker.store_ref().session(id).unwrap();
         fixture
             .broker
             .has_restorable_state_with(&session, |_| Some(false))
     };
-    set(crate::clock::epoch_ms() - 3_600_000);
-    assert_eq!(judge(), Some(true), "no tombstone, cleaned an hour ago");
-    set(crate::clock::epoch_ms() - 100 * 86_400_000);
-    assert_eq!(judge(), Some(false), "past the retention age");
+    set(&fixture, crate::clock::epoch_ms() - 3_600_000);
+    assert_eq!(
+        judge(&fixture),
+        Some(true),
+        "no tombstone, cleaned an hour ago"
+    );
+    set(&fixture, crate::clock::epoch_ms() - 100 * 86_400_000);
+    assert_eq!(judge(&fixture), Some(false), "past the retention age");
 }
 
 /// An archive directory that cannot be listed is unknown, not empty: every
