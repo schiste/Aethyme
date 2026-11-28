@@ -1073,8 +1073,10 @@ fn validate_submit_decision(
         _ => failure_message(&verdict, &sources),
     };
 
+    let symbols = findings.keys().cloned().collect::<Vec<_>>().join(", ");
     Err(format!(
         "ERROR: contract-decision preflight failed before any gate ran: {}\
+         Matched tracked symbols: {symbols}\n\
          Add `Contract decision: <none|introduce|soft-retire|hard-delete>` to a commit message in this session. \
          The broker's contract gate reads only the decision your commits carry; a PR body is not visible to it.\n\
          If `none` is correct for a tracked removal, also add `Contract justification: <reason>` (at least {MIN_JUSTIFICATION_CHARS} characters).\n",
@@ -1990,6 +1992,7 @@ mod tests {
         assert!(error.contains("to a commit message in this session"));
         assert!(error.contains("a PR body is not visible to it"));
         assert!(error.contains("pending session commit messages: no contract decision"));
+        assert!(error.contains("Matched tracked symbols: aethyme-explore"));
     }
 
     #[test]
