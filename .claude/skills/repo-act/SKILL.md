@@ -69,6 +69,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Run the workspace `cargo fmt --all --check` before submission. If formatting
+  one Rust file directly, use its crate edition; workspace crates may differ.
+
 - For Cargo tests that may spawn Cargo, export `CARGO_TARGET_DIR` to the session
   scratch target so child builds inherit it. A parent `--target-dir` flag alone
   does not propagate. When using prebuilt test binaries, verify they match the
