@@ -608,6 +608,75 @@ jobs:
       - name: Run doctests
         run: cargo test --locked --workspace --doc
 
+  # ── Policy guard on main ────────────────────────────────────────────────
+  # Main's push run skips the test shards, so a template or skill change that
+  # broke the generated agent policy (its token budget, in
+  # enhance_cli::agents_document_includes_broker_protocol_only_when_configured)
+  # went unnoticed there. This runs only the enhance crate's tests and the CLI's
+  # enhance tests, and only when the push touched the crate or the skills.
+  enhance-policy-guard:
+    name: Enhance policy guard
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Detect enhance or skills changes
+        id: scope
+        working-directory: .
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # An all-zero or unreachable `before` (new branch, force push) means
+          # the changed set is unknown: run the guard.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BEFORE" "$AFTER" -- \
+            packages/aethyme/rust/crates/aethyme-enhance/ packages/aethyme/skills/)"
+          if [ -n "$changed" ]; then
+            printf '%s\n' "$changed"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Rust
+        if: steps.scope.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      # Restores the cache `warm-rust-cache` saves from main; this job never
+      # saves, so it cannot evict it.
+      - name: Cache Rust build
+        if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
+      - name: Test the enhance crate
+        if: steps.scope.outputs.run == 'true'
+        run: cargo test --locked -p aethyme-enhance
+
+      - name: Test the CLI enhance commands
+        if: steps.scope.outputs.run == 'true'
+        run: cargo test --locked -p aethyme-cli --test it -- enhance_cli
+
   # ── Tested tree ─────────────────────────────────────────────────────────
   # A workflow_dispatch run tests the dispatched branch's head. Once both
   # suites pass, record that tree as an artifact. When a merge commit on main

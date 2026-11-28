@@ -112,8 +112,15 @@ def run_trial(binary, git, root, concurrent, recent_sweep):
         rows["advance"] = [(elapsed, metrics(repo, "advance")[-1])]
     integrate_and_finish(first, checkout)
     return {step: {"wall_ms": [wall for wall, _ in samples],
-                   "phases": [row.get("phase_timings_ms", {}) for _, row in samples]}
+                   "phases": [row.get("phase_timings_ms", {}) for _, row in samples],
+                   "phase_counts": [row.get("phase_counts", {}) for _, row in samples]}
             for step, samples in rows.items()}
+
+
+def occurrences(timings, counts, name):
+    if name in counts:
+        return counts[name]
+    return 1 if name in timings else 0
 
 
 def summarize(trials):
@@ -124,13 +131,17 @@ def summarize(trials):
     result = {}
     for name, rows in steps.items():
         walls = [wall for row in rows for wall in row["wall_ms"]]
-        phases = [phase for row in rows for phase in row["phases"]]
-        names = sorted({key for phase in phases for key in phase})
+        phases = [(timings, counts) for row in rows
+                  for timings, counts in zip(row["phases"], row["phase_counts"])]
+        # Rows omit zero-ms timings, zero counts and a count of 1 beside a timing.
+        names = sorted({key for pair in phases for part in pair for key in part})
         result[name] = {
             "wall": distribution(walls),
             "samples": len(walls),
-            "phases": {key: {**distribution([row.get(key, 0) for row in phases]),
-                             "occurrences": sum(key in row for row in phases)} for key in names},
+            "phases": {key: {**distribution([timings.get(key, 0) for timings, _ in phases]),
+                             "occurrences": sum(occurrences(timings, counts, key)
+                                                for timings, counts in phases)}
+                       for key in names},
         }
     return result
 

@@ -83,6 +83,28 @@ fn pull_requests_trigger_only_the_contract_check() {
 }
 
 #[test]
+fn main_guards_the_generated_policy_on_push() {
+    let oss = workflow("oss-ci.yml");
+    let guard = block(&oss, "  enhance-policy-guard:");
+    assert!(guard.contains(&"    if: github.event_name == 'push'"));
+    assert!(
+        guard
+            .iter()
+            .any(|line| line.contains("0000000000000000000000000000000000000000"))
+    );
+    assert!(guard.contains(&"          save-if: false"));
+    assert!(guard.contains(&"        run: cargo test --locked -p aethyme-enhance"));
+    assert!(
+        guard.contains(&"        run: cargo test --locked -p aethyme-cli --test it -- enhance_cli")
+    );
+    assert!(
+        !guard
+            .iter()
+            .any(|line| line.contains("macos") || line.contains("windows"))
+    );
+}
+
+#[test]
 fn main_has_one_automatic_full_workspace_owner() {
     let oss = workflow("oss-ci.yml");
     assert_eq!(
