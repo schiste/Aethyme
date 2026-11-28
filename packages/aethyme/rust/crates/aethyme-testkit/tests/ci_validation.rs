@@ -1227,7 +1227,7 @@ fn contract_gate_uses_broker_comparison_base_when_supplied() {
         .lines()
         .find_map(|line| line.strip_prefix("command = '"))
         .unwrap();
-    let setup = command.split(" && cargo run").next().unwrap();
+    let setup = command.split(" && if [ -x").next().unwrap();
     let script = format!(
         "git() {{ case \"$1\" in merge-base) printf integration-base;; rev-parse) printf parent-base;; esac; }}; {setup}; printf '%s' \"$BASE\""
     );
