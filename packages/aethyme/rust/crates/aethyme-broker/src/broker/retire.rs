@@ -12841,8 +12841,8 @@ mod tests {
 
         // Idle by session activity, but `HEAD` was just written (a commit
         // by an agent working by absolute paths): not idle.
-        let head = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
-            .join("HEAD");
+        let head =
+            PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim()).join("HEAD");
         age_files(&worktree);
         std::fs::File::open(&head)
             .unwrap()
