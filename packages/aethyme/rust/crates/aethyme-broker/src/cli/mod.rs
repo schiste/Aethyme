@@ -1039,12 +1039,13 @@ Usage:
       the marker for those it can prove, removing nothing; review a new
       storage plan afterwards. A root it cannot prove is never marked.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
-                                [--commit-messages] [--merged-pr]
+                                [--commit-messages] [--merged-pr] [--committed]
       Cross-process contract gate: refuse a diff that removes symbols
       listed in the consumers registry unless the PR body, the commits in
       <base>..HEAD, or (--merged-pr, via gh) the pull request GitHub
       associates with HEAD declare a contract decision. Run by CI and by
-      the `cross-process-contract` gate. Exit 1 = undeclared contract
+      the `cross-process-contract` gate. --committed compares base to HEAD
+      instead of the working tree. Exit 1 = undeclared contract
       change; the refusal lists every source it read.
 
 Overlaps with another session's explicit lease warn.

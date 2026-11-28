@@ -3137,6 +3137,14 @@ with evidence that satisfies the v4 contract. The v4 schema and migration do
 not by themselves enable profile-bound root capture or connect preparation
 dispatch to managed-ledger admission.
 
+### Contract checker committed candidates
+
+`aethyme broker check-contract --committed` compares the base commit to HEAD
+instead of reading staged and unstaged changes in the diff. The default still
+checks the working tree. Other checker inputs, including the consumer document
+and text-consumer checks, are read from the checkout in both modes; broker gates
+use the option only for their isolated committed merge candidate.
+
 ### Private spawned-agent supervision (#831)
 
 The router and broker shim dispatch the reserved
