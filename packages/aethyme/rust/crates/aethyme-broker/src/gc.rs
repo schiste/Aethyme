@@ -4094,6 +4094,57 @@ fn artifact_worker_process_is_suppressed() -> bool {
 /// installation. Never fall back to PATH: the detached process must be the
 /// exact broker runtime that recorded the request.
 fn artifact_worker_binaries() -> Option<(PathBuf, PathBuf)> {
+    let running = running_worker_binaries()?;
+    let Some(installed) = crate::update::managed_installed_pair(&running.0) else {
+        return Some(running);
+    };
+    Some(newer_installed_pair(
+        running,
+        installed,
+        env!("CARGO_PKG_VERSION"),
+        worker_binary_version,
+    ))
+}
+
+/// A continuation that outlives an update must hand its successor to the
+/// installed build, or a repository whose work never idles keeps its chain on
+/// the version it started with. The installed pair replaces the running one
+/// only when its banner parses to a strictly newer semantic version, so a
+/// rollback or an unreadable banner never launches an older or unknown build
+/// (a newer binary may migrate the broker database; an older one must not
+/// open it).
+fn newer_installed_pair(
+    running: (PathBuf, PathBuf),
+    installed: (PathBuf, PathBuf),
+    running_version: &str,
+    probe: impl Fn(&Path) -> Option<String>,
+) -> (PathBuf, PathBuf) {
+    let installed_version = probe(&installed.0)
+        .as_deref()
+        .and_then(crate::install_health::build_identity)
+        .and_then(|identity| identity.split_whitespace().next().map(str::to_string))
+        .and_then(|version| semver::Version::parse(&version).ok());
+    let running_version = semver::Version::parse(running_version).ok();
+    match (installed_version, running_version) {
+        (Some(installed_version), Some(running_version)) if installed_version > running_version => {
+            installed
+        }
+        _ => running,
+    }
+}
+
+/// Record that a detached worker launch chose a newer installed binary than
+/// the one running now.
+fn note_continuation_upgrade(router: &Path) {
+    let running = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    if running.is_some_and(|running| running != router) {
+        crate::phase_telemetry::add("gc_continuation_upgraded", Duration::ZERO);
+    }
+}
+
+fn running_worker_binaries() -> Option<(PathBuf, PathBuf)> {
     let executable = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
     let installation = crate::update::detect_installation(&executable);
     if installation.method == crate::update::InstallationMethod::Unknown {
@@ -9607,6 +9658,7 @@ impl Broker {
                 path: root.clone(),
                 source,
             })?;
+        note_continuation_upgrade(&router);
         let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
         let mut command = match self.artifact_sweep_worker_command(
             &router,
@@ -9763,6 +9815,7 @@ impl Broker {
         let Ok(canonical_root) = std::fs::canonicalize(&root) else {
             return false;
         };
+        note_continuation_upgrade(&router);
         let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
         let Ok(mut command) = self.detached_worker_command(
             &router,
@@ -9845,6 +9898,7 @@ impl Broker {
         let Ok(canonical_root) = std::fs::canonicalize(self.main_root()) else {
             return false;
         };
+        note_continuation_upgrade(&router);
         let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
         let Ok(mut command) = self.detached_worker_command(
             &router,
@@ -19850,6 +19904,30 @@ mod tests {
         let namespaces: Vec<String> = serde_json::from_str(&registry).unwrap();
         assert_eq!(namespaces.len(), 1);
         namespaces[0].clone()
+    }
+
+    #[test]
+    fn continuation_hands_off_only_to_a_strictly_newer_installed_pair() {
+        let running = (
+            PathBuf::from("/m/v1/aethyme"),
+            PathBuf::from("/m/v1/engine"),
+        );
+        let installed = (
+            PathBuf::from("/m/v2/aethyme"),
+            PathBuf::from("/m/v2/engine"),
+        );
+        let banner = |text: &'static str| move |_: &Path| Some(text.to_string());
+        let pick = |running_version, probe: &dyn Fn(&Path) -> Option<String>| {
+            newer_installed_pair(running.clone(), installed.clone(), running_version, probe)
+        };
+        assert_eq!(
+            pick("0.8.189", &banner("aethyme 0.8.190 build_date=x")),
+            installed
+        );
+        assert_eq!(pick("0.8.190", &banner("aethyme 0.8.190")), running);
+        assert_eq!(pick("0.8.190", &banner("aethyme 0.8.189")), running);
+        assert_eq!(pick("0.8.189", &|_: &Path| None), running);
+        assert_eq!(pick("0.8.189", &banner("garbage")), running);
     }
 
     #[test]
