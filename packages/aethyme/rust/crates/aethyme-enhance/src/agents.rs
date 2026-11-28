@@ -395,9 +395,8 @@ evidence. Check overlapping work before duplicating it. Path leases only
 inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
-Read-only investigations can use an existing checkout without a broker session
-or separate worktree. Check its revision and report any freshness limitation.
-Start a session before editing.
+Read-only work can use an existing checkout without a session: check its
+revision and report any freshness limitation. Start a session before editing.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -439,9 +438,8 @@ evidence. Check overlapping work before duplicating it. Path leases only
 inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
-Read-only investigations can use an existing checkout without a broker session
-or separate worktree. Check its revision and report any freshness limitation.
-Start a session before editing.
+Read-only work can use an existing checkout without a session: check its
+revision and report any freshness limitation. Start a session before editing.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -454,13 +452,13 @@ Start a session before editing.
 2. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Then `aethyme broker finish --session <id>`.
 
-For a local commit in your own active session, use
+To commit in your own active session, use
 `aethyme broker commit --session <id> -- <git-commit-args>`. It checks the
-registered worktree and branch, audits complete bounded path inventories
-before and after the commit, and runs the repository's normal Git hooks.
+registered worktree and branch, audits path inventories before and after, and
+runs the repository's normal Git hooks.
 Hook-bypass options and inherited Git routing/config overrides are refused.
-If post-commit ownership verification is unknown, inspect the worktree and
-execution receipt before trying another commit.
+If ownership verification after the commit is unknown, inspect the worktree
+and receipt before retrying.
 
 Remote or shared Git and GitHub writes go through `aethyme broker advanced git`
 and `aethyme broker advanced gh`; editing or submitting never authorizes
@@ -1677,9 +1675,9 @@ mod tests {
     #[test]
     fn both_broker_protocols_allow_read_only_work_without_a_session() {
         for protocol in [PUSHING_PROTOCOL, NON_PUSHING_PROTOCOL] {
-            assert!(protocol.contains(
-                "Read-only investigations can use an existing checkout without a broker session"
-            ));
+            assert!(
+                protocol.contains("Read-only work can use an existing checkout without a session")
+            );
             assert!(protocol.contains("Start a session before editing."));
             assert!(!protocol.contains("Before running repository tools or audits"));
         }
@@ -1703,7 +1701,7 @@ mod tests {
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
             "Never edit another\n   session's worktree.",
-            "Read-only investigations can use an existing checkout without a broker session",
+            "Read-only work can use an existing checkout without a session",
             "Start a session before editing.",
             "before running tools that need dependencies, check its",
             "aethyme broker submit prepare status --session <id> --json",
