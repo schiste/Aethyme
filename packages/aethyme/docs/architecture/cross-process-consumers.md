@@ -3162,9 +3162,12 @@ remains explicitly incomplete. Cleanup covers ordinary descendants in the
 owned process group; it is not containment of programs that deliberately
 escape that group. Consumers must preserve the private dispatch and exact
 runtime selection when changing entrypoints.
-Supervisor and cleanup-watcher readiness waits have a 30-second bound. When
-command telemetry is active, `agent_supervisor_readiness` measures the wait
-without recording its nonce.
+Supervisor validation and cleanup-watcher readiness each have a 30-second
+bound. A nonce-bound, opt-in validation frame starts the watcher allowance;
+older launchers and helpers retain their original handshake. When command
+telemetry is active, `agent_supervisor_readiness` measures the complete wait;
+`agent_supervisor_initial_readiness` and `agent_supervisor_cleanup_readiness`
+measure its phases without recording the nonce.
 
 ### Generic guarded-command supervision
 

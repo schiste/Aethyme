@@ -137,6 +137,8 @@ pub(crate) fn process(
         ));
     }
     let mut process = std::process::Command::new(&launch.executable);
+    // Opt in: older launchers must not see a frame they cannot parse.
+    process.env("AETHYME_AGENT_SUPERVISOR_PROGRESS", "1");
     #[cfg(not(test))]
     process.arg(FLAG).arg(payload);
     #[cfg(test)]
@@ -174,18 +176,39 @@ pub(crate) fn await_ready(stdout: &mut std::process::ChildStdout, nonce: &str) -
     // The supervisor verifies the repository and starts its cleanup watcher
     // before announcing readiness; allow slow hosts to complete that work.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    await_ready_with_wait(stdout, &expected, deadline, || {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    })
+    let progress = format!("AETHYME_AGENT_VALIDATED {nonce}");
+    await_ready_with_progress(
+        stdout,
+        &expected,
+        deadline,
+        Some((&progress, std::time::Duration::from_secs(30))),
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        },
+    )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn await_ready_with_wait<R: std::io::Read>(
     stdout: &mut R,
     expected: &str,
     deadline: std::time::Instant,
+    wait: impl FnMut(),
+) -> io::Result<()> {
+    await_ready_with_progress(stdout, expected, deadline, None, wait)
+}
+
+#[cfg(unix)]
+fn await_ready_with_progress<R: std::io::Read>(
+    stdout: &mut R,
+    expected: &str,
+    mut deadline: std::time::Instant,
+    mut progress: Option<(&str, std::time::Duration)>,
     mut wait: impl FnMut(),
 ) -> io::Result<()> {
+    let mut phase = Some(crate::phase_telemetry::span(
+        "agent_supervisor_initial_readiness",
+    ));
     let mut line = Vec::new();
     let mut total = 0;
     loop {
@@ -205,6 +228,18 @@ fn await_ready_with_wait<R: std::io::Read>(
                 if byte[0] == b'\n' {
                     if line == expected.as_bytes() {
                         return Ok(());
+                    }
+                    if let Some((frame, allowance)) = progress {
+                        if line == frame.as_bytes() {
+                            drop(phase.take());
+                            phase = Some(crate::phase_telemetry::span(
+                                "agent_supervisor_cleanup_readiness",
+                            ));
+                            deadline = std::time::Instant::now() + allowance;
+                            progress = None;
+                            line.clear();
+                            continue;
+                        }
                     }
                     #[cfg(not(test))]
                     return Err(io::Error::other("invalid supervisor readiness response"));
@@ -341,6 +376,13 @@ fn run(payload: &str) -> io::Result<u8> {
     let mut collector = BoundedGateLog::from_file(log, AGENT_LOG_MAX_BYTES, "agent")?;
     collector.write_header(b"aethyme: agent capture initially INCOMPLETE; only a final COMPLETE footer confirms capture\n")?;
     collector.sync_data()?;
+    if std::env::var_os("AETHYME_AGENT_SUPERVISOR_PROGRESS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        let mut progress = io::stdout().lock();
+        writeln!(progress, "AETHYME_AGENT_VALIDATED {}", launch.nonce)?;
+        progress.flush()?;
+    }
     let mut cleanup = start_cleanup_watcher()?;
     let mut ready = io::stdout().lock();
     writeln!(ready, "AETHYME_AGENT_READY {}", launch.nonce)?;
@@ -703,6 +745,43 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(status.success());
         result.unwrap();
+    }
+
+    #[test]
+    fn validation_progress_gives_cleanup_its_own_bounded_wait() {
+        struct PhasedReader {
+            first: std::io::Cursor<Vec<u8>>,
+            second: std::io::Cursor<Vec<u8>>,
+            blocked: bool,
+        }
+        impl std::io::Read for PhasedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.first.read(buf)?;
+                if n != 0 {
+                    return Ok(n);
+                }
+                if !self.blocked {
+                    self.blocked = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.second.read(buf)
+            }
+        }
+        let progress = "AETHYME_AGENT_VALIDATED test";
+        let ready = "AETHYME_AGENT_READY test";
+        let mut reader = PhasedReader {
+            first: std::io::Cursor::new(format!("{progress}\n").into_bytes()),
+            second: std::io::Cursor::new(format!("{ready}\n").into_bytes()),
+            blocked: false,
+        };
+        super::await_ready_with_progress(
+            &mut reader,
+            ready,
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+            Some((progress, std::time::Duration::from_secs(3))),
+            || std::thread::sleep(std::time::Duration::from_millis(600)),
+        )
+        .unwrap();
     }
 
     #[test]
