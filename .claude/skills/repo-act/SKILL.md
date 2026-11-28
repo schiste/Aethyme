@@ -69,6 +69,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Run the workspace `cargo fmt --all --check` before submission. If formatting
+  one Rust file directly, use its crate edition; workspace crates may differ.
+
+- For Cargo tests that may spawn Cargo, export `CARGO_TARGET_DIR` to the session
+  scratch target so child builds inherit it. A parent `--target-dir` flag alone
+  does not propagate. When using prebuilt test binaries, verify they match the
+  candidate and set `AETHYME_TESTKIT_PREBUILT_BINS=1` to avoid nested builds.
+
 - For `release_contract` after building the release router and engine, run
   from the Rust workspace with `AETHYME_RELEASE_BINARY_DIR="$PWD/target/debug"`
   so the version check reuses those binaries instead of rebuilding them.
@@ -889,6 +897,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
   accepts the prepared body.
+- When changing CLI help or flags, update the affected help snapshot and run
+  the `help_snapshots` suite before the full broker gate; inspect aliases too.
 - Before changing CLI advice commands, trace the public resolver, aliases and
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI
