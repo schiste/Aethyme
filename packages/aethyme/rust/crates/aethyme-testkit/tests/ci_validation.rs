@@ -382,9 +382,7 @@ fn contract_gate_runs_the_prebuilt_router_on_main() {
     assert!(gate.contains("cargo run --locked --quiet"));
     let gates = workflow("aethyme-gates.yml");
     let run = gates.find("      - name: Run all gates").unwrap();
-    assert!(
-        gates[run..].contains("AETHYME_CONTRACT_BIN: ${{ env.GATE_CACHE_DIR }}/debug/aethyme")
-    );
+    assert!(gates[run..].contains("AETHYME_CONTRACT_BIN: ${{ env.GATE_CACHE_DIR }}/debug/aethyme"));
 }
 
 /// Failed nextest output must survive later passing doc/example output. The
