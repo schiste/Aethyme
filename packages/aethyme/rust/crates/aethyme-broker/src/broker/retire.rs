@@ -12839,12 +12839,12 @@ mod tests {
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
 
-        // Idle by session activity, but the Git index was just written
-        // (an agent working by absolute paths): not idle.
-        let index = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
-            .join("index");
+        // Idle by session activity, but `HEAD` was just written (a commit
+        // by an agent working by absolute paths): not idle.
+        let head = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
+            .join("HEAD");
         age_files(&worktree);
-        std::fs::File::open(&index)
+        std::fs::File::open(&head)
             .unwrap()
             .set_modified(std::time::SystemTime::now())
             .unwrap();
@@ -12856,6 +12856,9 @@ mod tests {
             "{recent:#?}"
         );
         assert!(worktree.join("node_modules").exists());
+        // The refusal is remembered for a while; new session activity
+        // arms the next checks.
+        idle_since(&mut broker, 5, 1);
 
         // A preparation running (its shared lock on the checkout): skipped,
         // not remembered as handled.
