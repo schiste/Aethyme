@@ -6589,3 +6589,10 @@ across a child process, a sleep or a network call.
 - Attachment `broker_db_busy_wait_by_holder`: `{<holder command>: {count,
   total_ms, max_ms}}` of time waited, keyed by the recorded holder's command
   surface read when the wait began (`unrecorded` when there was none).
+
+Gate admission phase telemetry records `gate_load_admission`, `gate_owner_lock_wait`,
+and `gate_resource_admission` separately on the admission loop. An immediate
+verification-slot probe can bypass that loop; missing spans do not imply zero
+wait. `gate_command_execution` records the gate command lifecycle separately,
+including setup (also recorded by `gate_command_setup`); spans overlap and must
+not be summed.
