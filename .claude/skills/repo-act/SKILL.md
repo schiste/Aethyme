@@ -897,6 +897,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
   accepts the prepared body.
+- When changing CLI help or flags, update the affected help snapshot and run
+  the `help_snapshots` suite before the full broker gate; inspect aliases too.
 - Before changing CLI advice commands, trace the public resolver, aliases and
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI
