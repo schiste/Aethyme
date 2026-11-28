@@ -31,6 +31,14 @@ jobs:
     # contract is judged on), but avoid rebuilding the checker for title-only
     # edits.
     if: github.event.action != 'edited' || github.event.changes.body || github.event.changes.base
+    # A newer push or body edit supersedes an in-flight run for the same PR. The
+    # group is on the job, not the workflow, so a title-only edit (whose job is
+    # skipped by the `if` above) never takes the group and cannot cancel a real
+    # run. The newest run always completes, and its check-run is the latest on
+    # the head SHA.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR (full history for diff)
