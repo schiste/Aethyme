@@ -1068,8 +1068,10 @@ impl Broker {
             Ok(false) => {}
             // A session idle for the artifact max age whose only unresolved
             // work is a command's receipt that has not been written for as
-            // long never settled; the open-file check below still sees a
-            // command that is in fact running in the checkout.
+            // long never settled. A guarded command that is in fact running
+            // is still caught below: by its artifact-use producer marker and
+            // lock (`checkout_busy` or `checkout_marker_live`) and by the
+            // working-directory and open-file check.
             Ok(true) => match receipt_stale_before_ms {
                 Some(stale_before) => {
                     match self.session_operations_unresolved_ignoring_stale_receipts(

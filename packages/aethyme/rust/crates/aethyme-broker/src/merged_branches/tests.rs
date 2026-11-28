@@ -664,6 +664,35 @@ fn the_slice_listing_answers_as_the_fresh_reading() {
     }
 }
 
+/// A retired spawned session keeps its branch for `recovery_archive_days`
+/// after cleanup even when its tombstone is gone.
+#[test]
+fn a_cleaned_spawned_session_keeps_its_branch_until_the_retention_age() {
+    let mut fixture = fixture();
+    let id = fixture.session("agent/retained", false);
+    let set = |completed: i64| {
+        fixture
+            .broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET origin = 'spawned', cleanup_completed_at = ?1 WHERE id = ?2",
+                rusqlite::params![completed, id],
+            )
+            .unwrap();
+    };
+    let judge = || {
+        let session = fixture.broker.store_ref().session(id).unwrap();
+        fixture
+            .broker
+            .has_restorable_state_with(&session, |_| Some(false))
+    };
+    set(crate::clock::epoch_ms() - 3_600_000);
+    assert_eq!(judge(), Some(true), "no tombstone, cleaned an hour ago");
+    set(crate::clock::epoch_ms() - 100 * 86_400_000);
+    assert_eq!(judge(), Some(false), "past the retention age");
+}
+
 /// An archive directory that cannot be listed is unknown, not empty: every
 /// branch that needs it is kept, and none is taken to the claimed re-judge.
 #[test]

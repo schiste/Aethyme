@@ -329,6 +329,21 @@ impl crate::Broker {
         if tombstone {
             return Some(true);
         }
+        // A retired checkout restores from its branch for as long as its
+        // tombstone may stand (`recovery_archive_days`), whether or not the
+        // tombstone is still there: removing one early (past the artifact
+        // max age) must not shorten the branch's retention.
+        if session.origin == crate::SessionOrigin::Spawned
+            && let Some(completed) = session.cleanup_completed_at
+        {
+            let days = crate::load_retention_policy(self.main_root())
+                .map(|policy| policy.recovery_archive_days)
+                .unwrap_or(90);
+            let age_ms = crate::clock::epoch_ms().saturating_sub(completed);
+            if days == 0 || age_ms < i64::from(days).saturating_mul(86_400_000) {
+                return Some(true);
+            }
+        }
         archived(&session.id.to_string())
     }
 

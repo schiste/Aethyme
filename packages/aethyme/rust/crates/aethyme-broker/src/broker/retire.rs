@@ -13303,4 +13303,96 @@ mod tests {
             "{later:#?}"
         );
     }
+
+    /// A session idle past the artifact max age ignores a guarded command's
+    /// stale receipt, but a command that is in fact running still holds the
+    /// checkout's artifact-use lock: the strip refuses as `checkout_busy`
+    /// and removes nothing. Mutation caught: letting the ignored receipt
+    /// skip the lock.
+    #[test]
+    fn a_live_guarded_command_with_an_old_receipt_still_refuses_as_checkout_busy() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let open = broker
+            .start_worktree("old receipt, live command", None)
+            .unwrap();
+        let worktree = PathBuf::from(&open.worktree_path);
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+             required_for_hooks = false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::write(
+            worktree.join("node_modules/.modules.yaml"),
+            "layoutVersion: 5\n",
+        )
+        .unwrap();
+        let receipt = broker.store().begin_guarded_exec_receipt(open.id).unwrap();
+        broker
+            .store()
+            .mark_guarded_exec_running(open.id, &receipt)
+            .unwrap();
+        let now = crate::clock::epoch_ms();
+        let long_ago = now - 48 * 3_600_000;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE guarded_exec_receipts SET created_at_ms = ?1, updated_at_ms = ?1 \
+                 WHERE receipt_id = ?2",
+                rusqlite::params![long_ago, receipt],
+            )
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![long_ago, open.id],
+            )
+            .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(40 * 3_600);
+        crate::worktree_status_activity::age_tree_for_test(&worktree, old);
+        let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+        for name in ["index", "HEAD"] {
+            std::fs::File::options()
+                .write(true)
+                .open(admin.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let crate::file_lock::artifact_use::ArtifactUseScopeAdmission::Admitted(_running) =
+            crate::file_lock::artifact_use::begin_artifact_use_scope(broker.main_root(), &worktree)
+                .unwrap()
+        else {
+            panic!("artifact-use scope admitted");
+        };
+        let far = Instant::now() + Duration::from_secs(600);
+        let mut run = broker
+            .begin_checkout_retirement_run(far)
+            .unwrap()
+            .expect("open paths resolve");
+        let report = broker.strip_idle_open_checkouts(&mut run, far, 100);
+        assert_eq!(
+            report.strip.refused.get("checkout_busy"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.strip.refused.get("operation_unresolved"),
+            None,
+            "{report:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+        crate::session_holder::set_process_use_snapshot_for_tests(None);
+    }
 }
