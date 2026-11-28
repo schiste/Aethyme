@@ -226,6 +226,12 @@ jobs:
           # all four cores instead of their bounds for shared workstations.
           AETHYME_GATE_BUILD_JOBS: "4"
           AETHYME_GATE_TEST_THREADS: "4"
+          # The broker refreshes the mtime of every tree file before a gate
+          # with a managed cache, so `cargo run` in cross-process-contract
+          # recompiled the workspace (102 s in run 46141192594) although the
+          # step above had just built it. The gate runs this binary, built
+          # from this same tree, when the variable names an executable.
+          AETHYME_CONTRACT_BIN: ${{ env.GATE_CACHE_DIR }}/debug/aethyme
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/gate-telemetry"

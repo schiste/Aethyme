@@ -361,6 +361,30 @@ fn main_gate_cache_is_the_contract_gates_managed_cache() {
     );
 }
 
+/// The broker refreshes source mtimes before a gate with a managed cache, so
+/// cargo rebuilds the workspace however warm the cache is. The contract gate
+/// must run the router Aethyme Gates built when one is offered, and the main
+/// job must offer it.
+#[test]
+fn contract_gate_runs_the_prebuilt_router_on_main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let policy = std::fs::read_to_string(root.join(".aethyme/gates.toml")).unwrap();
+    let gate = policy
+        .split("[[gate]]")
+        .find(|gate| gate.contains("name = \"cross-process-contract\""))
+        .unwrap();
+    assert!(gate.contains("[ -x \"${AETHYME_CONTRACT_BIN:-}\" ]"));
+    assert!(gate.contains("\"$AETHYME_CONTRACT_BIN\" broker check-contract"));
+    // The fallback still builds from the worktree under test.
+    assert!(gate.contains("cargo run --locked --quiet"));
+    let gates = workflow("aethyme-gates.yml");
+    let run = gates.find("      - name: Run all gates").unwrap();
+    assert!(gates[run..].contains("AETHYME_CONTRACT_BIN: ${{ env.GATE_CACHE_DIR }}/debug/aethyme"));
+}
+
 /// Failed nextest output must survive later passing doc/example output. The
 /// failure-only step adds diagnostics; it never changes gate selection/results.
 #[test]
@@ -883,6 +907,33 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
     assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
 }
 
+/// A release's macOS build restores `rust-tests-macos`, which only main saves,
+/// and no main run builds it. The nightly warms it with the same toolchain,
+/// cache block, environment and archive command.
+#[test]
+fn macos_nightly_warms_the_release_test_cache() {
+    let nightly = workflow("macos-nightly.yml");
+    let release = workflow("macos-tests.yml");
+    let warm = block(&nightly, "  macos-release-test-cache:").join("\n");
+    let build = block(&release, "  macos-tests-build:").join("\n");
+    assert!(warm.contains("runs-on: macos-15") && build.contains("runs-on: macos-15"));
+    for shared in [
+        "toolchain: stable",
+        "workspaces: packages/aethyme/rust",
+        "shared-key: rust-tests-macos",
+        "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        "run: ../scripts/test-like-ci.sh --archive \"$RUNNER_TEMP/rust-tests.tar.zst\"",
+        "uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+        "uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87",
+    ] {
+        assert!(warm.contains(shared), "nightly warm job lacks {shared}");
+        assert!(build.contains(shared), "release build lacks {shared}");
+    }
+    assert!(warm.contains("save-if: true"));
+    assert!(!warm.contains("needs:"));
+}
+
 /// Every release tag runs the workspace suite on macOS, with the commands of
 /// the Linux shards. It stays off pull requests and off merges to main (each
 /// merge queued a ~55 minute run nobody read) and is no required check.
@@ -1176,7 +1227,7 @@ fn contract_gate_uses_broker_comparison_base_when_supplied() {
         .lines()
         .find_map(|line| line.strip_prefix("command = '"))
         .unwrap();
-    let setup = command.split(" && cargo run").next().unwrap();
+    let setup = command.split(" && if [ -x").next().unwrap();
     let script = format!(
         "git() {{ case \"$1\" in merge-base) printf integration-base;; rev-parse) printf parent-base;; esac; }}; {setup}; printf '%s' \"$BASE\""
     );

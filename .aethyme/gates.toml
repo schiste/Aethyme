@@ -385,8 +385,14 @@ limit = 6
 # the list of sources read; it never passes by default. In a broker
 # session the decision still belongs in a commit message, which needs no
 # network.
+# 2026-11-28: the broker advances every tree file's mtime before a gate with a
+# managed cache (`refresh_source_mtimes`, issue #391), so cargo always rebuilds
+# the workspace crates and the vendored libsqlite3-sys, and `cargo run` spent
+# ~100 s on main even with the cache warm. When `AETHYME_CONTRACT_BIN` names an
+# executable (Aethyme Gates sets it to the router it just built from this same
+# tree), the gate runs it; everywhere else it still builds from the worktree.
 name = "cross-process-contract"
-command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="${AETHYME_GATE_BASE_COMMIT:-$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)}" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --commit-messages --merged-pr'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="${AETHYME_GATE_BASE_COMMIT:-$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)}" && if [ -x "${AETHYME_CONTRACT_BIN:-}" ]; then "$AETHYME_CONTRACT_BIN" broker check-contract --base "$BASE" --commit-messages --merged-pr; else cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --commit-messages --merged-pr; fi'
 cost = 1
 cache = false
 timeout_seconds = 300

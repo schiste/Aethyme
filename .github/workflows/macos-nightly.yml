@@ -65,6 +65,50 @@ jobs:
       - name: Run doctests
         run: cargo test --locked --workspace --doc
 
+  # Warms the `rust-tests-macos` cache that macos-tests.yml restores on a
+  # release tag. That workflow saves it only from main, and it runs on tags
+  # and on request only, so nothing ever saved it: v0.8.189 found "No cache
+  # found" and compiled 327 crates in 1035 s. Same runner, toolchain, cache
+  # block, env and archive command as its macos-tests-build job; keep them
+  # equal. Independent of the jobs above and below, so a red one blocks nothing.
+  macos-release-test-cache:
+    name: Warm the macOS release test cache
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests-macos
+          save-if: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # Set on this step only: rust-cache keys on CARGO_* variables present when
+      # it restores.
+      - name: Build the test archive
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: ../scripts/test-like-ci.sh --archive "$RUNNER_TEMP/rust-tests.tar.zst"
+
   rust-coverage-linux:
     name: Rust workspace coverage (Linux)
     runs-on: ubuntu-latest
