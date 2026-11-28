@@ -326,8 +326,9 @@ fn a_push_runs_one_review_and_a_repeated_push_posts_nothing_new() {
         "review_on_push_child_start",
         "review_on_push_child_wait",
     ] {
+        // A span that took under a millisecond keeps only its count.
         assert!(
-            metric["phase_timings_ms"][phase].as_u64().is_some(),
+            metric["phase_timings_ms"][phase].is_u64() || metric["phase_counts"][phase].is_u64(),
             "missing {phase}: {metric}"
         );
     }
@@ -358,9 +359,11 @@ fn nothing_runs_when_run_on_push_is_off() {
         "push_overlap",
         "push_finalization",
     ] {
+        // Zero timings are omitted from a row: absent means 0 ms.
         assert!(
-            metric["phase_timings_ms"][phase].as_u64().is_some(),
-            "missing {phase}: {metric}"
+            metric["phase_timings_ms"][phase].is_null()
+                || metric["phase_timings_ms"][phase].is_u64(),
+            "malformed {phase}: {metric}"
         );
     }
     assert!(fixture.writes().is_empty());

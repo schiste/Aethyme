@@ -374,11 +374,18 @@ fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
     );
     for line in &lines {
         assert!(
-            line["phase_counts"]["subprocess_git"].as_u64().unwrap() >= 1,
+            line["phase_counts"]["subprocess_git"].as_u64().unwrap_or(1) >= 1,
             "every command here runs Git: {line}"
         );
-        assert!(line["phase_timings_ms"]["subprocess_git"].is_u64());
-        assert!(line["phase_counts"]["broker_open"].as_u64().unwrap() >= 1);
+        // Absent means 0 ms and, beside a timing, one occurrence.
+        assert!(
+            line["phase_timings_ms"]["subprocess_git"].is_u64()
+                || line["phase_counts"]["subprocess_git"].is_u64()
+        );
+        assert!(
+            line["phase_timings_ms"]["broker_open"].is_u64()
+                || line["phase_counts"]["broker_open"].is_u64()
+        );
     }
     assert!(lines.iter().any(|line| line["command"] != "start"));
 }
@@ -443,19 +450,12 @@ fn every_status_form_runs_the_gc_service_check_and_names_its_mode() {
             .rfind(|line| line["command"] == "status")
             .unwrap();
         assert_eq!(
-            status["phase_counts"]["status_gc_service_runtime"].as_u64(),
-            Some(1),
+            phase_count(&status, "status_gc_service_runtime"),
+            1,
             "{args:?}: {status}"
         );
-        assert_eq!(
-            status["phase_counts"][mode].as_u64(),
-            Some(1),
-            "{args:?}: {status}"
-        );
-        assert!(
-            status["phase_counts"][other].is_null(),
-            "{args:?}: {status}"
-        );
+        assert_eq!(phase_count(&status, mode), 1, "{args:?}: {status}");
+        assert_eq!(phase_count(&status, other), 0, "{args:?}: {status}");
     }
 }
 
@@ -489,15 +489,7 @@ fn a_session_status_metric_line_names_each_step_of_the_view() {
         "status_session_stack",
         "status_session_render",
     ] {
-        assert_eq!(
-            status["phase_counts"][phase].as_u64(),
-            Some(1),
-            "{phase}: {status}"
-        );
-        assert!(
-            status["phase_timings_ms"][phase].is_u64(),
-            "{phase}: {status}"
-        );
+        assert_eq!(phase_count(&status, phase), 1, "{phase}: {status}");
     }
     // Inside the peer view, coordination and blockers.
     for phase in [
@@ -514,10 +506,7 @@ fn a_session_status_metric_line_names_each_step_of_the_view() {
         "blockers_resource_leases",
         "blockers_pidfiles",
     ] {
-        assert!(
-            status["phase_counts"][phase].as_u64() >= Some(1),
-            "{phase}: {status}"
-        );
+        assert!(phase_count(&status, phase) >= 1, "{phase}: {status}");
     }
 }
 
@@ -562,4 +551,12 @@ fn status_names_an_object_store_with_many_loose_objects() {
             .unwrap()
             .ends_with("gc --no-prune")
     );
+}
+
+/// How many times a span or counter ran, from a command-metrics row. Rows omit
+/// what is implied: a missing count is 1 beside a timing and 0 without one.
+fn phase_count(row: &serde_json::Value, name: &str) -> u64 {
+    row["phase_counts"][name]
+        .as_u64()
+        .unwrap_or_else(|| u64::from(row["phase_timings_ms"][name].is_u64()))
 }

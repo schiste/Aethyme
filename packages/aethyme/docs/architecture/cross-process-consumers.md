@@ -4145,6 +4145,35 @@ one can exceed `duration_ms` and they must not be added together. The set
 grows; consumers must ignore names they do not know. Spans never cause a
 read-only command to write a metric line.
 
+Command metric rows omit what a reader can infer (absent means the omitted
+value; no key is renamed). Written by `compact_row_fields` in
+`aethyme-broker/src/cli/telemetry.rs` for every row (normal, interrupted and
+hook rows), in the unreleased 0.8.188. Measured on a busy repository's 2026-11 log: rows
+averaged 3.3 KB, 81% of it `phase_timings_ms` and `phase_counts` (about 44 long
+key names each, nearly half of the timings zero and most counts exactly 1). A
+sanitized set of an `exec`, a `status`, a `prepare` and a `gc` row (the
+fixture `cli/telemetry_fixtures/representative_rows.jsonl`) shrinks from 38,438
+to about 26,900 bytes in total (exec rows about 39%, gc 31%, status 32%,
+prepare 19%); the unit test fails if the total reduction falls under 25%.
+
+- A `phase_timings_ms` entry of 0 is omitted: a missing timing is 0 ms.
+- A `phase_counts` entry of 0 is omitted: a missing count is 0 when the name
+  has no timing.
+- A `phase_counts` entry of 1 is omitted when the same name has a (nonzero)
+  `phase_timings_ms` entry: a timed span ran once. A missing count is
+  therefore 1 beside a timing. A span or counter that ran once in under a
+  millisecond keeps its `phase_counts` entry of 1, which is the only record
+  that it ran; counts above 1 are always kept.
+- Null fields and empty objects or arrays are omitted at any depth (for
+  example `session_id` with no session, `caller_hint`, `over_budget_phases`
+  when nothing was over budget, `by_kind` objects with no kinds). A reader
+  treats a missing field as null or empty; `row["x"].as_array()` must fall
+  back to an empty list.
+
+Consumers that sum timings (`aethyme broker advanced scoreboard`) are
+unaffected: a missing timing adds 0. Consumers that test whether a span ran
+must look at both maps: `phase_counts[name]` or `phase_timings_ms[name]`.
+
 Submit command metrics add `phase_timings_ms` for broker opening, contract
 preflight, ownership auditing, planning, merge simulation, verification slot
 wait, verification checkout setup, graph and gate selection, gate execution,

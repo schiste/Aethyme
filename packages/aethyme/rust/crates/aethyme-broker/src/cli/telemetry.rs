@@ -487,6 +487,7 @@ pub(super) fn command_metric_line(
         }
     };
     details.insert("outcome".into(), serde_json::json!(outcome));
+    compact_row_fields(&mut details);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -602,6 +603,49 @@ pub(super) fn with_spans(
         named.entry(name).or_insert(count.into());
     }
     fields
+}
+
+/// Drop what a reader can recompute, so a row carries only information.
+/// Absent means the same as the dropped value, and no key is renamed:
+///
+/// - a `phase_timings_ms` entry of 0 is dropped (a span that ran in under a
+///   millisecond keeps its `phase_counts` entry, which says it ran);
+/// - a `phase_counts` entry of 0 is dropped, and so is one of 1 whose name
+///   still has a `phase_timings_ms` entry (a timed span ran once);
+/// - null fields and empty objects or arrays are dropped, at any depth.
+///
+/// Readers therefore take a missing timing as 0, and a missing count as 1
+/// when the name has a timing and 0 when it has none.
+pub(super) fn compact_row_fields(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(serde_json::Value::Object(timings)) = fields.get_mut("phase_timings_ms") {
+        timings.retain(|_, value| value.as_u64() != Some(0));
+    }
+    let timed: std::collections::BTreeSet<String> = match fields.get("phase_timings_ms") {
+        Some(serde_json::Value::Object(timings)) => timings.keys().cloned().collect(),
+        _ => Default::default(),
+    };
+    if let Some(serde_json::Value::Object(counts)) = fields.get_mut("phase_counts") {
+        counts.retain(|name, value| match value.as_u64() {
+            Some(0) => false,
+            Some(1) => !timed.contains(name),
+            _ => true,
+        });
+    }
+    prune_empty(fields);
+}
+
+fn prune_empty(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    for value in fields.values_mut() {
+        if let serde_json::Value::Object(inner) = value {
+            prune_empty(inner);
+        }
+    }
+    fields.retain(|_, value| match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(inner) => !inner.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => true,
+    });
 }
 
 /// The object at `key`, created when absent. Every reader of these rows
@@ -1144,5 +1188,95 @@ mod tests {
 
         let gc_apply = ["gc", "apply"].map(str::to_string);
         assert!(command_metric_enabled(&gc_apply, false, false));
+    }
+
+    /// Real row shapes (an `exec`, a `status`, a `prepare` and a `gc`; paths,
+    /// ids and hashes replaced by placeholders), as written before compaction.
+    const REPRESENTATIVE_ROWS: &str = include_str!("telemetry_fixtures/representative_rows.jsonl");
+
+    fn effective(
+        row: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::collections::BTreeMap<String, (u64, u64)> {
+        let get = |field: &str| {
+            row.get(field)
+                .and_then(|value| value.as_object())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (timings, counts) = (get("phase_timings_ms"), get("phase_counts"));
+        let mut names: std::collections::BTreeSet<&String> = timings.keys().collect();
+        names.extend(counts.keys());
+        names
+            .into_iter()
+            .map(|name| {
+                let ms = timings.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+                // Absent count: 1 when the name has a timing, else 0.
+                let count = counts
+                    .get(name)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::from(timings.contains_key(name)));
+                (name.clone(), (ms, count))
+            })
+            .filter(|(_, (ms, count))| *ms != 0 || *count != 0)
+            .collect()
+    }
+
+    #[test]
+    fn compaction_keeps_every_phase_fact_and_shrinks_representative_rows() {
+        let (mut before_total, mut after_total) = (0usize, 0usize);
+        for line in REPRESENTATIVE_ROWS.lines() {
+            let original: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            let mut compacted = original.clone();
+            super::compact_row_fields(&mut compacted);
+
+            // Same timings and counts once absent is read as 0 (or 1 beside a timing).
+            assert_eq!(effective(&compacted), effective(&original), "{line}");
+            // Nothing a reader branches on moved.
+            for field in ["ts", "command", "duration_ms", "exit", "outcome", "cpu_ms"] {
+                assert_eq!(compacted.get(field), original.get(field), "{field}");
+            }
+            let json = serde_json::Value::Object(compacted.clone());
+            assert!(!json.to_string().contains("null"), "{json}");
+            assert!(!json.to_string().contains("{}") && !json.to_string().contains("[]"));
+
+            let before = line.len();
+            let after = serde_json::to_string(&compacted).unwrap().len();
+            assert!(after * 100 <= before * 90, "{before} -> {after}: {line}");
+            before_total += before;
+            after_total += after;
+        }
+        eprintln!("representative rows: {before_total} -> {after_total} bytes");
+        // Measured at 38438 -> about 26900: the entries that only said
+        // "zero" or "once" are gone, and counters that ran once without a
+        // measurable time stay as the only record that they ran.
+        assert!(
+            after_total * 100 <= before_total * 75,
+            "{before_total} -> {after_total}"
+        );
+    }
+
+    #[test]
+    fn compaction_drops_zero_and_implied_entries_only() {
+        let mut fields = serde_json::json!({
+            "session_id": null,
+            "empty": {},
+            "list": [],
+            "nested": {"keep": 0, "gone": null, "also_gone": {}},
+            "phase_timings_ms": {"timed_once": 7, "timed_twice": 9, "zero_once": 0, "zero_never": 0},
+            "phase_counts": {"timed_once": 1, "timed_twice": 2, "zero_once": 1, "zero_never": 0, "plain": 3},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        super::compact_row_fields(&mut fields);
+        assert_eq!(
+            serde_json::Value::Object(fields),
+            serde_json::json!({
+                "nested": {"keep": 0},
+                "phase_timings_ms": {"timed_once": 7, "timed_twice": 9},
+                "phase_counts": {"timed_twice": 2, "zero_once": 1, "plain": 3},
+            })
+        );
     }
 }
