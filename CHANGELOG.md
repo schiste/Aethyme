@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.189] - 2026-11-28
+
+### Changed
+
+- Sessions idle past the artifact max age (24 h) now actually lose their dependency trees. On the busiest repository 143 idle-strip passes in a day examined 657 checkouts and stripped none: refusals were not remembered, so the same oldest sessions headed every pass; guarded-exec receipts left `running` by killed commands blocked 91 sessions forever; and a `backend/.venv` whose interpreter was not declared was never proven removable (566 kept, 0 removed). Now a stale receipt older than the max age no longer blocks an idle session (the artifact-use marker and the open-file and working-directory checks still protect a running command), six refusal kinds back off for 2 h unless the session's activity moves, an environment root is removable when the session's last completed preparation created its `pyvenv.cfg`, and pacing scales with the backlog and yields to installs and gates. A stripped session re-prepares on next use. About 835 idle sessions were waiting, each holding roughly 0.5–2 GB of `node_modules` and `.venv` (#2076).
+- A cleaned session's `ARCHIVED-SESSION.txt` tombstone folder is removed after the max age when restore does not need it; its branch stays protected until `recovery_archive_days` either way (#2076).
+- Command-metrics rows omit zero phase timings and counts, a count of 1 beside a timing, and null or empty fields; absent means zero, empty, or one occurrence beside a timing. Sampled rows shrink about 30% (exec rows 39%); the busiest repository writes 65–89 MB of metrics a day (#2073).
+- The generated agent policy is back under its 1,200-token budget (#2074).
+
+### Added
+
+- `storage status` estimates checkout bytes per worktree root (`checkouts.open_checkouts`, `sampled_checkouts`, `estimated_checkout_bytes`), from paced samples of regenerable trees; before, checkouts were counted but never sized (#2076).
+- Counters `checkout_idle_strip_skipped_backoff`, `_stale_receipts_ignored`, `_covered_environment_root_recorded`, `_yielded_to_foreground`, `_backlog_floor`; spans `checkout_idle_strip_foreground_check`, `_estimate` (#2076).
+
+### Build and release
+
+- Main's Aethyme Gates prebuild and cache the managed cache the cross-process-contract gate actually uses (`rust-contract-v1`) instead of a directory the gate never read, so the gate no longer rebuilds the CLI from a cold target dir. Warm, the "Run all gates" job drops from 6m02 to about 3m (#2077).
+- A push to main that changes the agent-policy templates runs the enhance tests, so a policy over its token budget can no longer turn main red unnoticed (#2075).
+- `profile_open.py` reads compacted metrics rows (#2075).
+
+### Upgrade notes
+
+- Readers of command-metrics rows must treat a missing phase timing or count as 0 (or a count of 1 beside a timing) and a missing field as null or empty (#2073).
+- The first day after upgrade re-examines every idle session once; expect heavy but paced deletion of `node_modules` and `.venv` from sessions idle more than 24 h (#2076).
+
 ## [0.8.188] - 2026-11-27
 
 ### Added
