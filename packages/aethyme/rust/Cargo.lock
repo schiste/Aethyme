@@ -84,6 +84,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aethyme-contract-check"
+version = "0.8.188"
+dependencies = [
+ "regex",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "aethyme-contracts"
 version = "0.8.188"
 dependencies = [

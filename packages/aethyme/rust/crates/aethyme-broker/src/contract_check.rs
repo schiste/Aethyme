@@ -97,7 +97,7 @@ const REMOVAL_MARKERS: &[&str] = &["do not run", "not a valid command", "was rem
 
 const USAGE: &str = "\
 usage: aethyme broker check-contract [--base <ref>] [--pr-body <file>]
-                                     [--commit-messages] [--merged-pr]
+                                     [--commit-messages] [--merged-pr] [--committed]
                                      [--consumers-doc <file>]
 
 Refuse diffs that remove cross-process symbols without a declared
@@ -106,6 +106,7 @@ contract decision.
   --base <ref>            base ref to diff against (default: origin/main)
   --pr-body <file>        file containing the PR body (or any text),
                           parsed for the contract decision
+  --committed             compare base to HEAD instead of the working tree
   --commit-messages       also read the messages of the commits in
                           <base>..HEAD
   --merged-pr             when no other source declares a decision, ask
@@ -124,6 +125,7 @@ struct Args {
     pr_body: Option<PathBuf>,
     commit_messages: bool,
     merged_pr: bool,
+    committed: bool,
     consumers_doc: Option<PathBuf>,
 }
 
@@ -189,7 +191,7 @@ pub fn run(args: &[String]) -> u8 {
         return 1;
     }
 
-    let diff_lines = match read_diff(&repo_root, &parsed.base) {
+    let diff_lines = match read_requested_diff(&repo_root, &parsed.base, parsed.committed) {
         Ok(lines) => lines,
         Err(message) => {
             eprintln!("ERROR: {message}");
@@ -407,6 +409,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         pr_body: None,
         commit_messages: false,
         merged_pr: false,
+        committed: false,
         consumers_doc: None,
     };
     let mut index = 0;
@@ -427,6 +430,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                         .ok_or_else(|| "--pr-body requires a value".to_string())?,
                 ));
             }
+            "--committed" => parsed.committed = true,
             "--commit-messages" => parsed.commit_messages = true,
             "--merged-pr" => parsed.merged_pr = true,
             "--consumers-doc" => {
@@ -627,6 +631,20 @@ fn is_excluded(token: &str) -> bool {
         return true;
     }
     token.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The broker checks an immutable merged candidate; ordinary invocations must
+/// continue to inspect staged and unstaged work as well.
+fn read_requested_diff(
+    repo_root: &Path,
+    base: &str,
+    committed: bool,
+) -> Result<Vec<String>, String> {
+    if committed {
+        read_diff_between(repo_root, base, "HEAD")
+    } else {
+        read_diff(repo_root, base)
+    }
 }
 
 /// Return the unified diff of the working tree against `base`.
@@ -1952,6 +1970,65 @@ mod tests {
     #[test]
     fn parse_contract_decision_handles_empty_body() {
         assert_eq!(parse_contract_decision(""), None);
+    }
+
+    #[test]
+    fn committed_diff_ignores_uncommitted_edits_but_default_keeps_them() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let mut command = crate::git::git_command();
+            crate::git::remove_git_environment(&mut command);
+            let output = command
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked"), "base\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(repo.path().join("tracked"), "committed\n").unwrap();
+        git(&["commit", "-qam", "candidate"]);
+        std::fs::write(repo.path().join("tracked"), "staged\n").unwrap();
+        git(&["add", "tracked"]);
+        let staged = read_requested_diff(repo.path(), "HEAD^", false)
+            .unwrap()
+            .join("\n");
+        assert!(staged.contains("+staged"));
+        std::fs::write(repo.path().join("tracked"), "uncommitted\n").unwrap();
+
+        let committed = read_requested_diff(repo.path(), "HEAD^", true)
+            .unwrap()
+            .join("\n");
+        let working = read_requested_diff(repo.path(), "HEAD^", false)
+            .unwrap()
+            .join("\n");
+        assert!(committed.contains("+committed"));
+        assert!(!committed.contains("+uncommitted"));
+        assert!(working.contains("+uncommitted"));
+        assert!(
+            parse_args(&["--committed".into()])
+                .unwrap()
+                .unwrap()
+                .committed
+        );
+        assert!(!parse_args(&[]).unwrap().unwrap().committed);
     }
 
     #[test]
