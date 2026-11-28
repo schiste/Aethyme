@@ -395,11 +395,15 @@ evidence. Check overlapping work before duplicating it. Path leases only
 inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
+Read-only investigations can use an existing checkout without a broker session
+or separate worktree. Check its revision and report any freshness limitation.
+Start a session before editing.
+
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
    session's worktree.
-   Before running repository tools or audits, check the session's preparation
-   status and follow its `next_action` when dependencies are required:
+   In a session, before running tools that need dependencies, check its
+   preparation status and follow its `next_action`:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
    Builds, temp files, logs and checkouts go in its `scratch_dir`, never `/tmp`.
@@ -435,11 +439,15 @@ evidence. Check overlapping work before duplicating it. Path leases only
 inform: they never block edits or submit. Reconcile before merging and
 resolve blockers and refusals.
 
+Read-only investigations can use an existing checkout without a broker session
+or separate worktree. Check its revision and report any freshness limitation.
+Start a session before editing.
+
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
    session's worktree.
-   Before running repository tools or audits, check the session's preparation
-   status and follow its `next_action` when dependencies are required:
+   In a session, before running tools that need dependencies, check its
+   preparation status and follow its `next_action`:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
    Builds, temp files, logs and checkouts go in its `scratch_dir`, never `/tmp`.
@@ -709,8 +717,8 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
-   Before running repository tools or audits, inspect the session's preparation
-   status and follow its `next_action` when dependencies are required:
+   In a session, before running tools that need dependencies, inspect its
+   preparation status and follow its `next_action`:
    `aethyme broker submit prepare status --session <your-session-id> --json`.
    Worktrees do not inherit ignored dependencies such as `node_modules/` or
    `.venv/` from the main checkout; preparation is explicit.
@@ -1667,6 +1675,17 @@ mod tests {
     }
 
     #[test]
+    fn both_broker_protocols_allow_read_only_work_without_a_session() {
+        for protocol in [PUSHING_PROTOCOL, NON_PUSHING_PROTOCOL] {
+            assert!(protocol.contains(
+                "Read-only investigations can use an existing checkout without a broker session"
+            ));
+            assert!(protocol.contains("Start a session before editing."));
+            assert!(!protocol.contains("Before running repository tools or audits"));
+        }
+    }
+
+    #[test]
     fn broker_section_gated_on_config() {
         let repo = fixture_repo("broker");
         let doc = render_agents_document(Some(&repo)).unwrap();
@@ -1684,7 +1703,9 @@ mod tests {
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
             "Never edit another\n   session's worktree.",
-            "Before running repository tools or audits, check the session's preparation",
+            "Read-only investigations can use an existing checkout without a broker session",
+            "Start a session before editing.",
+            "before running tools that need dependencies, check its",
             "aethyme broker submit prepare status --session <id> --json",
             "do not assume a fresh worktree has installed dependencies.",
             "Builds, temp files, logs and checkouts go in its `scratch_dir`, never `/tmp`.",
