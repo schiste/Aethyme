@@ -903,6 +903,23 @@ pub struct CheckoutCounts {
     pub sessions_created_today: usize,
     #[serde(default)]
     pub checkouts_retired_today: usize,
+    /// The repository's worktree root (the directory holding its checkouts).
+    #[serde(default)]
+    pub worktree_root: String,
+    /// Open sessions' checkouts, how many of them the idle strip has
+    /// measured, the bytes of regenerable directories (dependency trees)
+    /// measured in those, and the estimate for all of them: the measured
+    /// bytes plus the mean of the measured checkouts still holding bytes for
+    /// each one not measured. Measured in small, paced slices by the idle
+    /// strip, never in one walk; checkout files Git tracks are not counted.
+    #[serde(default)]
+    pub open_checkouts: usize,
+    #[serde(default)]
+    pub sampled_checkouts: usize,
+    #[serde(default)]
+    pub measured_checkout_bytes: u64,
+    #[serde(default)]
+    pub estimated_checkout_bytes: u64,
 }
 
 /// One repository's recorded counts, with the repository it names.

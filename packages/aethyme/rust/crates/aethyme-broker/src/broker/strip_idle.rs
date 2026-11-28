@@ -85,10 +85,49 @@ pub(crate) const IDLE_STRIP_RULES_KEY: &str = "checkout_strip.idle_done_rules";
 /// The current coverage rules; bump it whenever what the idle strip may
 /// remove from an open session widens. 2: environment roots whose
 /// interpreter a step declares, and pnpm workspace members with their root.
-pub(crate) const IDLE_STRIP_RULES: u32 = 2;
+/// 3: environment roots a recorded preparation created, and receipts of
+/// commands that never settled no longer keep a session idle for the
+/// artifact max age.
+pub(crate) const IDLE_STRIP_RULES: u32 = 3;
 /// Meta key: open sessions the idle strip handled once idle for the artifact
 /// max age (JSON: session id to the `last_activity_at` it saw).
 pub(crate) const IDLE_STRIP_MAX_AGE_DONE_KEY: &str = "checkout_strip.idle_max_age_done";
+/// Meta key: open sessions the idle strip refused for a reason that lasts
+/// (JSON: session id to `[last_activity_at, refused_at_ms]`). Such a session
+/// is not examined again for [`IDLE_STRIP_REFUSAL_BACKOFF_MS`] unless its
+/// activity moves, so the oldest sessions, which sort first, cannot keep the
+/// whole pass to themselves (on the busiest repository 143 passes in a day
+/// re-examined the same refused sessions and stripped none).
+pub(crate) const IDLE_STRIP_REFUSED_KEY: &str = "checkout_strip.idle_refused";
+/// Meta key: idle open sessions still waiting after the last pass (JSON
+/// integer); the retirement run reads it to give a large backlog a larger
+/// share of its window.
+pub(crate) const IDLE_STRIP_BACKLOG_KEY: &str = "checkout_strip.idle_backlog";
+/// Meta key: bytes of regenerable directories measured in an open session's
+/// checkout (JSON: session id to bytes, `0` once stripped).
+pub(crate) const IDLE_STRIP_SAMPLES_KEY: &str = "checkout_strip.idle_samples";
+/// Meta key: the last [`CheckoutByteEstimate`] (JSON), shown by `storage
+/// status`.
+pub(crate) const IDLE_STRIP_ESTIMATE_KEY: &str = "checkout_strip.byte_estimate";
+/// How long a lasting refusal keeps a session from being examined again.
+const IDLE_STRIP_REFUSAL_BACKOFF_MS: i64 = 2 * 3_600_000;
+/// Refusals that outlast a pass and cost time to reach (the session is
+/// examined again once the backoff ends, or its activity moves). Every other
+/// refusal (a process in the checkout, a preparation running, recent file
+/// activity, a transient one) is judged again at the next pass.
+const BACKOFF_REFUSALS: &[&str] = &[
+    "operation_unresolved",
+    "operations_unknown",
+    "gates_unknown",
+    "activity_unknown",
+    "checkout_missing",
+    "discovery_failed",
+];
+/// Checkouts examined per pass while foreground work (an install, a gate)
+/// writes on the checkouts' volume: the strip competes with it for the disk.
+const IDLE_STRIP_FOREGROUND_CAP: usize = 3;
+/// Remembered measurements at most; the lowest ids go first.
+const IDLE_STRIP_SAMPLES_MAX: usize = 16_384;
 /// Remembered sessions at most; the lowest ids go first.
 const IDLE_STRIP_DONE_MAX: usize = 16_384;
 /// Open sessions the idle strip lists per run, at most (each costs a few
@@ -119,6 +158,12 @@ pub(crate) struct IdleStripReport {
     pub skipped_handled: usize,
     /// Sessions given the note this run.
     pub noted: usize,
+    /// Idle sessions not examined because a lasting refusal is still
+    /// within its backoff.
+    pub skipped_backoff: usize,
+    /// Bytes of regenerable directories measured per examined session this
+    /// pass (what stayed after the strip).
+    pub samples: BTreeMap<i64, u64>,
     /// Idle sessions kept because a recent file-system modification time
     /// shows someone working in the checkout.
     pub kept_recent_files: usize,
@@ -146,9 +191,10 @@ pub(crate) struct KindTally {
 }
 
 /// The longest one checkout's byte measurement may take.
-const IDLE_STRIP_MEASURE_BUDGET: Duration = Duration::from_secs(2);
-/// The longest all byte measurements of one pass may take together.
-const IDLE_STRIP_MEASURE_PASS_BUDGET: Duration = Duration::from_secs(6);
+const IDLE_STRIP_MEASURE_BUDGET: Duration = Duration::from_secs(1);
+/// The longest all byte measurements of one pass may take together (the
+/// measurement is telemetry; the time belongs to the strip).
+const IDLE_STRIP_MEASURE_PASS_BUDGET: Duration = Duration::from_secs(3);
 
 /// How a catalogued directory is covered by the session's preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +227,7 @@ pub(crate) fn rebuilt_on_demand(
 
 /// The host's artifact max age in milliseconds, `None` when it is off or
 /// the host state directory is unknown.
-fn artifact_max_age_ms(host_state: Option<&Path>) -> Option<i64> {
+pub(super) fn artifact_max_age_ms(host_state: Option<&Path>) -> Option<i64> {
     let (budgets, _) = crate::storage_ledger::Budgets::load(host_state?);
     budgets
         .artifact_max_age()
@@ -595,6 +641,85 @@ pub(crate) fn recent_file_activity(
     }
 }
 
+/// What the open sessions' checkouts hold in regenerable directories, as far
+/// as the idle strip's paced measurements reach (see
+/// [`estimate_open_checkout_bytes`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CheckoutByteEstimate {
+    /// The worktree root (the directory holding the checkouts).
+    pub worktree_root: String,
+    /// Open sessions of this repository.
+    pub open_checkouts: usize,
+    /// Of those, the ones with a measurement.
+    pub sampled: usize,
+    /// Bytes measured across the sampled ones.
+    pub measured_bytes: u64,
+    /// `measured_bytes` plus the mean of the sampled checkouts still holding
+    /// directories for every checkout not sampled.
+    pub estimated_bytes: u64,
+    pub observed_at_ms: i64,
+}
+
+/// The estimate for `open` sessions from `samples` (session id to measured
+/// bytes, `0` for a stripped one). A session without a measurement counts
+/// as the mean of the measured sessions that still hold bytes: the sessions
+/// examined first are the oldest, so a stripped one is no sign of what the
+/// rest hold.
+pub(crate) fn estimate_open_checkout_bytes(
+    open: &[i64],
+    samples: &BTreeMap<i64, u64>,
+) -> CheckoutByteEstimate {
+    let measured: Vec<u64> = open
+        .iter()
+        .filter_map(|id| samples.get(id))
+        .copied()
+        .collect();
+    let holding: Vec<u64> = measured
+        .iter()
+        .copied()
+        .filter(|bytes| *bytes > 0)
+        .collect();
+    let measured_bytes = measured
+        .iter()
+        .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
+    let mean = if holding.is_empty() {
+        0
+    } else {
+        holding
+            .iter()
+            .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes))
+            / u64::try_from(holding.len()).unwrap_or(u64::MAX).max(1)
+    };
+    let unsampled = u64::try_from(open.len().saturating_sub(measured.len())).unwrap_or(u64::MAX);
+    CheckoutByteEstimate {
+        worktree_root: String::new(),
+        open_checkouts: open.len(),
+        sampled: measured.len(),
+        measured_bytes,
+        estimated_bytes: measured_bytes.saturating_add(mean.saturating_mul(unsampled)),
+        observed_at_ms: 0,
+    }
+}
+
+/// Whether the Python environment at `relative` was created by the
+/// preparation that ran in `window` (epoch ms, start and completion): its
+/// `pyvenv.cfg`, which only creating the environment writes, is dated inside
+/// it. A step that declares files inside the environment but not its
+/// interpreter may only install into an environment made elsewhere; one that
+/// created it can create it again.
+pub(crate) fn environment_created_in(worktree: &Path, relative: &str, window: (i64, i64)) -> bool {
+    const SLACK_MS: i64 = 2_000;
+    std::fs::metadata(worktree.join(relative).join("pyvenv.cfg"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .is_some_and(|modified| {
+            modified >= window.0.saturating_sub(SLACK_MS)
+                && modified <= window.1.saturating_add(SLACK_MS)
+        })
+}
+
 impl Broker {
     /// Strip catalogued regenerable directories from open sessions idle
     /// past `[cleanup] idle_strip_after_hours`, oldest activity first, at
@@ -616,21 +741,43 @@ impl Broker {
         }
         let deadline = deadline.min(run.deadline());
         let now_ms = crate::clock::epoch_ms();
-        let mut idle = match self.store_ref().live_sessions() {
+        let open: Vec<Session> = match self.store_ref().live_sessions() {
             Ok(sessions) => sessions
                 .into_iter()
                 .filter(|session| {
                     session.cleanup_state == crate::SessionCleanupState::Open
                         && session.origin == crate::SessionOrigin::Spawned
-                        && now_ms.saturating_sub(session.last_activity_at) >= idle_after_ms
                 })
-                .collect::<Vec<_>>(),
+                .collect(),
             Err(error) => {
                 crate::warn_unrecorded::<(), _>("list idle open sessions", Err(error));
                 return report;
             }
         };
+        let mut idle = open
+            .iter()
+            .filter(|session| now_ms.saturating_sub(session.last_activity_at) >= idle_after_ms)
+            .cloned()
+            .collect::<Vec<_>>();
         idle.sort_by_key(|session| (session.last_activity_at, session.id));
+        // Foreground work (an install, a gate) writing on the checkouts'
+        // volume has the disk first: examine only a few this pass.
+        let cap = {
+            let _span = crate::phase_telemetry::span("checkout_idle_strip_foreground_check");
+            let device = idle
+                .first()
+                .and_then(|session| Path::new(&session.worktree_path).parent())
+                .and_then(crate::foreground_io::device_of);
+            if device.is_some_and(|device| crate::foreground_io::active_on(&[device])) {
+                crate::phase_telemetry::add(
+                    "checkout_idle_strip_yielded_to_foreground",
+                    Duration::ZERO,
+                );
+                cap.min(IDLE_STRIP_FOREGROUND_CAP)
+            } else {
+                cap
+            }
+        };
         // A memo written under older coverage rules is set aside: every
         // idle session is examined once more under the current ones.
         let rules: u32 = self.meta_json(IDLE_STRIP_RULES_KEY);
@@ -644,11 +791,14 @@ impl Broker {
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let idle_hours = idle_after_ms / 3_600_000;
         let max_age_ms = artifact_max_age_ms(self.storage_context().host_state_dir.as_deref());
-        let handled_max_age: BTreeMap<i64, i64> = if max_age_ms.is_some() {
+        let handled_max_age: BTreeMap<i64, i64> = if max_age_ms.is_some() && !memo_outdated {
             self.meta_json(IDLE_STRIP_MAX_AGE_DONE_KEY)
         } else {
             BTreeMap::new()
         };
+        let refused_before: BTreeMap<i64, (i64, i64)> = self.meta_json(IDLE_STRIP_REFUSED_KEY);
+        let mut newly_refused: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        let mut cleared_refusals: Vec<i64> = Vec::new();
         let mut newly_handled = BTreeMap::new();
         let mut newly_handled_max_age = BTreeMap::new();
         let mut listed = 0_usize;
@@ -662,6 +812,17 @@ impl Broker {
             };
             if handled_now {
                 report.skipped_handled += 1;
+                continue;
+            }
+            if refused_before
+                .get(&session.id)
+                .is_some_and(|(activity, at)| {
+                    *activity == session.last_activity_at
+                        && now_ms.saturating_sub(*at) < IDLE_STRIP_REFUSAL_BACKOFF_MS
+                })
+            {
+                report.skipped_backoff += 1;
+                crate::phase_telemetry::add("checkout_idle_strip_skipped_backoff", Duration::ZERO);
                 continue;
             }
             report.idle_backlog += 1;
@@ -679,11 +840,14 @@ impl Broker {
                 run,
                 checkout_deadline,
                 &venv_markers,
-                past_max_age,
+                max_age_ms
+                    .filter(|_| past_max_age)
+                    .map(|age| now_ms.saturating_sub(age)),
                 &mut report,
             ) {
                 IdleStrip::Done(stripped, on_demand) => {
                     if transient_before == super::strip::transient_refusals(&report.strip) {
+                        cleared_refusals.push(session.id);
                         newly_handled.insert(session.id, session.last_activity_at);
                         if past_max_age {
                             newly_handled_max_age.insert(session.id, session.last_activity_at);
@@ -752,6 +916,9 @@ impl Broker {
                 }
                 IdleStrip::Refused(code) => {
                     note_idle_refusal(&mut report, code);
+                    if BACKOFF_REFUSALS.contains(&code) {
+                        newly_refused.insert(session.id, (session.last_activity_at, now_ms));
+                    }
                     if code == "not_owned" || code == "preparation_not_configured" {
                         newly_handled.insert(session.id, session.last_activity_at);
                         if past_max_age {
@@ -766,6 +933,33 @@ impl Broker {
                 }
             }
         }
+        if !newly_refused.is_empty() || !cleared_refusals.is_empty() {
+            crate::warn_unrecorded(
+                "remember sessions the idle strip refused",
+                self.update_meta_json(
+                    IDLE_STRIP_REFUSED_KEY,
+                    |stored: &mut BTreeMap<i64, (i64, i64)>| {
+                        for id in &cleared_refusals {
+                            stored.remove(id);
+                        }
+                        stored.extend(newly_refused.iter().map(|(id, seen)| (*id, *seen)));
+                        stored.retain(|_, (_, at)| {
+                            now_ms.saturating_sub(*at) < 8 * IDLE_STRIP_REFUSAL_BACKOFF_MS
+                        });
+                        while stored.len() > IDLE_STRIP_DONE_MAX {
+                            stored.pop_first();
+                        }
+                    },
+                ),
+            );
+        }
+        crate::warn_unrecorded(
+            "remember the idle strip's backlog",
+            self.store_ref()
+                .meta_set(IDLE_STRIP_BACKLOG_KEY, &report.idle_backlog.to_string())
+                .map_err(|error| error.to_string()),
+        );
+        self.record_checkout_byte_estimate(&open, &report.samples, now_ms);
         if !newly_handled.is_empty() {
             crate::warn_unrecorded(
                 "remember idle-stripped sessions",
@@ -785,6 +979,9 @@ impl Broker {
                     self.update_meta_json(
                         IDLE_STRIP_MAX_AGE_DONE_KEY,
                         |stored: &mut BTreeMap<i64, i64>| {
+                            if memo_outdated {
+                                stored.clear();
+                            }
                             stored.extend(newly_handled_max_age.iter().map(|(id, at)| (*id, *at)));
                             while stored.len() > IDLE_STRIP_DONE_MAX {
                                 stored.pop_first();
@@ -810,6 +1007,7 @@ impl Broker {
                 "idle_sessions": idle.len(),
                 "backlog": report.idle_backlog,
                 "skipped_handled": report.skipped_handled,
+                "skipped_backoff": report.skipped_backoff,
                 "examined": report.strip.checkouts_examined,
                 "checkouts_stripped": report.strip.checkouts_stripped,
                 "directories_stripped": report.strip.directories_stripped,
@@ -837,10 +1035,12 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         deadline: Instant,
         venv_markers: &[String],
-        past_max_age: bool,
+        receipt_stale_before_ms: Option<i64>,
         report: &mut IdleStripReport,
     ) -> IdleStrip {
         use IdleStrip::Refused;
+        // Set exactly when the session is idle for the artifact max age.
+        let past_max_age = receipt_stale_before_ms.is_some();
         if Instant::now() >= deadline {
             return Refused("deadline");
         }
@@ -866,7 +1066,28 @@ impl Broker {
             .collect::<Vec<_>>();
         match self.session_operations_unresolved_since_boot(session.id) {
             Ok(false) => {}
-            Ok(true) => return Refused("operation_unresolved"),
+            // A session idle for the artifact max age whose only unresolved
+            // work is a command's receipt that has not been written for as
+            // long never settled. A guarded command that is in fact running
+            // is still caught below: by its artifact-use producer marker and
+            // lock (`checkout_busy` or `checkout_marker_live`) and by the
+            // working-directory and open-file check.
+            Ok(true) => match receipt_stale_before_ms {
+                Some(stale_before) => {
+                    match self.session_operations_unresolved_ignoring_stale_receipts(
+                        session.id,
+                        stale_before,
+                    ) {
+                        Ok(false) => crate::phase_telemetry::add(
+                            "checkout_idle_strip_stale_receipts_ignored",
+                            Duration::ZERO,
+                        ),
+                        Ok(true) => return Refused("operation_unresolved"),
+                        Err(_) => return Refused("operations_unknown"),
+                    }
+                }
+                None => return Refused("operation_unresolved"),
+            },
             Err(_) => return Refused("operations_unknown"),
         }
         match crate::gates::checked_running_session_gates_until(
@@ -919,6 +1140,8 @@ impl Broker {
         // Only what the session's own preparation recreates: exact outputs
         // and environment roots first; workspace members only together with
         // (or after) their top-level `node_modules`.
+        let preparation_window =
+            crate::preparation::completed_preparation_window(self.main_root(), session.id);
         let mut primary = Vec::new();
         let mut members = Vec::new();
         let mut not_declared = Vec::new();
@@ -934,6 +1157,20 @@ impl Broker {
                     primary.push(candidate);
                 }
                 Some(Coverage::WorkspaceMember) => members.push(candidate),
+                // Its step declares files inside the environment but not its
+                // interpreter; the recorded preparation still proves it made
+                // the environment when `pyvenv.cfg` is dated inside the run.
+                Some(Coverage::EnvironmentRootUnproven)
+                    if preparation_window.is_some_and(|window| {
+                        environment_created_in(&worktree, &candidate.relative, window)
+                    }) =>
+                {
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_covered_environment_root_recorded",
+                        Duration::ZERO,
+                    );
+                    primary.push(candidate);
+                }
                 Some(Coverage::EnvironmentRootUnproven) => {
                     *report
                         .strip
@@ -974,6 +1211,9 @@ impl Broker {
         }
         if candidates.is_empty() && members.is_empty() {
             tally_kinds(report, &all_candidates, &[], &BTreeMap::new());
+            if all_candidates.is_empty() {
+                report.samples.insert(session.id, 0);
+            }
             return IdleStrip::Done(Vec::new(), Vec::new());
         }
         // A complete open-file observation (shared by the run): any process
@@ -1120,6 +1360,16 @@ impl Broker {
             }
         }
         tally_kinds(report, &all_candidates, &stripped, &sizes);
+        // What the checkout still holds, when every covered directory was
+        // measured (a partial measurement would understate it).
+        if sizes.len() == covered.len() {
+            let remaining = covered
+                .iter()
+                .filter(|candidate| !stripped.contains(&candidate.relative))
+                .filter_map(|candidate| sizes.get(&candidate.relative))
+                .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
+            report.samples.insert(session.id, remaining);
+        }
         let on_demand = on_demand
             .into_iter()
             .filter(|relative| stripped.contains(relative))
@@ -1129,6 +1379,57 @@ impl Broker {
 }
 
 impl Broker {
+    /// Fold this pass's measurements into the remembered ones and write the
+    /// estimate `storage status` shows for this repository's worktree root.
+    fn record_checkout_byte_estimate(
+        &self,
+        open: &[Session],
+        measured: &BTreeMap<i64, u64>,
+        now_ms: i64,
+    ) {
+        let _span = crate::phase_telemetry::span("checkout_idle_strip_estimate");
+        let mut samples: BTreeMap<i64, u64> = self.meta_json(IDLE_STRIP_SAMPLES_KEY);
+        if !measured.is_empty() {
+            samples.extend(measured.iter().map(|(id, bytes)| (*id, *bytes)));
+            while samples.len() > IDLE_STRIP_SAMPLES_MAX {
+                samples.pop_first();
+            }
+            crate::warn_unrecorded(
+                "remember measured checkout bytes",
+                self.update_meta_json(IDLE_STRIP_SAMPLES_KEY, |stored: &mut BTreeMap<i64, u64>| {
+                    stored.extend(measured.iter().map(|(id, bytes)| (*id, *bytes)));
+                    while stored.len() > IDLE_STRIP_SAMPLES_MAX {
+                        stored.pop_first();
+                    }
+                }),
+            );
+        }
+        let ids: Vec<i64> = open.iter().map(|session| session.id).collect();
+        let mut estimate = estimate_open_checkout_bytes(&ids, &samples);
+        estimate.worktree_root = open
+            .first()
+            .and_then(|session| Path::new(&session.worktree_path).parent())
+            .map(|root| root.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        estimate.observed_at_ms = now_ms;
+        crate::phase_telemetry::attach(
+            "checkout_idle_strip_estimate",
+            serde_json::json!({
+                "open_checkouts": estimate.open_checkouts,
+                "sampled": estimate.sampled,
+                "measured_bytes": estimate.measured_bytes,
+                "estimated_bytes": estimate.estimated_bytes,
+            }),
+        );
+        crate::warn_unrecorded(
+            "record the open checkouts' byte estimate",
+            self.store_ref().meta_set(
+                IDLE_STRIP_ESTIMATE_KEY,
+                &serde_json::to_string(&estimate).unwrap_or_default(),
+            ),
+        );
+    }
+
     /// Bytes of `covered` candidates, within this checkout's budget and what
     /// is left of the pass budget; unmeasured ones are left out.
     fn measure_covered(
@@ -1225,6 +1526,47 @@ mod tests {
         let note = idle_strip_note(7, &["node_modules".into(), "backend/.venv".into()], 4);
         assert!(note.contains("node_modules, backend/.venv"));
         assert!(note.contains("aethyme broker submit prepare --session 7"));
+    }
+
+    /// Sessions the estimate has no measurement for count as the mean of the
+    /// measured ones that still hold bytes; stripped ones count as zero and
+    /// do not pull that mean down.
+    #[test]
+    fn the_byte_estimate_extrapolates_from_sessions_still_holding_bytes() {
+        let samples = BTreeMap::from([(1, 0_u64), (2, 100), (3, 300), (9, 5_000)]);
+        let estimate = estimate_open_checkout_bytes(&[1, 2, 3, 4, 5], &samples);
+        assert_eq!(estimate.open_checkouts, 5);
+        assert_eq!(estimate.sampled, 3);
+        assert_eq!(estimate.measured_bytes, 400);
+        // Two unsampled sessions at the mean of 100 and 300.
+        assert_eq!(estimate.estimated_bytes, 400 + 2 * 200);
+        let nothing = estimate_open_checkout_bytes(&[4, 5], &BTreeMap::new());
+        assert_eq!((nothing.sampled, nothing.estimated_bytes), (0, 0));
+    }
+
+    /// An environment is proven created by a preparation only when its
+    /// `pyvenv.cfg` is dated inside that preparation's run.
+    #[test]
+    fn an_environment_is_created_by_the_preparation_that_dated_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("backend/.venv");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("pyvenv.cfg");
+        std::fs::write(&config, "home = /usr/bin\n").unwrap();
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        let inside = (990_000, 1_010_000);
+        assert!(environment_created_in(dir.path(), "backend/.venv", inside));
+        let before = (1_100_000, 1_200_000);
+        assert!(!environment_created_in(dir.path(), "backend/.venv", before));
+        let after = (100_000, 900_000);
+        assert!(!environment_created_in(dir.path(), "backend/.venv", after));
+        assert!(!environment_created_in(dir.path(), "other/.venv", inside));
     }
 
     /// Past the artifact max age, an undeclared Cargo target goes too (Cargo

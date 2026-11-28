@@ -441,6 +441,22 @@ impl super::BrokerStore {
         session_id: i64,
         evidence: &crate::host_boot::BootEvidence,
     ) -> Result<bool, BrokerError> {
+        self.session_has_unresolved_operations_ignoring_stale_receipts(session_id, evidence, None)
+    }
+
+    /// [`Self::session_has_unresolved_operations_since_boot`], except that a
+    /// guarded command's receipt left in `starting` or `running` whose last
+    /// write predates `stale_before_ms` is not counted: a command that has
+    /// not written in that long, in a session idle just as long, is a
+    /// receipt its killed command never settled, not a command in flight.
+    /// An `outcome_unknown` receipt and every coordinated operation still
+    /// count. `None` counts every receipt.
+    pub(crate) fn session_has_unresolved_operations_ignoring_stale_receipts(
+        &self,
+        session_id: i64,
+        evidence: &crate::host_boot::BootEvidence,
+        stale_before_ms: Option<i64>,
+    ) -> Result<bool, BrokerError> {
         self.conn
             .query_row(
                 &format!(
@@ -453,9 +469,17 @@ impl super::BrokerStore {
                         WHERE session_id = ?1
                           AND phase IN ('starting', 'running', 'outcome_unknown')
                           AND NOT ({DEAD_RECEIPT_SQL})
+                          AND NOT (?4 IS NOT NULL
+                                   AND phase IN ('starting', 'running')
+                                   AND updated_at_ms < ?4)
                      )"
                 ),
-                params![session_id, evidence.boot_id, evidence.cutoff_ms],
+                params![
+                    session_id,
+                    evidence.boot_id,
+                    evidence.cutoff_ms,
+                    stale_before_ms
+                ],
                 |row| row.get(0),
             )
             .map_err(BrokerError::from)
@@ -967,6 +991,39 @@ mod tests {
                 .unwrap(),
             "an outcome_unknown receipt stays unresolved whatever its boot"
         );
+    }
+
+    /// Past the staleness cutoff a `starting` or `running` receipt is a
+    /// command that never settled; an `outcome_unknown` one still counts.
+    #[test]
+    fn stale_running_receipts_are_ignored_only_past_the_cutoff() {
+        let mut store = store();
+        let running = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &running).unwrap();
+        set_receipt(&store, &running, Some("boot-b"), 5_000);
+        let evidence = crate::host_boot::BootEvidence {
+            boot_id: Some("boot-b".into()),
+            ..Default::default()
+        };
+        let unresolved = |store: &super::super::BrokerStore, stale_before: Option<i64>| {
+            store
+                .session_has_unresolved_operations_ignoring_stale_receipts(
+                    1,
+                    &evidence,
+                    stale_before,
+                )
+                .unwrap()
+        };
+        assert!(unresolved(&store, None));
+        assert!(unresolved(&store, Some(5_000)), "written at the cutoff");
+        assert!(!unresolved(&store, Some(5_001)), "written before it");
+        let unknown = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &unknown).unwrap();
+        store
+            .mark_guarded_exec_outcome_unknown(1, &unknown, "unverified")
+            .unwrap();
+        set_receipt(&store, &unknown, Some("boot-b"), 1_000);
+        assert!(unresolved(&store, Some(10_000)));
     }
 
     /// A command whose receipt was settled as abandoned and that reports

@@ -1809,6 +1809,23 @@ impl Broker {
             )
     }
 
+    /// [`Self::session_operations_unresolved_since_boot`], except that a
+    /// guarded command's receipt still `starting` or `running` whose last
+    /// write predates `stale_before_ms` is not counted (see the store's
+    /// `session_has_unresolved_operations_ignoring_stale_receipts`).
+    pub(crate) fn session_operations_unresolved_ignoring_stale_receipts(
+        &self,
+        session_id: i64,
+        stale_before_ms: i64,
+    ) -> Result<bool, crate::BrokerError> {
+        self.store_ref()
+            .session_has_unresolved_operations_ignoring_stale_receipts(
+                session_id,
+                &crate::host_boot::BootEvidence::current(),
+                Some(stale_before_ms),
+            )
+    }
+
     /// After a close, settle the session's receipts whose command died with
     /// an earlier boot, so they stop reading as running.
     fn settle_dead_receipts_after_close(&mut self, session_id: i64) {

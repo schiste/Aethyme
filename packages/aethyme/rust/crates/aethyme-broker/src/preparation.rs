@@ -4830,6 +4830,21 @@ pub(crate) fn mark_stripped(
     fs::write(&path, relatives.join("\n"))
 }
 
+/// When the session's last completed, current preparation ran (epoch ms:
+/// start, completion). `None` when there is no such record. A file a step
+/// writes only while it creates something (a Python environment's
+/// `pyvenv.cfg`) dated inside this window was created by that preparation.
+pub(crate) fn completed_preparation_window(
+    main_root: &Path,
+    session_id: i64,
+) -> Option<(i64, i64)> {
+    let record = read_record(&record_path(main_root, session_id)).ok()??;
+    // A start of zero or less (an unreadable clock) proves nothing.
+    (record.state == PreparationState::Current && record.started_at > 0)
+        .then(|| record.completed_at.map(|done| (record.started_at, done)))
+        .flatten()
+}
+
 /// Whether the idle strip removed directories after the session's last
 /// preparation record was written (a later preparation rewrites the record
 /// and so reads current again).
@@ -8625,6 +8640,40 @@ mod tests {
         ] {
             assert_eq!(preparation_step_error_outcome(&error.into()), "unknown");
         }
+    }
+
+    /// Only a completed, current record with a real start gives a window.
+    #[test]
+    fn the_completed_preparation_window_needs_a_current_record_with_a_start() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |state: &str, started: i64, completed: serde_json::Value| {
+            let record: PreparationRecord = serde_json::from_value(serde_json::json!({
+                "schema_version": PREPARATION_SCHEMA_VERSION,
+                "session_id": 7,
+                "state": state,
+                "digest": "d",
+                "source_digest": "s",
+                "started_at": started,
+                "completed_at": completed,
+                "failed_step": null,
+                "exit_code": null,
+                "host_lease_id": null,
+                "host_lease_generation": null,
+            }))
+            .unwrap();
+            write_record(&record_path(root.path(), 7), &record).unwrap();
+        };
+        write("current", 1_000, serde_json::json!(2_000));
+        assert_eq!(
+            completed_preparation_window(root.path(), 7),
+            Some((1_000, 2_000))
+        );
+        write("current", 0, serde_json::json!(2_000));
+        assert_eq!(completed_preparation_window(root.path(), 7), None);
+        write("current", 1_000, serde_json::Value::Null);
+        assert_eq!(completed_preparation_window(root.path(), 7), None);
+        write("failed", 1_000, serde_json::json!(2_000));
+        assert_eq!(completed_preparation_window(root.path(), 7), None);
     }
 
     #[test]
