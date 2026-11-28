@@ -2384,6 +2384,33 @@ fn archive_plan(
     }
 }
 
+/// The router and engine the installer-managed `current` link selects now,
+/// as canonical paths inside the managed versions directory, for a running
+/// executable that belongs to that managed install. `None` when the
+/// executable is not installer-managed (Cargo, Homebrew, archives, tests), the
+/// receipt is invalid, or the link resolves to the running executable itself.
+/// The caller decides whether the answer is newer than the running build.
+pub fn managed_installed_pair(executable: &Path) -> Option<(PathBuf, PathBuf)> {
+    let executable = fs::canonicalize(executable).ok()?;
+    let (_, receipt) = find_receipt(&executable)?;
+    receipt.validate().ok()?;
+    let versions = fs::canonicalize(&receipt.versions_dir).ok()?;
+    if !executable.starts_with(&versions) {
+        return None;
+    }
+    let router = fs::canonicalize(&receipt.router_path).ok()?;
+    let engine = fs::canonicalize(&receipt.engine_path).ok()?;
+    if router == executable
+        || !router.starts_with(&versions)
+        || !router.is_file()
+        || !engine.is_file()
+        || router.parent() != engine.parent()
+    {
+        return None;
+    }
+    Some((router, engine))
+}
+
 fn find_receipt(executable: &Path) -> Option<(PathBuf, InstallReceipt)> {
     for ancestor in executable.ancestors().take(6) {
         let path = ancestor.join(INSTALL_RECEIPT_FILENAME);
@@ -2454,6 +2481,60 @@ mod tests {
             },
         );
         serde_json::to_vec_pretty(&manifest).unwrap()
+    }
+
+    #[test]
+    fn managed_installed_pair_follows_current_link_and_is_absent_outside_a_managed_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = fs::canonicalize(temp.path()).unwrap();
+        let managed = install_dir.join(".aethyme-managed");
+        let versions = managed.join("versions");
+        let old = versions.join("v1");
+        let new = versions.join("v2");
+        for dir in [&old, &new] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("aethyme"), "").unwrap();
+            fs::write(dir.join("aethyme-engine-cli"), "").unwrap();
+        }
+        let receipt = InstallReceipt {
+            schema_version: INSTALL_RECEIPT_SCHEMA_VERSION,
+            method: "aethyme-installer".into(),
+            install_dir: install_dir.clone(),
+            managed_root: managed.clone(),
+            router_path: install_dir.join("aethyme"),
+            engine_path: install_dir.join("aethyme-engine-cli"),
+            current_link: managed.join("current"),
+            previous_link: managed.join("previous"),
+            versions_dir: versions.clone(),
+        };
+        fs::write(
+            managed.join(INSTALL_RECEIPT_FILENAME),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&new, managed.join("current")).unwrap();
+        std::os::unix::fs::symlink(
+            ".aethyme-managed/current/aethyme",
+            install_dir.join("aethyme"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            ".aethyme-managed/current/aethyme-engine-cli",
+            install_dir.join("aethyme-engine-cli"),
+        )
+        .unwrap();
+
+        // A superseded version resolves to the installed one.
+        assert_eq!(
+            managed_installed_pair(&old.join("aethyme")),
+            Some((new.join("aethyme"), new.join("aethyme-engine-cli")))
+        );
+        // The installed version itself has no successor.
+        assert_eq!(managed_installed_pair(&new.join("aethyme")), None);
+        // A binary outside any managed install never resolves.
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("aethyme"), "").unwrap();
+        assert_eq!(managed_installed_pair(&other.path().join("aethyme")), None);
     }
 
     fn provenance(method: InstallationMethod) -> InstallationProvenance {
