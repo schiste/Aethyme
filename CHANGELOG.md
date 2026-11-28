@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.191] - 2026-11-28
+
+### Changed
+
+- Detached gc workers (continuation, trash catch-up, retirement lane) launch the installed binary when it is newer than the running one. Each worker spawned its successor from its own executable, so after 0.8.190 was installed the busiest repository's chain kept running 0.8.189 for about an hour (9 idle-strip passes, all on the old version) while other repositories had moved on. The installed router/engine pair from the installer receipt's `current` link is used only when its version banner parses to a strictly newer version; an equal, older or unreadable one keeps the running pair, so an older binary never opens a database a newer one migrated. Cargo, Homebrew and archive installs are unchanged (#2082).
+- The idle strip no longer gives up on loaded volumes. On the busiest repository, 0.8.190 refused 19 of 26 examined sessions as `activity_unknown`: 21 of 24 activity looks timed out, because the fallback mtime walk descended entry by entry into workspace packages' `node_modules` (100k+ entries) that carry no package-manager marker. The walk now skips a `node_modules`, `.venv`, `.pnpm-store` or `target` directory the checkout's own ignore rules hide, still reading that directory's own time; on four stale sessions the walk went from 0.97–2.67 s to about 0.35 s. `activity_unknown` backs off 30 minutes instead of 2 hours (#2084).
+
+### Added
+
+- Counter `gc_continuation_upgraded` (#2082); span `worktree_ignore_check` and counter `worktree_mtime_walk_skipped_dependency_root` (#2084). Documented in `cross-process-consumers.md`.
+
+### Build and release
+
+- A newer push or body edit cancels a pull request's in-progress cross-process contract check. The check ran up to 7 times per pull request; the last 60 runs took 153 runner-minutes, about 2.5 minutes each, and roughly 75–100 of those would have been saved. Merges read the newest check run for the head commit, which always completes (#2083).
+- Measured from 0.8.190 (#2079): main's "Run all gates" job took 177–184 s over three runs, down from 261 s.
+
+### Upgrade notes
+
+- Workers still running an older version switch at their next spawn; the first upgrade that benefits is the one after this release (#2082).
+- A tracked file force-added inside an ignored dependency directory is seen by the `git status` probe but no longer by the fallback walk (#2084).
+
 ## [0.8.190] - 2026-11-28
 
 ### Changed
