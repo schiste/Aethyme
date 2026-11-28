@@ -376,7 +376,9 @@ thread_local! {
 /// catalogue the status probe excludes), and a directory `regenerable`
 /// accepts (the caller passes the strip catalogue's own witness check, so
 /// a tracked source directory merely named like a regenerable one is
-/// walked). `Some(true)`: one found (activity); `Some(false)`: the walk
+/// walked) and a directory `dependency_root` accepts (a catalogued name the
+/// checkout's ignore rules hide, with no witness; its own time is still
+/// read). `Some(true)`: one found (activity); `Some(false)`: the walk
 /// finished and found none, which proves nothing else changed; `None`: it
 /// stopped at its deadline or cap (the caller keeps the session).
 pub(crate) fn recent_mtime_walk(
@@ -385,6 +387,7 @@ pub(crate) fn recent_mtime_walk(
     deadline: Instant,
     cap: usize,
     regenerable: &dyn Fn(&Path, &str) -> bool,
+    dependency_root: &dyn Fn(&Path, &str) -> bool,
 ) -> Option<bool> {
     let _span = crate::phase_telemetry::span("worktree_mtime_walk");
     let mut read = 0_usize;
@@ -436,6 +439,23 @@ pub(crate) fn recent_mtime_walk(
             if newer(&metadata) {
                 crate::phase_telemetry::add("worktree_mtime_walk_found_recent", Duration::ZERO);
                 return Some(true);
+            }
+            // A dependency directory the checkout's ignore rules hide but
+            // that has no strip witness (a workspace package's
+            // `node_modules` without its manager's marker): its own time
+            // was read above (a fresh install moves it), its contents are
+            // not the agent's work, and walking them is what ran the walk
+            // out of time (100 000 entries and more per checkout).
+            if metadata.is_dir()
+                && name
+                    .to_str()
+                    .is_some_and(|name| dependency_root(&path, name))
+            {
+                crate::phase_telemetry::add(
+                    "worktree_mtime_walk_skipped_dependency_root",
+                    Duration::ZERO,
+                );
+                continue;
             }
             if metadata.is_dir() {
                 stack.push(path);
@@ -741,8 +761,16 @@ mod tests {
                 .set_modified(SystemTime::now())
                 .unwrap();
         };
+        let dependency_root = |_: &Path, _: &str| false;
         let walk = |deadline: Instant, cap: usize| {
-            recent_mtime_walk(worktree, since, deadline, cap, &regenerable)
+            recent_mtime_walk(
+                worktree,
+                since,
+                deadline,
+                cap,
+                &regenerable,
+                &dependency_root,
+            )
         };
         age_tree_for_test(worktree, old);
         // The regenerable tree and the broker's runtime files do not count.
@@ -767,5 +795,49 @@ mod tests {
         // Its cap and its deadline fail closed.
         assert_eq!(walk(far(), 1), None);
         assert_eq!(walk(Instant::now(), MTIME_WALK_ENTRIES), None);
+    }
+
+    /// An ignored dependency directory without a witness is not walked (its
+    /// 100 000 entries ran the walk out of time), yet its own time still
+    /// counts, and an unignored directory of the same name is walked.
+    #[test]
+    fn the_mtime_walk_skips_unwitnessed_dependency_roots_but_reads_their_time() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        std::fs::create_dir_all(worktree.join("apps/web/node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("apps/web/node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join("src/node_modules")).unwrap();
+        std::fs::write(worktree.join("src/node_modules/mod.js"), "x\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10 * 3_600);
+        let since = SystemTime::now() - Duration::from_secs(4 * 3_600);
+        let never = |_: &Path, _: &str| false;
+        let ignored_only_apps = |path: &Path, name: &str| {
+            name == "node_modules" && path.starts_with(worktree.join("apps"))
+        };
+        let far = || Instant::now() + MTIME_WALK_BUDGET;
+        let touch = |path: &str| {
+            std::fs::File::open(worktree.join(path))
+                .unwrap()
+                .set_modified(SystemTime::now())
+                .unwrap();
+        };
+        let walk = |dependency: &dyn Fn(&Path, &str) -> bool, cap: usize| {
+            recent_mtime_walk(worktree, since, far(), cap, &never, dependency)
+        };
+        age_tree_for_test(worktree, old);
+        touch("apps/web/node_modules/dep/index.js");
+        // Skipped: the recent file inside is not seen, and the entries it
+        // holds do not count against the cap (the walk finishes at 6).
+        assert_eq!(walk(&ignored_only_apps, 6), Some(false));
+        // Not skipped when nothing says it is an ignored dependency root.
+        assert_eq!(walk(&never, MTIME_WALK_ENTRIES), Some(true));
+        // The root's own time is evidence even when its contents are skipped.
+        age_tree_for_test(worktree, old);
+        touch("apps/web/node_modules");
+        assert_eq!(walk(&ignored_only_apps, MTIME_WALK_ENTRIES), Some(true));
+        // An unignored directory of the same name is walked.
+        age_tree_for_test(worktree, old);
+        touch("src/node_modules/mod.js");
+        assert_eq!(walk(&ignored_only_apps, MTIME_WALK_ENTRIES), Some(true));
     }
 }

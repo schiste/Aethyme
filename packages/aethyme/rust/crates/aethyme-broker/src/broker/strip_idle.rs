@@ -111,9 +111,10 @@ pub(crate) const IDLE_STRIP_SAMPLES_KEY: &str = "checkout_strip.idle_samples";
 pub(crate) const IDLE_STRIP_ESTIMATE_KEY: &str = "checkout_strip.byte_estimate";
 /// How long a lasting refusal keeps a session from being examined again.
 const IDLE_STRIP_REFUSAL_BACKOFF_MS: i64 = 2 * 3_600_000;
-/// How long a `recent_file_activity` refusal keeps a session from being
-/// examined again: shorter, because the activity is real and ends within
-/// hours, while the cause of the other refusals can last for days.
+/// How long a `recent_file_activity` or `activity_unknown` refusal keeps a
+/// session from being examined again: shorter, because the activity is real
+/// and ends within hours (or the probe ran out of time on a loaded volume,
+/// which passes), while the cause of the other refusals can last for days.
 const IDLE_STRIP_FILE_ACTIVITY_BACKOFF_MS: i64 = 30 * 60_000;
 /// Refusals that outlast a pass and cost time to reach (the session is
 /// examined again once the backoff ends, or its activity moves). Every other
@@ -131,7 +132,7 @@ const BACKOFF_REFUSALS: &[&str] = &[
 
 /// The backoff of a remembered refusal for `code`.
 fn refusal_backoff_ms(code: &str) -> i64 {
-    if code == "recent_file_activity" {
+    if code == "recent_file_activity" || code == ACTIVITY_UNKNOWN {
         IDLE_STRIP_FILE_ACTIVITY_BACKOFF_MS
     } else {
         IDLE_STRIP_REFUSAL_BACKOFF_MS
@@ -702,12 +703,41 @@ fn changed_file_activity(
                 super::strip::StripKind::for_name(name)
                     .is_some_and(|kind| kind.witness(path, &[]).is_ok())
             },
+            &|path: &Path, name: &str| {
+                super::strip::StripKind::for_name(name).is_some()
+                    && git_ignores_directory(worktree, path)
+            },
         ) {
             Some(true) => Some("changed_file_walk"),
             Some(false) => None,
             None => Some(ACTIVITY_UNKNOWN),
         },
     }
+}
+
+/// Whether the checkout's own ignore rules hide the directory `path`
+/// (`git check-ignore --no-index`: the rules only, so no index is read or
+/// written). A failed or slow check says no, so the walk looks inside.
+fn git_ignores_directory(worktree: &Path, path: &Path) -> bool {
+    let _span = crate::phase_telemetry::span("worktree_ignore_check");
+    let Ok(relative) = path.strip_prefix(worktree) else {
+        return false;
+    };
+    let mut command = crate::git::git_command();
+    command
+        .args([
+            "--no-optional-locks",
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "--",
+        ])
+        .arg(relative)
+        .current_dir(worktree);
+    matches!(
+        crate::bounded_output::output_limited(&mut command, Duration::from_secs(2), 4096),
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) if output.status.success()
+    )
 }
 
 /// What the open sessions' checkouts hold in regenerable directories, as far
@@ -1643,6 +1673,51 @@ fn tally_kinds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe that ran out of time on a loaded volume is asked again within
+    /// the half hour, not the two hours of a refusal whose cause lasts; the
+    /// stored time makes the one expiry rule agree.
+    #[test]
+    fn activity_unknown_backs_off_for_half_an_hour() {
+        assert_eq!(refusal_backoff_ms(ACTIVITY_UNKNOWN), 30 * 60_000);
+        assert_eq!(refusal_backoff_ms("operation_unresolved"), 2 * 3_600_000);
+        let now = 10_000_000_000_i64;
+        let stored = stored_refusal_time(ACTIVITY_UNKNOWN, now);
+        let within = |at: i64| at - stored < IDLE_STRIP_REFUSAL_BACKOFF_MS;
+        assert!(within(now + 29 * 60_000));
+        assert!(!within(now + 31 * 60_000));
+    }
+
+    /// The walk's dependency-root test asks the checkout's own ignore rules.
+    #[test]
+    fn git_ignores_directory_follows_the_checkouts_ignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(worktree)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(worktree.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(worktree.join("apps/web/node_modules")).unwrap();
+        std::fs::create_dir_all(worktree.join("src/target")).unwrap();
+        assert!(git_ignores_directory(
+            worktree,
+            &worktree.join("apps/web/node_modules")
+        ));
+        assert!(!git_ignores_directory(
+            worktree,
+            &worktree.join("src/target")
+        ));
+        assert!(!git_ignores_directory(
+            worktree,
+            &worktree.parent().unwrap().join("elsewhere")
+        ));
+    }
 
     #[test]
     fn every_refusal_has_its_own_counter() {
