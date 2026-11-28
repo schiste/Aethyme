@@ -4830,6 +4830,20 @@ pub(crate) fn mark_stripped(
     fs::write(&path, relatives.join("\n"))
 }
 
+/// When the session's last completed, current preparation ran (epoch ms:
+/// start, completion). `None` when there is no such record. A file a step
+/// writes only while it creates something (a Python environment's
+/// `pyvenv.cfg`) dated inside this window was created by that preparation.
+pub(crate) fn completed_preparation_window(
+    main_root: &Path,
+    session_id: i64,
+) -> Option<(i64, i64)> {
+    let record = read_record(&record_path(main_root, session_id)).ok()??;
+    (record.state == PreparationState::Current)
+        .then(|| record.completed_at.map(|done| (record.started_at, done)))
+        .flatten()
+}
+
 /// Whether the idle strip removed directories after the session's last
 /// preparation record was written (a later preparation rewrites the record
 /// and so reads current again).

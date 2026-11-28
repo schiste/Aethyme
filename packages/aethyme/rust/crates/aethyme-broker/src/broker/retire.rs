@@ -126,6 +126,11 @@ const RETIRE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_se
 const RETIRE_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
 const RETIRE_CLEANED_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(10);
 const RETIRE_IDLE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(15);
+/// The idle strip's floor while at least [`RETIRE_IDLE_STRIP_BACKLOG_AT`]
+/// idle open sessions wait: the pass drains them within a day instead of
+/// examining a handful per run (it still yields the disk to foreground work).
+const RETIRE_IDLE_STRIP_BACKLOG_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(45);
+const RETIRE_IDLE_STRIP_BACKLOG_AT: usize = 40;
 /// Next run when nothing is left to do.
 const RETIRE_IDLE_RECHECK_MS: i64 = 10 * 60 * 1_000;
 /// Next run while a lap or the trash is unfinished.
@@ -3023,6 +3028,44 @@ impl Broker {
                 .is_some_and(|age| age.as_secs() >= u64::from(days) * 86_400)
     }
 
+    /// Whether the tombstone at `path` is older than the host's artifact max
+    /// age and nothing needs it any more (see
+    /// [`Self::tombstone_older_than_without_need`]). `false` when the max age
+    /// is off.
+    fn tombstone_past_max_age(&self, session_id: i64, path: &Path) -> bool {
+        super::strip_idle::artifact_max_age_ms(self.storage_context().host_state_dir.as_deref())
+            .is_some_and(|age| self.tombstone_older_than_without_need(session_id, path, age))
+    }
+
+    /// Whether the tombstone at `path` is at least `age_ms` old and
+    /// `start --reuse` does not need it: it names no archive (the work is in
+    /// Git; the restore recreates the checkout from the branch), or the
+    /// archive it names is the one this repository's own record names, which
+    /// the restore finds without the note. A tombstone naming an archive the
+    /// record does not (or cannot be read) stays: it may be the only thing
+    /// that does.
+    fn tombstone_older_than_without_need(&self, session_id: i64, path: &Path, age_ms: i64) -> bool {
+        let Ok(Some(note)) = super::tombstone::read_checkout_tombstone(path) else {
+            return false;
+        };
+        let old_enough = std::fs::metadata(path.join(super::tombstone::TOMBSTONE_FILE))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| {
+                i64::try_from(age.as_millis()).is_ok_and(|elapsed| elapsed >= age_ms)
+            });
+        if !old_enough {
+            return false;
+        }
+        match super::tombstone::note_archive(&note) {
+            None => true,
+            Some(named) => {
+                matches!(self.recorded_archive(session_id), Ok(Some(recorded)) if recorded == named)
+            }
+        }
+    }
+
     /// Whether `session_id`'s checkout was retired through an archive that is
     /// still there, for a decision that deletes when there is none: `None`
     /// when the record cannot be read, or when the recorded archive cannot be
@@ -3870,7 +3913,18 @@ impl Broker {
                         strip_deadline,
                         super::strip::STRIP_CHECKOUTS_PER_RUN,
                     );
-                    let idle_deadline = share(1, 4, RETIRE_IDLE_STRIP_MIN_SHARE);
+                    let idle_backlog: usize =
+                        this.meta_json(super::strip_idle::IDLE_STRIP_BACKLOG_KEY);
+                    let idle_floor = if idle_backlog >= RETIRE_IDLE_STRIP_BACKLOG_AT {
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_backlog_floor",
+                            std::time::Duration::ZERO,
+                        );
+                        RETIRE_IDLE_STRIP_BACKLOG_MIN_SHARE
+                    } else {
+                        RETIRE_IDLE_STRIP_MIN_SHARE
+                    };
+                    let idle_deadline = share(1, 4, idle_floor);
                     run.deadline = idle_deadline;
                     report.idle_strip = this.strip_idle_open_checkouts(
                         run,
@@ -4152,6 +4206,8 @@ impl Broker {
         {
             let backlog = &progress.strip.backlog;
             let today = progress.strip.days.last_key_value().map(|(_, day)| day);
+            let byte_estimate: super::strip_idle::CheckoutByteEstimate =
+                self.meta_json(super::strip_idle::IDLE_STRIP_ESTIMATE_KEY);
             crate::warn_unrecorded(
                 "record checkout counts in the storage ledger",
                 crate::storage_ledger::record_checkout_counts(
@@ -4165,6 +4221,11 @@ impl Broker {
                         last_checkouts_stripped: progress.strip.last_checkouts_stripped,
                         last_directories_stripped: progress.strip.last_directories_stripped,
                         observed_at_ms: backlog.observed_at_ms,
+                        worktree_root: byte_estimate.worktree_root,
+                        open_checkouts: byte_estimate.open_checkouts,
+                        sampled_checkouts: byte_estimate.sampled,
+                        measured_checkout_bytes: byte_estimate.measured_bytes,
+                        estimated_checkout_bytes: byte_estimate.estimated_bytes,
                         sessions_created_today: today.map_or(0, |day| day.sessions_created),
                         checkouts_retired_today: today.map_or(0, |day| day.checkouts_retired),
                     },
@@ -4295,7 +4356,9 @@ impl Broker {
                         "checkout_retirement_tombstone_skipped",
                         std::time::Duration::ZERO,
                     );
-                    if self.tombstone_expired(Path::new(&session.worktree_path))
+                    let tombstone_path = Path::new(&session.worktree_path);
+                    if (self.tombstone_expired(tombstone_path)
+                        || self.tombstone_past_max_age(session.id, tombstone_path))
                         && super::tombstone::remove_checkout_tombstone(Path::new(
                             &session.worktree_path,
                         ))
@@ -11202,6 +11265,34 @@ mod tests {
         assert!(worktree.join("base.txt").is_file());
     }
 
+    /// Past the artifact max age a tombstone goes when the restore does not
+    /// need it: it names no archive, or the one this repository's record
+    /// names. One naming an archive the record does not stays. Mutations
+    /// caught: removing a tombstone whose archive only it names, ignoring the
+    /// age.
+    #[test]
+    fn a_tombstone_past_the_max_age_goes_unless_only_it_names_the_archive() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree, _) = retired_with_archive(&mut broker, "max age");
+        assert!(broker.tombstone_older_than_without_need(session.id, &worktree, 0));
+        assert!(!broker.tombstone_older_than_without_need(session.id, &worktree, 3_600_000));
+        // A record that names another archive: the note is the only link.
+        let note = note_at(&worktree);
+        let named = super::super::tombstone::note_archive(&note).unwrap();
+        let elsewhere = named.with_file_name("not-the-recorded-one");
+        let rewritten = note.replace(
+            &named.display().to_string(),
+            &elsewhere.display().to_string(),
+        );
+        assert_ne!(rewritten, note);
+        std::fs::write(
+            worktree.join(super::super::tombstone::TOMBSTONE_FILE),
+            rewritten,
+        )
+        .unwrap();
+        assert!(!broker.tombstone_older_than_without_need(session.id, &worktree, 0));
+    }
+
     /// A tombstone expires only when its archive is proven gone. Mutation
     /// caught: reading a directory that is gone with its volume as a removed
     /// archive.
@@ -13137,6 +13228,79 @@ mod tests {
                 .as_deref(),
             Some(stamped.as_str()),
             "not expired again within the interval"
+        );
+    }
+
+    /// A refusal that lasts (here: the checkout is gone) is remembered with
+    /// the session's activity, and the session is not examined again until
+    /// the backoff ends or its activity moves, so it cannot hold the head of
+    /// the oldest-first order. Mutations caught: not remembering the refusal,
+    /// ignoring the activity, never expiring the backoff.
+    #[test]
+    fn a_lasting_idle_refusal_is_not_examined_again_until_its_backoff_ends() {
+        use super::super::strip_idle::{IDLE_STRIP_REFUSED_KEY, IdleStripReport};
+        let (_owner, _storage, mut broker) = fixture();
+        let open = broker
+            .start_worktree("vanished idle session", None)
+            .unwrap();
+        let set_activity = |broker: &mut crate::Broker, hours: i64| {
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                    rusqlite::params![crate::clock::epoch_ms() - hours * 3_600_000, open.id],
+                )
+                .unwrap();
+        };
+        set_activity(&mut broker, 5);
+        std::fs::remove_dir_all(&open.worktree_path).unwrap();
+        let pass = |broker: &mut crate::Broker| -> IdleStripReport {
+            let far = Instant::now() + Duration::from_secs(600);
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_idle_open_checkouts(&mut run, far, 100)
+        };
+
+        let first = pass(&mut broker);
+        assert_eq!(
+            first.strip.refused.get("checkout_missing"),
+            Some(&1),
+            "{first:#?}"
+        );
+        assert_eq!(first.skipped_backoff, 0);
+        let second = pass(&mut broker);
+        assert_eq!(second.skipped_backoff, 1, "{second:#?}");
+        assert!(second.strip.refused.is_empty(), "{second:#?}");
+        assert_eq!(second.idle_backlog, 0, "{second:#?}");
+
+        // New activity (still idle for the threshold) arms it again.
+        set_activity(&mut broker, 6);
+        let moved = pass(&mut broker);
+        assert_eq!(
+            moved.strip.refused.get("checkout_missing"),
+            Some(&1),
+            "{moved:#?}"
+        );
+
+        // The backoff ends after its interval.
+        broker
+            .update_meta_json(
+                IDLE_STRIP_REFUSED_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, (i64, i64)>| {
+                    for (_, at) in stored.values_mut() {
+                        *at -= 3 * 3_600_000;
+                    }
+                },
+            )
+            .unwrap();
+        let later = pass(&mut broker);
+        assert_eq!(
+            later.strip.refused.get("checkout_missing"),
+            Some(&1),
+            "{later:#?}"
         );
     }
 }

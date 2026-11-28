@@ -346,8 +346,11 @@ pub fn status_value(host_state: &Path) -> Value {
                 "bytes_freed_by_strip": checkouts.values().map(|counts| counts.bytes_freed_by_strip).sum::<u64>(),
                 "sessions_created_today": checkouts.values().map(|counts| counts.sessions_created_today).sum::<usize>(),
                 "checkouts_retired_today": checkouts.values().map(|counts| counts.checkouts_retired_today).sum::<usize>(),
+                "open_checkouts": checkouts.values().map(|counts| counts.open_checkouts).sum::<usize>(),
+                "sampled_checkouts": checkouts.values().map(|counts| counts.sampled_checkouts).sum::<usize>(),
+                "estimated_checkout_bytes": checkouts.values().map(|counts| counts.estimated_checkout_bytes).sum::<u64>(),
                 "repositories": checkouts,
-                "why_not": "counts only: checkout folders are not walked for bytes",
+                "why_not": "folder counts; bytes are an estimate of the open checkouts' regenerable directories, sampled by the idle strip (checkout folders are never walked in one go)",
             }),
         );
     }
@@ -560,6 +563,20 @@ fn status(json_output: bool) -> u8 {
                     entry["sessions_created_today"].as_u64().unwrap_or(0),
                     entry["checkouts_retired_today"].as_u64().unwrap_or(0),
                 );
+                if let Some(repositories) = entry["repositories"].as_object() {
+                    for counts in repositories.values() {
+                        if counts["open_checkouts"].as_u64().unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        println!(
+                            "  {}: ~{} of dependency directories in {} open checkout(s) (estimate, {} measured)",
+                            counts["worktree_root"].as_str().unwrap_or("?"),
+                            human(counts["estimated_checkout_bytes"].as_u64().unwrap_or(0)),
+                            counts["open_checkouts"].as_u64().unwrap_or(0),
+                            counts["sampled_checkouts"].as_u64().unwrap_or(0),
+                        );
+                    }
+                }
                 continue;
             }
             let budget = entry["budget_bytes"]
