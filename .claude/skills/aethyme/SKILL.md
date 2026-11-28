@@ -19,6 +19,12 @@ AETHYME_BIN="${AETHYME_BIN:-aethyme}"
 REPO="$PWD"
 ```
 
+For direct shell commands in a broker session, obtain `scratch_dir` from the
+session's start or status JSON and set it explicitly before using it for build
+or temporary paths. `AETHYME_SESSION_SCRATCH_DIR` is supplied to commands run
+by the broker; do not assume it is exported in an independent shell. Check it
+is nonempty before appending a suffix, so an unset value cannot select `/target`.
+
 Important: `python -m src.cli ...` was removed — the Python CLI no longer
 exists, so that spelling fails outright. Use the `aethyme` binary for
 graph, task, facts, intents, analyze, enhance, and Explore.
