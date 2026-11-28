@@ -918,8 +918,11 @@ pub struct CheckoutCounts {
     pub sampled_checkouts: usize,
     #[serde(default)]
     pub measured_checkout_bytes: u64,
-    #[serde(default)]
-    pub estimated_checkout_bytes: u64,
+    /// `None` while no open checkout has been measured (unmeasured, not zero).
+    /// Left out of the JSON when `None`, so older readers (a `u64` with a
+    /// default) read it as absent rather than failing on `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_checkout_bytes: Option<u64>,
 }
 
 /// One repository's recorded counts, with the repository it names.

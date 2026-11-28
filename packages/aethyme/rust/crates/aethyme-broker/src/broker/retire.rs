@@ -12524,7 +12524,7 @@ mod tests {
                 std::time::SystemTime::now() - Duration::from_secs(10 * 3_600),
             );
             let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-            for name in ["index", "HEAD"] {
+            for name in ["index", "HEAD", "logs/HEAD"] {
                 std::fs::File::options()
                     .write(true)
                     .open(admin.join(name))
@@ -12686,7 +12686,7 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
         crate::worktree_status_activity::age_tree_for_test(&worktree, old);
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-        for name in ["index", "HEAD"] {
+        for name in ["index", "HEAD", "logs/HEAD"] {
             std::fs::File::options()
                 .write(true)
                 .open(admin.join(name))
@@ -12783,7 +12783,10 @@ mod tests {
             let mut paths = vec![
                 admin.join("index"),
                 admin.join("HEAD"),
+                admin.join("logs/HEAD"),
                 worktree.to_path_buf(),
+                worktree.join("node_modules"),
+                worktree.join("node_modules/.modules.yaml"),
             ];
             for name in git(worktree, &["ls-tree", "-d", "--name-only", "HEAD"]).lines() {
                 paths.push(worktree.join(name));
@@ -12839,12 +12842,13 @@ mod tests {
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
 
-        // Idle by session activity, but the Git index was just written
-        // (an agent working by absolute paths): not idle.
-        let index = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
-            .join("index");
+        // Idle by session activity, but `HEAD` was just rewritten (a
+        // checkout by an agent working by absolute paths): not idle. A
+        // commit's reflog is covered in strip_idle's own tests with real Git.
+        let head =
+            PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim()).join("HEAD");
         age_files(&worktree);
-        std::fs::File::open(&index)
+        std::fs::File::open(&head)
             .unwrap()
             .set_modified(std::time::SystemTime::now())
             .unwrap();
@@ -12856,6 +12860,9 @@ mod tests {
             "{recent:#?}"
         );
         assert!(worktree.join("node_modules").exists());
+        // The refusal is remembered for a while; new session activity
+        // arms the next checks.
+        idle_since(&mut broker, 5, 1);
 
         // A preparation running (its shared lock on the checkout): skipped,
         // not remembered as handled.
@@ -13304,6 +13311,181 @@ mod tests {
         );
     }
 
+    /// An idle session with a declared `node_modules`, every file aged
+    /// beyond the idle window.
+    fn aged_idle_session_with_node_modules(
+        broker: &mut crate::Broker,
+        task: &str,
+    ) -> (i64, PathBuf, PathBuf) {
+        let open = broker.start_worktree(task, None).unwrap();
+        let worktree = PathBuf::from(&open.worktree_path);
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+             required_for_hooks = false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::write(
+            worktree.join("node_modules/.modules.yaml"),
+            "layoutVersion: 5\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![crate::clock::epoch_ms() - 5 * 3_600_000, open.id],
+            )
+            .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
+        crate::worktree_status_activity::age_tree_for_test(&worktree, old);
+        let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+        for name in ["index", "HEAD", "logs/HEAD"] {
+            std::fs::File::options()
+                .write(true)
+                .open(admin.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        (open.id, worktree, admin)
+    }
+
+    /// A fresh Git index alone (a plain `git status` by an editor refreshes
+    /// it) is not activity: the session is stripped. With a freshly modified
+    /// tracked file it is kept as `recent_file_activity`, backs off for 30
+    /// minutes (not the 2 hours of the lasting refusals), lapses when the
+    /// backoff ends or the session's activity moves, and the kept checkout's
+    /// bytes are measured for the estimate. Mutations caught: the index
+    /// counting as activity, no backoff for the refusal, the 2-hour backoff,
+    /// ignoring the activity key, not measuring a kept checkout.
+    #[test]
+    fn a_fresh_index_alone_does_not_keep_an_idle_session_and_file_activity_backs_off() {
+        use super::super::strip_idle::{IDLE_STRIP_REFUSED_KEY, IdleStripReport};
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let pass = |broker: &mut crate::Broker| -> IdleStripReport {
+            let far = Instant::now() + Duration::from_secs(600);
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_idle_open_checkouts(&mut run, far, 100)
+        };
+
+        // Only the index is fresh.
+        let (_id, stat_refreshed, admin) =
+            aged_idle_session_with_node_modules(&mut broker, "index stat refresh");
+        std::fs::File::options()
+            .write(true)
+            .open(admin.join("index"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let report = pass(&mut broker);
+        assert_eq!(report.strip.checkouts_stripped, 1, "{report:#?}");
+        assert_eq!(report.kept_recent_files, 0, "{report:#?}");
+        assert!(!stat_refreshed.join("node_modules").exists());
+
+        // A tracked file modified a minute ago.
+        let (id, edited, _admin) = aethyme_edited_session(&mut broker);
+        let report = pass(&mut broker);
+        assert_eq!(report.kept_recent_files, 1, "{report:#?}");
+        assert_eq!(
+            report.strip.refused.get("recent_file_activity"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(edited.join("node_modules/dep/index.js").exists());
+        assert_eq!(report.kept_sampled, 1, "{report:#?}");
+        assert!(
+            report.samples.get(&id).is_some_and(|bytes| *bytes > 0),
+            "{report:#?}"
+        );
+
+        // Within its 30 minutes it is not examined again.
+        let again = pass(&mut broker);
+        assert_eq!(again.skipped_backoff, 1, "{again:#?}");
+        assert_eq!(again.kept_recent_files, 0, "{again:#?}");
+        let shift = |broker: &mut crate::Broker, minutes: i64| {
+            broker
+                .update_meta_json(
+                    IDLE_STRIP_REFUSED_KEY,
+                    |stored: &mut std::collections::BTreeMap<i64, (i64, i64)>| {
+                        for (_, at) in stored.values_mut() {
+                            *at -= minutes * 60_000;
+                        }
+                    },
+                )
+                .unwrap();
+        };
+        shift(&mut broker, 20);
+        assert_eq!(pass(&mut broker).skipped_backoff, 1);
+        // It lapses after 30 minutes in all.
+        shift(&mut broker, 15);
+        let lapsed = pass(&mut broker);
+        assert_eq!(lapsed.skipped_backoff, 0, "{lapsed:#?}");
+        assert_eq!(lapsed.kept_recent_files, 1, "{lapsed:#?}");
+
+        // And when the session's activity moves, at once.
+        assert_eq!(pass(&mut broker).skipped_backoff, 1);
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![crate::clock::epoch_ms() - 6 * 3_600_000, id],
+            )
+            .unwrap();
+        let moved = pass(&mut broker);
+        assert_eq!(moved.skipped_backoff, 0, "{moved:#?}");
+        assert_eq!(moved.kept_recent_files, 1, "{moved:#?}");
+
+        // A dependency directory installed just now (gitignored, so the
+        // changed-file probe never sees it) keeps the session even though
+        // everything else is old; an old one with a fresh index (above) did
+        // not.
+        let (_id, installing, _admin) =
+            aged_idle_session_with_node_modules(&mut broker, "fresh install");
+        set_file_mtime(
+            &installing.join("node_modules/.modules.yaml"),
+            std::time::SystemTime::now(),
+        );
+        let installed = pass(&mut broker);
+        assert_eq!(
+            installed.strip.refused.get("recent_file_activity"),
+            Some(&1),
+            "{installed:#?}"
+        );
+        assert!(installing.join("node_modules/dep/index.js").exists());
+        crate::session_holder::set_process_use_snapshot_for_tests(None);
+    }
+
+    fn set_file_mtime(path: &Path, when: std::time::SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// An aged idle session whose first tracked file was modified just now.
+    fn aethyme_edited_session(broker: &mut crate::Broker) -> (i64, PathBuf, PathBuf) {
+        let (id, worktree, admin) =
+            aged_idle_session_with_node_modules(broker, "tracked file edited");
+        let tracked = git(&worktree, &["ls-files"]);
+        let tracked = tracked.lines().next().expect("a tracked file").to_owned();
+        std::fs::write(worktree.join(&tracked), "edited just now\n").unwrap();
+        (id, worktree, admin)
+    }
+
     /// A session idle past the artifact max age ignores a guarded command's
     /// stale receipt, but a command that is in fact running still holds the
     /// checkout's artifact-use lock: the strip refuses as `checkout_busy`
@@ -13362,7 +13544,7 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(40 * 3_600);
         crate::worktree_status_activity::age_tree_for_test(&worktree, old);
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-        for name in ["index", "HEAD"] {
+        for name in ["index", "HEAD", "logs/HEAD"] {
             std::fs::File::options()
                 .write(true)
                 .open(admin.join(name))
