@@ -12524,7 +12524,7 @@ mod tests {
                 std::time::SystemTime::now() - Duration::from_secs(10 * 3_600),
             );
             let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-            for name in ["index", "HEAD"] {
+            for name in ["index", "HEAD", "logs/HEAD"] {
                 std::fs::File::options()
                     .write(true)
                     .open(admin.join(name))
@@ -12686,7 +12686,7 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
         crate::worktree_status_activity::age_tree_for_test(&worktree, old);
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-        for name in ["index", "HEAD"] {
+        for name in ["index", "HEAD", "logs/HEAD"] {
             std::fs::File::options()
                 .write(true)
                 .open(admin.join(name))
@@ -12783,7 +12783,10 @@ mod tests {
             let mut paths = vec![
                 admin.join("index"),
                 admin.join("HEAD"),
+                admin.join("logs/HEAD"),
                 worktree.to_path_buf(),
+                worktree.join("node_modules"),
+                worktree.join("node_modules/.modules.yaml"),
             ];
             for name in git(worktree, &["ls-tree", "-d", "--name-only", "HEAD"]).lines() {
                 paths.push(worktree.join(name));
@@ -12839,8 +12842,9 @@ mod tests {
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
 
-        // Idle by session activity, but `HEAD` was just written (a commit
-        // by an agent working by absolute paths): not idle.
+        // Idle by session activity, but `HEAD` was just rewritten (a
+        // checkout by an agent working by absolute paths): not idle. A
+        // commit's reflog is covered in strip_idle's own tests with real Git.
         let head =
             PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim()).join("HEAD");
         age_files(&worktree);
@@ -13341,7 +13345,7 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
         crate::worktree_status_activity::age_tree_for_test(&worktree, old);
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-        for name in ["index", "HEAD"] {
+        for name in ["index", "HEAD", "logs/HEAD"] {
             std::fs::File::options()
                 .write(true)
                 .open(admin.join(name))
@@ -13444,7 +13448,32 @@ mod tests {
         let moved = pass(&mut broker);
         assert_eq!(moved.skipped_backoff, 0, "{moved:#?}");
         assert_eq!(moved.kept_recent_files, 1, "{moved:#?}");
+
+        // A dependency directory installed just now (gitignored, so the
+        // changed-file probe never sees it) keeps the session even though
+        // everything else is old; an old one with a fresh index (above) did
+        // not.
+        let (_id, installing, _admin) =
+            aged_idle_session_with_node_modules(&mut broker, "fresh install");
+        set_file_mtime(
+            &installing.join("node_modules/.modules.yaml"),
+            std::time::SystemTime::now(),
+        );
+        let installed = pass(&mut broker);
+        assert_eq!(
+            installed.strip.refused.get("recent_file_activity"),
+            Some(&1),
+            "{installed:#?}"
+        );
+        assert!(installing.join("node_modules/dep/index.js").exists());
         crate::session_holder::set_process_use_snapshot_for_tests(None);
+    }
+
+    fn set_file_mtime(path: &Path, when: std::time::SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     /// An aged idle session whose first tracked file was modified just now.
@@ -13515,7 +13544,7 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(40 * 3_600);
         crate::worktree_status_activity::age_tree_for_test(&worktree, old);
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-        for name in ["index", "HEAD"] {
+        for name in ["index", "HEAD", "logs/HEAD"] {
             std::fs::File::options()
                 .write(true)
                 .open(admin.join(name))

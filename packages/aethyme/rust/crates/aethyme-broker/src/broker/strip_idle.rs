@@ -166,6 +166,14 @@ pub(crate) const ACTIVITY_UNKNOWN: &str = "activity_unknown";
 /// The fingerprint of the note left after an idle strip.
 pub(crate) const IDLE_STRIP_NOTE_FINGERPRINT: &str = "idle-regenerable-strip";
 
+/// A checkout kept for recent file activity, queued for measurement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingKeptSample {
+    session_id: i64,
+    worktree: PathBuf,
+    declared_outputs: Vec<String>,
+}
+
 /// What the idle strip pass did, beside the directory-level counters of
 /// its [`CheckoutStripReport`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -190,6 +198,9 @@ pub(crate) struct IdleStripReport {
     /// Checkouts kept for recent file activity whose bytes were measured
     /// this pass (at most [`IDLE_STRIP_KEPT_SAMPLES_PER_PASS`]).
     pub kept_sampled: usize,
+    /// Kept checkouts waiting for their byte measurement at the end of the
+    /// pass.
+    pending_kept: Vec<PendingKeptSample>,
     /// Catalogued directories kept because no preparation step declares
     /// them as an output.
     pub kept_not_declared: usize,
@@ -579,8 +590,32 @@ fn git_admin_dir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Activity on the directories the strip would remove, which the changed-file
+/// probe cannot see (it ignores gitignored paths): a recent modification time
+/// on a covered candidate's root, or on the file its install or environment
+/// creation writes last (`.modules.yaml`, `.package-lock.json`,
+/// `pyvenv.cfg`). A fresh `npm install` or a new virtual environment counts.
+fn recent_regenerable_root(
+    worktree: &Path,
+    covered: &[super::strip::StripCandidate],
+    since: std::time::SystemTime,
+) -> bool {
+    let newer = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified >= since)
+    };
+    covered.iter().any(|candidate| {
+        let root = worktree.join(&candidate.relative);
+        newer(&root)
+            || [".modules.yaml", ".package-lock.json", "pyvenv.cfg"]
+                .iter()
+                .any(|marker| newer(&root.join(marker)))
+    })
+}
+
 /// File-system evidence that someone worked in `worktree` since `since`:
-/// `HEAD` (a commit or checkout), or a changed file found by the changed-file
+/// `HEAD` (a checkout or switch), its reflog (a commit, reset or stash), or a changed file found by the changed-file
 /// probe or the modification-time walk; `None` when there is none.
 ///
 /// The Git index and the checkout directory's own modification times are not
@@ -611,6 +646,14 @@ pub(crate) fn recent_file_activity(
                 crate::worktree_status_activity::IDLE_STRIP_LOOK,
             );
             return Some("git_head");
+        }
+        // `git commit`, `reset` and `stash` do not touch `HEAD` but append
+        // to its reflog; a plain `git status` (an index refresh) does not.
+        if newer(&admin.join("logs").join("HEAD")) {
+            crate::worktree_status_activity::note_index_head_decides(
+                crate::worktree_status_activity::IDLE_STRIP_LOOK,
+            );
+            return Some("git_reflog");
         }
         index_newer = newer(&admin.join("index"));
     }
@@ -683,6 +726,10 @@ pub(crate) struct CheckoutByteEstimate {
     /// `measured_bytes` plus the mean of the sampled checkouts still holding
     /// directories for every checkout not sampled; `None` (unmeasured) while
     /// no checkout has been sampled, which is not the same as zero bytes.
+    /// Left out of the JSON when `None`: a reader from before this field was
+    /// optional (a `u64` with a default) then reads the field as absent, not
+    /// a `null` it cannot parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     pub observed_at_ms: i64,
 }
@@ -990,6 +1037,7 @@ impl Broker {
                 .meta_set(IDLE_STRIP_BACKLOG_KEY, &report.idle_backlog.to_string())
                 .map_err(|error| error.to_string()),
         );
+        self.sample_kept_checkouts(&mut report, deadline);
         self.record_checkout_byte_estimate(&open, &report.samples, now_ms);
         if !newly_handled.is_empty() {
             crate::warn_unrecorded(
@@ -1148,14 +1196,13 @@ impl Broker {
             return Refused("activity_unknown");
         }
         if let Some(evidence) = evidence {
-            report.kept_recent_files += 1;
-            crate::phase_telemetry::add("checkout_idle_strip_kept_recent_files", Duration::ZERO);
-            crate::phase_telemetry::attach(
-                "checkout_idle_strip_recent_file_evidence",
-                serde_json::json!({ "session_id": session.id, "evidence": evidence }),
+            return self.keep_for_activity(
+                report,
+                session.id,
+                &worktree,
+                &declared_outputs,
+                evidence,
             );
-            self.sample_kept_checkout(report, session.id, &worktree, &declared_outputs, deadline);
-            return Refused("recent_file_activity");
         }
         drop(preconditions);
         report.strip.checkouts_listed += 1;
@@ -1334,6 +1381,15 @@ impl Broker {
         // candidates only), within this checkout's share of the pass budget.
         let mut covered = candidates.clone();
         covered.extend(members.iter().cloned());
+        if recent_regenerable_root(&worktree, &covered, since) {
+            return self.keep_for_activity(
+                report,
+                session.id,
+                &worktree,
+                &declared_outputs,
+                "regenerable_root",
+            );
+        }
         let sizes = self.measure_covered(report, &worktree, &covered, deadline);
         // Every covered candidate is proved before anything moves (the
         // pnpm-member proof reads the top-level `node_modules/.bin`).
@@ -1463,37 +1519,64 @@ impl Broker {
         );
     }
 
-    /// Measure what a checkout kept for recent file activity holds in the
-    /// directories the strip would cover, for the byte estimate; within the
-    /// pass's measurement budget and [`IDLE_STRIP_KEPT_SAMPLES_PER_PASS`].
-    fn sample_kept_checkout(
+    /// Keep a checkout for recent file activity of kind `evidence`, and queue
+    /// it for byte measurement at the end of the pass.
+    fn keep_for_activity(
         &self,
         report: &mut IdleStripReport,
         session_id: i64,
         worktree: &Path,
         declared_outputs: &[String],
-        deadline: Instant,
-    ) {
-        if report.kept_sampled >= IDLE_STRIP_KEPT_SAMPLES_PER_PASS
-            || Duration::from_millis(report.measure_ms) >= IDLE_STRIP_MEASURE_PASS_BUDGET
-        {
-            return;
+        evidence: &'static str,
+    ) -> IdleStrip {
+        report.kept_recent_files += 1;
+        crate::phase_telemetry::add("checkout_idle_strip_kept_recent_files", Duration::ZERO);
+        crate::phase_telemetry::attach(
+            "checkout_idle_strip_recent_file_evidence",
+            serde_json::json!({ "session_id": session_id, "evidence": evidence }),
+        );
+        if report.pending_kept.len() < IDLE_STRIP_KEPT_SAMPLES_PER_PASS {
+            report.pending_kept.push(PendingKeptSample {
+                session_id,
+                worktree: worktree.to_path_buf(),
+                declared_outputs: declared_outputs.to_vec(),
+            });
         }
-        report.kept_sampled += 1;
-        let Ok(candidates) = super::strip::regenerable_candidates(worktree, deadline) else {
-            return;
-        };
-        let covered: Vec<_> = candidates
-            .into_iter()
-            .filter(|candidate| idle_coverage(declared_outputs, candidate).is_some())
-            .collect();
-        let sizes = self.measure_covered(report, worktree, &covered, deadline);
-        if sizes.len() == covered.len() {
-            let bytes = sizes
-                .values()
-                .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
-            report.samples.insert(session_id, bytes);
-            crate::phase_telemetry::add("checkout_idle_strip_kept_sampled", Duration::ZERO);
+        IdleStrip::Refused("recent_file_activity")
+    }
+
+    /// Measure what the checkouts kept for recent file activity hold in the
+    /// directories the strip would cover, for the byte estimate. Run after
+    /// every stripped checkout was measured, so it only uses what is left of
+    /// the pass's measurement budget.
+    fn sample_kept_checkouts(&self, report: &mut IdleStripReport, deadline: Instant) {
+        let pending = std::mem::take(&mut report.pending_kept);
+        for kept in pending {
+            if Instant::now() >= deadline
+                || Duration::from_millis(report.measure_ms) >= IDLE_STRIP_MEASURE_PASS_BUDGET
+            {
+                break;
+            }
+            let _span = crate::phase_telemetry::span("checkout_idle_strip_kept_sample");
+            let checkout_deadline = deadline.min(Instant::now() + IDLE_STRIP_CHECKOUT_BUDGET);
+            let Ok(candidates) =
+                super::strip::regenerable_candidates(&kept.worktree, checkout_deadline)
+            else {
+                continue;
+            };
+            let covered: Vec<_> = candidates
+                .into_iter()
+                .filter(|candidate| idle_coverage(&kept.declared_outputs, candidate).is_some())
+                .collect();
+            let sizes = self.measure_covered(report, &kept.worktree, &covered, checkout_deadline);
+            if sizes.len() == covered.len() {
+                let bytes = sizes
+                    .values()
+                    .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
+                report.samples.insert(kept.session_id, bytes);
+                report.kept_sampled += 1;
+                crate::phase_telemetry::add("checkout_idle_strip_kept_sampled", Duration::ZERO);
+            }
         }
     }
 
@@ -1801,6 +1884,7 @@ mod tests {
             for path in [
                 worktree.join(".git/index"),
                 worktree.join(".git/HEAD"),
+                worktree.join(".git/logs/HEAD"),
                 worktree.join("src"),
                 worktree.to_path_buf(),
             ] {
@@ -1809,10 +1893,21 @@ mod tests {
         };
         age_all();
         assert_eq!(recent_file_activity(worktree, since, far()), None);
+        // A checkout or switch rewrites `HEAD` itself.
         set_mtime(&worktree.join(".git/HEAD"), std::time::SystemTime::now());
         assert_eq!(
             recent_file_activity(worktree, since, far()),
             Some("git_head")
+        );
+        age_all();
+        // A commit, reset or stash appends to the reflog instead.
+        set_mtime(
+            &worktree.join(".git/logs/HEAD"),
+            std::time::SystemTime::now(),
+        );
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("git_reflog")
         );
         age_all();
         // A fresh index with no changed file (a stat refresh) is not activity.
@@ -1857,6 +1952,147 @@ mod tests {
             Some(ACTIVITY_UNKNOWN)
         );
         crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(false));
+    }
+
+    /// Real Git in a linked worktree: a commit (which leaves `HEAD`'s time
+    /// alone and writes the reflog and index) is activity, while a plain
+    /// `git status` that only refreshes the index is not. Mutations caught:
+    /// reading only `HEAD`, reading the index as activity.
+    #[test]
+    fn a_real_commit_is_activity_and_a_plain_status_refresh_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let far = || Instant::now() + Duration::from_secs(60);
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                crate::git::git_command()
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.txt"), "x\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "init"]);
+        git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        let admin = git_admin_dir(&linked).expect("linked worktree admin dir");
+        let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3600);
+        let since = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
+        let age_all = || {
+            for path in [
+                admin.join("index"),
+                admin.join("HEAD"),
+                admin.join("logs/HEAD"),
+                linked.join("a.txt"),
+                linked.clone(),
+            ] {
+                set_mtime(&path, old);
+            }
+        };
+        age_all();
+        assert_eq!(recent_file_activity(&linked, since, far()), None);
+
+        // A plain `git status` after a file's stat data changed refreshes
+        // (rewrites) the index: new index time, same content, no reflog.
+        set_mtime(&linked.join("a.txt"), old - Duration::from_secs(3600));
+        git(&linked, &["status", "--porcelain"]);
+        let index_time = std::fs::metadata(admin.join("index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(index_time >= since, "the status refreshed the index");
+        assert_eq!(recent_file_activity(&linked, since, far()), None);
+
+        // A real commit leaves `HEAD` alone but writes the reflog.
+        age_all();
+        git(&linked, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        let head_time = std::fs::metadata(admin.join("HEAD"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(head_time < since, "a commit does not rewrite HEAD");
+        assert_eq!(
+            recent_file_activity(&linked, since, far()),
+            Some("git_reflog")
+        );
+    }
+
+    /// A covered directory the strip would remove that was created or
+    /// installed into recently is activity the changed-file probe cannot see
+    /// (it ignores gitignored paths); an old one is not. Mutation caught:
+    /// dropping the root check.
+    #[test]
+    fn a_fresh_dependency_directory_is_activity_and_an_old_one_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        let candidate = |relative: &str| super::super::strip::StripCandidate {
+            relative: relative.to_string(),
+            kind: super::super::strip::StripKind::for_name("node_modules").unwrap(),
+        };
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/.modules.yaml"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join(".venv")).unwrap();
+        std::fs::write(worktree.join(".venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3600);
+        let since = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
+        let covered = [candidate("node_modules"), candidate(".venv")];
+        let age = || {
+            for path in [
+                "node_modules/.modules.yaml",
+                "node_modules/dep",
+                "node_modules",
+                ".venv/pyvenv.cfg",
+                ".venv",
+            ] {
+                set_mtime(&worktree.join(path), old);
+            }
+        };
+        age();
+        assert!(!recent_regenerable_root(worktree, &covered, since));
+        for fresh in [
+            "node_modules",
+            "node_modules/.modules.yaml",
+            ".venv",
+            ".venv/pyvenv.cfg",
+        ] {
+            age();
+            set_mtime(&worktree.join(fresh), std::time::SystemTime::now());
+            assert!(
+                recent_regenerable_root(worktree, &covered, since),
+                "{fresh}"
+            );
+        }
+    }
+
+    /// The optional estimate fields are left out of the JSON when unmeasured,
+    /// so a reader from before they were optional (a `u64` with a default)
+    /// still parses the record. Mutation caught: serialising `null`.
+    #[test]
+    fn an_unmeasured_estimate_is_absent_from_json_for_older_readers() {
+        #[derive(serde::Deserialize)]
+        struct Old {
+            #[serde(default)]
+            estimated_bytes: u64,
+            open_checkouts: usize,
+        }
+        let unmeasured = estimate_open_checkout_bytes(&[1, 2], &BTreeMap::new());
+        let json = serde_json::to_string(&unmeasured).unwrap();
+        assert!(!json.contains("estimated_bytes"), "{json}");
+        let old: Old = serde_json::from_str(&json).unwrap();
+        assert_eq!((old.estimated_bytes, old.open_checkouts), (0, 2));
+        let measured = estimate_open_checkout_bytes(&[1], &BTreeMap::from([(1, 7_u64)]));
+        let old: Old = serde_json::from_str(&serde_json::to_string(&measured).unwrap()).unwrap();
+        assert_eq!(old.estimated_bytes, 7);
+        let back: CheckoutByteEstimate =
+            serde_json::from_str(&serde_json::to_string(&unmeasured).unwrap()).unwrap();
+        assert_eq!(back.estimated_bytes, None);
     }
 
     /// The notice is created only when absent: a conflict notice is never

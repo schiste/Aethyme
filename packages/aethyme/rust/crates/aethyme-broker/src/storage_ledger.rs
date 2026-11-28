@@ -919,7 +919,9 @@ pub struct CheckoutCounts {
     #[serde(default)]
     pub measured_checkout_bytes: u64,
     /// `None` while no open checkout has been measured (unmeasured, not zero).
-    #[serde(default)]
+    /// Left out of the JSON when `None`, so older readers (a `u64` with a
+    /// default) read it as absent rather than failing on `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_checkout_bytes: Option<u64>,
 }
 
